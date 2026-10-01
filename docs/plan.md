@@ -114,16 +114,39 @@
 
 **目标：** 主代理能通过角色工具委派给 DSH 内置子代理，并拿回结构化结果。
 
-**产出：**
-- `src/schema.js` / `src/roles.js`：角色模型与校验
-- `src/host/tools.js`：每个角色注册一个工具，内部 `ctx.agents.requireInitiator()` 取父代理 → `ctx.subagents.start(provider, request)`
-- `src/host/prompt.js`：角色提示词 + 结果契约
+**状态：已完成并真机验证。**
 
-**验收：**
-1. 配三个角色（`spawn` 后端），工具清单里出现三个对应工具。
-2. 真实调用其中一个，主代理收到子代理回传的文本结果。
-3. 角色 `backend: cli` 但 `allowCrossCli: false` 时，工具**不注册**（而不是注册后报错）。
-4. 角色 maxDepth 递归：子代理再委派时受既定上限约束，不出现无限递归。
+**产出（已落地）：**
+- `src/roles.js`：纯函数角色模型与校验（不 import DSH 运行时，故可离线单测）
+- `src/index.js`：`apply` 时用 `ctx.plugin()` 为每个角色挂载一个 `dsh-tool-subagent` 实例；并注册角色路由指引到 `ctx.systemPrompt`
+- `scripts/check-roles.mjs`：61 条离线断言
+- `scripts/check-config-schema.mjs`：Config 与依赖解析离线预检
+- `scripts/gen-role-config.mjs`：把 `raw/agents/*.toml` 转成插件 Config（含 YAML 校验与备份）
+
+**验收结果（全部真机通过）：**
+
+| # | 验收项 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 1 | 角色工具出现在工具清单 | ✅ | 4 个 `delegate_to_*` 工具上线 |
+| 2 | 真实派发并拿回结果 | ✅ | 向 scout 派发三个可核对问题，答案与引用均正确 |
+| 3 | `readOnly` 约束生效 | ✅ | scout 拒绝修改文件；其工具清单无 `write`/`edit`/`pwsh`，而 worker 有 |
+| 4 | `persona` 生效 | ✅ | scout 按角色的「证据优先」格式作答，给出 `src/roles.js:24–32` 等精确引用 |
+| 5 | 嵌套派发默认关闭 | ✅ | 角色工具配置 `maxDepth: 1`，子代理无法再派 |
+| 6 | 路由指引传达给主代理 | ✅ | 系统提示中出现 `## Subagent roles` 段 |
+| 7 | **模型按角色切换** | ⚠️ **未能独立验证** | 见下 |
+
+**未能验证的一项，以及原因（重要）：**
+
+「角色是否真的用上了各自指定的 `model` / `effort`」——配置已下发到每个工具实例的
+`agentOptions`（结构上必然被消费），但**我无法从任何模型可见的表面反查实际使用的模型**。已逐一排查并确认这些表面**都不含**该信息：
+
+- 子代理自己的上下文：worker 明确回答 `not stated in my context`，拒绝猜测（这是它的正确行为）
+- `ctx.subagents` 的 catalog（`SubagentCatalogEntry`）：不含模型字段
+- 持久化会话记录 `session.v4.jsonl.zstd`：当前可读部分只有 header，无 `request/header` 事件
+- `list_subagent_models` 工具：需要 `modelSelectionSettings: true` 才注册，而本插件按 D12 设为 false
+- Client 侧源码：未发现 per-session 模型展示
+
+**这是一个真实的可观测性缺口，不是本插件的 bug。** 决定性的验证手段是**反证实验**：把某个角色的 `model` 改成一个不存在的 id，重新启用后派发该角色——若失败，即证明 `agentOptions.model` 确实被消费；若仍成功，则说明该字段被忽略。这需要一次重启，尚未执行。
 
 ## Phase 3 · CLI 后端
 
