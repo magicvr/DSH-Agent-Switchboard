@@ -64,6 +64,128 @@ const BACKEND_LABEL = {
 };
 
 /**
+ * 已知 CLI 驱动的**界面镜像**。
+ *
+ * ⚠️ 本表与 `src/cli/drivers.js` 的 `CLI_DRIVERS` **必须一致**（id / label / command /
+ * prefixArgs / args / promptDelivery）。Client 半边是自包含单文件（`factory` 里不能
+ * import），因此无法复用 Host 的模块，只能内联。`scripts/check-client.mjs` 会断言两处
+ * 一字不差，防止漂移 —— 与 `parseJsonArray` / `validateRoles` 用的是同一套做法。
+ *
+ * 为什么 UI 需要**参数模板**而不只是名字：选中驱动要「一键填好」那四个字段。
+ * 若只给名字、不给模板，界面就无法填入正确参数，等于没做。
+ */
+const CLI_DRIVER_OPTIONS = [
+  {
+    id: 'codex',
+    label: 'Codex CLI',
+    description: 'OpenAI Codex。非交互走 `codex exec`，提示词走 stdin。只读由 `-s read-only` 实现。',
+    command: '{node}',
+    prefixArgs: ['{npmRoot}\\@openai\\codex\\bin\\codex.js'],
+    promptDelivery: 'stdin',
+    modelPlaceholder: 'gpt-6-luna',
+    args: (readOnly) => [
+      'exec',
+      '-s',
+      readOnly ? 'read-only' : 'workspace-write',
+      '--skip-git-repo-check',
+      '-m',
+      '{model}',
+      '-c',
+      'model_reasoning_effort={effort}',
+      '-',
+    ],
+  },
+  {
+    id: 'claude',
+    label: 'Claude Code',
+    description: 'Anthropic Claude Code。非交互走 `-p/--print`，提示词走 stdin。只读用 `--permission-mode plan`。',
+    command: 'claude',
+    prefixArgs: [],
+    promptDelivery: 'stdin',
+    modelPlaceholder: 'sonnet',
+    args: (readOnly) => [
+      '-p',
+      '--model',
+      '{model}',
+      '--effort',
+      '{effort}',
+      '--permission-mode',
+      readOnly ? 'plan' : 'acceptEdits',
+    ],
+  },
+  {
+    id: 'grok',
+    label: 'Grok CLI',
+    description: 'xAI Grok。非交互走 `-p/--single`，提示词是**参数**而非 stdin。只读用 `--permission-mode plan`。',
+    command: 'grok',
+    prefixArgs: [],
+    promptDelivery: 'argv',
+    modelPlaceholder: 'grok-4.7',
+    args: (readOnly) => [
+      '-p',
+      '{prompt}',
+      '-m',
+      '{model}',
+      '--reasoning-effort',
+      '{effort}',
+      '--permission-mode',
+      readOnly ? 'plan' : 'acceptEdits',
+    ],
+  },
+  {
+    id: 'custom',
+    label: '自定义命令',
+    description: '自行填写命令与参数。适用于本表未收录的 CLI。',
+    command: '',
+    prefixArgs: [],
+    promptDelivery: 'stdin',
+    modelPlaceholder: '',
+    args: (readOnly) => [],
+  },
+];
+
+/**
+ * 产出一个驱动对应的 `cli*` 字段（与 Host 的 `cliFieldsFor` 行为一致）。
+ *
+ * @param {string} id - 驱动 id。
+ * @param {boolean} readOnly - 角色是否只读。
+ * @returns {{cliCommand: string, cliPrefixArgs: string[], cliArgs: string[], cliPromptDelivery: string}|undefined} 字段值。
+ */
+function cliFieldsFor(id, readOnly) {
+  const d = CLI_DRIVER_OPTIONS.find((x) => x.id === id);
+  if (d === undefined || d.id === 'custom') return undefined;
+  return {
+    cliCommand: d.command,
+    cliPrefixArgs: [...d.prefixArgs],
+    cliArgs: d.args(readOnly),
+    cliPromptDelivery: d.promptDelivery,
+  };
+}
+
+/**
+ * 反推角色当前属于哪个驱动（与 Host 的 `inferCliDriver` 行为一致）。
+ *
+ * 若用户手工改过 `cli*` 字段导致与任何驱动都不一致，返回 `custom` ——
+ * 避免界面把用户的自定义配置**显示**成某个预设（那会误导）。
+ *
+ * @param {object} role - 角色。
+ * @returns {string} 驱动 id。
+ */
+function inferCliDriver(role) {
+  for (const d of CLI_DRIVER_OPTIONS) {
+    if (d.id === 'custom') continue;
+    if (role?.cliCommand !== d.command) continue;
+    if (JSON.stringify(role.cliPrefixArgs ?? []) !== JSON.stringify(d.prefixArgs)) continue;
+    if ((role.cliPromptDelivery ?? 'stdin') !== d.promptDelivery) continue;
+    const args = role.cliArgs ?? [];
+    for (const readOnly of [true, false]) {
+      if (JSON.stringify(args) === JSON.stringify(d.args(readOnly))) return d.id;
+    }
+  }
+  return 'custom';
+}
+
+/**
  * 解析一个 JSON 字符串数组。
  *
  * ⚠️ 本函数与 `src/client/logic.js` 里的 `parseJsonArray` **必须逐字相同**：
@@ -257,6 +379,44 @@ window.__ModuleLoader__.load({
     /** 复制一份角色数组，避免直接改读到快照里的对象。 */
     const cloneRoles = (roles) => roles.map((r) => ({ ...r }));
 
+    /**
+     * 单行输入框的统一外观。
+     *
+     * 抽成函数是为了让「驱动选择器」这类自绘控件与 `text()` 完全同款，
+     * 不必复制一份样式（复制会漂移）。
+     *
+     * @returns {object} 内联样式。
+     */
+    function inputStyle() {
+      return {
+        width: '100%',
+        boxSizing: 'border-box',
+        padding: '3px 6px',
+        fontSize: '12px',
+        color: 'var(--dsw-alias-label-primary)',
+        background: 'var(--dsw-alias-bg-base)',
+        border: '1px solid var(--dsw-alias-border-l2)',
+        borderRadius: '4px',
+      };
+    }
+
+    /**
+     * 下拉框的统一外观。
+     *
+     * @returns {object} 内联样式。
+     */
+    function selectStyle() {
+      return {
+        width: '100%',
+        padding: '3px 6px',
+        fontSize: '12px',
+        color: 'var(--dsw-alias-label-primary)',
+        background: 'var(--dsw-alias-bg-base)',
+        border: '1px solid var(--dsw-alias-border-l2)',
+        borderRadius: '4px',
+      };
+    }
+
     /** 文本域 / 输入框的统一外观。 */
     function monoStyle() {
       return {
@@ -303,6 +463,16 @@ window.__ModuleLoader__.load({
     function RoleRow(props) {
       const { role, index, onChange, onRemove, disabled } = props;
       const isCli = role.backend === 'cli';
+      // 当前驱动由**字段反推**，而不是读 `cliDriver` —— 这样即使用户手工改了参数，
+      // 下拉框也会如实显示成「自定义命令」，不会把一个改过的配置显示成某个预设。
+      const currentDriver = isCli ? inferCliDriver(role) : 'custom';
+      const driverDef = CLI_DRIVER_OPTIONS.find((d) => d.id === currentDriver);
+      const driverHint =
+        driverDef === undefined
+          ? ''
+          : `${driverDef.description}${
+              driverDef.modelPlaceholder ? ` 模型示例：${driverDef.modelPlaceholder}` : ''
+            }`;
 
       /** 改本行某个字段。 */
       const set = (key, value) => onChange(index, { ...role, [key]: value });
@@ -324,16 +494,7 @@ window.__ModuleLoader__.load({
           placeholder,
           disabled,
           onChange: (e) => set(key, e.target.value),
-          style: {
-            width: '100%',
-            boxSizing: 'border-box',
-            padding: '3px 6px',
-            fontSize: '12px',
-            color: 'var(--dsw-alias-label-primary)',
-            background: 'var(--dsw-alias-bg-base)',
-            border: '1px solid var(--dsw-alias-border-l2)',
-            borderRadius: '4px',
-          },
+          style: inputStyle(),
         });
 
       /** 统一样式的下拉。 */
@@ -344,15 +505,7 @@ window.__ModuleLoader__.load({
             value: role[key] ?? options[0],
             disabled,
             onChange: (e) => set(key, e.target.value),
-            style: {
-              width: '100%',
-              padding: '3px 6px',
-              fontSize: '12px',
-              color: 'var(--dsw-alias-label-primary)',
-              background: 'var(--dsw-alias-bg-base)',
-              border: '1px solid var(--dsw-alias-border-l2)',
-              borderRadius: '4px',
-            },
+            style: selectStyle(),
           },
           options.map((o) => h('option', { key: o, value: o }, labels ? labels[o] ?? o : o)),
         );
@@ -441,7 +594,49 @@ window.__ModuleLoader__.load({
               h(
                 'span',
                 { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
-                '外部 CLI 参数（占位符：{prompt} / {cwd} / {model} / {effort}）',
+                '外部 CLI —— 选一个具体 CLI，或自定义',
+              ),
+              // ⚠️ 这里是「选**哪个** CLI」，不是笼统的「外部 CLI」。
+              //    选中后会把该 CLI 的 command / prefixArgs / args / promptDelivery
+              //    一键填好；它们仍是可编辑的权威数据（驱动只是填默认值，不是覆盖层）。
+              field(
+                'CLI',
+                h(
+                  'div',
+                  { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+                  h(
+                    'select',
+                    {
+                      value: currentDriver,
+                      disabled,
+                      onChange: (e) => {
+                        const id = e.target.value;
+                        set('cliDriver', id);
+                        const fields = cliFieldsFor(id, role.readOnly === true);
+                        if (fields !== undefined) {
+                          // 只填「命令形态」四件套；模型与工作目录属于用户自己的环境，
+                          // 不由驱动改写（每个 CLI 有自己的模型命名空间，插件给不出默认值）。
+                          set('cliCommand', fields.cliCommand);
+                          set('cliPrefixArgs', fields.cliPrefixArgs);
+                          set('cliArgs', fields.cliArgs);
+                          set('cliPromptDelivery', fields.cliPromptDelivery);
+                        }
+                      },
+                      style: selectStyle(),
+                    },
+                    CLI_DRIVER_OPTIONS.map((d) => h('option', { key: d.id, value: d.id }, d.label)),
+                  ),
+                ),
+              ),
+              h(
+                'span',
+                { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
+                driverHint,
+              ),
+              h(
+                'span',
+                { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
+                '参数（占位符：{prompt} / {cwd} / {model} / {effort}）',
               ),
               h(
                 'div',

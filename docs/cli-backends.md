@@ -25,8 +25,31 @@
 
 **结论（codex）**：必须以 `node <codex.js>` 形式调用，即 `argv = [node 可执行文件, <codex.js>, 'exec', ...]`。
 
-> ⚠️ 这条结论**只对 codex 实测过**。`claude`（`.exe`）与 `grok`（`.exe`）是真正的可执行文件，
-> 预期可直接 spawn，但**尚未实测**。Phase 3 实现时必须逐个确认，不能假定与 codex 相同。
+### 1b. 三个 CLI 的入口都实测过了（`scripts/probe-clis.mjs`）
+
+| CLI | 本机入口 | 能否被 `spawn(shell:false)` 执行 |
+| --- | --- | --- |
+| `codex` | `%APPDATA%\npm\node_modules\@openai\codex\bin\codex.js` | ✅ **但必须走 `node <codex.js>`**（见上） |
+| `claude` | `C:\Users\<你>\.local\bin\claude.exe` | ✅ 真 `.exe`，可直接 spawn |
+| `grok` | `C:\Users\<你>\.grok\bin\grok.exe` | ✅ 真 `.exe`，可直接 spawn |
+
+即：**「`.exe` 可直接 spawn」这个预期被证实了**，而 codex 是唯一的例外（它是 npm 脚本包装）。
+探测方式：`where.exe` 取全部入口 → 优先 `.exe` → 否则回落 `node <包的 bin/*.js>`。
+
+### 1c. 每个 CLI 有**自己的模型命名空间**（重要，实测踩到）
+
+第一轮真机调用（`scripts/probe-cli-run.mjs`）把插件可用的 LLM 路由名 `gpt-6-luna`
+填给三个 CLI，结果：
+
+| CLI | 结果 |
+| --- | --- |
+| codex | ✅ 退出 0，stderr 自报 `model: gpt-6-luna` |
+| claude | ❌ 退出 1：`"gpt-6-luna" isn't described by this version's model catalog` |
+| grok | ❌ 退出 1：`unknown model id`（`grok models` 才是它的真实列表） |
+
+**结论：`cliArgs` 里的 `{model}` 由用户按各自 CLI 的命名空间填写，插件不提供默认值。**
+因此 `normalizeRole` 对 CLI 角色**要求显式给出 model**（缺失即报错）——这不是「必填形式主义」，
+而是防止 CLI 静默使用它自己的配置（见 §2.4 结论 4）。
 
 ## 2. codex
 
@@ -169,7 +192,42 @@ reasoning effort: ...
 
 ## 3. claude
 
-### 3.1 调用形态（仅来自 `--help`，**未实测**）
+### 3. claude
+
+#### 3.0 实测结论（`scripts/probe-cli-run.mjs` / `probe-cli-run2.mjs` / `probe-claude-isolate.mjs`）
+
+| 项 | 实测结果 |
+| --- | --- |
+| 入口 | `C:\Users\<你>\.local\bin\claude.exe`，可直接 spawn，`--version` → `2.1.285 (Claude Code)` |
+| 非交互 | `-p` / `--print` ✅ 被接受 |
+| 模型 | `--model <model>` ✅ **确实生效**（报错里回显的正是传入值） |
+| 强度 | `--effort <low\|medium\|high\|xhigh\|max>` ✅ 被接受 |
+| 只读 | `--permission-mode <acceptEdits\|auto\|bypassPermissions\|manual\|dontAsk\|plan>` |
+| **端到端** | ❌ **本机跑不通**，原因在客户端配置，与插件无关 |
+
+**失败根因（已定位到具体层，不是猜的）**：claude 会用它**内置的模型目录**校验 `--model`，
+凡是目录里没有的名字一律拒绝：
+
+```
+[claude-code:unrecognized_model] {"model":"gpt-6-luna","query_source":"sdk"}
+```
+
+已排除的可能：
+- **不是** `--model` 没生效 —— 换任意名字，报错就回显那个名字；
+- **不是**网关不认 —— 同一台机器的 codex 用 `gpt-6-luna` 通过，且
+  `GET <网关>/v1/models` 返回 200 且确实含 `gpt-6-luna`；
+- **不是**环境变量覆盖 —— 清掉 `ANTHROPIC_MODEL` 等变量后仍然失败；
+- **不是**「名字太新」—— 连 `claude-sonnet-4-5-20250929`、`claude-sonnet-5` 也被拒。
+
+claude 自己给出的官方出路是**把未知模型映射到它认识的模型**：
+`behavesAs`（modelPicker 行）或 `modelOverrides`。这属于**该 CLI 的配置工作**，
+不由本插件代劳。
+
+> 因此驱动表里保留了 `claude` 预设（调用形态是按实测写的），但**本机尚不可用**。
+> 一旦它的模型映射配好，该预设即可直接使用 —— 不需要改插件代码。
+
+#### 3.1 调用形态（`--help` + 上表实测）
+
 
 - **非交互**：`-p, --print`。help 明确说「useful for pipes」，且在 `-p` 或 stdout 非 TTY 时跳过 workspace trust 对话框。
 - **输出格式**：`--output-format <text|json|stream-json>`（仅配合 `--print`）。
@@ -190,9 +248,25 @@ reasoning effort: ...
 
 ## 4. grok
 
-### 4.1 调用形态（仅来自 `--help`，**未实测**）
+### 4.0 实测结论（`scripts/probe-cli-run.mjs` / `probe-cli-run2.mjs`）
 
-- 无独立非交互子命令；`grok [OPTIONS] [PROMPT]` 默认是 TUI。非交互路径**未实测**。
+| 项 | 实测结果 |
+| --- | --- |
+| 入口 | `C:\Users\<你>\.grok\bin\grok.exe`，可直接 spawn，`--version` → `grok 1.0.44` |
+| 非交互 | `-p` / `--single <PROMPT>` —— 提示词是**参数**，不是 stdin。**无需 TTY** |
+| 模型 | `-m <MODEL>`；`grok models` 实测本机可用：`grok-4.7`（默认）/ `grok-4.7-build-fast` / `grok-4.6` / `grok-4.5` |
+| 强度 | `--reasoning-effort <EFFORT>`（别名 `--effort`） |
+| 只读 | `--permission-mode <default\|acceptEdits\|auto\|dontAsk\|bypassPermissions\|plan>` |
+| **端到端** | ✅ **通过**：`-p <prompt> -m grok-4.7 --reasoning-effort low` → 退出 0，stdout 收到标记串 |
+
+⚠️ 因为提示词是参数，驱动模板里**必须**含 `{prompt}`（`promptDelivery: 'argv'`）。
+`scripts/check-drivers.mjs` 有一条断言锁死这个自洽性：`argv` 传递必须含 `{prompt}`，
+`stdin` 传递必须不含（否则提示词会被传两次）。
+
+### 4.1 调用形态（`--help` + 上表实测）
+
+- 无独立非交互子命令；`grok [OPTIONS] [PROMPT]` 默认是 TUI。**非交互路径已实测**：
+  `-p/--single` 可用，不需要 TTY。
 - `--json-schema <SCHEMA>`：约束结构化输出，隐含 `--output-format json`。
 - `--output-format streaming-messages-json`、`--include-partial-messages`。
 - `--cwd <CWD>`、`--allow` / `--deny`、`--always-approve`。
@@ -225,7 +299,10 @@ reasoning effort: ...
       但**未做真机验证** —— 离线断言用的是假 spawn，证明不了真实进程树被清理。
 - [ ] codex：`--json` 事件流的确切结构（仅在需要结构化 usage/耗时统计时才值得再查）
 - [ ] codex：非零退出码的具体语义细分（额度耗尽 vs 参数错误 vs 模型不存在）——目前只知「都会以致码 1 失败」
-- [ ] claude：能否直接 spawn；stdin 提示词形态；`--effort` 是否真的生效（**不能只信 help**，
-      codex 的教训表明未文档化/已文档化都不等于真的生效）
-- [ ] grok：非交互调用形态（是否必须 TTY）
-- [ ] 三者：是否需要 TTY（若需要，改用 `ctx.subprocess.spawnTerminal`）
+- [x] ~~claude：能否直接 spawn；stdin 提示词形态；`--effort` 是否真的生效~~ → 已实测：
+      入口可直接 spawn、`-p` + stdin 可用、`--model` 与 `--effort` 都被接受。
+      **但本机端到端仍不可用**，原因是 claude 自己的模型目录校验（不是插件问题），见 §3.0。
+- [x] ~~grok：非交互调用形态（是否必须 TTY）~~ → 已实测：`-p/--single` 可用，无需 TTY，见 §4.0
+- [x] ~~三者：是否需要 TTY~~ → 已实测：codex 与 grok 都不需要；claude 的非交互路径也被接受。
+- [ ] claude：**如何让它的模型目录接受网关模型**（`behavesAs` / `modelOverrides` 的具体写法）。
+      这是该 CLI 的配置工作，不由本插件代劳；配好后驱动预设即可直接使用。

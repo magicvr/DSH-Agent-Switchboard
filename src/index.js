@@ -241,6 +241,11 @@ export const Config = z.object({
         allowNestedDispatch: z.boolean().default(false),
         // --- cli 后端需要：可执行文件与参数模板 ---
         // 放在角色**顶层**而非嵌套对象，是为了让设置面板把每一项当普通标量字段渲染。
+        //
+        // `cliDriver` 只是「用户选了哪个 CLI 预设」的**记录**，不参与执行：真正生效的是
+        // 下面四个字段。这样既不引入「预设 vs 手工覆盖」两套真相，又能在界面上把选中的
+        // 预设显示出来（反推失败时显示为 custom）。取值不设 enum，允许用户自定义。
+        cliDriver: z.string().description('所选 CLI 预设的标识（仅记录用；执行以 cliCommand / cliArgs 为准）'),
         cliCommand: z.string(),
         cliPrefixArgs: z.array(z.string()),
         cliArgs: z.array(z.string()),

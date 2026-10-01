@@ -237,6 +237,8 @@ section('provider 命名一致性（跨模块）');
       description: 'd',
       instructions: 'i',
       backend: 'cli',
+      // ⚠️ CLI 角色必须显式给模型：不传 `-m` 时 codex 会静默使用它自己的配置。
+      model: 'gpt-6-luna',
       cliCommand: 'node',
       cliArgs: ['exec', '-'],
       cliCwd: 'C:/w',

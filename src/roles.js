@@ -9,6 +9,7 @@
  * @module @magicvr/dsh-agent-switchboard/roles
  */
 import { validateTemplate } from './cli/argv.js';
+import { resolveDriverPlaceholders } from './cli/drivers.js';
 
 /** 思考强度的统一枚举。与 DSH 的 `ReasoningEffortId` 取值一致。 */
 export const EFFORT_VALUES = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']);
@@ -160,9 +161,26 @@ export function normalizeRole(raw, index, defaultProvider, defaultCwd) {
       for (const line of templateErrors) errors.push(`${at}.cliArgs：${line}`);
     }
 
+    // ⚠️ CLI 角色**必须显式给出模型**。
+    //
+    // 实测（`docs/cli-backends.md`）：codex 在不传 `-m` 时会静默使用它自己
+    // `~/.codex/config.toml` 里的模型，外观上与传了参数毫无区别 —— 角色配置被悄悄架空。
+    // 但**「必填」不等于「由插件提供默认值」**：每个 CLI 有自己的模型命名空间
+    // （把插件的路由名 `gpt-6-luna` 填给 claude 会被拒），所以默认值只能由用户按自己的
+    // CLI 填。这里只做「缺失就报错」，不给默认值。
+    const cliModel = read('model');
+    if (!cliModel) {
+      errors.push(
+        `${at}.model 必填（backend 为 cli 时必须显式给出模型，否则该 CLI 会静默使用它自己的配置）`,
+      );
+    }
+
     cli = {
-      command: cliCommand,
-      prefixArgs: Array.isArray(cliPrefixArgs) ? [...cliPrefixArgs] : [],
+      // 驱动预设里的 `{node}` / `{npmRoot}` 在这里解析成真实路径：这样预设不必把本机
+      // 用户名写进仓库（AGENTS.md 硬规则 5），也不会把占位符漏给子进程。
+      // `{model}` / `{effort}` / `{prompt}` / `{cwd}` 由 `buildArgs` 在每次派发时填充。
+      command: resolveDriverPlaceholders(cliCommand),
+      prefixArgs: Array.isArray(cliPrefixArgs) ? cliPrefixArgs.map(resolveDriverPlaceholders) : [],
       args: Array.isArray(cliArgs) ? [...cliArgs] : [],
       promptDelivery: cliPromptDelivery,
       cwd: cliCwd,

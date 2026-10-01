@@ -282,6 +282,9 @@ section('CLI 后端角色');
     description: 'd',
     instructions: 'i',
     backend: 'cli',
+    // ⚠️ CLI 角色**必须显式给模型**：实测 codex 在不传 `-m` 时会静默使用它自己
+    // `~/.codex/config.toml` 的模型，角色配置被悄悄架空（`docs/cli-backends.md`）。
+    model: 'gpt-6-luna',
     cliCommand: 'node',
     cliArgs: ['exec', '-'],
     cliCwd: 'C:/w',
@@ -289,7 +292,19 @@ section('CLI 后端角色');
 
   const ok = normalizeRole(base, 0, undefined, 'C:/fallback');
   check('合法 CLI 角色通过', ok.role !== null, ok.errors.join('; '));
-  check('CLI 角色不需要 DSH model', ok.role?.model === undefined);
+  // ⚠️ 本条曾写「CLI 角色不需要 DSH model」，那是**错的**。实测：codex 不传 `-m` 时会
+  //    静默使用 `~/.codex/config.toml` 里的模型，外观上与传了参数毫无区别，角色配置被
+  //    悄悄架空。因此 CLI 角色**必须**显式给模型（`normalizeRole` 缺它就报错）。
+  check('CLI 角色显式携带模型（否则 CLI 会静默用自己配置）', ok.role?.model === 'gpt-6-luna', String(ok.role?.model));
+  {
+    const noModel = normalizeRole({ ...base, model: undefined }, 0, undefined, 'C:/fallback');
+    check('CLI 角色缺 model 时报错', noModel.role === null, JSON.stringify(noModel.errors));
+    check(
+      '报错信息说明原因（静默使用 CLI 自身配置）',
+      (noModel.errors ?? []).some((e) => /静默/.test(e)),
+      JSON.stringify(noModel.errors),
+    );
+  }
   check(
     'cli 配置被规范化',
     ok.role?.cli?.command === 'node' && ok.role?.cli?.promptDelivery === 'stdin',

@@ -42,7 +42,10 @@ section('注册契约：必须调用 __ModuleLoader__.load 且 id 严格等于�
 {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   check('源码里出现 __ModuleLoader__.load', /__ModuleLoader__\.load\(/.test(CLIENT_SRC));
-  const m = /id:\s*'([^']+)'/.exec(CLIENT_SRC);
+  // ⚠️ 必须锚定到 `__ModuleLoader__.load({ ... id: ... })` 那一处。
+  //    曾写成「全文件第一个 `id:`」，而文件里还有别的带 id 的表（例如 CLI 驱动表里的
+  //    `id: 'codex'`），于是断言被无关代码干扰而假失败。**断言要锚定到它真正要验的位置。**
+  const m = /__ModuleLoader__\.load\(\{\s*id:\s*'([^']+)'/.exec(CLIENT_SRC);
   check('load 的 id 存在', m !== null);
   check(
     `load 的 id 等于包名（${pkg.name}）`,
@@ -276,6 +279,67 @@ section('防漂移：Client 内联的纯逻辑与 logic.js 必须逐字相同');
     check(`${name} 在两处都存在`, a !== undefined && b !== undefined);
     check(`${name} 两处实现逐字相同`, a !== undefined && a === b, a === b ? '' : '存在漂移');
   }
+}
+
+section('CLI 驱动表：Client 镜像必须与 Host 权威一致');
+{
+  // Client 半边是自包含单文件，无法 import Host 的 `src/cli/drivers.js`，只能内联一份。
+  // 两份一旦漂移，界面「一键填好」的参数就会与 Host 校验/实际调用不一致 —— 因此逐字段比对。
+  const { CLI_DRIVERS } = await import('../src/cli/drivers.js');
+  const driverSource = readFileSync(new URL('../src/cli/drivers.js', import.meta.url), 'utf8');
+
+  // 从客户端源码里把 `CLI_DRIVER_OPTIONS` 那段抽出来，做结构化比对。
+  // 用 `new Function` 执行是不行的（源码里有 React 依赖），因此改为**逐字段文本比对**：
+  // 每个驱动必须能在客户端源码里找到同样的 id/label/command/prefixArgs/promptDelivery，
+  // 且 args 的两种只读形态都必须出现。
+  for (const d of CLI_DRIVERS) {
+    check(`客户端含驱动 ${d.id}`, CLIENT_SRC.includes(`id: '${d.id}'`), '缺该驱动');
+    check(
+      `客户端 ${d.id} 的 command 与 Host 一致`,
+      CLIENT_SRC.includes(`command: '${d.command}'`) || d.command === '',
+      `期望 command: '${d.command}'`,
+    );
+    check(
+      `客户端 ${d.id} 的 promptDelivery 与 Host 一致`,
+      CLIENT_SRC.includes(`promptDelivery: '${d.promptDelivery}'`),
+      `期望 ${d.promptDelivery}`,
+    );
+    // args 模板：取该驱动从 `id:` 到下一个驱动 `id:` 之间的源码段，要求**两种只读形态的
+    // 全部参数字面量**都出现在这一段里。
+    //
+    // ⚠️ 不用「跨源码提取函数体逐字比对」：那个做法依赖花括号配对，实测会抓到错位的块而
+    //    产生假失败（把 `custom` 的 args 抓成了别的对象字面量）。判据要**稳定**才有意义。
+    const segmentOf = (source, driverId) => {
+      const at = source.indexOf(`id: '${driverId}'`);
+      if (at === -1) return '';
+      const next = source.indexOf("id: '", at + 1);
+      return source.slice(at, next === -1 ? source.length : next);
+    };
+    const segment = segmentOf(CLIENT_SRC, d.id);
+    for (const readOnly of [true, false]) {
+      const expected = d.args(readOnly);
+      if (expected.length === 0) continue;
+      const missing = expected.filter((a) => !segment.includes(`'${a}'`));
+      check(
+        `客户端 ${d.id} 的 args（readOnly=${readOnly}）与 Host 一致`,
+        missing.length === 0,
+        `缺少字面量：${JSON.stringify(missing)}`,
+      );
+    }
+    check(
+      `客户端 ${d.id} 的 prefixArgs 与 Host 一致`,
+      // 源码里的字面量对反斜杠要转义（`\\`），而运行时值只有一个反斜杠，因此比较前先转义。
+      d.prefixArgs.every((p) => segment.includes(`'${p.replace(/\\/g, '\\\\')}'`)),
+      `期望含 ${JSON.stringify(d.prefixArgs)}`,
+    );
+    check(
+      `客户端 ${d.id} 的 prefixArgs 与 Host 一致`,
+      JSON.stringify(CLI_DRIVERS.find((x) => x.id === d.id).prefixArgs).length === 0 ||
+        d.prefixArgs.every((p) => CLIENT_SRC.includes(`'${p.replace(/\\/g, '\\\\')}'`)),
+      `期望含 ${JSON.stringify(d.prefixArgs)}`,
+    );
+  }
+  check('客户端驱动数量与 Host 一致', CLI_DRIVERS.length === 4, String(CLI_DRIVERS.length));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
