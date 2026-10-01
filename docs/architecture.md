@@ -129,6 +129,26 @@
 19. **schemastery 没有 `z.enum`。** 枚举要用 `z.union([...])`（真实插件 `dsh-agent-tool-presentation` 即如此写）。沿 zod 的直觉写 `z.enum([...])` 会在**模块加载期**抛 `TypeError: z.enum is not a function`。
     - 症状可用于快速分流：它让条目停在 **`fiberPhase: null`**（fiber 根本没创建），与「`apply` 内出错」的 **`fiberPhase: failed`** 不同。
 20. **`toJSON()` 不是 JSON Schema。** 它返回 schemastery 的内部表示（`uid` / `refs` / `dict` / `list` / `inner`），而 `toJSONSchema` 不在 `@deepseek-ai/schemastery` 上（在 typert/loader 侧）。要检查字段是否被描述到，**直接遍历内部表示**即可，不必为检查去复刻一个投影器。
+20b. **CLI 角色的工具配置必须显式写 `maxDepth: 'provider-managed'`，「不写」反而是错的。**
+    - `dsh-tool-subagent` 的断言：
+      ```js
+      if (ctx.subagents.resolveMaxDepth(config.maxDepth) !== void 0
+          && !subagentProvider.capabilities.depthLimit)
+        throw new Error(`... cannot enforce maxDepth (no depthLimit capability) — set maxDepth: 'provider-managed' to leave the recursion budget to the provider`);
+      ```
+      而 `resolveMaxDepth` 是：
+      ```js
+      if (configured === "provider-managed") return void 0;   // ← 只有这一条能绕过断言
+      if (configured !== void 0) return configured;
+      const depth = this.config.maxDepth.get();               // ← 不写就回落到数字默认值
+      ```
+    - ⚠️ 本仓库一度按「CLI provider 没有 `depthLimit` 能力，所以**不要**设 maxDepth」来做 —— **依据是反的**。不设 → 回落到数字默认值 → 断言照样触发并抛错。
+    - 实测后果：provider 注册成功、自检报 `codex-scout=OK`，但工具**没有**注册，主代理调用时报 `unknown tool "delegate_to_codex_scout"`。断言自己的报错信息就直接给出了正确做法。
+20c. **`ctx.plugin()` 的抛错不会传到调用方，所以「挂载成功」必须核实，不能假设。**
+    - `ctx.plugin(module, config)` 只是**启动一个 fiber**，插件的 `apply` 在其后运行；插件在 `apply` 里抛的错发生在另一个调用栈上，`try/catch` **抓不到**。
+    - 本仓库的 `mountRoleTool` 原先是 `try { ctx.plugin(...); return {ok:true} }` —— 无条件报成功，于是自检在骗人（`OK` + `unknown tool` 并存）。
+    - 修法：`ctx.plugin()` 之后 `await` 两个微任务让 fiber 完成激活，再用 `ctx.get('tools').get(role.toolName)` 核实工具是否真的出现；`undefined` 一律视为失败。宁可少一个工具并如实报告，也不要报 OK 而实际没有。
+    - 一般化：**任何「启动型」API 的返回值都不等于「启动成功」。** 要么核实终态，要么明确标注为未核实。
 
 > **离线预检的可行性前提（重要）**：`npm install` 会把 `peerDependencies` 一并装入仓库的 `node_modules`，因此 `@deepseek-ai/schemastery`、`@deepseek-ai/dsh-tools` 等**在仓库里就装得到**，于是 import 插件模块、构造 Config、遍历 schema 都能在 Node 里离线完成，**不必重启 dsh**。这是本项目应对「Host 半边不能热加载」的主要手段。
 >

@@ -268,25 +268,33 @@ export function toolConfigFor(role, { maxDepth }) {
     config.persona = role.instructions;
   }
 
-  // 深度上限是**绝对深度**，不是「相对嵌套层数」。
+  // ⚠️ CLI 后端必须**显式**设 `maxDepth: 'provider-managed'`。
   //
+  // 这里曾写成「只对 builtin 后端设置 maxDepth，CLI 不设」，理由是想避开
+  // `dsh-tool-subagent` 的 depthLimit 断言。**那个判断是反的**：不设 maxDepth 时
+  // `resolveMaxDepth(undefined)` 会回落到 `dsh-tool-subagent` 自己的**数字**默认值，
+  // 于是断言照样触发并抛错：
+  //
+  //   tool-subagent: provider "switchboard-cli-codex-scout" cannot enforce maxDepth
+  //   (no depthLimit capability) — set maxDepth: 'provider-managed' to leave the
+  //   recursion budget to the provider
+  //
+  // 实测后果：CLI provider 注册成功、自检报 `codex-scout=OK`，但工具**没有**注册，
+  // 主代理调用时报 `unknown tool "delegate_to_codex_scout"`。
+  // 正确做法就是断言自己给出的建议：`'provider-managed'`，
+  // 其实现是 `if (configured === 'provider-managed') return void 0;`
+  // —— 返回 undefined 即让 provider 自己负责深度，断言即不触发。
+  //
+  // builtin 后端则使用**绝对深度**（不是「相对嵌套层数」）：
   // 依据 dsh-subagent 的 resolveChildDepth：
   //     const childDepth = delegationDepthOf(parent) + 1;
-  //     if (maxDepth !== void 0 && childDepth > maxDepth) throw new SubagentDepthError(childDepth, maxDepth);
+  //     if (maxDepth !== void 0 && childDepth > maxDepth) throw new SubagentDepthError(...)
   // 顶层代理的 delegationDepthOf 为 0，因此**它派出的第一个子代理深度就是 1**。
   // 这意味着 maxDepth: 0 会连第一层派发都拒绝（实测报错
   // `subagent depth 1 exceeds maxDepth 0`），而不是「禁止子代理再往下派」。
-  //
-  // 因此：
   //   - 禁止嵌套 → 1（本层可派发，但子代理不能再派）
   //   - 允许嵌套 → 1 + maxDepth（额外给出 maxDepth 层）
-  //
-  // ⚠️ **只对 builtin 后端设置**：`dsh-tool-subagent` 要求 provider 具备
-  // `depthLimit` 能力，而 CLI provider 声明为 false（D7）。对 CLI 角色设置
-  // maxDepth 会让工具装载期直接抛错 —— 我们已经实测过同类约束的报错路径。
-  if (!isCli) {
-    config.maxDepth = role.allowNestedDispatch ? 1 + maxDepth : 1;
-  }
+  config.maxDepth = isCli ? 'provider-managed' : role.allowNestedDispatch ? 1 + maxDepth : 1;
 
   // ⚠️ `toolFilter` 同样只有 builtin provider 支持。
   // CLI 角色的「只读」只能由 CLI 自身的沙箱参数实现（例如 codex 的

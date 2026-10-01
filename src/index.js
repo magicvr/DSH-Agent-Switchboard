@@ -354,16 +354,65 @@ function selftestTool(ctx, diagnostics) {
  * @param {number} maxDepth - 嵌套派发深度上限。
  * @returns {{ ok: boolean, detail: string }}
  */
-function mountRoleTool(ctx, role, toolModule, maxDepth) {
+/**
+ * 挂载一个角色的委派工具。
+ *
+ * ⚠️ **必须验证注册结果，不能只看 `ctx.plugin()` 是否抛错。**
+ *
+ * `ctx.plugin()` 只是**启动一个 fiber**，插件的 `apply` 在其后运行。所以插件在
+ * `apply` 里抛出的错误（例如 `dsh-tool-subagent` 的配置断言）**不会**被这里的
+ * try/catch 捕获 —— 它发生在另一个调用栈上。
+ *
+ * 实测后果：自检报 `codex-scout=OK`，但主代理调用时报
+ * `unknown tool "delegate_to_codex_scout"`。这是「配置通过 ≠ 能力可用」的又一例，
+ * 而且比缺工具更糟 —— 诊断在骗人。
+ *
+ * 因此这里注册后**核实工具名是否真的出现**在 `ctx.tools` 上。`undefined` 一律
+ * 视为失败：宁可少一个工具并如实报告，也不要报 OK 而实际没有。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} role - 规范化后的角色。
+ * @param {object} toolModule - 已 import 的 `dsh-tool-subagent` 模块。
+ * @param {number} maxDepth - 允许嵌套时的额外层数。
+ * @returns {Promise<{ok: boolean, detail: string}>} 挂载结果。
+ */
+async function mountRoleTool(ctx, role, toolModule, maxDepth) {
   if (typeof ctx.plugin !== 'function') {
     return { ok: false, detail: 'ctx.plugin 不可用' };
   }
   try {
     ctx.plugin(toolModule, toolConfigFor(role, { maxDepth }));
-    return { ok: true, detail: '已挂载' };
   } catch (error) {
     return { ok: false, detail: error instanceof Error ? error.message : String(error) };
   }
+
+  // 让 fiber 完成激活（`ctx.plugin` 之后插件在当前 tick 内运行），再核实注册结果。
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const tools = ctx.get('tools');
+  if (tools === undefined) {
+    return { ok: false, detail: '无法核实：ctx.get("tools") 不可用' };
+  }
+  if (typeof tools.get !== 'function') {
+    return { ok: false, detail: '无法核实：tools.get 不可用' };
+  }
+  let registered;
+  try {
+    registered = tools.get(role.toolName);
+  } catch (error) {
+    return {
+      ok: false,
+      detail: `核实注册时抛错：${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  if (registered === undefined) {
+    return {
+      ok: false,
+      detail: '工具未出现在工具注册表中（插件 fiber 内的装载很可能抛错了；见 Host 日志）',
+    };
+  }
+  return { ok: true, detail: '已挂载并核实' };
 }
 
 /**
@@ -485,7 +534,7 @@ export function apply(ctx, config) {
 
   // 动态 import：把「工具包取不到」变成可上报的诊断，而不是整个插件激活失败。
   import('@deepseek-ai/dsh-tool-subagent')
-    .then((toolModule) => {
+    .then(async (toolModule) => {
       for (const role of roles) {
         // ⚠️ 必须**按角色**复用同一个判定，不能只 gate provider 注册。
         //
@@ -504,7 +553,8 @@ export function apply(ctx, config) {
           });
           continue;
         }
-        const outcome = mountRoleTool(ctx, role, toolModule, maxDepth);
+        // `mountRoleTool` 会核实工具是否真的注册成功（见其 JSDoc）。
+        const outcome = await mountRoleTool(ctx, role, toolModule, maxDepth);
         diagnostics.mounts.push({ id: role.id, ok: outcome.ok, detail: outcome.detail });
         if (!outcome.ok) console.error(`[${name}] 角色 "${role.id}" 挂载失败：${outcome.detail}`);
       }

@@ -330,11 +330,21 @@ section('CLI 后端角色');
     missingCwd.errors.join('; '),
   );
 
-  // toolConfigFor：CLI 后端**不得**设置 maxDepth / toolFilter / agentOptions / persona。
-  // CLI provider 把这四项能力都声明为 false（D7），设了会让工具装载期抛错。
+  // toolConfigFor：CLI 后端必须设 `maxDepth: 'provider-managed'`，且**不得**设置
+  // toolFilter / agentOptions / persona（这三项 CLI provider 声明为 false，设了会抛错）。
+  //
+  // ⚠️ 这里曾断言「不设置 maxDepth」，依据是「CLI provider 无 depthLimit 能力」。
+  //    **那个依据是反的**：不设 maxDepth 时 `resolveMaxDepth(undefined)` 会回落到
+  //    dsh-tool-subagent 自己的数字默认值，depthLimit 断言照样触发并抛错。实测后果是
+  //    provider 注册成功、自检报 `codex-scout=OK`，但工具没注册，调用时报
+  //    `unknown tool "delegate_to_codex_scout"`。
   const cfg = toolConfigFor(ok.role, { maxDepth: 3 });
   check('provider 指向该角色自己的 CLI provider', cfg.provider === 'switchboard-cli-codex-worker', cfg.provider);
-  check('不设置 maxDepth（CLI provider 无 depthLimit 能力）', !('maxDepth' in cfg));
+  check(
+    "maxDepth 为 'provider-managed'（把递归预算交给 provider，从而不触发 depthLimit 断言）",
+    cfg.maxDepth === 'provider-managed',
+    `实际 ${JSON.stringify(cfg.maxDepth)}`,
+  );
   check('不设置 toolFilter（CLI provider 无该能力）', !('toolFilter' in cfg));
   check('不设置 agentOptions（CLI provider 无该能力）', !('agentOptions' in cfg));
   check('不设置 persona（CLI provider 无该能力）', !('persona' in cfg));
