@@ -1,8 +1,8 @@
 // 离线：仅写临时 fixture，不运行外部 CLI、不改变真实 USERPROFILE。
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, openSync, closeSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { captureSync } from './lib/capture.mjs';
 import { configPathFor } from '../src/config-file.js';
 import { PLACEHOLDERS } from '../src/cli/argv.js';
 import { REPO_ROOT, parsePathArgs, resolvePaths, resolveAsar, printPaths } from './lib/paths.mjs';
@@ -19,27 +19,6 @@ function test(label, fn) {
 }
 function rejects(fn, pattern = /./) {
   try { fn(); return false; } catch (error) { return pattern.test(error.message); }
-}
-
-// 保留真实进程验证；受限沙箱不允许管道捕获，所以用文件描述符读回输出。
-function spawnSyncToFiles(command, argv, { cwd, env }) {
-  const captureDir = mkdtempSync(join(tmpdir(), 'switchboard-capture-'));
-  const stdoutPath = join(captureDir, 'stdout');
-  const stderrPath = join(captureDir, 'stderr');
-  let stdoutFd;
-  let stderrFd;
-  try {
-    stdoutFd = openSync(stdoutPath, 'w');
-    stderrFd = openSync(stderrPath, 'w');
-    const result = spawnSync(command, argv, { cwd, env, stdio: ['ignore', stdoutFd, stderrFd] });
-    return { ...result, stdout: readFileSync(stdoutPath, 'utf8'), stderr: readFileSync(stderrPath, 'utf8') };
-  } finally {
-    try { if (stdoutFd !== undefined) closeSync(stdoutFd); }
-    finally {
-      try { if (stderrFd !== undefined) closeSync(stderrFd); }
-      finally { rmSync(captureDir, { recursive: true, force: true }); }
-    }
-  }
 }
 
 const temp = mkdtempSync(join(tmpdir(), 'switchboard-portability-'));
@@ -94,7 +73,7 @@ try {
 
   console.log('\n=== 显式目标与 wiring 进程退出 ===');
   const env = { ...process.env }; delete env.DSH_HOME;
-  const runWiring = (argv, extraEnv = {}) => spawnSyncToFiles(process.execPath,
+  const runWiring = (argv, extraEnv = {}) => captureSync(process.execPath,
     [join(REPO_ROOT, 'scripts', 'check-profile-wiring.mjs'), ...argv], { cwd: temp, env: { ...env, ...extraEnv } });
   for (const [label, argv, extraEnv] of [
     ['显式 home 缺失失败不跳过', ['--home', join(temp, 'missing')], {}],

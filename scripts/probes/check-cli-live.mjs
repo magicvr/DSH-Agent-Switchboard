@@ -1,7 +1,7 @@
 // 可选 live 检查：读取插件既有 roles.json，复用真实派发的 argv + 输出解析层。
 // 不属于 npm run check；不会发现或猜测 CLI 安装位置，不读取 .env。
 // 用法：npm run check:live -- --roles-file <JSON.local> --role <角色 id>
-import { spawnSync } from 'node:child_process';
+import { captureSync } from '../lib/capture.mjs';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -74,8 +74,8 @@ try {
     check('prefixArgs 与角色配置一致', role.cli.prefixArgs.every((value, index) => invocation.argv[index + 1] === value));
     check('stdin 模式不把提示词放进 argv', delivery !== 'stdin' || !invocation.argv.some(arg => arg.includes(MARKER)));
     const started = Date.now();
-    const result = spawnSync(invocation.argv[0], invocation.argv.slice(1), {
-      cwd: paths.cwd, input: delivery === 'stdin' ? prompt : '', encoding: 'utf8',
+    const result = captureSync(invocation.argv[0], invocation.argv.slice(1), {
+      cwd: paths.cwd, input: delivery === 'stdin' ? prompt : undefined,
       timeout: role.cli.timeoutMs ?? 180000, shell: false, windowsHide: true,
       maxBuffer: 64 * 1024 * 1024, env: { ...process.env, NO_COLOR: '1' },
     });

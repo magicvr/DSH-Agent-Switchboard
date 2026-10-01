@@ -1,5 +1,5 @@
-// 四个配置驱动探针共用的调用边界；不发现入口，不读取 .env。
-import { spawn } from 'node:child_process';
+// 配置驱动探针共用的调用边界；不发现入口，不读取 .env。
+import { captureAsync } from './capture.mjs';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -50,29 +50,9 @@ export async function runProbe(config, name, prompt, timeout, { maxBuffer = 1024
     console.log(`argv: ${JSON.stringify(visibleArgs(invocation.argv))}`);
     console.log(`提示词传递: ${delivery}`);
     const started = Date.now();
-    const result = await new Promise(resolve => {
-      const child = spawn(invocation.command, invocation.argv, {
-        ...invocation.options, windowsHide: true, env, stdio: ['pipe', 'pipe', 'pipe'],
-      });
-      const stdout = [];
-      const stderr = [];
-      let error;
-      let bytes = 0;
-      const timer = setTimeout(() => { error = new Error(`CLI 超时 (${timeout}ms)`); child.kill(); }, timeout);
-      const collect = target => chunk => {
-        bytes += chunk.length;
-        if (bytes > maxBuffer) { error ??= new Error(`CLI 输出超过 ${maxBuffer} 字节`); child.kill(); }
-        else target.push(chunk);
-      };
-      child.stdout.on('data', collect(stdout));
-      child.stderr.on('data', collect(stderr));
-      child.on('error', cause => { error = cause; });
-      child.stdin.on('error', cause => { if (cause.code !== 'EPIPE') { error = cause; child.kill(); } });
-      child.on('close', (status, signal) => {
-        clearTimeout(timer);
-        resolve({ status, signal, error, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') });
-      });
-      child.stdin.end(delivery === 'stdin' ? prompt : '');
+    const result = await captureAsync(invocation.command, invocation.argv, {
+      ...invocation.options, env, timeout, maxBuffer,
+      input: delivery === 'stdin' ? prompt : undefined,
     });
     if (result.error || result.status !== 0) {
       process.exitCode = 1;

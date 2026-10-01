@@ -14,7 +14,7 @@
 //   node scripts/gen-preset.mjs --check     只比对漂移，不写盘
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { captureSync } from './lib/capture.mjs';
 
 const ROOT = process.cwd();
 // 用裸说明符由 Node 自行解析入口（`yaml` 的入口不是 index.js）。
@@ -33,10 +33,13 @@ const OUT_FILE = join(ROOT, 'presets', 'switchboard.patch.yml');
  * @returns {string} 文件文本。
  */
 function cat(asarPath) {
-  return execFileSync(process.execPath, [join(ROOT, 'scripts', 'dsh-cat.mjs'), asarPath], {
-    encoding: 'utf8',
+  const result = captureSync(process.execPath, [join(ROOT, 'scripts', 'dsh-cat.mjs'), asarPath], {
     maxBuffer: 64 * 1024 * 1024,
   });
+  if (result.error || result.status !== 0) {
+    throw result.error ?? Object.assign(new Error(`dsh-cat 失败：退出码 ${result.status}，信号 ${result.signal ?? '-'}\n${result.stderr}`), result);
+  }
+  return result.stdout;
 }
 
 /** standard preset 的原始文本。 */

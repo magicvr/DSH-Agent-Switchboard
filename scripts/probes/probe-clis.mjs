@@ -1,7 +1,7 @@
 // 默认只报告候选；PATH 发现不证明入口可执行，绝不自动执行候选。
 // 执行：node scripts/probes/probe-clis.mjs --execute --cli-config <JSON.local>
 // 仅执行配置中的 help.* 用例；版本/help 参数也必须由用户配置声明。
-import { execFileSync } from 'node:child_process';
+import { captureSync } from '../lib/capture.mjs';
 import { accessSync, constants, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -11,10 +11,14 @@ import { parsePathArgs } from '../lib/paths.mjs';
 
 export function discoverEntries(name, { platform = process.platform, env = process.env } = {}) {
   if (platform === 'win32') {
-    const result = execFileSync('where.exe', [name], {
-      encoding: 'utf8', shell: false, windowsHide: true, env, timeout: 5000,
+    const result = captureSync('where.exe', [name], {
+      env, timeout: 5000, maxBuffer: 1024 * 1024,
     });
-    return [...new Set(result.split(/\r?\n/).map(line => line.trim()).filter(Boolean))]
+    if (result.error || result.status !== 0) {
+      const { error, ...details } = result;
+      throw Object.assign(error ?? new Error(`where.exe 失败：退出码 ${result.status}，信号 ${result.signal ?? '-'}`), details);
+    }
+    return [...new Set(result.stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean))]
       .map(path => ({ path, source: 'where.exe（PATH / 当前目录）' }));
   }
   const found = new Map();
