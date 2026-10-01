@@ -46,33 +46,32 @@ export const name = 'agent-switchboard';
 export const inject = ['tools', 'subagents', 'agents', 'systemPrompt', 'subprocess'];
 
 /**
- * 装载诊断。供自检工具读取；每次 `apply` 重算。
+ * 新建一份装载诊断记录。
  *
- * 诊断做得很细是有原因的：Host 半边在 link 安装下不能热加载
- * （docs/architecture.md 3.3），每次排错都要重启 dsh，所以必须在**一次**激活里
- * 把「哪个角色失败、为什么」全部报出来。
+ * ⚠️ 必须是**每次 `apply` 新建一份**，不能放在模块级共享。
+ * 原因：preset 机制下同一个插件会被**加载多次**（profile 级一次、每个选中它的
+ * 会话作用域再一次）。模块级可变状态会让后一次 `apply` 把前一次的记录清空，
+ * 于是自检出现自相矛盾的输出 —— 实测就出现过
+ * 「`codex-scout=失败`」与「`因开关未挂载：（无）`」并存。
  *
- * @type {{
- *   configErrors: string[],
- *   mounts: { id: string, ok: boolean, detail: string }[],
- *   providers: { id: string, name: string, ok: boolean, detail: string }[],
- *   executables: { id: string, command: string, resolved?: string, ok: boolean, detail?: string }[],
- *   blocked: { id: string, reason: string }[],
- *   presetScope: string | null | undefined,
- *   presetScopeError: string | undefined,
- *   fatal: string | undefined,
- * }}
+ * 诊断做得细是有原因的：Host 半边在 link 安装下不能热加载
+ * （docs/architecture.md 3.3），每次排错都要重启，所以必须在一次激活里把
+ * 「哪个角色失败、为什么」全部报出来。
+ *
+ * @returns {object} 空的诊断记录。
  */
-const diagnostics = {
-  configErrors: [],
-  mounts: [],
-  providers: [],
-  executables: [],
-  blocked: [],
-  presetScope: undefined,
-  presetScopeError: undefined,
-  fatal: undefined,
-};
+function newDiagnostics() {
+  return {
+    configErrors: [],
+    mounts: [],
+    providers: [],
+    executables: [],
+    blocked: [],
+    presetScope: undefined,
+    presetScopeError: undefined,
+    fatal: undefined,
+  };
+}
 
 /**
  * 插件配置。
@@ -251,10 +250,14 @@ function presetDiagnostics(ctx) {
 /**
  * 自检工具：一次调用即可看清装载结果，避免为每个问题重启一次 dsh。
  *
+ * `diagnostics` 由调用方按激活实例传入（**不是**模块级共享），否则同一插件被
+ * 多个 preset 作用域加载时会互相覆盖记录。
+ *
  * @param {object} ctx - Cordis 上下文（用于读取 preset 诊断）。
+ * @param {object} diagnostics - 本激活实例的诊断记录。
  * @returns {object} ToolDefinition
  */
-function selftestTool(ctx) {
+function selftestTool(ctx, diagnostics) {
   const presets = presetDiagnostics(ctx);
   return defineTool({
     name: 'switchboard_selftest',
@@ -379,14 +382,10 @@ function mountRoleTool(ctx, role, toolModule, maxDepth) {
  */
 export function apply(ctx, config) {
   const resolved = config ?? {};
-  diagnostics.configErrors = [];
-  diagnostics.mounts = [];
-  diagnostics.providers = [];
-  diagnostics.executables = [];
-  diagnostics.blocked = [];
-  diagnostics.presetScope = undefined;
-  diagnostics.presetScopeError = undefined;
-  diagnostics.fatal = undefined;
+
+  // 每次激活一份独立记录。preset 机制下同一插件会被多次加载，共享模块级状态
+  // 会让后一次激活清空前一次的记录（实测出现自相矛盾的自检输出）。
+  const diagnostics = newDiagnostics();
 
   // 探测本插件当前所处的作用域。这决定「是否只在选中我们的 preset 时才生效」。
   const scope = detectPresetScope(ctx);
@@ -403,7 +402,7 @@ export function apply(ctx, config) {
   );
 
   // 自检工具总是注册：即使角色配置全错，也要能用它看到错在哪。
-  ctx.tools.register(selftestTool(ctx));
+  ctx.tools.register(selftestTool(ctx, diagnostics));
 
   const { roles, errors } = normalizeRoles(resolved.roles, resolved.provider, resolved.cwd);
   diagnostics.configErrors = errors;
