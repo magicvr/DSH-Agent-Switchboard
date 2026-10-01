@@ -104,6 +104,28 @@
     - 其 JSDoc 原文：「Select fields whose **nearest volatile ancestor** makes them editable without remounting.」→ 标在一个对象节点上，其**子字段**即自动可编辑；不必逐字段标记。
     - 实测 `.volatile()` 的落点：`z.boolean().volatile()` → 该字段 `meta.volatile: true`；`z.object({a}).volatile()` → **只有对象节点**带标记，`a` 不带。
     - ⚠️ **本插件为此栽过一次**：代码里写的是 `volatile: z.object({...}).default({})` —— 注释还明确写着「volatile 子对象里的字段可在设置页实时编辑」，但**代码里根本没有 `.volatile()`**。典型的文档与实现脱节。离线预检（`scripts/check-config-schema.mjs`）现在会把这条抓出来。
+
+18b. **`.volatile()` 之后，该子对象变成「引用对象」：属性不在自身上，必须用 `.get()` 取值。**
+    - 实测（`node -e` 直接跑真实 `Config`）：
+      ```text
+      r.volatile                  → {}                  （JSON.stringify 也是 {}）
+      r.volatile.allowCrossCli    → undefined           ← 直接读恒为 undefined
+      r.volatile.get()            → {"allowCrossCli":true,"cliTimeoutSec":900}
+      ```
+    - ⚠️ **这是一个真实且长期潜伏的 bug 的根因**：`src/index.js` 曾写
+      `const allowCrossCli = resolved.volatile?.allowCrossCli === true;`
+      → **恒为 `false`**，跨 CLI 派发开关**从未真正生效过**。
+    - 为什么长期没被发现：自检一直显示「allowCrossCli 未开启」，而那**恰好就是
+      默认关闭时的正常表现** —— 失效与默认值的外观完全一致。直到在 preset 里显式
+      写入 `volatile.allowCrossCli: true` 仍不生效，才暴露出来。
+    - 为什么已有 103+55+55 条断言都没抓住：它们直接调用纯函数
+      `planCliMounts(roles, boolean)`，**绕过了 `apply` 层的取值**。
+    - 修法与防线：新增 `readVolatile(resolved)`（兼容带 `.get()` 的引用对象与普通对象，
+      因为 Loader 经 JSON Schema 投影后可能给出后者），并新增
+      `scripts/check-config-volatile.mjs` —— 它刻意**穿过真实 `Config` schema** 取值，
+      且先自检「直接读确实取不到值」以证明自己在测真实行为而非测空气。
+    - 教训：**「配置通过」不等于「配置被读到」。** 纯函数单测无法覆盖「取值方式」这一类
+      错误，必须有一条穿过真实 schema 的路径。
 19. **schemastery 没有 `z.enum`。** 枚举要用 `z.union([...])`（真实插件 `dsh-agent-tool-presentation` 即如此写）。沿 zod 的直觉写 `z.enum([...])` 会在**模块加载期**抛 `TypeError: z.enum is not a function`。
     - 症状可用于快速分流：它让条目停在 **`fiberPhase: null`**（fiber 根本没创建），与「`apply` 内出错」的 **`fiberPhase: failed`** 不同。
 20. **`toJSON()` 不是 JSON Schema。** 它返回 schemastery 的内部表示（`uid` / `refs` / `dict` / `list` / `inner`），而 `toJSONSchema` 不在 `@deepseek-ai/schemastery` 上（在 typert/loader 侧）。要检查字段是否被描述到，**直接遍历内部表示**即可，不必为检查去复刻一个投影器。

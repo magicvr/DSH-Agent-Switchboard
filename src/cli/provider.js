@@ -81,12 +81,21 @@ export function promptText(prompt) {
  * @param {object} spec.role - 规范化后的角色，须含 `cli` 配置。
  * @param {Function} spec.spawn - 与 `ctx.subprocess.spawn` 同形的函数。
  * @param {Function} [spec.resolveExecutable] - 与 `ctx.subprocess.resolveExecutable` 同形。
+ * @param {number} [spec.timeoutMs] - 单次 CLI 派发的超时（毫秒）。缺省或非正数表示不设超时。
  * @param {Function} [spec.now] - 取当前时间的函数，便于测试注入。
  * @returns {object} SubagentProvider
  */
-export function createCliProvider({ role, spawn, resolveExecutable, now = () => Date.now() }) {
+export function createCliProvider({
+  role,
+  spawn,
+  resolveExecutable,
+  timeoutMs,
+  now = () => Date.now(),
+}) {
   const cli = role.cli;
   if (!cli) throw new Error(`角色 "${role.id}" 使用 cli 后端但缺少 cli 配置`);
+
+  const timeout = typeof timeoutMs === 'number' && timeoutMs > 0 ? timeoutMs : undefined;
 
   return {
     name: cliProviderNameFor(role.id),
@@ -158,6 +167,36 @@ export function createCliProvider({ role, spawn, resolveExecutable, now = () => 
         cli.promptDelivery === 'argv' ? 'ignore' : { data: withRole };
 
       let handle;
+      // 单次派发的超时。
+      //
+      // ⚠️ 为什么必须自己做：`ctx.subprocess.spawn` 的 spec **没有** `timeoutMs`
+      //    字段（实测 dsh-bash-local 传给 spawn 的是 `{argv, cwd, stdio, graceMs,
+      //    signal, env}`，它是用自带的 deadline 辅助融合超时与中止信号的）。
+      //    在本实现之前，`cliTimeoutSec` 声明了却从未被读取，`timedOut` 只反映
+      //    调用方是否中止 —— 一个不响应的 CLI 会一直挂到调用方放弃为止。
+      //
+      // 用 `AbortSignal.any` 把「调用方中止」与「我们自己的超时」融合成一个信号；
+      // 再用 `timedOutByUs` 区分二者，避免把调用方主动取消误报成超时。
+      const controller = typeof AbortController === 'function' ? new AbortController() : undefined;
+      let timer;
+      let timedOutByUs = false;
+      if (timeout !== undefined && controller !== undefined) {
+        timer = setTimeout(() => {
+          timedOutByUs = true;
+          controller.abort(new Error(`CLI 派发超过 ${timeout}ms 未结束`));
+        }, timeout);
+      }
+      const callerSignal = request.signal;
+      const combinedSignal =
+        controller === undefined
+          ? callerSignal
+          : callerSignal === undefined
+            ? controller.signal
+            : typeof AbortSignal.any === 'function'
+              ? AbortSignal.any([callerSignal, controller.signal])
+              : // 无 AbortSignal.any 时退化为「谁先中止用谁」，功能上等价。
+                controller.signal;
+
       try {
         // `invocation.argv` 的 [0] 就是可执行文件，因此整条命令可直接交给 spawn。
         handle = spawn({
@@ -169,14 +208,16 @@ export function createCliProvider({ role, spawn, resolveExecutable, now = () => 
             stderr: { maxBytes: cli.maxErrorBytes },
           },
           graceMs: cli.graceMs,
-          signal: request.signal,
+          signal: combinedSignal,
           env: cli.env,
         });
       } catch (error) {
+        if (timer !== undefined) clearTimeout(timer);
         return failedRun(`无法启动 CLI：${error instanceof Error ? error.message : String(error)}`);
       }
 
       const outcome = await handle.done;
+      if (timer !== undefined) clearTimeout(timer);
       const durationMs = now() - startedAt;
       const stdout = readCollected(handle.collected?.stdout);
       const stderr = readCollected(handle.collected?.stderr);
@@ -187,7 +228,7 @@ export function createCliProvider({ role, spawn, resolveExecutable, now = () => 
         argv: invocation.argv,
         exitCode: outcome.exitCode,
         signal: outcome.signal,
-        timedOut: request.signal?.aborted === true,
+        timedOut: timedOutByUs || request.signal?.aborted === true,
         stdout,
         stderr,
         durationMs,

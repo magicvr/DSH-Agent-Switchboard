@@ -36,6 +36,36 @@ import { createCliProvider } from './cli/provider.js';
 export const name = 'agent-switchboard';
 
 /**
+ * 读取 `volatile` 子对象的实际取值。
+ *
+ * ⚠️ **这是一个踩过的真坑**：调用 `.volatile()` 后，schemastery 把该子对象变成
+ * 一个**引用对象**（Volatile ref），其属性**不在对象自身上** ——
+ *   - `JSON.stringify(resolved.volatile)` → `{}`
+ *   - `resolved.volatile.allowCrossCli`   → `undefined`（恒为 undefined）
+ *   - `resolved.volatile.get()`           → `{ allowCrossCli: true, cliTimeoutSec: 900 }`
+ *
+ * 因此 `resolved.volatile?.allowCrossCli === true` 这种直接访问**永远**判定为
+ * 未开启。实测后果：跨 CLI 派发开关从未真正生效过，而自检一直显示
+ * 「allowCrossCli 未开启」，看起来与「默认关闭」的表现完全相同，所以长期未被发现 ——
+ * 直到在 preset 里显式写入 `volatile.allowCrossCli: true` 仍不生效才暴露。
+ *
+ * 这里对两种形态都兼容：带 `.get()` 的引用对象，以及普通对象
+ * （Loader 经 JSON Schema 投影后可能给出后者）。拿不到就返回 `{}`。
+ *
+ * @param {object} resolved - 已校验的插件配置。
+ * @returns {object} volatile 字段的普通对象视图。
+ */
+export function readVolatile(resolved) {
+  const raw = resolved?.volatile;
+  if (raw === null || raw === undefined) return {};
+  if (typeof raw.get === 'function') {
+    const value = raw.get();
+    return value !== null && typeof value === 'object' ? value : {};
+  }
+  return typeof raw === 'object' ? raw : {};
+}
+
+/**
  * 声明式依赖。Cordis 会等到这些 Service 就绪后再调用 `apply`。
  * - `subagents`：注册 CLI provider，并解析内置后端。
  * - `agents`：取发起本次调用的父代理（在被挂载的工具内部使用）。
@@ -391,7 +421,18 @@ export function apply(ctx, config) {
   // 跨 CLI 派发的总开关。**默认关闭**：CLI 后端会真的在本机执行本地命令，
   // 因此必须显式开启（`volatile.allowCrossCli`）。判定逻辑在纯函数
   // `planCliMounts()` 里，以便离线测试覆盖。
-  const allowCrossCli = resolved.volatile?.allowCrossCli === true;
+  //
+  // ⚠️ 必须经 `readVolatile()` 取值，不能直接读 `resolved.volatile.xxx`
+  //    （那恒为 undefined，曾导致本开关从未真正生效）。
+  const volatile = readVolatile(resolved);
+  const allowCrossCli = volatile.allowCrossCli === true;
+  const cliTimeoutSec =
+    typeof volatile.cliTimeoutSec === 'number' && volatile.cliTimeoutSec > 0
+      ? volatile.cliTimeoutSec
+      : 900;
+  console.error(
+    `[${name}] 跨 CLI 开关：allowCrossCli=${allowCrossCli}，cliTimeoutSec=${cliTimeoutSec}`,
+  );
   const { active: activeCliRoles, blocked: blockedCliRoles } = planCliMounts(roles, allowCrossCli);
 
   // 注册 CLI 角色各自的 provider 实例。
@@ -416,6 +457,7 @@ export function apply(ctx, config) {
         role,
         spawn: (spec) => safeSpawn(ctx, spec),
         resolveExecutable: (command, env, signal) => ctx.subprocess.resolveExecutable(command, env, signal),
+        timeoutMs: cliTimeoutSec * 1000,
       });
       ctx.subagents.registerProvider(provider);
       diagnostics.providers.push({ id: role.id, name: provider.name, ok: true, detail: '已注册' });
