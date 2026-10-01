@@ -2,7 +2,7 @@
 
 > 把 DSH 主代理降级为「信息流统合器」，把具体工作委派给带角色的子代理——并且允许这些子代理活在本机的其他 CLI 里。
 
-[![status](https://img.shields.io/badge/status-early%20design-orange)](#路线图)
+[![status](https://img.shields.io/badge/status-implemented-green)](#路线图)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 ---
@@ -52,9 +52,10 @@
 
 ### 3. 配置（Plugin Panel）
 
-角色存放在**根条目的插件配置**里（即 profile patch 中 `id: agent-switchboard` 那一行的 `config.roles`），
-设置面板直接读写它；Host 侧会把角色同步一份到 `$DSH_HOME/agent-switchboard/roles.json`，
-供选中 Switchboard preset 的会话读取。形状如下（**示意**）：
+角色配置文件为 **`$DSH_HOME/agent-switchboard/roles.json`**，供选中 Switchboard preset 的会话读取。
+设置面板读 `configForms` 镜像、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，
+Host 根实例将配置同步到文件。根条目保持启用，但只在 `mount: true` 的作用域挂载角色工具；
+**preset 不再携带 `config.roles`**。保存的角色供新会话使用。文件形状如下（**示意**）：
 
 ```jsonc
 {
@@ -65,8 +66,11 @@
       "id": "scout",
       "title": "侦察员",
       "description": "只读调研：定位相关代码、给出证据路径，不做任何修改。",
+      "instructions": "只读调研，返回结论与证据路径。",
       // 派发机制：内置 spawn / fork，或外部 CLI。
       "backend": "spawn",
+      "model": "<DSH LLM route 的模型名>",
+      "effort": "medium",
       "readOnly": true,
       // 是否允许该角色再往下派发子代理。默认 false，防无限递归。
       "allowNestedDispatch": false
@@ -75,6 +79,7 @@
       "id": "architect",
       "title": "架构师",
       "description": "产出实现方案与接口约定，不写实现代码。",
+      "instructions": "分析方案取舍并给出接口约定，不修改文件。",
       // 走外部 CLI 的角色：cli* 字段是**扁平**的（便于面板当普通标量渲染）。
       // 在面板里更简单：把「派发机制」选成「外部 CLI」，再从 CLI 下拉框选具体 CLI，
       // 下面这组参数会被一键填好。
@@ -96,7 +101,10 @@
       "id": "worker",
       "title": "实现者",
       "description": "在指定文件范围内落地实现并保证可运行。",
+      "instructions": "只在指定范围实现并验证，汇报改动与验证结果。",
       "backend": "spawn",
+      "model": "<DSH LLM route 的模型名>",
+      "effort": "high",
       "readOnly": false
     }
   ]
@@ -114,11 +122,11 @@
 
 ### 4. 主代理的约束
 
-「主代理不下场」这件事需要被机制保证，而不是靠提示词自觉。规划中的手段：
+当前实现提供按角色委派与线路提示；以下机制仍是目标，尚未全部落地：
 
 - 主代理默认拿不到写文件类工具（DSH 提供 `ctx.tools.restrict()` 隐藏工具、`ctx.tools.guard()` 同步拒绝调用，见 [`docs/architecture.md`](./docs/architecture.md) 第 3 节）。
 - 派发出去的每个任务都要求子代理回传结构化结果，主代理汇总的是结果而不是原始过程。
-- 每次派发都记录「谁派的、派给谁、走哪条线路、耗时、成功与否」，形成可审计的调度日志。
+- CLI 派发已在回传结果附带角色、线路、argv、耗时与退出状态；内置后端没有等价的返回日志，统一调度记录仍待完善（见架构文档第 7 节）。
 
 ## 实现约束（已核实）
 
@@ -140,8 +148,9 @@
 - [x] **Phase 0 · 设计与取证** — 仓库初始化、摸清 DSH 契约、技术决策与实施方案定型
 - [x] **Phase 1 · 最小可加载插件** — Host 与 Client 两半边均已生效
 - [x] **Phase 2 · builtin 后端** — 5 条角色工具上线；模型按角色切换已用会话记录实证（详见 [`docs/plan.md`](docs/plan.md)）
-- [~] **Phase 3 · CLI 后端** — provider、参数模板、输出解析均已实现并通过**真实 codex 端到端**验证（14/14）；接入插件的人类可读验收待一次重启
-- [ ] **Phase 4 · 可观测性与打磨** — 调度日志、可写面板、并发预算
+- [x] **Phase 3 · CLI 后端** — provider、参数模板、输出解析已实现；codex 与 grok 均有真实派发通过记录。codex 的模型/强度有 CLI 自报路由证据；grok 的已记录端到端样本为 `grok-4.7` / `low`，不代表全部模型与强度组合已验证（见 [`docs/cli-backends.md`](./docs/cli-backends.md)）
+- [x] **Phase 4 已落地部分** — 角色与派发设置页已实现并真机验收，CLI 调度信息进入主代理可见的回传结果
+- [ ] **Phase 4 剩余项** — 并发与预算上限、统一调度记录及用法文档继续完善；内置后端返回日志的限制见 [`docs/architecture.md`](./docs/architecture.md#7-可观测性)
 
 ## 仓库布局
 
@@ -149,13 +158,19 @@
 .
 ├── docs/
 │   ├── architecture.md   已核实的 DSH 插件契约与取证
-│   ├── decisions.md      技术决策记录 D1–D10
+│   ├── decisions.md      技术决策记录（含历史方案与后续修订）
 │   └── plan.md           目录结构、分期实施方案、验收标准、风险登记
-├── scripts/              只读取证探针（见 AGENTS.md）
+├── src/                  Host、Client、角色模型、CLI provider 与配置存储
+├── presets/              Switchboard preset 声明
+├── scripts/              根目录保留 check 链与仓库工具（含 asar 探针）
+│   ├── lib/              共享路径解析与校验
+│   ├── ops/              本机运维工具，含写入、迁移与修复
+│   └── probes/           依赖本机安装与 CLI 的现场探针
 └── raw/                  临时草稿区，已被 git 忽略，不进入历史
 ```
 
-`src/`、`test/` 在 Phase 1 落地，结构与理由见 [`docs/plan.md`](./docs/plan.md#目录结构)。
+当前没有 `test/` 目录；检查位于 `scripts/check-*.mjs`，完整检查入口为 `npm run check`。
+分阶段方案见 [`docs/plan.md`](./docs/plan.md#目录结构)，其中历史布局与状态待后续文档批次校准。
 
 ## 本地约定
 

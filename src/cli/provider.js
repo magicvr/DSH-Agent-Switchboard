@@ -286,7 +286,7 @@ export function createCliProvider({
         command: invocation.argv[0],
         argv: invocation.argv,
         // 与系统提示词里的路由指引**同一套措辞**，这样主代理能把
-        // 「本该走哪条线路」与「实际走了哪条」直接对上。由调用方传入（避免循环依赖）。
+        // 「本该走哪条线路」与「实际走了哪条」直接对上。由调用方传入，以免 provider 依赖角色配置。
         routeSummary,
         exitCode: outcome.exitCode,
         signal: outcome.signal,

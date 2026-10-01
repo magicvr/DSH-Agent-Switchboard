@@ -15,10 +15,10 @@
  *    整个 slot 空掉：`slot entry crashed in '<slot>'`）。因此表单**自绘**，只用
  *    原生 `React.createElement`（由 `require('react')` 取得）。
  * 3. 只使用 `--dsw-alias-*` 主题 token，不碰 app root / document.body / 别人的 DOM。
- * 4. 读写配置走**本插件自己的远程服务** `ctx.remote.roleConfig`（见 `src/config-service.js`），
- *    不经过 `settings` / `configForms`。
+ * 4. **读**走 `configForms` 镜像，**写**走 `remote.settings.mutate`；在插件上下文绑定
+ *    操作后传给组件。只注入内核提供的 `slots` / `configForms` / `remote.settings`。
  *
- * ## 为什么配置不走 `settings`（关键架构决策，见 decisions.md D13）
+ * ## 配置桥接与作用域隔离（见 decisions.md D13 / D14）
  *
  * 角色列表一度放在 profile patch 的 `config.roles` 里。实测发现两条互相冲突的约束：
  *   1. `settings.describe()` 按 `ns` 去重、**只报告根条目**的配置。preset 里的那份插件
@@ -28,10 +28,11 @@
  *      （实测：一个 `standard` 会话的子代理能看到根注册的 `switchboard_selftest`），
  *      于是所有会话都会冒出一批 `delegate_to_*`。
  *
- * 换成插件自己的文件 + 自己的远程方法后，两条同时解开：
- *   - 配置只经过我们的远程服务，不受 `ns` 去重与 volatile/数组限制；
- *   - 角色工具是否可见，只取决于**本插件在哪个会话作用域被激活**（由 preset 的
- *     `mount: true` 决定），与配置存在哪里无关。
+ * 当前设置页经内核 settings 通道读写根条目的 volatile `roles`（命名空间不带 `include:`），
+ * Host 根实例将它同步到 `$DSH_HOME/agent-switchboard/roles.json`，preset 实例读取文件。
+ * 根条目保持启用，让设置页始终可见；角色工具只在 `mount: true` 的作用域挂载。
+ * 旧方案的自建 `remote.roleConfig` 服务已移除：外部插件无法新增客户端远程命名空间，
+ * 把该延迟服务列为必需依赖曾导致页面永远 pending、无法启动（见本文件末尾 inject 注释）。
  *
  * ## 本文件刻意保持「不信任输入」的姿态
  *

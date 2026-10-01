@@ -2,7 +2,7 @@
 
 ## 当前阶段
 
-项目处于早期设计阶段，**尚无可用实现**。此刻最有价值的贡献是设计与决策讨论，而不是提交实现代码——关键决策（见 [`docs/architecture.md`](./docs/architecture.md) 第 3 节）尚未定型，过早写实现大概率要重写。
+Host、Client 角色设置页、CLI provider 与角色委派已实现并完成真机验收。贡献可以围绕功能修复、针对性检查与文档校准展开；保持纯 ESM JavaScript、零构建及现有目录布局。改动前核对 [`docs/architecture.md`](./docs/architecture.md) 的契约与当前代码，按需运行 `npm run check`。主代理写工具限制、统一结构化结果契约、并发与预算上限等仍是开放的设计与实现议题，不能当作现有能力。
 
 ## 提交信息
 

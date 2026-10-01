@@ -1,6 +1,6 @@
 # 架构设计
 
-> **状态：草案。** 本文描述的是**目标形态**，不是已实现的形态。带「待定」标记的地方都还没有结论。
+> **状态：核心实现已落地。** Host、Client 角色设置页、CLI provider 与按角色委派均已实现。本文同时保留 DSH 契约、历史实测与仍适用的设计约束；历史方案被取代处注明当前行为。主代理写工具限制、统一结构化结果契约、并发与预算上限尚未实现；不要把目标形态当作已具备的能力。带「待定」或「未核实」标记的内容仍需验证。
 
 ## 1. 问题
 
@@ -80,13 +80,11 @@
 
 ### 3.1d preset 机制实测（本项目最关键的机制结论）
 
-21. **把包列在 preset 的 `plugins` 里，它就会在选中该 preset 的会话中被实例化** —— 但**前提是该包没有同时在别处被挂载**。
-    - 实测过程：先只「加上 preset 声明」，插件仍报告挂在根上；再把 profile 里的全局条目 `disabled: true`，插件随即**只在选中该 preset 的会话里生效**（角色工具齐备），而其他会话连 `switchboard_selftest` 都看不到。
-    - 机制解释：Loader 按**包名**处理，同一包已在根上加载时 preset 那次不会重复执行。
-    - 因此「不选这个 preset 就不生效」这一目标形态成立于：`preset 声明 + 移除全局挂载`。
-    - preset 里那一条目的 `config` 会被当作插件配置传入（实测 `provider/maxDepth/cwd/roles` 均正确到达），这给了「按 preset 携带角色配置」的官方路径。
-    - **preset 层的挂载会覆盖根层同 id 条目的 `disabled: true`**（实测）：本仓库 `cordis.patch.yml` 把条目声明为 `disabled: true`（默认惰性），preset 仍能在选中它的会话里激活插件。因此「bundle 里声明 disabled + preset 里再声明一次」是可用组合，不必用空数组 `[]` 表达「无全局挂载」（`[]` 语法合法但官方零先例）。
-    - **最干净的证据是 A/B 对照**：同一次运行、同一 profile，未选该 preset 的会话在主代理工具面里**看不到** `switchboard_selftest` 与 `delegate_to_*`；选中它的会话则有 30 个工具（含 `switchboard_selftest` 与 4 个 `delegate_to_*`）。这比任何自检字段都直接。
+21. **当前组合是「根条目启用 + preset 显式 `mount: true`」。** 根实例提供配置同步与自检；角色工具和路由指引只在声明了 `mount: true` 的作用域挂载。
+    - **历史实测（以下禁用根条目的方案已被后续 D13 / D14 取代）：** 早期先只「加上 preset 声明」，插件仍报告挂在根上；再把 profile 全局条目设为 `disabled: true`，角色工具才只在选中该 preset 的会话里生效，其他会话连 `switchboard_selftest` 都看不到。当时以 Loader 按包名处理解释该现象，采用了「preset 声明 + 移除全局挂载」。这不是当前的挂载门禁。
+    - preset 条目的 `config` 会作为插件配置传入（历史实测 `provider/maxDepth/cwd/roles` 均正确到达）。**当前 preset 不再携带 `roles`**，只声明挂载等作用域配置；角色从 `$DSH_HOME/agent-switchboard/roles.json` 读取（见第 36 条）。
+    - 历史上「bundle 声明 `disabled: true` + preset 再声明一次」确实能激活 preset 插件，`[]` 也曾被确认语法合法；**该方案已被后续决策取代，不能据此禁用当前根条目**。客户端模块扫描跳过 disabled 条目，禁用根条目会让「角色与派发」设置页**静默消失，没有报错**（`cordis.patch.yml` 第 5–15 行）。
+    - 历史 A/B 对照曾是：未选 preset 看不到自检和委派工具，选中后有 30 个工具（含自检与 4 个委派工具）。**当前自检在 `mount` 判断之前注册，根作用域及继承它的会话都可看到 `switchboard_selftest`；`delegate_to_*` 仍只在挂载角色的作用域可见。** 不应把旧工具数量或自检不可见作为当前验收条件。
 22. **`agentPresets.composedPreset(ctx)` 必须传入「处于该作用域内」的 ctx，否则永远返回 `undefined`。**
     - 实现是 `standingMountFor(ctx)?.presetId`，即**从传入的上下文向上找最近的 preset 挂载**。
     - 本插件的 `apply` 运行在**根上下文**，从那里向上查找永远命中不到 preset 挂载 —— 所以曾一度出现在自检里的 `preset 作用域：根作用域` 是**假信号**，与 preset 是否生效无关（该字段已删除）。
@@ -95,7 +93,7 @@
 23. **插件的诊断/状态不能放在模块级**：本仓库初版把 `diagnostics` 写成模块级对象，实测出现自相矛盾的自检输出（`codex-scout=失败` 与 `因开关未挂载：（无）` 并存）。
     - 直接原因是当时本插件被**激活两次**（根一次、preset 作用域再一次）：后一次 `apply` 重置了模块级字段，而自检读到的是产生 `mounts` 的那一次。
     - 现已把这份状态改为每次 `apply` 用 `newDiagnostics()` 新建一份（无论将来是否又会变成多实例都正确）。
-    - 现状补充：由于 `cordis.patch.yml` 已把条目声明为 `disabled: true`，本插件在**非 preset 会话里根本不激活**，实际只激活一次；但「实例自带状态、不共享模块级可变对象」这条原则仍然保留 —— 它消除的是整类隐患，而不只是当前这个症状。
+    - 现状补充：根条目启用，根实例注册自检并同步配置；preset 实例在 `mount: true` 时挂载角色。因此仍必须保持「实例自带状态、不共享模块级可变对象」，不能假定只激活一次。
 
 ### 3.1c Phase 2 实测补充：三个会重复踩的坑
 
@@ -196,7 +194,7 @@
     | `settings.replace(ns, section, rev)` | 否 | **否** |
 
     - 因此编辑 `roles` 有两条路：**甲**给 `roles` 标 `.volatile()` 并用 `mutate` 下标路径；**乙**不改 schema，用 `replace` 整块写 `{roles: [...]}`。
-    - 本插件选**甲**（`roles` 已标 volatile）：它让「改角色立即生效」在 schema 层也是准确表述，且 `mutate` 能显式携带 `revision` 做并发保护。乙是保留方案。
+    - 本插件选**甲**（`roles` 已标 volatile），设置页整体提交 `set(['roles'], value)` 并携带 `revision` 做并发保护；Host 根实例将角色同步到文件，选中 Switchboard preset 的新会话读取它。**保存不等于已挂载会话立即更新角色工具。** 乙是保留方案。
     - 另注：`write` 还要求 `volatileForm(schema) !== undefined`，否则抛 `Plugin entry "…" has no volatile…` —— 一个 volatile 字段都没有的插件**完全无法通过设置页写入**。
 29. **`describe()` 是同步的**，返回**数组**（其 JSDoc 写「keyed by unique profile entry ids」，与实现不一致，以实现为准）。行的关键字段：`ns` / `schema` / `value` / `revision` / `writable` / `base` / `user` / `autoGenerate` / `applies`。**没有 `patch` 字段**。
     - 行会被**丢弃**的条件：`schema` 取不到、`entry.fiber` 不存在、`fiber.runtime === null`、`fiber.state !== 2`（ACTIVE），或 `volatileForm(schema) === undefined`。
@@ -210,7 +208,7 @@
     - **只有根条目有 settings 行。** `configEditor.entries()`（`dsh-config-editor/lib/index.js`
       第 31 行）先筛 `entry.parent.tree.ctx.fiber.entry?.id === "include"`，再按
       `entry.options.id` 去重。**preset 内的插件声明不在这个集合里**，因此既没有 settings 行、
-      也读不到写不到 —— 这是「角色必须放根条目配置」的根本原因（D14 第 1 条）。
+      也读不到写不到 —— 这是 UI 必须经根条目配置写入的原因（D14 第 1 条）。根配置是设置页的读写桥接面，preset 不携带角色列表；Host 将其同步到角色文件。
 30. **`.volatile()` 只能标在数组整体，不能标在数组元素内部。** 这是第 24 条的另一面：数组元素路径经 `schema.inner` → `[...path, '*']` 变成**非固定**路径，客户端 `validateVolatileSchema` 随即抛错。
 31. **⚠️ 用 PowerShell 的 `>` 重定向采集探针输出会引入编码损坏 —— 这是本机实测踩到的坑，不是归档的问题。**
     - 实测：`node scripts/dsh-cat.mjs <path> > raw/foo.js` 产出的文件前 4 字节是 `ff fe 77 00`，即 **UTF-16LE**；而用 `execFileSync(..., {encoding:'utf8'})` 或管道（`|`）采集时同一文件是**纯 UTF-8、零 NUL**。
@@ -272,8 +270,8 @@
     - `dsh.profile.bundles` **必须含本包**（`dependencies` 里有**不够**）：Loader 只加载
       `bundles` 列出的包。缺失后果是**应用正常启动、但插件完全不存在**，且**没有任何报错**
       （实测踩到：Loader 条目数 187 而非 188，`include:agent-switchboard` 从未创建）。
-    - profile patch 里根条目需带 `config.roles`，否则设置页找不到配置行。
-    - 已由 `scripts/check-profile-wiring.mjs` 显式断言（找不到 profile 时优雅跳过）。
+    - 根条目**必须启用**，bundle 声明不必携带 `config.roles`；设置页读 `configForms`、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，Host 将角色同步到 `$DSH_HOME/agent-switchboard/roles.json`。preset 中本包只需 `mount: true`，**不得再携带 `roles`**；挂载实例在本作用域 Cordis 角色非空时优先使用它，否则读取文件。
+    - `scripts/check-profile-wiring.mjs` 显式断言根条目未禁用、preset 的 `mount: true` 及 `selfRow?.config?.roles === undefined`（找不到默认 profile 时跳过；显式目标缺失则失败）。
 37. **禁用/启用插件这个操作本身会重写 profile，且只保留它认识的条目。** 实测两次：一次
     web boot 失败后，profile 的 `cordis.patch.yml` 从 41,802 字节被削到 670 字节，
     `dsh.profile.bundles` 里本包也消失。**含义：修 bug 时不要靠「禁用插件」作为试探手段；
@@ -319,28 +317,30 @@
 | 派发抽象 | 统一走 `ctx.subagents`，两类后端收敛到 `SubagentProvider` | 第 3 节补充：`subagents` 是具名 provider 注册表 |
 | 角色 → 工具 | 自己注册工具，内部调 `ctx.subagents.start()` | 第 3 节第 7 条 |
 | 子进程 | `ctx.subprocess.spawn`（argv 数组，无 shell） | `subprocess` 服务契约 |
-| 配置 | 分两层；GUI 可编辑字段必须 `.volatile()` | 第 3 节第 5 条 |
+| 配置 | 角色文件 + 根条目设置桥接；经 `mutate` 编辑的字段必须 `.volatile()` | 第 3 节第 5、36 条 |
 
-## 5. 角色模型（草案）
+## 5. 角色模型（当前实现）
 
 一个角色至少包含：
 
 - `id` / `title` / `description`
-- `systemPrompt` — 子代理的角色提示词
+- `instructions` — 子代理的角色提示词
 - `readOnly` — 是否允许修改文件
 - `allowNestedDispatch` — 是否允许该子代理再往下派发（**默认 `false`**，防无限递归，见 `decisions.md` D11）
-- `backend` — `builtin` 或 `cli`
-- `cli` — 当 `backend` 为 `cli` 时：可执行文件、`args` 数组模板、**`model` 与 `effort`（模型与思考强度）**、`modelFlag` / `effortFlag` 映射、工作目录、超时
-- `resultContract` — 期望的回传结构
+- `backend` — `spawn` / `fork`（内置）或 `cli`
+- `model` / `effort` — 角色顶层的模型与思考强度
+- `cliCommand` / `cliPrefixArgs` / `cliArgs` / `cliPromptDelivery` / `cliCwd` — CLI 角色的扁平配置；归一化后生成内部 `cli` 对象。提示词传递支持 `stdin` / `argv` / `promptFile`；超时由插件的 `volatile.cliTimeoutSec` 配置。
 
-其中 `model` 与 `effort` 是**角色级固定配置，主代理无权覆盖**（`decisions.md` D12）。`effort` 取值来自统一枚举 `minimal | low | medium | high | xhigh | max`，若与后端声明的 `effortValues` 不匹配则**装载期报错，不静默降级**。
+早期草案的 `systemPrompt`、嵌套 `cli.model` / `cli.effort`、`modelFlag` / `effortFlag` 已被当前 schema 与参数模板取代；`resultContract` 尚未成为配置字段，统一结构化结果契约仍是目标。
 
-## 6. CLI 派发后端（草案）
+其中 `model` 与 `effort` 是**角色级固定配置，主代理无权覆盖**（`decisions.md` D12）。`effort` 取值为 `low | medium | high | xhigh | max`，非法值在角色校验时报错，不静默降级；各 CLI 的真实支持范围仍需以实测为准。
+
+## 6. CLI 派发后端（已实现，保留设计约束）
 
 调用外部 CLI 至少要考虑：
 
 1. **调用形态**：多数 CLI 支持一次性（print/exec）与非交互会话两种模式，需要确认各自的实际参数。
-2. **提示词传递**：走命令行参数还是 stdin；参数长度上限。
+2. **提示词传递**：已支持命令行参数、stdin 与临时提示词文件；当前 grok 驱动用 `promptFile`，避免多行提示词进入 argv。
 3. **工作目录与沙箱**：外部 CLI 自己的沙箱与权限需要单独配置，不能假设它与 DSH 的沙箱一致。`codex` 有独立的 `-s/--sandbox` 与审批策略，必须由用户显式声明，不可与 DSH 的沙箱策略混为一谈。
 4. **输出解析**：是否支持结构化输出（如 JSON），不支持时如何从文本里稳定提取结果。
 5. **模型与思考强度**：三者 flag 形态完全不同（`codex` 走未文档化的 `-c model_reasoning_effort=`、`claude` 走 `--effort`、`grok` 走 `--reasoning-effort`），且可用档位随模型变化。由本插件的 `model` / `effort` 结构化字段映射，见 `decisions.md` D12。
@@ -352,7 +352,7 @@
 
 ## 7. 可观测性
 
-每次派发记录：任务标识、角色、后端线路、起止时间、退出状态、结果摘要。用途是你能回答「这件事到底是谁做的、花了多久、成功没有」。
+当前角色路由在派发前注入提示词，CLI 派发结果附带角色、线路、argv、耗时与退出状态；内置后端的限制见下节。统一记录任务标识、起止时间与结果摘要仍是观测目标。
 
 ### 7.1 「调度日志进主代理可见输出」的现状（已实现，含一处固有限制）
 

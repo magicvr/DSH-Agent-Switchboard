@@ -44,7 +44,7 @@ import { existsSync } from 'node:fs';
 /**
  * 提示词传递方式。
  *
- * @typedef {'stdin' | 'argv'} PromptDelivery
+ * @typedef {'stdin' | 'argv' | 'promptFile'} PromptDelivery
  */
 
 /**

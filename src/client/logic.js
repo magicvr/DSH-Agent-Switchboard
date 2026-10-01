@@ -16,9 +16,6 @@ export const BACKENDS = ['spawn', 'fork', 'cli'];
 /** 思考强度取值，必须与 Host 的 `EFFORT_VALUES` 一致。 */
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-/** 配置命名空间 = Loader 条目 id。 */
-export const SWITCHBOARD_NS = 'include:agent-switchboard';
-
 /**
  * 解析一个 JSON 字符串数组。
  *

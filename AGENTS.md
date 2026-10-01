@@ -19,22 +19,22 @@ DSH 插件 `DSH Agent Switchboard`：把主代理限制为「信息流统合器�
 - 文本文件以 LF 入库（`.gitattributes` 保证）。
 - 提交信息遵循 Conventional Commits，见 [`CONTRIBUTING.md`](./CONTRIBUTING.md)。
 - 文档用中文；代码标识符、提交类型、配置键用英文。
-- 当前处于设计阶段：改动应优先落在 `docs/`，实现代码等决策定型后再写。
+- 核心实现已落地并完成真机验收：改动须对照当前代码与已接受决策，保持现有布局和纯 ESM、零构建；文档要区分已实现、历史实测与尚未验证的内容，代码改动执行相应检查。
 
 ## 文档地图
 
 | 文件 | 内容 |
 | --- | --- |
 | [`README.md`](./README.md) | 项目定位、核心设计、状态 |
-| [`docs/plan.md`](./docs/plan.md) | **目录结构、分阶段实施方案、验收标准、风险登记** |
-| [`docs/decisions.md`](./docs/decisions.md) | **技术决策记录 D1–D12（含依据与代价）** |
-| [`docs/architecture.md`](./docs/architecture.md) | 已核实的 DSH 插件契约与取证 |
+| [`docs/plan.md`](./docs/plan.md) | **分阶段实施方案、验收标准、风险登记（历史布局与状态待校准）** |
+| [`docs/decisions.md`](./docs/decisions.md) | **技术决策记录（含依据、代价与后续修订）** |
+| [`docs/architecture.md`](./docs/architecture.md) | 当前实现、已核实的 DSH 契约、历史取证与设计约束 |
 | [`docs/cli-backends.md`](./docs/cli-backends.md) | **CLI 后端实测参数表（入口可执行性、模型/强度 flag 及验证方式）** |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | 提交规范与自查项 |
 
 ## 取证工具
 
-探针的检查点路径可用 `DSH_ASAR` 环境变量覆盖（默认指向本机安装位置）：
+asar 探针仍在 `scripts/` 根目录。归档路径可用 `DSH_ASAR` 环境变量覆盖；Windows 默认由 `LOCALAPPDATA`（缺省时由用户 home）动态推导安装位置，非 Windows 须显式设置：
 
 ```bash
 node scripts/dsh-probe.mjs list-registry        # 列出归档内所有 DSH 包
@@ -42,5 +42,7 @@ node scripts/dsh-probe.mjs ls <dir>             # 列出归档内目录
 node scripts/dsh-probe.mjs grep <regex>         # 在归档内搜索
 node scripts/dsh-cat.mjs <asar-relative-path>   # 打印归档内单个文件
 ```
+
+`scripts/` 根目录还保留 check 链与仓库工具；`scripts/lib/` 放共享解析与校验，`scripts/ops/` 放含写入的本机运维工具，`scripts/probes/` 放依赖本机 CLI 与安装环境的现场探针。不要把整个 `scripts/` 当作只读工具集。
 
 检查 DSH 真实接口时，**优先用 `cordis_inspect_query`**（Provider `Service` / `Event` / `Config` / `Tool` / `Slots`），它是运行时权威；探针用于读源码实现细节。
