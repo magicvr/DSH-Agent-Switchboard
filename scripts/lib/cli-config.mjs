@@ -13,27 +13,38 @@ function array(value, label) {
   const unknown = findUnknownPlaceholders(value);
   if (unknown.length) throw new Error(`${label} 未知占位符：${unknown.join(', ')}`);
 }
+function command(value, label) {
+  text(value, label);
+  if (/[{}]/.test(value)) throw new Error(`${label} 不允许占位符`);
+}
 
 export function validateCliConfig(config, { cwd = process.cwd() } = {}) {
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('CLI 配置必须是对象');
-  text(config.command, 'command');
-  // 入口始终是配置字面量，不允许模型用占位符替换可执行文件。
-  if (/[{}]/.test(config.command)) throw new Error('command 不允许占位符');
-  array(config.prefixArgs, 'prefixArgs');
+  // 保留顶层入口格式，同时允许各用例声明自己的入口。
+  if (config.command !== undefined) command(config.command, 'command');
+  if (config.prefixArgs !== undefined) array(config.prefixArgs, 'prefixArgs');
   if (!config.cases || typeof config.cases !== 'object' || Array.isArray(config.cases)
     || !Object.keys(config.cases).length) throw new Error('cases 必须是非空用例对象');
   const cases = {};
   for (const [name, spec] of Object.entries(config.cases)) {
     if (!spec || typeof spec !== 'object' || Array.isArray(spec)) throw new Error(`cases.${name} 必须是对象`);
+    const executable = Object.hasOwn(spec, 'command') ? spec.command : config.command;
+    const prefixArgs = Object.hasOwn(spec, 'prefixArgs') ? spec.prefixArgs : config.prefixArgs;
+    command(executable, `${name}.command`);
+    array(prefixArgs, `${name}.prefixArgs`);
     array(spec.args, `${name}.args`);
     text(spec.promptDelivery, `${name}.promptDelivery`);
     // prefixArgs 也参与提示词传递一致性校验。
-    const errors = validateTemplate([...config.prefixArgs, ...spec.args], { promptDelivery: spec.promptDelivery });
+    const errors = validateTemplate([...prefixArgs, ...spec.args], { promptDelivery: spec.promptDelivery });
     if (errors.length) throw new Error(`${name}: ${errors.join('；')}`);
-    cases[name] = { args: [...spec.args], promptDelivery: spec.promptDelivery,
+    for (const key of ['model', 'effort']) if (spec[key] !== undefined) text(spec[key], `${name}.${key}`);
+    cases[name] = { command: executable, prefixArgs: [...prefixArgs],
+      args: [...spec.args], promptDelivery: spec.promptDelivery,
+      ...(spec.model === undefined ? {} : { model: spec.model }),
+      ...(spec.effort === undefined ? {} : { effort: spec.effort }),
       ...(spec.cwd === undefined ? {} : { cwd: pathValue(spec.cwd, `${name}.cwd`, cwd) }) };
   }
-  return { command: config.command, prefixArgs: [...config.prefixArgs], cases };
+  return { command: config.command, prefixArgs: config.prefixArgs === undefined ? undefined : [...config.prefixArgs], cases };
 }
 
 export function loadCliConfig({ argv = process.argv.slice(2), env = process.env, cwd = process.cwd() } = {}) {
@@ -56,7 +67,9 @@ export function cliInvocation(loaded, caseName, values, options = {}) {
   if (!spec) throw new Error(`未知 CLI 用例：${caseName}`);
   const paths = resolvePaths({ ...options, cliCwd: spec.cwd });
   printPaths(paths, options.log ?? console.log);
-  const argv = buildArgs([...loaded.config.prefixArgs, ...spec.args], { ...values, cwd: paths.cwd });
-  return { command: loaded.config.command, argv, promptDelivery: spec.promptDelivery,
+  const argv = buildArgs([...spec.prefixArgs, ...spec.args], {
+    model: spec.model, effort: spec.effort, ...values, cwd: paths.cwd,
+  });
+  return { command: spec.command, argv, promptDelivery: spec.promptDelivery,
     options: { cwd: paths.cwd, shell: false } };
 }

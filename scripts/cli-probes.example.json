@@ -1,0 +1,285 @@
+{
+  "cases": {
+    "help.codex": {
+      "command": "example-node",
+      "prefixArgs": [
+        "example-codex-entry.js"
+      ],
+      "cwd": ".",
+      "args": [
+        "--help"
+      ],
+      "promptDelivery": "stdin"
+    },
+    "help.claude": {
+      "command": "example-claude",
+      "prefixArgs": [],
+      "cwd": ".",
+      "args": [
+        "--help"
+      ],
+      "promptDelivery": "stdin"
+    },
+    "help.grok": {
+      "command": "example-grok",
+      "prefixArgs": [],
+      "cwd": ".",
+      "args": [
+        "--help"
+      ],
+      "promptDelivery": "stdin"
+    },
+    "run.codex": {
+      "command": "example-node",
+      "prefixArgs": [
+        "example-codex-entry.js"
+      ],
+      "cwd": ".",
+      "args": [
+        "exec",
+        "-s",
+        "read-only",
+        "--skip-git-repo-check",
+        "-m",
+        "{model}",
+        "-c",
+        "model_reasoning_effort={effort}",
+        "-"
+      ],
+      "promptDelivery": "stdin",
+      "model": "example-shared-model",
+      "effort": "low"
+    },
+    "run.claude": {
+      "command": "example-claude",
+      "prefixArgs": [],
+      "cwd": ".",
+      "args": [
+        "-p",
+        "--model",
+        "{model}",
+        "--effort",
+        "{effort}"
+      ],
+      "promptDelivery": "stdin",
+      "model": "example-shared-model",
+      "effort": "low"
+    },
+    "run.grok": {
+      "command": "example-grok",
+      "prefixArgs": [],
+      "cwd": ".",
+      "args": [
+        "-p",
+        "{prompt}",
+        "-m",
+        "{model}",
+        "--reasoning-effort",
+        "{effort}"
+      ],
+      "promptDelivery": "argv",
+      "model": "example-shared-model",
+      "effort": "low"
+    },
+    "run2.claude-effort": {
+      "command": "example-claude",
+      "prefixArgs": [],
+      "cwd": ".",
+      "args": [
+        "-p",
+        "--model",
+        "{model}",
+        "--effort",
+        "{effort}"
+      ],
+      "promptDelivery": "stdin",
+      "model": "example-claude-model",
+      "effort": "low"
+    },
+    "run2.claude-no-effort": {
+      "command": "example-claude",
+      "prefixArgs": [],
+      "cwd": ".",
+      "args": [
+        "-p",
+        "--model",
+        "{model}"
+      ],
+      "promptDelivery": "stdin",
+      "model": "example-claude-model"
+    },
+    "run2.grok-effort": {
+      "command": "example-grok",
+      "prefixArgs": [],
+      "cwd": ".",
+      "args": [
+        "-p",
+        "{prompt}",
+        "-m",
+        "{model}",
+        "--reasoning-effort",
+        "{effort}"
+      ],
+      "promptDelivery": "argv",
+      "model": "example-grok-model",
+      "effort": "low"
+    },
+    "codex.baseline": {
+      "command": "example-node",
+      "prefixArgs": [
+        "example-codex-entry.js"
+      ],
+      "cwd": ".",
+      "args": [
+        "exec",
+        "-s",
+        "read-only",
+        "--skip-git-repo-check",
+        "-o",
+        "{cwd}/raw/codex-probe/baseline.txt",
+        "-"
+      ],
+      "promptDelivery": "stdin"
+    },
+    "codex.model-a": {
+      "command": "example-node",
+      "prefixArgs": [
+        "example-codex-entry.js"
+      ],
+      "cwd": ".",
+      "args": [
+        "exec",
+        "-s",
+        "read-only",
+        "--skip-git-repo-check",
+        "-m",
+        "example-model-a",
+        "-o",
+        "{cwd}/raw/codex-probe/model-a.txt",
+        "-"
+      ],
+      "promptDelivery": "stdin"
+    },
+    "codex.model-b": {
+      "command": "example-node",
+      "prefixArgs": [
+        "example-codex-entry.js"
+      ],
+      "cwd": ".",
+      "args": [
+        "exec",
+        "-s",
+        "read-only",
+        "--skip-git-repo-check",
+        "-m",
+        "example-model-b",
+        "-o",
+        "{cwd}/raw/codex-probe/model-b.txt",
+        "-"
+      ],
+      "promptDelivery": "stdin"
+    },
+    "codex.effort-high": {
+      "command": "example-node",
+      "prefixArgs": [
+        "example-codex-entry.js"
+      ],
+      "cwd": ".",
+      "args": [
+        "exec",
+        "-s",
+        "read-only",
+        "--skip-git-repo-check",
+        "-m",
+        "example-model-a",
+        "-c",
+        "model_reasoning_effort=high",
+        "-o",
+        "{cwd}/raw/codex-probe/effort-high.txt",
+        "-"
+      ],
+      "promptDelivery": "stdin"
+    },
+    "codex.effort-low": {
+      "command": "example-node",
+      "prefixArgs": [
+        "example-codex-entry.js"
+      ],
+      "cwd": ".",
+      "args": [
+        "exec",
+        "-s",
+        "read-only",
+        "--skip-git-repo-check",
+        "-m",
+        "example-model-a",
+        "-c",
+        "model_reasoning_effort=low",
+        "-o",
+        "{cwd}/raw/codex-probe/effort-low.txt",
+        "-"
+      ],
+      "promptDelivery": "stdin"
+    },
+    "codex.bogus-model": {
+      "command": "example-node",
+      "prefixArgs": [
+        "example-codex-entry.js"
+      ],
+      "cwd": ".",
+      "args": [
+        "exec",
+        "-s",
+        "read-only",
+        "--skip-git-repo-check",
+        "-m",
+        "example-invalid-model",
+        "-o",
+        "{cwd}/raw/codex-probe/bogus-model.txt",
+        "-"
+      ],
+      "promptDelivery": "stdin"
+    },
+    "codex.bogus-effort": {
+      "command": "example-node",
+      "prefixArgs": [
+        "example-codex-entry.js"
+      ],
+      "cwd": ".",
+      "args": [
+        "exec",
+        "-s",
+        "read-only",
+        "--skip-git-repo-check",
+        "-m",
+        "example-model-a",
+        "-c",
+        "model_reasoning_effort=example-invalid-effort",
+        "-o",
+        "{cwd}/raw/codex-probe/bogus-effort.txt",
+        "-"
+      ],
+      "promptDelivery": "stdin"
+    },
+    "codex.json": {
+      "command": "example-node",
+      "prefixArgs": [
+        "example-codex-entry.js"
+      ],
+      "cwd": ".",
+      "args": [
+        "exec",
+        "-s",
+        "read-only",
+        "--skip-git-repo-check",
+        "-m",
+        "example-model-a",
+        "--json",
+        "-o",
+        "{cwd}/raw/codex-probe/json.txt",
+        "-"
+      ],
+      "promptDelivery": "stdin"
+    }
+  }
+}

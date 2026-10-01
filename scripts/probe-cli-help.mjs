@@ -4,32 +4,8 @@
 // 不等于真的生效（codex 的 `model_reasoning_effort` 在 help 里完全没出现）。
 // 因此这里的输出只是**候选**，是否生效必须靠真实调用验证（见 scripts/probe-cli-run.mjs）。
 //
-// 用法：node scripts/probe-cli-help.mjs
-import { spawnSync } from 'node:child_process';
-
-/** 入口（与本机实测一致，见 scripts/probe-clis.mjs 的输出）。 */
-const ENTRIES = {
-  codex: [process.execPath, `${process.env.APPDATA}\\npm\\node_modules\\@openai\\codex\\bin\\codex.js`],
-  claude: ['C:\\Users\\magicvr\\.local\\bin\\claude.exe'],
-  grok: ['C:\\Users\\magicvr\\.grok\\bin\\grok.exe'],
-};
-
-/**
- * 跑一次 help。
- *
- * @param {string[]} argv - argv 前缀。
- * @param {string[]} args - 参数。
- * @returns {string} stdout+stderr。
- */
-function run(argv, args) {
-  const r = spawnSync(argv[0], [...argv.slice(1), ...args], {
-    encoding: 'utf8',
-    timeout: 25000,
-    shell: false,
-    windowsHide: true,
-  });
-  return `${r.stdout ?? ''}\n${r.stderr ?? ''}`;
-}
+// 用法：node scripts/probe-cli-help.mjs --cli-config <JSON.local>
+import { probeConfig, runProbe } from './lib/probe-cli.mjs';
 
 /** 关心的关键字。 */
 const KEYS = [
@@ -42,26 +18,33 @@ const KEYS = [
   /stdin|pipe/i,
 ];
 
-for (const [name, argv] of Object.entries(ENTRIES)) {
-  console.log(`\n${'='.repeat(64)}\n${name}\n${'='.repeat(64)}`);
-  const text = run(argv, ['--help']);
-  const lines = text.split('\n');
-  const hits = new Set();
-  lines.forEach((l, i) => {
-    if (KEYS.some((re) => re.test(l))) {
-      // 取该行及后续两行（help 常有换行续写）
-      for (let k = i; k < Math.min(lines.length, i + 3); k++) hits.add(k);
+try {
+  const config = probeConfig('help');
+  for (const name of config.names) {
+    console.log(`\n${'='.repeat(64)}\n${name}\n${'='.repeat(64)}`);
+    const r = await runProbe(config, name, '', 25000);
+    const text = `${r.stdout}\n${r.stderr}`;
+    const lines = text.split('\n');
+    const hits = new Set();
+    lines.forEach((l, i) => {
+      if (KEYS.some((re) => re.test(l))) {
+        // 取该行及后续两行（help 常有换行续写）
+        for (let k = i; k < Math.min(lines.length, i + 3); k++) hits.add(k);
+      }
+    });
+    const sorted = [...hits].sort((a, b) => a - b);
+    if (sorted.length === 0) {
+      console.log('  （无匹配行）');
+      continue;
     }
-  });
-  const sorted = [...hits].sort((a, b) => a - b);
-  if (sorted.length === 0) {
-    console.log('  （无匹配行）');
-    continue;
+    let prev = -2;
+    for (const i of sorted) {
+      if (i > prev + 1) console.log('  ---');
+      console.log(`  ${lines[i].trimEnd()}`);
+      prev = i;
+    }
   }
-  let prev = -2;
-  for (const i of sorted) {
-    if (i > prev + 1) console.log('  ---');
-    console.log(`  ${lines[i].trimEnd()}`);
-    prev = i;
-  }
+} catch (error) {
+  console.error(`CLI help 探针失败：${error.message}`);
+  process.exitCode = 1;
 }
