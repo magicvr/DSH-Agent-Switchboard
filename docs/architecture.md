@@ -78,6 +78,20 @@
 16. **`SubagentStartRequest` 没有沙箱字段**（完整声明：`label` / `prompt` / `parent` / `signal` / `agentOptions` / `outputSchema` / `maxDepth` / `toolFilter` / `persona`）。因此角色的「只读」**只能**用 `toolFilter.deny` 做工具级约束，无法做成沙箱子会话。这一点必须在文档与界面上如实标注，不能含糊成「只读沙箱」。
 17. **`dsh-tool-subagent` 的 Config 是每实例一个工具的机制**：官方 `dsh-base` 就是靠挂两个实例（`toolName: subagent` + `toolName: subagent_fork`）同时提供两种派发方式。
 
+### 3.1d preset 机制实测（本项目最关键的机制结论）
+
+21. **把包列在 preset 的 `plugins` 里，它就会在选中该 preset 的会话中被实例化** —— 但**前提是该包没有同时在别处被挂载**。
+    - 实测过程：先只「加上 preset 声明」，插件仍报告挂在根上；再把 profile 里的全局条目 `disabled: true`，插件随即**只在选中该 preset 的会话里生效**（角色工具齐备），而其他会话连 `switchboard_selftest` 都看不到。
+    - 机制解释：Loader 按**包名**处理，同一包已在根上加载时 preset 那次不会重复执行。
+    - 因此「不选这个 preset 就不生效」这一目标形态成立于：`preset 声明 + 移除全局挂载`。
+    - preset 里那一条目的 `config` 会被当作插件配置传入（实测 `provider/maxDepth/cwd/roles` 均正确到达），这给了「按 preset 携带角色配置」的官方路径。
+22. **`agentPresets.composedPreset(ctx)` 必须传入「处于该作用域内」的 ctx，否则永远返回 `undefined`。**
+    - 实现是 `standingMountFor(ctx)?.presetId`，即**从传入的上下文向上找最近的 preset 挂载**。
+    - 本插件的 `apply` 运行在**根上下文**，从那里向上查找永远命中不到 preset 挂载 —— 所以自检里的 `preset 作用域：根作用域` 是**假信号**，与 preset 是否生效无关。
+    - 正确用法：在**工具调用时**传 `exec.agent.ctx`（那才处于会话的作用域内）。`dsh-subagent` 里的 `composeFrom(childCtx, parent.ctx)` 同理。
+    - ⚠️ **教训：问「我在哪个作用域」时，必须用在作用域内的那个 ctx。用作用域外的 ctx 去问，答案永远是「不在任何作用域」。**
+23. **同一个插件会被激活多次**（根一次、每个选中它的 preset 作用域再一次）。因此插件的诊断/状态**不能放在模块级**：实测模块级 `diagnostics` 导致后一次激活清空前一次的记录，自检出现自相矛盾的输出。每次 `apply` 必须新建一份实例状态。
+
 ### 3.1c Phase 2 实测补充：三个会重复踩的坑
 
 18. **必须显式调用 `.volatile()`；把子对象「命名」为 `volatile` 没有任何效果。**
