@@ -637,24 +637,28 @@ function applyInner(ctx, config) {
   // 作用域查不到父作用域注册的工具（这正是角色工具不重复出现的实测机制）。
   const mountHere = readVolatileField(resolved, 'mount') === true;
 
-  // --- roleConfig 服务：**只在根作用域、且延迟到首次使用时注册** -------------------
+  // --- roleConfig 服务：**只在根作用域注册（且必须真的注册）** ---------------------
   //
-  // ⚠️ 这里曾写成「每个作用域都注册，若外层已提供则跳过」，结果让**应用无法启动**，
-  //    只能禁用插件才进得来。两个教训：
+  // ⚠️ 这里有两条都来自实测的硬约束，必须同时满足：
   //
-  //   1. **`Service` 的构造函数会同步调用 `ctx.reflect.provide()`**（已核实 cordis 源码）。
-  //      在**每个会话都会走的 preset 路径**上做服务注册，等于把「注册失败」升级成
-  //      「会话起不来」。现在 preset 侧完全不注册 —— 设置页是全局 UI，它解析到的
-  //      就是根实例的服务。
-  //   2. 曾用「`ctx.get(服务名)` 已存在就跳过」当守卫。那是**基于对作用域继承语义的
-  //      推理**，而不是实测事实；一旦推理不成立就会重复注册并抛错。现在改为
-  //      **延迟注册**：把注册推迟到设置页第一次真正读写时，正常浏览/对话路径根本不碰它。
+  //   (a) **服务必须真的在装载期注册**，不能只「延迟到首次使用」。
+  //       实测：客户端设置页若把该服务写成必需注入，等到它时才注册会让客户端**永远
+  //       pending**，整页启动失败：
+  //           web boot: 1 entry did not activate
+  //           @magicvr/dsh-agent-switchboard: pending (waiting for service: remote.roleConfig)
   //
-  // 于是「插件装载」与「设置页可用」被解耦：即使注册真的失败，代价也只是设置页报错，
-  // 而不是应用起不来。
+  //   (b) **绝不能在 preset 作用域注册**。`Service` 的构造函数会同步调用
+  //       `ctx.reflect.provide()`（已核实 cordis 源码），而 preset 路径是**每个会话
+  //       都会走**的；在那里注册等于把「注册失败」升级成「会话起不来」→「应用起不来」。
+  //       本插件确实因此让应用无法启动过一次，用户只能禁用插件才进得来。
+  //
+  // 两者合起来只剩一个安全解：**只在根作用域注册恰好一次**，并用 try/catch 兜住。
+  // 根作用域只装载一次，因此不存在重复注册；出错也只降级为设置页报错。
   if (!mountHere) {
-    diagnostics.roleConfigEnsure = () => ensureRoleConfigService(ctx, roleConfigPath, resolved, diagnostics);
-    console.error(`[${name}] 根条目：只提供配置服务（延迟注册），不挂载角色工具`);
+    const ensured = ensureRoleConfigService(ctx, roleConfigPath, resolved, diagnostics);
+    console.error(
+      `[${name}] 根条目：roleConfig ${ensured.ok ? '已就绪' : '注册失败'}，不挂载角色工具`,
+    );
     return;
   }
 

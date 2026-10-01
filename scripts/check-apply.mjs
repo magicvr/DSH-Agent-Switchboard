@@ -2,6 +2,7 @@
 //
 // 为什么必须做：本插件曾让应用无法启动。必须在不重启的前提下，用假 ctx 把
 // 根路径与 preset 路径都真跑一遍 —— 重启一次的成本太高，而且失败会让用户进不去。
+import { readFileSync } from 'node:fs';
 import { apply, Config, ensureRoleConfigService } from '../src/index.js';
 
 let pass = 0;
@@ -36,18 +37,33 @@ function section(title) {
  *
  * @param {object} options - 选项。
  * @param {boolean} options.provideProfileContext - 是否提供 profileContext。
+ * @param {boolean} options.provideReflect - 是否提供 reflect.provide。
  * @returns {object} 假 ctx。
  */
-function makeCtx({ provideProfileContext = true } = {}) {
+function makeCtx({ provideProfileContext = true, provideReflect = true } = {}) {
   const registered = [];
+  const provided = [];
   const ctx = {
     registered,
+    provided,
     get(key) {
       if (key === 'profileContext') {
         return provideProfileContext ? { home: 'C:/tmp/dsh-home', dir: 'C:/tmp/profile' } : undefined;
       }
       return undefined;
     },
+    // ⚠️ 必须存在：`RoleConfigService extends TypertRemoteService`，其构造会经由
+    //    `Service` 同步调用 `ctx.reflect.provide()`。缺了它就会走「注册失败」的降级路径
+    //    —— 那本身也是我们要测的一种情况，因此不能把它变成永远成功的桩。
+    reflect: provideReflect
+      ? {
+          props: {},
+          provide(name, instance) {
+            provided.push(name);
+            return instance;
+          },
+        }
+      : undefined,
     tools: {
       register(def) {
         registered.push(def?.name);
@@ -227,6 +243,38 @@ section('异常输入不得让 apply 抛出（兜底边界）');
     }
     check(`apply 在「${label}」时不抛错（降级为日志）`, !threw, error?.message);
   }
+}
+
+section('角色配置服务必须在**根作用域装载期**就绪（客户端依赖它）');
+{
+  // ⚠️ 这条直接锁死一次真实启动失败：
+  //     web boot: 1 entry did not activate
+  //     @magicvr/dsh-agent-switchboard: pending (waiting for service: remote.roleConfig)
+  //     根因是「客户端把该服务写成必需注入」而「Host 侧延迟注册」两者矛盾。
+  //     因此断言：根条目装载后，服务**必须已经注册**（不能只登记一个延迟回调）。
+  const ctx = makeCtx();
+  apply(ctx, { provider: 'self', cwd: 'C:/w' });
+  check(
+    '根条目装载后 roleConfig 已注册（该服务名进入 ctx.reflect.provide）',
+    ctx.provided.includes('roleConfig'),
+    `实际注册：${ctx.provided.join(', ') || '（无）'}`,
+  );
+}
+
+section('客户端必需注入不得与服务注册时机矛盾');
+{
+  // 客户端的 `inject` 是**必需**依赖：声明了就必须在装载期存在。而 `remote.*` 命名空间
+  // 只有在对应 Host 服务注册后才存在。因此客户端**不能**把 `remote.<ns>` 写进 inject ——
+  // 否则一旦 Host 侧改为延迟注册，客户端就永远 pending，整页启动失败。
+  const clientSrc = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
+  const m = /inject:\s*\[([^\]]*)\]/.exec(clientSrc);
+  const declared = (m?.[1] ?? '')
+    .split(',')
+    .map((s) => s.trim().replace(/^['"]|['"]$/g, ''))
+    .filter((s) => s.length > 0);
+  console.log(`       客户端 inject = ${JSON.stringify(declared)}`);
+  check('客户端 inject 里没有 remote.* 项', !declared.some((n) => n.startsWith('remote.')), declared.join(','));
+  check('客户端 inject 含 slots（它唯一的真实必需依赖）', declared.includes('slots'), declared.join(','));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

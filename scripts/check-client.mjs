@@ -117,9 +117,14 @@ section('模块可被真跑：桩化 window/require 后 factory 返回合法插�
     }
     if (plugin) {
       check('插件导出了 inject', Array.isArray(plugin.inject));
+      check('inject 含 slots（唯一的真实必需依赖）', plugin.inject.includes('slots'), plugin.inject.join(','));
+      // ⚠️ 这条锁死一次真实启动失败：客户端曾把 `remote.roleConfig` 写成必需注入，
+      //    而 Host 侧该服务当时是延迟注册的 → 客户端永远 pending → 整页启动失败
+      //    （`web boot: 1 entry did not activate`）。`inject` 是必需依赖，不能用来
+      //    声明「可能晚到的服务」；那类依赖要改为用时检查。
       check(
-        'inject 含 slots / remote.roleConfig',
-        ['slots', 'remote.roleConfig'].every((n) => plugin.inject.includes(n)),
+        'inject 不含任何 remote.* （必需依赖不能声明可能晚到的服务）',
+        !plugin.inject.some((n) => String(n).startsWith('remote.')),
         plugin.inject.join(','),
       );
       check(

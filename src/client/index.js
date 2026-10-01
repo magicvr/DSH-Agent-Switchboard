@@ -123,6 +123,36 @@ window.__ModuleLoader__.load({
     const { useState, useEffect, useRef, useCallback } = React;
 
     /**
+     * 取远程服务。
+     *
+     * ⚠️ **不能把 `remote.roleConfig` 写进 `inject`**，这是实测踩到的一次启动失败：
+     *
+     *     web boot: 1 entry did not activate
+     *     @magicvr/dsh-agent-switchboard: pending (waiting for service: remote.roleConfig)
+     *
+     * `inject` 是**必需依赖**：声明了它，Cordis 会一直等到该服务出现才让本插件激活。
+     * 而 Host 侧的 `roleConfig` 服务是**延迟注册**的（只在真正读写时才构造，见
+     * `src/handler` 的说明），因此在装载期并不存在 —— 两者直接矛盾，客户端插件永远
+     * pending，整页启动失败。
+     *
+     * 这里改为「用时检查」：装载阶段只依赖 `slots`，真正读写时才取服务，取不到就如实
+     * 显示一行诊断，而不是把整个插件卡住。
+     *
+     * @param {object} ctx - Client 插件上下文。
+     * @returns {object|undefined} 远程命名空间对象，未就绪时返回 undefined。
+     */
+    function roleConfigChannel(ctx) {
+      try {
+        const remote = ctx?.remote;
+        if (remote === undefined || remote === null) return undefined;
+        return remote[REMOTE_NAMESPACE];
+      } catch {
+        // 某些情况下访问未就绪的 remote 命名空间会抛错，按「未就绪」处理。
+        return undefined;
+      }
+    }
+
+    /**
      * 通过插件的远程服务读取角色配置。
      *
      * ⚠️ 不再用 `ctx.configForms`：角色已不从 Cordis 配置走（见 `src/config-file.js`
@@ -136,8 +166,16 @@ window.__ModuleLoader__.load({
      * @returns {Promise<{ok: boolean, roles: object[], error?: string, path?: string, missing?: boolean}>} 读取结果。
      */
     async function fetchRoles(ctx) {
+      const channel = roleConfigChannel(ctx);
+      if (channel === undefined || typeof channel.read !== 'function') {
+        return {
+          ok: false,
+          roles: [],
+          error: 'roleConfig 服务尚未就绪（它由选中 Switchboard preset 的会话或根条目提供）。',
+        };
+      }
       try {
-        const response = await ctx.remote[REMOTE_NAMESPACE].read();
+        const response = await channel.read();
         if (response && response.ok === false) {
           return { ok: false, roles: [], error: String(response.error ?? '读取失败'), path: response.path };
         }
@@ -158,8 +196,12 @@ window.__ModuleLoader__.load({
      * @returns {Promise<{ok: boolean, message: string, roleCount?: number}>} 结果。
      */
     async function saveRoles(ctx, payload) {
+      const channel = roleConfigChannel(ctx);
+      if (channel === undefined || typeof channel.write !== 'function') {
+        return { ok: false, message: 'roleConfig 服务尚未就绪，无法保存。' };
+      }
       try {
-        const response = await ctx.remote[REMOTE_NAMESPACE].write(payload);
+        const response = await channel.write(payload);
         if (response && response.ok === false) {
           return { ok: false, message: String(response.error ?? '写入失败') };
         }
@@ -641,9 +683,11 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      // `remote.roleConfig` 是本插件自己的远程服务（见 src/config-service.js）。
-      // 不再需要 `configForms` / `remote.settings` —— 角色配置已不走 settings。
-      inject: ['slots', 'remote.roleConfig'],
+      // ⚠️ **只注入 `slots`**。绝不能把 `remote.roleConfig` 放进来 —— 那是**必需**依赖，
+      //    而 Host 侧的服务是延迟注册的，二者矛盾会让本插件永远 pending 并导致整页
+      //    启动失败（实测报错：`pending (waiting for service: remote.roleConfig)`）。
+      //    远程服务改为「用时检查」，见 `roleConfigChannel`。
+      inject: ['slots'],
       apply(ctx) {
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(
