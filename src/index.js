@@ -45,6 +45,12 @@ const diagnostics = { configErrors: [], mounts: [], fatal: undefined };
  * 改动后需要重新启用插件。
  */
 export const Config = z.object({
+  // ⚠️ `.volatile()` 是必须调用的，仅把子对象**命名**为 volatile 没有任何效果。
+  // 依据 dsh-settings 的 volatileForm：
+  //   if (schema.meta.volatile) return plainSchema(schema)
+  // 其 JSDoc 为「Select fields whose nearest volatile ancestor makes them editable
+  // without remounting」—— 标在这一个对象上，其子字段即可在设置页实时编辑。
+  // 这里曾漏调用一次，注释写着 volatile、代码却没有，是典型「文档与实现脱节」。
   volatile: z
     .object({
       /** 跨 CLI 派发的总开关。Phase 3 使用。 */
@@ -52,7 +58,8 @@ export const Config = z.object({
       /** 单次 CLI 派发的超时（秒）。Phase 3 使用。 */
       cliTimeoutSec: z.number().step(1).min(1).default(900).description('单次 CLI 派发的超时（秒）'),
     })
-    .default({}),
+    .default({})
+    .volatile(),
   /** 角色默认使用的 LLM route provider；角色自身可用 provider 覆盖。 */
   provider: z.string().description('角色默认 LLM provider'),
   /** 允许嵌套派发时，子代理可用的深度上限。 */
@@ -66,10 +73,11 @@ export const Config = z.object({
         description: z.string().required(),
         provider: z.string(),
         model: z.string().required(),
-        effort: z.enum(EFFORT_VALUES),
+        // ⚠️ schemastery **没有** `z.enum`（沿 zod 的直觉会踩坑）：枚举用 `z.union`。
+        effort: z.union(EFFORT_VALUES),
         instructions: z.string().required(),
         readOnly: z.boolean().default(false),
-        backend: z.enum(['spawn', 'fork']).default('spawn'),
+        backend: z.union(['spawn', 'fork']).default('spawn'),
         allowNestedDispatch: z.boolean().default(false),
       }),
     )
