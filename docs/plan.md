@@ -23,7 +23,7 @@
  （DSH 内置）           （本插件注册，走 ctx.subprocess）
       │                    │
       ▼                    ▼
-  DSH 子代理会话        本机 codex / claude / grok
+  DSH 子代理会话        本机 codex / grok（+ 自定义命令）
 ```
 
 主代理看到的只有「一组按角色命名的委派工具」，看不到线路差异。

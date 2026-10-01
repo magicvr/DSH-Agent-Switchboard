@@ -95,24 +95,8 @@ const CLI_DRIVER_OPTIONS = [
       '-',
     ],
   },
-  {
-    id: 'claude',
-    label: 'Claude Code',
-    description: 'Anthropic Claude Code。非交互走 `-p/--print`，提示词走 stdin。只读用 `--permission-mode plan`。',
-    command: 'claude',
-    prefixArgs: [],
-    promptDelivery: 'stdin',
-    modelPlaceholder: 'sonnet',
-    args: (readOnly) => [
-      '-p',
-      '--model',
-      '{model}',
-      '--effort',
-      '{effort}',
-      '--permission-mode',
-      readOnly ? 'plan' : 'acceptEdits',
-    ],
-  },
+  // 说明：**不再提供 Claude Code 预设**（用户已长期不用，明确要求排除）。
+  // 取证记录保留在 `docs/cli-backends.md` §3.0；想用回它可选「自定义命令」。
   {
     id: 'grok',
     label: 'Grok CLI',

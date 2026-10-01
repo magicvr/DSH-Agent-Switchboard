@@ -339,7 +339,13 @@ section('CLI 驱动表：Client 镜像必须与 Host 权威一致');
       `期望含 ${JSON.stringify(d.prefixArgs)}`,
     );
   }
-  check('客户端驱动数量与 Host 一致', CLI_DRIVERS.length === 4, String(CLI_DRIVERS.length));
+  check(
+    '客户端驱动数量与 Host 一致（codex / grok / custom）',
+    CLI_DRIVERS.length === 3,
+    String(CLI_DRIVERS.length),
+  );
+  // 反向断言：被移除的预设**不得**残留在客户端镜像里（漏删一半会造成「界面有、Host 没有」）。
+  check('客户端不含 claude 预设', !CLIENT_SRC.includes("id: 'claude'"));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

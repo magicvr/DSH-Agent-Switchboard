@@ -95,26 +95,14 @@ export const CLI_DRIVERS = [
       '-',
     ],
   },
-  {
-    id: 'claude',
-    label: 'Claude Code',
-    description: 'Anthropic Claude Code。非交互走 `-p/--print`，提示词走 stdin。只读用 `--permission-mode plan`。',
-    command: 'claude',
-    prefixArgs: [],
-    promptDelivery: 'stdin',
-    // 实测：claude 接受别名（fable / opus / sonnet）；填插件路由名会被拒。
-    modelPlaceholder: 'sonnet',
-    effortValues: ['low', 'medium', 'high', 'xhigh', 'max'],
-    args: (readOnly) => [
-      '-p',
-      '--model',
-      '{model}',
-      '--effort',
-      '{effort}',
-      '--permission-mode',
-      readOnly ? 'plan' : 'acceptEdits',
-    ],
-  },
+  // 说明：**不再提供 Claude Code 预设。**
+  //
+  // 事实上曾实测过它的调用形态（入口可直接 spawn、`-p` + stdin 可用、`--model` 确实生效），
+  // 但本机端到端始终不可用：claude 用它**内置的模型目录**校验 `--model`，网关模型名会被拒
+  // （`[claude-code:unrecognized_model]`），而本机已经很久不用它了。用户明确要求排除。
+  //
+  // 取证记录**保留**在 `docs/cli-backends.md` §3.0 —— 那证明「已排查过」，删掉等于丢失证据。
+  // 用户若日后想用回它，选「自定义命令」填 `claude` 即可，或按 §3.0 恢复一个预设。
   {
     id: 'grok',
     label: 'Grok CLI',

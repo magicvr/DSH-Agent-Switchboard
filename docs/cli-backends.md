@@ -194,6 +194,13 @@ reasoning effort: ...
 
 ### 3. claude
 
+> **状态：本插件的驱动预设已移除**（用户长期不用，明确要求排除）。
+> 「角色 → CLI」下拉框里**不会出现** Claude Code。
+> 想临时用它：选「自定义命令」，`command` 填 `claude`，参数按下面 §3.0 的形态填。
+>
+> **本节刻意保留**：这些是真实取证，证明「已排查过、卡在哪一层」。删掉等于丢失证据，
+> 日后有人想恢复时会重复踩一遍同样的坑。
+
 #### 3.0 实测结论（`scripts/probe-cli-run.mjs` / `probe-cli-run2.mjs` / `probe-claude-isolate.mjs`）
 
 | 项 | 实测结果 |

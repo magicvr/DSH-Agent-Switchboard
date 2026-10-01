@@ -44,7 +44,15 @@ function section(title) {
 
 section('驱动表结构');
 {
-  check('至少含 codex / claude / grok / custom', CLI_DRIVER_IDS.length >= 4, CLI_DRIVER_IDS.join(','));
+  // ⚠️ 断言的是**当前实际提供的集合**，不是「越多越好」。
+  //    Claude Code 预设已移除（用户长期不用，明确要求排除），因此不在列。
+  //    日后若要恢复，连同本行与 `check-client.mjs` 的数量断言一起改。
+  check(
+    '驱动集合恰为 codex / grok / custom',
+    CLI_DRIVER_IDS.slice().sort().join(',') === 'codex,custom,grok',
+    CLI_DRIVER_IDS.join(','),
+  );
+  check('不含 claude（已按用户要求排除）', !CLI_DRIVER_IDS.includes('claude'), CLI_DRIVER_IDS.join(','));
   check('custom 始终在表内（自定义兜底）', CLI_DRIVER_IDS.includes('custom'));
   const ids = new Set();
   for (const d of CLI_DRIVERS) {
