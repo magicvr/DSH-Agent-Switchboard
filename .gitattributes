@@ -1,0 +1,48 @@
+# 默认：仓库内文本一律以 LF 存储。
+# Windows 检出时若需要 CRLF，由各人的 core.autocrlf / core.eol 决定。
+* text=auto eol=lf
+
+# 明确的文本类型
+*.ts   text
+*.tsx  text
+*.js   text
+*.mjs  text
+*.cjs  text
+*.json text
+*.jsonc text
+*.md   text
+*.yml  text
+*.yaml text
+*.toml text
+*.css  text
+*.html text
+*.sh   text eol=lf
+
+# Windows 批处理必须保留 CRLF
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# 二进制：不做任何行尾转换，也不参与 diff
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.7z   binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.otf  binary
+
+# 锁文件：折叠进 diff，不显示逐行内容
+pnpm-lock.yaml -diff
+package-lock.json -diff
+yarn.lock -diff
+
+# 语言统计：避免把生成物算进仓库语言构成
+docs/** linguist-documentation
