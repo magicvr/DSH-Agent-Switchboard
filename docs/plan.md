@@ -57,11 +57,19 @@
 │   └── client/
 │       └── index.js             __ModuleLoader__.load + composer.dock 只读指示
 ├── scripts/
+│   ├── lib/                     路径解析与本地 CLI 配置校验共享模块
+│   ├── ops/                     写入、迁移、修复脚本（批次 2 归类）
+│   ├── probes/                  环境相关取证与实机实验（批次 2 归类）
+│   ├── check-*.mjs              可移植离线检查及显式目标预检
 │   ├── dsh-probe.mjs            只读 asar 取证（已完成）
 │   ├── dsh-cat.mjs              只读读取归档内单文件（已完成）
 │   └── inline-asar-probe.mjs    底层解析器（已完成）
 └── test/                        Phase 2 起
 ```
+
+脚本按副作用与环境依赖分类：`lib/` 只提供共享解析和校验，`ops/` 承载业务允许的写入，
+`probes/` 承载安装环境与外部 CLI 取证；离线检查保留在 `scripts/`。批次 1 仅新增
+`lib/`，已有脚本不移动，`ops/` 与 `probes/` 留待批次 2。路径契约见 D15。
 
 ## Phase 1 · 最小可加载插件（打通装载链路）
 

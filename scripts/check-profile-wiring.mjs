@@ -11,12 +11,16 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'yaml';
+import { resolvePaths, printPaths } from './lib/paths.mjs';
 
 const SELF = '@magicvr/dsh-agent-switchboard';
 
-const idx = process.argv.indexOf('--profile');
-const profileDir =
-  idx === -1 ? 'C:/Users/magicvr/.dsh/profiles/desktop' : process.argv[idx + 1];
+let paths;
+try { paths = resolvePaths(); } catch (error) {
+  console.error(`FAIL  ${error.message}`);
+  process.exit(1);
+}
+const profileDir = paths.profile;
 
 let pass = 0;
 let fail = 0;
@@ -37,11 +41,15 @@ function check(label, condition, detail = '') {
   }
 }
 
-console.log(`profile: ${profileDir}\n`);
+printPaths(paths);
 
 // 本检查针对**本机已安装的 profile**，因此在别的机器/CI 上应优雅跳过，
 // 而不是把 `npm run check` 弄红 —— 那些环境本来就没有这个 profile。
 if (!existsSync(join(profileDir, 'package.json'))) {
+  if (paths.explicitTarget) {
+    console.error(`FAIL  显式目标缺少 profile package.json：${profileDir}`);
+    process.exit(1);
+  }
   console.log(`跳过：${profileDir} 下没有 profile（本检查只对已安装的 profile 有意义）。`);
   console.log(`\n结果：0 通过 / 0 失败（跳过）`);
   process.exit(0);
@@ -70,7 +78,7 @@ check(
 
 // --- 2) 仓库里的 bundle patch：必须声明条目且启用 --------------------------------
 console.log('\n=== 仓库 cordis.patch.yml（bundle 层）===');
-const repoPatch = 'cordis.patch.yml';
+const repoPatch = new URL('../cordis.patch.yml', import.meta.url);
 if (!existsSync(repoPatch)) {
   console.error(`FAIL  找不到 ${repoPatch}`);
   process.exit(1);
@@ -87,7 +95,7 @@ check(
 
 // --- 3) preset 声明里必须带 mount:true -----------------------------------------
 console.log('\n=== profile cordis.patch.yml（preset 声明）===');
-const profilePatch = join(profileDir, 'cordis.patch.yml');
+const profilePatch = paths.patch;
 if (!existsSync(profilePatch)) {
   console.error(`FAIL  找不到 ${profilePatch}`);
   process.exit(1);
@@ -112,8 +120,12 @@ check(
 
 // --- 4) 角色配置文件 -----------------------------------------------------------
 console.log('\n=== 角色配置文件 ===');
-const rolesPath = 'C:/Users/magicvr/.dsh/agent-switchboard/roles.json';
+const rolesPath = paths.roles;
 if (!existsSync(rolesPath)) {
+  if (paths.explicitTarget) {
+    console.error(`FAIL  显式目标缺少 roles 文件：${rolesPath}`);
+    process.exit(1);
+  }
   console.log(`  （尚无 ${rolesPath} —— 首次进入设置页保存时会创建）`);
 } else {
   const data = JSON.parse(readFileSync(rolesPath, 'utf8'));

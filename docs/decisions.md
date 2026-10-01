@@ -471,3 +471,35 @@ SettingsPathOp = { op:'set', path: readonly string[], value: unknown } | { op:'u
 而官方页面早把正确写法摆在那里。用户一句「官方『模型』页是怎么做的？」直接结束了三轮
 试错。**先读同构先例，再动手。**
 
+
+---
+
+## D15 · 脚本路径与目录分类
+
+**决策：** 按 `docs/plan.md` 的既有布局扩展 `scripts/lib/`、`ops/`、`probes/`。
+共享模块统一解析路径和校验用户提供的 CLI JSON 配置，离线 `check-*.mjs` 保留在脚本根目录。
+批次 1 不移动已有脚本；有写入副作用的运维脚本与环境探针在批次 2 归类。
+
+**依据（已核实）：** 四个 check 脚本和两个 ASAR 入口含本机路径；`configPathFor(home)`
+只依赖 Node 模块，CLI 参数校验已有 `src/cli/argv.js` 权威实现，可直接复用。
+
+**路径契约：** 仓库根从模块 URL 推导。home 按 `--home` → `DSH_HOME` →
+`os.homedir()/.dsh`，profile 按 `--profile` → `home/profiles/desktop`，patch 按
+`--patch` → `profile/cordis.patch.yml`，roles 按 `--roles-file` → `configPathFor(home)`，
+CLI cwd 按 `--cwd` → 用户 CLI 用例配置 → 仓库根。profile 不反推 home。
+显式相对路径以启动 cwd 为锚点，不做 shell 展开；缺值、冲突、空白或无效配置直接报错，
+homedir 不可用时要求 `--home`/`DSH_HOME`，不回退 cwd。解析不创建目录、不读取 roles，
+执行前显示路径及来源。默认未安装 profile 可跳过，显式目标缺失必须失败。
+
+CLI 配置只按 `--cli-config` → `SWITCHBOARD_CLI_CONFIG` 读取，未提供即报错，建议使用
+已被忽略的 `*.local` 文件。格式为 `{command, prefixArgs, cases: {用例名: {args,
+promptDelivery, cwd?}}}`；数组须为字符串数组，占位符复用 argv.js 白名单。
+调用方使用 `spawn(command, argv, {shell:false})`，不读取 `.env`、不扫描安装位置后执行。
+
+ASAR 保留 `DSH_ASAR` 覆盖（指定文件缺失不回退）；Windows 默认使用
+`LOCALAPPDATA/Programs/DeepSeek Harness/resources/app.asar`，缺 LOCALAPPDATA 时由
+homedir 的 `AppData/Local` 推导。后缀来自已有实现；非 Windows 要求显式 DSH_ASAR。
+
+**代价与缓解：** 共享模块成为脚本依赖，错误目标将更早失败；用注入 env/cwd/homedir 的
+离线测试和变异实验验证优先级与失败边界。目录归类分两批实施，避免同时改变入口与路径语义。
+历史 CLI 实测结论保持原样。

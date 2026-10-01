@@ -2,11 +2,9 @@
 // JSON Schema 打印出来。目的是把「schemastery API 用错」这类问题在**重启前**暴露
 // ——它已经真实发生过一次（`z.enum is not a function`，见 architecture.md 3.1c）。
 //
-// ⚠️ 必须在 profile 目录下运行，因为 `@deepseek-ai/schemastery` 由 dsh 安装处
-// 以双锚点解析供给，磁盘上并不存在于本仓库：
-//   node "C:\...\DSH-Agent-Switchboard\scripts\check-config-schema.mjs"
-// 用法：在上面基础上加 --json 可打印完整 JSON Schema。
-const hostUrl = 'file:///C:/Users/magicvr/Documents/Code/DSH-Agent-Switchboard/src/index.js';
+// Host 与 package.json 由本脚本 URL 定位，可从任意 cwd 运行；依赖仍须真实可解析。
+// 用法：node scripts/check-config-schema.mjs [--json]
+const hostUrl = new URL('../src/index.js', import.meta.url);
 
 const wantJson = process.argv.includes('--json');
 

@@ -9,6 +9,10 @@ import { createScope, scopeOf } from '@deepseek-ai/dsh-scope';
 import { apply, Config, liveRoleTools, selftestTool } from '../src/index.js';
 import { configPathFor, initialConfig, writeConfigFile } from '../src/config-file.js';
 
+const fixtureHome = mkdtempSync(join(tmpdir(), 'switchboard-check-apply-'));
+const previousDshHome = process.env.DSH_HOME;
+const fixtureRole = { id: 'fixture', description: '离线测试角色', instructions: '只用于测试', model: 'test-model' };
+
 let pass = 0;
 let fail = 0;
 /**
@@ -61,7 +65,7 @@ function makeCtx({ provideProfileContext = true, provideReflect = true, scope } 
     get(key) {
       if (key === 'tools') return this.tools;
       if (key === 'profileContext') {
-        return provideProfileContext ? { home: 'C:/tmp/dsh-home', dir: 'C:/tmp/profile' } : undefined;
+        return provideProfileContext ? { home: fixtureHome, dir: join(fixtureHome, 'profiles', 'desktop') } : undefined;
       }
       return undefined;
     },
@@ -122,6 +126,11 @@ function makeCtx({ provideProfileContext = true, provideReflect = true, scope } 
   return ctx;
 }
 
+try {
+const writtenFixture = writeConfigFile(configPathFor(fixtureHome), initialConfig([fixtureRole], { provider: 'self' }));
+if (!writtenFixture.ok) throw new Error(writtenFixture.error);
+process.env.DSH_HOME = fixtureHome; // headless 路径也只读临时 home，不改 USERPROFILE。
+
 section('Config：mount 字段与内置 roles 字段是否冲突');
 {
   const a = Config({ provider: 'self' });
@@ -174,18 +183,7 @@ section('profileContext 缺失时也必须能装载（headless/sdk/acp）');
 
 section('preset 路径（mount:true）：读角色文件并挂载工具，不该抛错');
 {
-  // 用真 profileContext 指向真实配置目录（迁移已播种 4 个角色）。
-  const makeRealCtx = () => {
-    const c = makeCtx();
-    const get = c.get.bind(c);
-    c.get = (key) =>
-      key === 'profileContext'
-        ? { home: 'C:/Users/magicvr/.dsh', dir: 'C:/Users/magicvr/.dsh/profiles/desktop' }
-        : get(key);
-    return c;
-  };
-
-  const ctx = makeRealCtx();
+  const ctx = makeCtx();
   let threw = false;
   let error;
   try {
@@ -196,6 +194,11 @@ section('preset 路径（mount:true）：读角色文件并挂载工具，不该
   }
   check('apply 不抛错', !threw, error?.message);
   check('注册了自检工具', ctx.registered.includes('switchboard_selftest'), ctx.registered.join(','));
+  await import('@deepseek-ai/dsh-tool-subagent');
+  await new Promise(setImmediate);
+  const mounted = await ctx.tools.get('switchboard_selftest').execute({});
+  check('确实读取并挂载了 fixture 角色', ctx.registered.includes('delegate_to_fixture')
+    && mounted.roleCount === 1 && mounted.mounted === 'fixture=OK', JSON.stringify(mounted));
   console.log(`       注册的工具：${ctx.registered.join(', ')}`);
 
   // mount:true 的作用域**不得**注册服务（那是根条目的职责，避免每个会话都冒注册风险）。
@@ -208,15 +211,16 @@ section('preset 路径（mount:true）：读角色文件并挂载工具，不该
 
 section('同步到文件失败时必须降级而不是抛出');
 {
-  // 根条目把角色同步到文件。文件路径不可写（含非法字符的路径）时必须只记诊断，
-  // 因为同步失败不该影响应用启动。
+  // 用文件占据配置目录，确定性制造同步写入失败。
+  const brokenHome = join(fixtureHome, 'blocked-home');
+  mkdirSync(brokenHome);
+  writeFileSync(dirname(configPathFor(brokenHome)), '阻碍目录创建');
   const ctx = makeCtx();
   ctx.get = (key) =>
-    key === 'profileContext' ? { home: 'C:/tmp/dsh-home', dir: 'C:/tmp/profile' } : undefined;
+    key === 'profileContext' ? { home: brokenHome, dir: join(brokenHome, 'profiles', 'desktop') } : undefined;
   let threw = false;
   let error;
   try {
-    // 用一个不可能写入的路径（Windows 保留名 + 非法字符）。
     apply(ctx, { provider: 'self', cwd: 'C:/w', roles: [{ id: 'scout', description: 'd', instructions: 'i', model: 'gpt-6-luna' }] });
   } catch (e) {
     threw = true;
@@ -693,4 +697,9 @@ section('诊断边界：不可查询、零角色、非法配置与服务注册 s
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
+} finally {
+  if (previousDshHome === undefined) delete process.env.DSH_HOME;
+  else process.env.DSH_HOME = previousDshHome;
+  rmSync(fixtureHome, { recursive: true, force: true });
+}
 process.exit(fail === 0 ? 0 : 1);

@@ -151,7 +151,7 @@ section('parseRouteFacts：codex 的真实 stderr');
   const stderr = [
     'OpenAI Codex v0.159.2',
     '--------',
-    'workdir: C:\\Users\\magicvr\\Documents\\Code\\DSH-Agent-Switchboard',
+    'workdir: C:\\fixture workspace\\project',
     'model: gpt-6-astra',
     'provider: openai',
     'approval: never',

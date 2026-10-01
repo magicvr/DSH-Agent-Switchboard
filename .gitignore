@@ -23,6 +23,8 @@ dist/
 build/
 out/
 lib/
+!scripts/lib/
+!scripts/lib/**
 *.tsbuildinfo
 .turbo/
 .cache/
