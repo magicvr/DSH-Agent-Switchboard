@@ -32,15 +32,12 @@ import {
   toolConfigFor,
 } from './roles.js';
 import { createCliProvider } from './cli/provider.js';
-import { configPathFor, readConfigFile } from './config-file.js';
-import { RoleConfigService, ROLE_CONFIG_SERVICE } from './config-service.js';
+import { configPathFor, readConfigFile, writeConfigFile, initialConfig } from './config-file.js';
 
 /**
  * 从插件自己的配置文件读取角色。
  *
- * 与 `RoleConfigService.read` 分开是有意的：那个是**远程方法的对外契约**（返回
- * `{ok, roles, path}` 供界面消费），这里是**装载期的内部读取**（返回可直接交给
- * `normalizeRoles` 的归一化结果与一句诊断）。两者的错误表述面向不同读者。
+ * 这是**装载期的内部读取**：返回可直接交给 `normalizeRoles` 的归一化结果与一句诊断。
  *
  * @param {string|undefined} path - 配置文件绝对路径；不可用时为 undefined。
  * @returns {{ok: boolean, value?: object, detail: string}} 读取结果。
@@ -165,8 +162,8 @@ function newDiagnostics() {
     executables: [],
     blocked: [],
     roleConfigPath: undefined,
-    roleConfigError: undefined,
     roleConfigRead: undefined,
+    roleConfigSync: undefined,
     fatal: undefined,
   };
 }
@@ -405,6 +402,7 @@ function selftestTool(ctx, diagnostics) {
           presetRoster: { type: 'string', required: true },
           presetBroken: { type: 'string', required: true },
           settingsNamespaces: { type: 'string', required: true },
+          roleConfigStatus: { type: 'string', required: true },
           configErrors: { type: 'string', required: true },
           fatal: { type: 'string', required: true },
         },
@@ -417,6 +415,7 @@ function selftestTool(ctx, diagnostics) {
           `preset roster：${value.presetRoster}`,
           `preset 异常行：${value.presetBroken}`,
           `settings 命名空间：${value.settingsNamespaces}`,
+          `roleConfig 状态：${value.roleConfigStatus}`,
           `CLI provider：${value.providers}`,
           `CLI 可执行文件：${value.executables}`,
           `因开关未挂载：${value.blocked}`,
@@ -462,6 +461,11 @@ function selftestTool(ctx, diagnostics) {
         presetRoster,
         presetBroken,
         settingsNamespaces: settingsNamespacesText(ctx),
+        roleConfigStatus: [
+          `路径=${diagnostics.roleConfigPath ?? '未解析'}`,
+          `读取=${diagnostics.roleConfigRead ?? '（本作用域未读取）'}`,
+          `同步=${diagnostics.roleConfigSync ?? '（本作用域未同步）'}`,
+        ].join(' | '),
         configErrors: diagnostics.configErrors.join('\n'),
         fatal: diagnostics.fatal ?? '',
       };
@@ -637,28 +641,19 @@ function applyInner(ctx, config) {
   // 作用域查不到父作用域注册的工具（这正是角色工具不重复出现的实测机制）。
   const mountHere = readVolatileField(resolved, 'mount') === true;
 
-  // --- roleConfig 服务：**只在根作用域注册（且必须真的注册）** ---------------------
+  // --- 根条目：做「配置 → 文件」的同步，不挂载角色工具 -----------------------------
   //
-  // ⚠️ 这里有两条都来自实测的硬约束，必须同时满足：
+  // 为什么是根条目来做同步：客户端唯一可写通道是 `settings.mutate(ns, …)`，而 `ns`
+  // 只能是根条目 id（`configEditor.entries()` 只取 `parent.tree.ctx.fiber.entry?.id
+  // === "include"` 的条目，preset 内的插件声明没有 settings 行）。因此 UI 写的必然是
+  // **根条目的配置**；而真正挂载角色工具的是 preset 实例。文件就是两者之间的桥。
   //
-  //   (a) **服务必须真的在装载期注册**，不能只「延迟到首次使用」。
-  //       实测：客户端设置页若把该服务写成必需注入，等到它时才注册会让客户端**永远
-  //       pending**，整页启动失败：
-  //           web boot: 1 entry did not activate
-  //           @magicvr/dsh-agent-switchboard: pending (waiting for service: remote.roleConfig)
-  //
-  //   (b) **绝不能在 preset 作用域注册**。`Service` 的构造函数会同步调用
-  //       `ctx.reflect.provide()`（已核实 cordis 源码），而 preset 路径是**每个会话
-  //       都会走**的；在那里注册等于把「注册失败」升级成「会话起不来」→「应用起不来」。
-  //       本插件确实因此让应用无法启动过一次，用户只能禁用插件才进得来。
-  //
-  // 两者合起来只剩一个安全解：**只在根作用域注册恰好一次**，并用 try/catch 兜住。
-  // 根作用域只装载一次，因此不存在重复注册；出错也只降级为设置页报错。
+  // ⚠️ 本插件**不再注册任何 Cordis 服务**。曾经注册过一个 `roleConfig` 远程服务想给
+  //    客户端设置页用，但实测证明外部插件**无法新增客户端可调用的远程命名空间**
+  //    （客户端只装载构建期生成的静态贡献清单，且没有 Proxy），那个服务客户端根本
+  //    调不到；留着它只会平添「注册失败拖垮启动」的风险。现在客户端走 `settings`。
   if (!mountHere) {
-    const ensured = ensureRoleConfigService(ctx, roleConfigPath, resolved, diagnostics);
-    console.error(
-      `[${name}] 根条目：roleConfig ${ensured.ok ? '已就绪' : '注册失败'}，不挂载角色工具`,
-    );
+    syncRolesToFile({ resolved, roleConfigPath, diagnostics });
     return;
   }
 
@@ -666,42 +661,51 @@ function applyInner(ctx, config) {
 }
 
 /**
- * 确保 `roleConfig` 服务已注册（幂等、延迟）。
+ * 把根条目 Cordis 配置里的角色同步到文件。
  *
- * 为什么延迟：`Service` 的构造函数会同步调用 `ctx.reflect.provide()`，因此「注册」
- * 本身是一个可能抛错的**副作用**。把它推迟到设置页第一次真正读写时，正常的浏览与
- * 对话路径完全不碰它 —— 于是「插件装载」与「设置页可用」解耦，注册失败最多让设置页
- * 报错，而不会让应用起不来。
+ * 这是「UI 改配置」到「preset 会话读文件」之间的桥。只在根条目执行，且**任何失败都
+ * 只记诊断**：同步失败不该影响应用，最坏情况是 preset 会话用到上一版角色。
  *
- * 导出是为了让自检工具能主动触发一次，把注册结果带进诊断，而不是等用户打开设置页
- * 才发现。
- *
- * @param {object} ctx - Cordis 上下文。
- * @param {string} path - 配置文件绝对路径。
- * @param {object} [resolved] - 已校验的配置。
- * @param {object} [diagnostics] - 诊断记录（可省略）。
- * @returns {{ok: boolean, error?: string}} 注册结果。
+ * @param {object} options - 选项。
+ * @param {object} options.resolved - 根条目的已校验配置。
+ * @param {string} options.roleConfigPath - 配置文件绝对路径。
+ * @param {object} options.diagnostics - 诊断记录。
  */
-export function ensureRoleConfigService(ctx, path, resolved = {}, diagnostics = undefined) {
-  // 已注册过就直接复用：同一 ctx 上重复构造会因服务名冲突抛错。
-  const existing = typeof ctx.get === 'function' ? ctx.get(ROLE_CONFIG_SERVICE) : undefined;
-  if (existing !== undefined) return { ok: true };
-  try {
-    new RoleConfigService(ctx, {
-      path,
-      provider: resolved.provider,
-      cwd: resolved.cwd,
-      maxDepth: typeof resolved.maxDepth === 'number' ? resolved.maxDepth : undefined,
-      log: (msg) => console.error(`[${name}] ${msg}`),
-    });
-    console.error(`[${name}] roleConfig 服务已注册（路径：${path}）`);
-    return { ok: true };
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    if (diagnostics !== undefined) diagnostics.roleConfigError = detail;
-    console.error(`[${name}] roleConfig 服务注册失败（设置页将不可用，插件其余部分不受影响）：${detail}`);
-    return { ok: false, error: detail };
+function syncRolesToFile({ resolved, roleConfigPath, diagnostics }) {
+  const cordisRoles = readVolatileField(resolved, 'roles');
+  if (!Array.isArray(cordisRoles) || cordisRoles.length === 0) {
+    const current = readRoleConfigFile(roleConfigPath);
+    diagnostics.roleConfigSync =
+      current.ok && current.missing !== true
+        ? `根条目无角色；文件已有 ${current.value.roles.length} 个，保持不变`
+        : '根条目无角色，文件也没有 —— 等待 UI 写入';
+    console.error(`[${name}] ${diagnostics.roleConfigSync}`);
+    return;
   }
+
+  // 与文件比对后再写，避免每次启动都做一次无意义写盘。
+  const current = readRoleConfigFile(roleConfigPath);
+  if (current.ok && current.missing !== true) {
+    const same = JSON.stringify(current.value.roles) === JSON.stringify(cordisRoles);
+    if (same) {
+      diagnostics.roleConfigSync = `文件已与配置一致（${cordisRoles.length} 个），未重写`;
+      return;
+    }
+  }
+
+  const existing = current.ok && current.missing !== true ? current.value : {};
+  const written = writeConfigFile(
+    roleConfigPath,
+    initialConfig(cordisRoles, {
+      provider: existing.provider ?? resolved.provider,
+      cwd: existing.cwd ?? resolved.cwd,
+      maxDepth: existing.maxDepth ?? resolved.maxDepth,
+    }),
+  );
+  diagnostics.roleConfigSync = written.ok
+    ? `已把 ${cordisRoles.length} 个角色从配置同步到文件`
+    : `同步失败：${written.error}`;
+  console.error(`[${name}] ${diagnostics.roleConfigSync}`);
 }
 
 /**
@@ -715,20 +719,39 @@ export function ensureRoleConfigService(ctx, path, resolved = {}, diagnostics = 
  */
 function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
 
-  // 从文件读角色；读不到就如实报错，**绝不用空默认值覆盖**（那是用户的配置）。
-  const roleConfig = readRoleConfigFile(roleConfigPath);
-  diagnostics.roleConfigRead = roleConfig.detail;
-  if (!roleConfig.ok) {
-    diagnostics.configErrors = [roleConfig.detail];
-    console.error(`[${name}] ${roleConfig.detail}`);
+  // 角色来源有两个候选，**先记下各自看到什么**，再决定用哪个。
+  //
+  // 为什么要两条路（实测约束决定的）：
+  //   - 客户端唯一可写通道是 `settings.mutate(ns, …)`，而 `ns` 只能是**根条目** id
+  //     （`configEditor.entries()` 只取 `parent.tree.ctx.fiber.entry?.id === "include"`
+  //     的条目，preset 内的插件声明没有 settings 行）。所以「UI 可编辑」要求角色落在
+  //     **根条目的 Cordis 配置**里。
+  //   - 而真正挂载角色工具的是 **preset 实例**，它读的是自己那份配置。
+  // 因此必须确认 preset 实例能否看到根条目的配置；两条都记进诊断，一次重启即可判明。
+  const fromFile = readRoleConfigFile(roleConfigPath);
+  const fromCordis = readVolatileField(resolved, 'roles');
+  const cordisRoles = Array.isArray(fromCordis) ? fromCordis : [];
+  diagnostics.roleConfigRead =
+    `${fromFile.detail}；本作用域 Cordis 配置里 roles=${cordisRoles.length} 个`;
+
+  // 优先用 Cordis 配置（那是 UI 能写的地方）；为空时回落到文件。
+  // 这样「UI 改了但文件还没同步」与「文件是权威」两种时序都不会丢角色。
+  let rawRoles = cordisRoles.length > 0 ? cordisRoles : fromFile.ok ? fromFile.value.roles : [];
+  const defaults = {
+    provider: (fromFile.ok && fromFile.value.provider) || resolved.provider,
+    cwd: (fromFile.ok && fromFile.value.cwd) || resolved.cwd,
+  };
+  if (rawRoles.length === 0) {
+    if (!fromFile.ok) {
+      diagnostics.configErrors = [fromFile.detail];
+      console.error(`[${name}] ${fromFile.detail}`);
+      return;
+    }
+    console.error(`[${name}] 本作用域没有角色（Cordis 配置与文件都为空）`);
     return;
   }
 
-  const configDefaults = {
-    provider: roleConfig.value.provider ?? resolved.provider,
-    cwd: roleConfig.value.cwd ?? resolved.cwd,
-  };
-  const { roles, errors } = normalizeRoles(roleConfig.value.roles, configDefaults.provider, configDefaults.cwd);
+  const { roles, errors } = normalizeRoles(rawRoles, defaults.provider, defaults.cwd);
   diagnostics.configErrors = errors;
   if (errors.length > 0) {
     // 配置有错时不挂载任何角色工具：半挂载会让主代理看到一批语义不明的工具。

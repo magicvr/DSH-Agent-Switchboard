@@ -48,13 +48,13 @@
     "yaml": "^2.6.0"
   },
   "scripts": {
-    "check": "node scripts/check-roles.mjs && node scripts/check-cli.mjs && node scripts/check-cli-provider.mjs && node scripts/check-config-schema.mjs && node scripts/check-config-volatile.mjs && node scripts/check-config-service.mjs && node scripts/check-apply.mjs && node scripts/check-client.mjs && node scripts/check-profile-wiring.mjs",
+    "check": "node scripts/check-roles.mjs && node scripts/check-cli.mjs && node scripts/check-cli-provider.mjs && node scripts/check-config-schema.mjs && node scripts/check-config-volatile.mjs && node scripts/check-config-file.mjs && node scripts/check-apply.mjs && node scripts/check-client.mjs && node scripts/check-profile-wiring.mjs",
     "check:roles": "node scripts/check-roles.mjs",
     "check:cli": "node scripts/check-cli.mjs",
     "check:cli-provider": "node scripts/check-cli-provider.mjs",
     "check:schema": "node scripts/check-config-schema.mjs",
     "check:volatile": "node scripts/check-config-volatile.mjs",
-    "check:service": "node scripts/check-config-service.mjs",
+    "check:file": "node scripts/check-config-file.mjs",
     "check:apply": "node scripts/check-apply.mjs",
     "check:client": "node scripts/check-client.mjs",
     "check:wiring": "node scripts/check-profile-wiring.mjs",

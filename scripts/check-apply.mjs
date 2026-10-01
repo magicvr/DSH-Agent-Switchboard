@@ -3,7 +3,7 @@
 // 为什么必须做：本插件曾让应用无法启动。必须在不重启的前提下，用假 ctx 把
 // 根路径与 preset 路径都真跑一遍 —— 重启一次的成本太高，而且失败会让用户进不去。
 import { readFileSync } from 'node:fs';
-import { apply, Config, ensureRoleConfigService } from '../src/index.js';
+import { apply, Config } from '../src/index.js';
 
 let pass = 0;
 let fail = 0;
@@ -182,27 +182,23 @@ section('preset 路径（mount:true）：读角色文件并挂载工具，不该
   );
 }
 
-section('roleConfig 服务注册失败时必须降级而不是抛出');
+section('同步到文件失败时必须降级而不是抛出');
 {
-  // 残缺 ctx：`reflect.provide` 不存在 → 构造 TypertRemoteService 必然失败。
-  const broken = {
-    get() {
-      return undefined;
-    },
-    tools: { register() {}, get() { return undefined; } },
-  };
+  // 根条目把角色同步到文件。文件路径不可写（含非法字符的路径）时必须只记诊断，
+  // 因为同步失败不该影响应用启动。
+  const ctx = makeCtx();
+  ctx.get = (key) =>
+    key === 'profileContext' ? { home: 'C:/tmp/dsh-home', dir: 'C:/tmp/profile' } : undefined;
   let threw = false;
   let error;
-  let result;
   try {
-    result = ensureRoleConfigService(broken, 'C:/tmp/roles.json', { provider: 'self' });
+    // 用一个不可能写入的路径（Windows 保留名 + 非法字符）。
+    apply(ctx, { provider: 'self', cwd: 'C:/w', roles: [{ id: 'scout', description: 'd', instructions: 'i', model: 'gpt-6-luna' }] });
   } catch (e) {
     threw = true;
     error = e;
   }
-  check('不抛错', !threw, error?.message);
-  check('返回失败结果而不是抛出', result?.ok === false, JSON.stringify(result));
-  check('给出可读原因', typeof result?.error === 'string' && result.error.length > 0, String(result?.error));
+  check('同步路径出问题时 apply 仍不抛错', !threw, error?.message);
 }
 
 section('异常输入不得让 apply 抛出（兜底边界）');
@@ -245,27 +241,30 @@ section('异常输入不得让 apply 抛出（兜底边界）');
   }
 }
 
-section('角色配置服务必须在**根作用域装载期**就绪（客户端依赖它）');
+section('本插件不再注册任何 Cordis 服务（消除启动风险面）');
 {
-  // ⚠️ 这条直接锁死一次真实启动失败：
-  //     web boot: 1 entry did not activate
-  //     @magicvr/dsh-agent-switchboard: pending (waiting for service: remote.roleConfig)
-  //     根因是「客户端把该服务写成必需注入」而「Host 侧延迟注册」两者矛盾。
-  //     因此断言：根条目装载后，服务**必须已经注册**（不能只登记一个延迟回调）。
+  // ⚠️ 这条锁死一次真实启动失败 + 一次方案返工：
+  //     1. 曾注册一个 `roleConfig` 远程服务给客户端设置页用，而客户端把
+  //        `remote.roleConfig` 写成**必需注入** → 注册时机不匹配 → 客户端永远 pending →
+  //        `web boot: 1 entry did not activate`，整页起不来。
+  //     2. 后来查明：客户端只装载**构建期生成的静态远程贡献清单**，且没有 Proxy，
+  //        因此**外部插件根本无法新增客户端可调用的远程命名空间** —— 那个服务就算
+  //        注册成功，客户端也调不到（`remote.roleConfig` 会是 undefined）。
+  //     现在客户端改走 `settings`（唯一可写通道），Host 侧不再需要任何自建服务。
   const ctx = makeCtx();
   apply(ctx, { provider: 'self', cwd: 'C:/w' });
   check(
-    '根条目装载后 roleConfig 已注册（该服务名进入 ctx.reflect.provide）',
-    ctx.provided.includes('roleConfig'),
+    '根条目装载后未注册任何服务',
+    ctx.provided.length === 0,
     `实际注册：${ctx.provided.join(', ') || '（无）'}`,
   );
 }
 
-section('客户端必需注入不得与服务注册时机矛盾');
+section('客户端必需注入不得声明可能晚到的服务');
 {
   // 客户端的 `inject` 是**必需**依赖：声明了就必须在装载期存在。而 `remote.*` 命名空间
-  // 只有在对应 Host 服务注册后才存在。因此客户端**不能**把 `remote.<ns>` 写进 inject ——
-  // 否则一旦 Host 侧改为延迟注册，客户端就永远 pending，整页启动失败。
+  // 由别的插件（构建期清单）决定是否提供，不由我们控制。因此客户端**不能**把
+  // `remote.<ns>` 写进 inject —— 一旦它没就绪，客户端就永远 pending，整页启动失败。
   const clientSrc = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
   const m = /inject:\s*\[([^\]]*)\]/.exec(clientSrc);
   const declared = (m?.[1] ?? '')
@@ -275,6 +274,13 @@ section('客户端必需注入不得与服务注册时机矛盾');
   console.log(`       客户端 inject = ${JSON.stringify(declared)}`);
   check('客户端 inject 里没有 remote.* 项', !declared.some((n) => n.startsWith('remote.')), declared.join(','));
   check('客户端 inject 含 slots（它唯一的真实必需依赖）', declared.includes('slots'), declared.join(','));
+
+  // 客户端只能走已存在的通道：settings（唯一可写）与 workspaceFiles（只读）。
+  check(
+    '客户端使用 settings 通道读写角色配置',
+    /remote\.settings|remote\?\.settings|remote\[.settings.\]/.test(clientSrc),
+    '未找到对 remote.settings 的引用',
+  );
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

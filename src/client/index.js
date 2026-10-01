@@ -40,14 +40,15 @@
  */
 
 /**
- * 远程命名空间与已知配置形态。
+ * 本插件的 settings 命名空间，即根条目的 `entry.options.id`。
  *
- * ⚠️ 为什么不再用 `ctx.configForms` 读配置：角色**已经不从 Cordis 配置走**了
- * （见 `src/config-file.js` 顶部的架构说明）。`settings.describe()` 按 ns 去重、只报告
- * 根条目，因此那里永远读不到实际生效的角色。现在改走插件自己的远程服务
- * `ctx.remote.roleConfig`，与官方 `agent-presets` 的 `read` / `select` 同一条路。
+ * ⚠️ **不带 `include:` 前缀**。`plugin_manager` 显示的 `include:agent-switchboard` 是
+ * 展示层的组合形式；`settings.describe()` 行的 `ns` 取的是 `entry.options.id`
+ * （官方源码 `ns: entry.options.id`）。实测证据：本机 20 个 settings 命名空间全部
+ * 不带前缀（`agent-switchboard`、`agent-preset-registry`、`ui-settings` …），
+ * 其中 `agent-switchboard` 正是我们这一行。
  */
-const REMOTE_NAMESPACE = 'roleConfig';
+const CONFIG_NS = 'agent-switchboard';
 
 /** 已知的后端取值（必须与 Host 的 `z.union(['spawn','fork','cli'])` 一致）。 */
 const BACKENDS = ['spawn', 'fork', 'cli'];
@@ -123,90 +124,92 @@ window.__ModuleLoader__.load({
     const { useState, useEffect, useRef, useCallback } = React;
 
     /**
-     * 取远程服务。
+     * 取 settings 远程通道。
      *
-     * ⚠️ **不能把 `remote.roleConfig` 写进 `inject`**，这是实测踩到的一次启动失败：
+     * ⚠️ **角色的可写通道只有一个**：`settings`。这是实测结论，不是选择：
      *
-     *     web boot: 1 entry did not activate
-     *     @magicvr/dsh-agent-switchboard: pending (waiting for service: remote.roleConfig)
+     *   - 客户端可用的远程命名空间恰好 29 个（构建期生成的静态清单，且客户端**没有
+     *     Proxy** —— 源码注释明说「no JavaScript Proxy participates in method lookup」），
+     *     因此**外部插件无法新增自己的客户端远程命名空间**。
+     *   - 那份清单里 `workspaceFiles` 只有 `read` / `readBytes` / `stat` / `list` /
+     *     `changes` —— **客户端能读文件但没有写文件的能力**。
+     *   - 唯一的写通道是 `settings`（`mutate` / `replace` / `update`），它写的是
+     *     **插件配置**（profile patch），且 `ns` 只能是**根条目** id：
+     *     `configEditor.entries()` 只取 `parent.tree.ctx.fiber.entry?.id === "include"`
+     *     的条目，preset 内的插件声明**没有 settings 行**。
      *
-     * `inject` 是**必需依赖**：声明了它，Cordis 会一直等到该服务出现才让本插件激活。
-     * 而 Host 侧的 `roleConfig` 服务是**延迟注册**的（只在真正读写时才构造，见
-     * `src/handler` 的说明），因此在装载期并不存在 —— 两者直接矛盾，客户端插件永远
-     * pending，整页启动失败。
-     *
-     * 这里改为「用时检查」：装载阶段只依赖 `slots`，真正读写时才取服务，取不到就如实
-     * 显示一行诊断，而不是把整个插件卡住。
+     * 所以「UI 直接编辑那个 JSON 文件」在客户端侧做不到；正确做法是 UI 写插件配置，
+     * 由 Host 侧把它同步到文件（Host 才有完整文件能力）。
      *
      * @param {object} ctx - Client 插件上下文。
-     * @returns {object|undefined} 远程命名空间对象，未就绪时返回 undefined。
+     * @returns {object|undefined} settings 远程命名空间，未就绪时返回 undefined。
      */
-    function roleConfigChannel(ctx) {
+    function settingsChannel(ctx) {
       try {
         const remote = ctx?.remote;
         if (remote === undefined || remote === null) return undefined;
-        return remote[REMOTE_NAMESPACE];
+        return remote.settings;
       } catch {
-        // 某些情况下访问未就绪的 remote 命名空间会抛错，按「未就绪」处理。
         return undefined;
       }
     }
 
     /**
-     * 通过插件的远程服务读取角色配置。
-     *
-     * ⚠️ 不再用 `ctx.configForms`：角色已不从 Cordis 配置走（见 `src/config-file.js`
-     * 顶部的架构说明）。`settings.describe()` 按 ns 去重、只报告根条目，因此那里永远
-     * 读不到实际生效的角色 —— 实测踩到过「命名空间对、status 为 ready、值里却没有 roles」。
-     *
-     * 远程方法把结果包在 envelope 里且**不抛业务异常**，因此这里只需处理
-     * 「通道失败」与「业务失败」两种形态。
+     * 读出本插件的配置快照（含 roles）。
      *
      * @param {object} ctx - Client 插件上下文。
-     * @returns {Promise<{ok: boolean, roles: object[], error?: string, path?: string, missing?: boolean}>} 读取结果。
+     * @returns {Promise<{ok: boolean, roles: object[], revision?: number, missing?: boolean, error?: string}>} 读取结果。
      */
     async function fetchRoles(ctx) {
-      const channel = roleConfigChannel(ctx);
-      if (channel === undefined || typeof channel.read !== 'function') {
-        return {
-          ok: false,
-          roles: [],
-          error: 'roleConfig 服务尚未就绪（它由选中 Switchboard preset 的会话或根条目提供）。',
-        };
+      const channel = settingsChannel(ctx);
+      if (channel === undefined || typeof channel.describe !== 'function') {
+        return { ok: false, roles: [], error: 'settings 服务尚未就绪。' };
       }
       try {
-        const response = await channel.read();
-        if (response && response.ok === false) {
-          return { ok: false, roles: [], error: String(response.error ?? '读取失败'), path: response.path };
+        const rows = await channel.describe();
+        const row = (Array.isArray(rows) ? rows : []).find((r) => r?.ns === CONFIG_NS);
+        if (row === undefined) {
+          return {
+            ok: false,
+            roles: [],
+            error: `找不到本插件的配置行（ns=${CONFIG_NS}）。若插件条目被禁用，请先启用。`,
+          };
         }
-        // 远程调用可能被包成 `{ok:true, value}` 或直接返回业务对象，两种都兼容。
-        const value = response && response.value !== undefined ? response.value : response;
-        const roles = Array.isArray(value?.roles) ? value.roles : [];
-        return { ok: true, roles, path: value?.path, missing: value?.missing === true };
+        const roles = Array.isArray(row.value?.roles) ? row.value.roles : [];
+        return { ok: true, roles, revision: row.revision, missing: roles.length === 0 };
       } catch (error) {
         return { ok: false, roles: [], error: error instanceof Error ? error.message : String(error) };
       }
     }
 
     /**
-     * 通过插件的远程服务写入角色配置。
+     * 写入角色到本插件配置。
+     *
+     * 整块 `set(['roles'], value)`：角色是变长数组，整体提交语义明确，不必算易错的
+     * 逐字段 diff。`roles` 在 Host schema 上标了 `.volatile()`，因此这条路径操作可写
+     * （`SettingsForms.write` 的 `isVolatilePath` 校验，已有回归测试锁定）。
      *
      * @param {object} ctx - Client 插件上下文。
-     * @param {object} payload - `{roles}`。
-     * @returns {Promise<{ok: boolean, message: string, roleCount?: number}>} 结果。
+     * @param {object[]} roles - 角色数组。
+     * @param {number|undefined} revision - 读取时拿到的 revision，用于并发保护。
+     * @returns {Promise<{ok: boolean, message: string}>} 结果。
      */
-    async function saveRoles(ctx, payload) {
-      const channel = roleConfigChannel(ctx);
-      if (channel === undefined || typeof channel.write !== 'function') {
-        return { ok: false, message: 'roleConfig 服务尚未就绪，无法保存。' };
+    async function saveRoles(ctx, roles, revision) {
+      const channel = settingsChannel(ctx);
+      if (channel === undefined || typeof channel.mutate !== 'function') {
+        return { ok: false, message: 'settings 服务尚未就绪，无法保存。' };
       }
       try {
-        const response = await channel.write(payload);
+        const response = await channel.mutate(
+          CONFIG_NS,
+          [{ op: 'set', path: ['roles'], value: roles }],
+          revision,
+        );
         if (response && response.ok === false) {
-          return { ok: false, message: String(response.error ?? '写入失败') };
+          const err = response.error;
+          return { ok: false, message: String(err?.message ?? err ?? '写入失败') };
         }
-        const value = response && response.value !== undefined ? response.value : response;
-        return { ok: true, message: '已写入', roleCount: value?.roleCount };
+        return { ok: true, message: '已写入' };
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : String(error) };
       }
@@ -469,9 +472,11 @@ window.__ModuleLoader__.load({
       const [status, setStatus] = useState('loading');
       const [notice, setNotice] = useState(null);
       const [busy, setBusy] = useState(false);
+      // 读取时拿到的 revision 必须留到写回时使用，否则并发保护无从谈起。
+      const [revision, setRevision] = useState(undefined);
       const savedRef = useRef(null);
 
-      /** 从 Host 重新读取（走插件的远程服务）。 */
+      /** 重新读取本插件的配置。 */
       const refresh = useCallback(() => {
         if (!ctx) {
           setStatus('no-context');
@@ -483,17 +488,20 @@ window.__ModuleLoader__.load({
             // 读取失败必须如实显示：静默当作空会把用户配置「藏起来」。
             setDraft([]);
             savedRef.current = JSON.stringify([]);
+            setRevision(undefined);
             setStatus(`error:${result.error}`);
             return;
           }
           setDraft(cloneRoles(result.roles));
           savedRef.current = JSON.stringify(result.roles);
+          // revision 用于并发保护：写回时必须带上读取时的那一个。
+          setRevision(result.revision);
           setStatus(result.roles.length > 0 ? 'ready' : result.missing === true ? 'missing' : 'empty');
         });
       }, [ctx]);
 
-      // 首次挂载时读取一次。不再订阅 configForms 镜像 —— 配置已不走 settings，
-      // 那里不会有我们的行；外部改动（例如用户直接编辑 JSON）由「重新读取」按钮处理。
+      // 首次挂载时读取一次。这里**不订阅** configForms 镜像：我们的可写通道是
+      // `settings` 远程服务，订阅镜像只会带来无关的重渲染。外部改动由「放弃改动」按钮刷新。
       useEffect(() => {
         if (!ctx) return undefined;
         refresh();
@@ -550,13 +558,13 @@ window.__ModuleLoader__.load({
         }
         setBusy(true);
         // 角色是变长数组，整体提交语义明确 —— 不必算易错的逐字段 diff。
-        const result = await saveRoles(ctx, { roles });
+        const result = await saveRoles(ctx, roles, revision);
         setBusy(false);
         if (result.ok) {
           savedRef.current = JSON.stringify(roles);
           setNotice({
             kind: 'ok',
-            text: `已保存 ${result.roleCount ?? roles.length} 个角色。选中 Switchboard preset 的新会话会使用它们。`,
+            text: `已保存 ${roles.length} 个角色。选中 Switchboard preset 的新会话会使用它们。`,
           });
           refresh();
         } else {
@@ -683,10 +691,10 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      // ⚠️ **只注入 `slots`**。绝不能把 `remote.roleConfig` 放进来 —— 那是**必需**依赖，
-      //    而 Host 侧的服务是延迟注册的，二者矛盾会让本插件永远 pending 并导致整页
-      //    启动失败（实测报错：`pending (waiting for service: remote.roleConfig)`）。
-      //    远程服务改为「用时检查」，见 `roleConfigChannel`。
+      // ⚠️ **只注入 `slots`**。绝不能把 `remote.*` 放进来 —— 那是**必需**依赖，
+      //    而远程命名空间的可用时机不由我们决定，二者矛盾会让本插件永远 pending 并导致
+      //    整页启动失败（实测报错：`pending (waiting for service: remote.roleConfig)`）。
+      //    settings 通道改为「用时检查」，见 `settingsChannel`。
       inject: ['slots'],
       apply(ctx) {
         ctx.slots.inject('settings.section', () =>
