@@ -1,0 +1,214 @@
+// 角色模块的离线验证。不依赖 dsh 运行时，因此无需重启即可跑。
+// 用法：node scripts/check-roles.mjs
+import {
+  EFFORT_VALUES,
+  WRITE_TOOLS,
+  normalizeRole,
+  normalizeRoles,
+  toolConfigFor,
+  toolDescriptionFor,
+} from '../src/roles.js';
+
+let pass = 0;
+let fail = 0;
+function check(label, condition, detail = '') {
+  if (condition) {
+    pass++;
+    console.log(`  PASS  ${label}`);
+  } else {
+    fail++;
+    console.log(`  FAIL  ${label}${detail ? ` — ${detail}` : ''}`);
+  }
+}
+function section(title) {
+  console.log(`\n=== ${title} ===`);
+}
+
+section('合法角色：规范化结果');
+{
+  const { role, errors } = normalizeRole(
+    {
+      id: 'scout',
+      title: '侦察员',
+      description: '只读调研',
+      model: 'gpt-6-luna',
+      effort: 'medium',
+      instructions: 'You are SCOUT.',
+      readOnly: true,
+    },
+    0,
+    'my-provider',
+  );
+  check('无错误', errors.length === 0, errors.join('; '));
+  check('编码了 provider 默认值', role?.provider === 'my-provider');
+  check('工具名由 id 推导', role?.toolName === 'delegate_to_scout');
+  check('readOnly 透传', role?.readOnly === true);
+  check('backend 默认 spawn', role?.backend === 'spawn');
+  check('allowNestedDispatch 默认 false', role?.allowNestedDispatch === false);
+}
+
+section('toolConfigFor：模型与强度进 agentOptions');
+{
+  const { role } = normalizeRole(
+    { id: 'worker', description: 'd', model: 'gpt-6.1-sol', effort: 'high', instructions: 'i' },
+    0,
+    'p',
+  );
+  const cfg = toolConfigFor(role, { maxDepth: 3 });
+  check('provider = backend', cfg.provider === 'spawn');
+  check('toolName 正确', cfg.toolName === 'delegate_to_worker');
+  check('agentOptions.provider', cfg.agentOptions.provider === 'p');
+  check('agentOptions.model', cfg.agentOptions.model === 'gpt-6.1-sol');
+  check('agentOptions.reasoningEffort', cfg.agentOptions.reasoningEffort === 'high');
+  check('persona = instructions', cfg.persona === 'i');
+  check('禁止嵌套 → maxDepth 0', cfg.maxDepth === 0);
+  check('backgroundMode one-shot', cfg.backgroundMode === 'one-shot');
+  check('非只读 → 无 toolFilter', cfg.toolFilter === undefined);
+}
+
+section('只读角色：写入类工具被 deny');
+{
+  const { role } = normalizeRole(
+    { id: 'reviewer', description: 'd', model: 'm', instructions: 'i', readOnly: true },
+    0,
+    'p',
+  );
+  const cfg = toolConfigFor(role, { maxDepth: 3 });
+  check('有 toolFilter', cfg.toolFilter !== undefined);
+  const denied = new Set(cfg.toolFilter?.deny ?? []);
+  check('write 被 deny', denied.has('write'));
+  check('edit 被 deny', denied.has('edit'));
+  check('pwsh 被 deny', denied.has('pwsh'));
+  check('deny 列表即 WRITE_TOOLS', denied.size === WRITE_TOOLS.length);
+}
+
+section('允许嵌套：maxDepth 用传入值');
+{
+  const { role } = normalizeRole(
+    { id: 'lead', description: 'd', model: 'm', instructions: 'i', allowNestedDispatch: true },
+    0,
+    'p',
+  );
+  const cfg = toolConfigFor(role, { maxDepth: 5 });
+  check('maxDepth = 5', cfg.maxDepth === 5);
+}
+
+section('省略 effort 时不写入 reasoningEffort');
+{
+  const { role } = normalizeRole({ id: 'x', description: 'd', model: 'm', instructions: 'i' }, 0, 'p');
+  const cfg = toolConfigFor(role, { maxDepth: 1 });
+  check('agentOptions 无 reasoningEffort 键', !('reasoningEffort' in cfg.agentOptions));
+}
+
+section('非法输入：逐条报错');
+{
+  const cases = [
+    ['缺 id', { description: 'd', model: 'm', instructions: 'i' }, 'id'],
+    ['id 非法字符', { id: 'Bad_ID', description: 'd', model: 'm', instructions: 'i' }, 'id'],
+    ['缺 description', { id: 'a', model: 'm', instructions: 'i' }, 'description'],
+    ['缺 model', { id: 'a', description: 'd', instructions: 'i' }, 'model'],
+    ['缺 instructions', { id: 'a', description: 'd', model: 'm' }, 'instructions'],
+    ['effort 非法', { id: 'a', description: 'd', model: 'm', instructions: 'i', effort: 'turbo' }, 'effort'],
+    ['backend 非法', { id: 'a', description: 'd', model: 'm', instructions: 'i', backend: 'acp' }, 'backend'],
+  ];
+  for (const [label, input, expectField] of cases) {
+    const { role, errors } = normalizeRole(input, 0, 'p');
+    check(
+      `${label} → 报错且定位到 ${expectField}`,
+      role === null && errors.some((e) => e.includes(expectField)),
+      errors.join('; ') || '(无错误)',
+    );
+  }
+}
+
+section('缺省 provider：全局也没有时报错');
+{
+  const { role, errors } = normalizeRole(
+    { id: 'a', description: 'd', model: 'm', instructions: 'i' },
+    0,
+    undefined,
+  );
+  check('报 provider 错', role === null && errors.some((e) => e.includes('provider')));
+}
+
+section('normalizeRoles：唯一性与整体拒绝');
+{
+  const good = normalizeRoles(
+    [
+      { id: 'a', description: 'd', model: 'm', instructions: 'i' },
+      { id: 'b', description: 'd', model: 'm', instructions: 'i' },
+    ],
+    'p',
+  );
+  check('两条合法角色通过', good.roles.length === 2 && good.errors.length === 0);
+
+  const dup = normalizeRoles(
+    [
+      { id: 'a', description: 'd', model: 'm', instructions: 'i' },
+      { id: 'a', description: 'd', model: 'm', instructions: 'i' },
+    ],
+    'p',
+  );
+  check('重复 id 被拦下', dup.errors.some((e) => e.includes('重复')) && dup.roles.length === 0);
+
+  const bad = normalizeRoles(
+    [
+      { id: 'a', description: 'd', model: 'm', instructions: 'i' },
+      { id: 'b', description: 'd', model: 'm' },
+    ],
+    'p',
+  );
+  check('一条出错则整份拒绝（不半挂载）', bad.roles.length === 0 && bad.errors.length > 0);
+
+  check('undefined → 空且无错', normalizeRoles(undefined, 'p').errors.length === 0);
+  check('非数组 → 报错', normalizeRoles({}, 'p').errors.length === 1);
+  check('空数组 → 空且无错', normalizeRoles([], 'p').errors.length === 0);
+}
+
+section('toolDescriptionFor：包含用途与事实标签');
+{
+  const { role } = normalizeRole(
+    {
+      id: 'scout',
+      title: '侦察员',
+      description: '只读调研',
+      model: 'm',
+      // 用一个绝不可能出现在描述里的哨兵串，才能真正验证 instructions 没被带进工具描述。
+      instructions: 'SENTINEL_INSTRUCTIONS_MUST_NOT_APPEAR',
+      readOnly: true,
+      allowNestedDispatch: true,
+    },
+    0,
+    'p',
+  );
+  const desc = toolDescriptionFor(role);
+  check('含用途', desc.includes('只读调研'));
+  check('含角色名', desc.includes('侦察员'));
+  check('标注只读', desc.includes('只读'));
+  check('标注后端', desc.includes('spawn'));
+  check('含嵌套派发状态', desc.includes('可继续派发'));
+  check(
+    '不含 instructions 正文',
+    !desc.includes('SENTINEL_INSTRUCTIONS_MUST_NOT_APPEAR'),
+    'instructions 被泄漏进工具描述',
+  );
+}
+
+section('toolDescriptionFor：禁止嵌套时的措辞');
+{
+  const { role } = normalizeRole(
+    { id: 'x', description: 'd', model: 'm', instructions: 'i', allowNestedDispatch: false },
+    0,
+    'p',
+  );
+  const desc = toolDescriptionFor(role);
+  check('标注不可继续派发', desc.includes('不可继续派发'));
+}
+
+section('枚举一致性');
+{
+  check('EFFORT_VALUES 与 DSH 取值一致', EFFORT_VALUES.join(',') === 'low,medium,high,xhigh,max');
+}
+
+console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
+process.exit(fail === 0 ? 0 : 1);

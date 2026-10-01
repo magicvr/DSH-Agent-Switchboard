@@ -37,5 +37,12 @@
     "@deepseek-ai/cordis": "~4.0.4",
     "@deepseek-ai/schemastery": "~3.18.4",
     "@deepseek-ai/dsh-tools": "0.2.0-rc.2"
+  },
+  "devDependencies": {
+    "yaml": "^2.6.0"
+  },
+  "scripts": {
+    "check": "node scripts/check-roles.mjs",
+    "gen:roles": "node scripts/gen-role-config.mjs"
   }
 }

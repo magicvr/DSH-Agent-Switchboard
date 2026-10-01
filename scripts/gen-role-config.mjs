@@ -1,0 +1,229 @@
+// 把 raw/agents/*.toml 的角色定义转换成插件 Config 所需的 YAML 片段。
+// 产物写入 raw/roles-block.yml，供人工过目后再并入 profile 的 cordis.patch.yml。
+// 用法：node scripts/gen-role-config.mjs
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const ROOT = process.cwd();
+const AGENTS_DIR = join(ROOT, 'raw', 'agents');
+
+/** 角色 TOML 里的模型名 → DSH 的 LLM route。经与 profile 的 llm-pi-ai 模型列表核对。 */
+const ROUTE = { provider: 'self' };
+
+/** 角色的展示名与只读判定来自设计意图，不来自 TOML（TOML 里没有这些字段）。 */
+const PRESENTATION = {
+  scout: { title: '侦察员', readOnly: true },
+  worker: { title: '实现者', readOnly: false },
+  architect: { title: '架构师', readOnly: true },
+  reviewer: { title: '审查员', readOnly: true },
+};
+
+const ORDER = ['scout', 'worker', 'architect', 'reviewer'];
+
+/**
+ * 极简 TOML 读取：只处理本项目里实际用到的形态
+ * —— 顶层的 `key = "..."` 与 `key = """..."""` 多行字符串。
+ * 刻意不引 TOML 依赖（decisions.md 的格式决策是「只用 JSON/YAML」）。
+ *
+ * @param {string} text - TOML 文件内容。
+ * @returns {Record<string, string>} 顶层键值。
+ */
+function parseToml(text) {
+  const out = {};
+  const lines = text.split(/\r?\n/);
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const basic = /^([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*"([^"]*)"\s*$/.exec(line);
+    if (basic) {
+      out[basic[1]] = basic[2];
+      i++;
+      continue;
+    }
+    const multi = /^([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*"""\s*$/.exec(line);
+    if (multi) {
+      const key = multi[1];
+      const body = [];
+      i++;
+      while (i < lines.length && !/^"""\s*$/.test(lines[i])) {
+        body.push(lines[i]);
+        i++;
+      }
+      i++; // 跳过结束的 """
+      out[key] = body.join('\n');
+      continue;
+    }
+    i++;
+  }
+  return out;
+}
+
+/** 把一段文本渲染成 YAML 的 `|` 字面块标量（保留换行）。 */
+function blockScalar(text, indent) {
+  const pad = ' '.repeat(indent);
+  const lines = text.replace(/\r\n/g, '\n').replace(/\s+$/, '').split('\n');
+  return ['|', ...lines.map((l) => (l.length > 0 ? pad + l : ''))].join('\n');
+}
+
+const roles = [];
+for (const name of ORDER) {
+  const toml = readFileSync(join(AGENTS_DIR, `${name}.toml`), 'utf8');
+  const parsed = parseToml(toml);
+  if (!parsed.model || !parsed.developer_instructions) {
+    console.error(`[gen-role-config] ${name}.toml 缺少 model 或 developer_instructions`);
+    process.exit(1);
+  }
+  roles.push({
+    id: name,
+    title: PRESENTATION[name]?.title,
+    description: parsed.description ?? '',
+    model: parsed.model,
+    effort: parsed.model_reasoning_effort ?? 'medium',
+    readOnly: PRESENTATION[name]?.readOnly === true,
+    instructions: parsed.developer_instructions,
+    /**
+     * 嵌套派发策略：只有 worker 允许（它需要能派发 scout 去查资料）。
+     * 其余角色默认关闭（decisions.md D11）。
+     */
+    allowNestedDispatch: name === 'worker',
+  });
+}
+
+// 手工渲染 YAML：字符串用双引号转义，长文本用块标量。
+const q = (s) => JSON.stringify(s);
+const out = [];
+out.push('  provider: self');
+out.push('  maxDepth: 3');
+out.push('  roles:');
+for (const r of roles) {
+  out.push(`    - id: ${q(r.id)}`);
+  if (r.title) out.push(`      title: ${q(r.title)}`);
+  out.push(`      description: ${q(r.description)}`);
+  out.push(`      model: ${q(r.model)}`);
+  out.push(`      effort: ${q(r.effort)}`);
+  out.push(`      readOnly: ${r.readOnly}`);
+  out.push(`      backend: spawn`);
+  out.push(`      allowNestedDispatch: ${r.allowNestedDispatch}`);
+  out.push(`      instructions: ${blockScalar(r.instructions, 8)}`);
+}
+
+const body = out.join('\n') + '\n';
+writeFileSync(join(ROOT, 'raw', 'roles-block.yml'), body, 'utf8');
+
+console.log('已生成 raw/roles-block.yml');
+console.log(`角色数：${roles.length}`);
+for (const r of roles) {
+  console.log(
+    `  ${r.id.padEnd(10)} model=${r.model.padEnd(14)} effort=${String(r.effort).padEnd(7)} ` +
+      `readOnly=${String(r.readOnly).padEnd(5)} nested=${String(r.allowNestedDispatch).padEnd(5)} ` +
+      `instructions=${r.instructions.length} 字符`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 可选：把配置块注入某个 profile 的 cordis.patch.yml
+// 用法：node scripts/gen-role-config.mjs --inject <patch 路径> [--dry-run]
+// 会先备份为 <patch>.bak-<时间戳>。只替换 agent-switchboard 条目的 config。
+// ---------------------------------------------------------------------------
+const injectIndex = process.argv.indexOf('--inject');
+if (injectIndex !== -1) {
+  const patchPath = process.argv[injectIndex + 1];
+  const dryRun = process.argv.includes('--dry-run');
+  if (!patchPath) {
+    console.error('--inject 需要一个路径参数');
+    process.exit(1);
+  }
+
+  const original = readFileSync(patchPath, 'utf8');
+  const lines = original.replace(/\r\n/g, '\n').split('\n');
+
+  // 定位我们的条目，并圈定它所属的顶层条目范围。
+  const entryStart = lines.findIndex((l) => /^-\s+id:\s*agent-switchboard\s*$/.test(l));
+  if (entryStart === -1) {
+    console.error(`在 ${patchPath} 中找不到 "- id: agent-switchboard" 条目`);
+    process.exit(1);
+  }
+  let entryEnd = lines.length;
+  for (let i = entryStart + 1; i < lines.length; i++) {
+    if (/^-\s/.test(lines[i])) {
+      entryEnd = i;
+      break;
+    }
+  }
+
+  const entryLines = lines.slice(entryStart, entryEnd);
+  // 条目级字段（disabled / name / inject）必须排在 `config:` **之前**：
+  // YAML 里同缩进的键属于同一个映射，把 disabled 放在 config 之后会被吞进 config。
+  const beforeConfig = entryLines
+    .filter((l) => /^\s+(disabled|name|inject):/.test(l))
+    .map((l) => l.trimEnd());
+  const disabledLine = beforeConfig.find((l) => /disabled:/.test(l));
+
+  const indented = body
+    .replace(/\n+$/, '')
+    .split('\n')
+    .map((l) => (l.length > 0 ? '  ' + l : ''));
+
+  const rebuilt = [lines[entryStart], ...beforeConfig, '  config:', ...indented];
+
+  const next = [...lines.slice(0, entryStart), ...rebuilt, ...lines.slice(entryEnd)];
+  const serialized = next.join('\n').replace(/\n*$/, '\n');
+
+  console.log('');
+  console.log(`目标条目：第 ${entryStart + 1}–${entryEnd} 行 → 重建为 ${rebuilt.length} 行`);
+  console.log(`保留的字段：${beforeConfig.map((l) => l.trim()).join(', ') || '(无)'}`);
+  if (disabledLine) console.log(`注意：保留了你手写的 "${disabledLine.trim()}"，置于 config 之前`);
+
+  if (dryRun) {
+    console.log('\n--dry-run：未写入。');
+  } else {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backup = `${patchPath}.bak-${stamp}`;
+    writeFileSync(backup, original, 'utf8');
+    writeFileSync(patchPath, serialized, 'utf8');
+    console.log(`\n已备份原文件到 ${backup}`);
+    console.log(`已写入 ${patchPath}`);
+  }
+
+  // 权威校验：用真正的 YAML 解析器确认合并后的文件可解析且结构正确。
+  // 这一步在写盘**之后**执行，因此即使校验失败也留有备份。
+  try {
+    const { parse } = await import('yaml');
+    const doc = parse(serialized);
+    const entry = Array.isArray(doc)
+      ? doc.find((row) => row && row.id === 'agent-switchboard')
+      : undefined;
+    if (!entry) {
+      console.error('校验失败：解析结果里找不到 agent-switchboard 条目');
+      process.exitCode = 1;
+    } else {
+      const cfg = entry.config ?? {};
+      const roleList = Array.isArray(cfg.roles) ? cfg.roles : [];
+      console.log('\n=== YAML 校验（用 yaml 解析合并结果） ===');
+      console.log(`顶层条目数：${doc.length}`);
+      console.log(`条目字段：${Object.keys(entry).join(', ')}`);
+      console.log(`disabled = ${JSON.stringify(entry.disabled)}`);
+      console.log(`config.provider = ${JSON.stringify(cfg.provider)}`);
+      console.log(`config.maxDepth = ${JSON.stringify(cfg.maxDepth)}`);
+      console.log(`config.roles 数量 = ${roleList.length}`);
+      for (const r of roleList) {
+        console.log(
+          `  ${String(r.id).padEnd(10)} model=${String(r.model).padEnd(14)} ` +
+            `effort=${String(r.effort).padEnd(7)} readOnly=${String(r.readOnly).padEnd(5)} ` +
+            `instructions=${typeof r.instructions === 'string' ? r.instructions.length : 'INVALID'} 字符`,
+        );
+      }
+      const bad = roleList.filter((r) => typeof r.instructions !== 'string' || r.instructions.length < 100);
+      if (bad.length > 0) {
+        console.error(`校验失败：${bad.length} 个角色的 instructions 不完整`);
+        process.exitCode = 1;
+      } else {
+        console.log('结构校验通过：4 个角色的 instructions 均为完整字符串');
+      }
+    }
+  } catch (error) {
+    console.error(`YAML 校验无法执行（缺 yaml 包或解析失败）：${error.message}`);
+    process.exitCode = 1;
+  }
+}
+
