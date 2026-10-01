@@ -126,29 +126,23 @@ window.__ModuleLoader__.load({
     /**
      * 取 settings 远程通道。
      *
-     * ⚠️ **角色的可写通道只有一个**：`settings`。这是实测结论，不是选择：
+     * ⚠️ **必须从插件 ctx 取，不能从 slot 的 props.ctx 取**。`remote.settings` 是
+     * `dsh-api-settings-controller` 生成的命名空间，挂在客户端根上下文上；slot 注入的
+     * ctx 看不到它 —— 实测现象就是界面报「settings 服务尚未就绪」。
      *
-     *   - 客户端可用的远程命名空间恰好 29 个（构建期生成的静态清单，且客户端**没有
-     *     Proxy** —— 源码注释明说「no JavaScript Proxy participates in method lookup」），
-     *     因此**外部插件无法新增自己的客户端远程命名空间**。
-     *   - 那份清单里 `workspaceFiles` 只有 `read` / `readBytes` / `stat` / `list` /
-     *     `changes` —— **客户端能读文件但没有写文件的能力**。
-     *   - 唯一的写通道是 `settings`（`mutate` / `replace` / `update`），它写的是
-     *     **插件配置**（profile patch），且 `ns` 只能是**根条目** id：
-     *     `configEditor.entries()` 只取 `parent.tree.ctx.fiber.entry?.id === "include"`
-     *     的条目，preset 内的插件声明**没有 settings 行**。
+     * 本插件因此把 `remote.settings` 写进了 `inject`（官方 `ui-settings-general` 也是
+     * 这么做的，见其 client.js 的 `inject = [..., "remote.settings"]`）。它与之前失败的
+     * `remote.roleConfig` 有本质区别：**前者由内核插件提供、每次启动都在**；后者是我们
+     * 自己延迟注册的，因此会被声明成必需依赖后永远等不到。
      *
-     * 所以「UI 直接编辑那个 JSON 文件」在客户端侧做不到；正确做法是 UI 写插件配置，
-     * 由 Host 侧把它同步到文件（Host 才有完整文件能力）。
+     * 这里仍做一次运行时检查而不是直接点属性：取不到时给界面一句可读诊断，比抛错好。
      *
-     * @param {object} ctx - Client 插件上下文。
+     * @param {object} ctx - Client 插件上下文（**不是** slot props 里的那个）。
      * @returns {object|undefined} settings 远程命名空间，未就绪时返回 undefined。
      */
     function settingsChannel(ctx) {
       try {
-        const remote = ctx?.remote;
-        if (remote === undefined || remote === null) return undefined;
-        return remote.settings;
+        return ctx?.remote?.settings;
       } catch {
         return undefined;
       }
@@ -163,7 +157,15 @@ window.__ModuleLoader__.load({
     async function fetchRoles(ctx) {
       const channel = settingsChannel(ctx);
       if (channel === undefined || typeof channel.describe !== 'function') {
-        return { ok: false, roles: [], error: 'settings 服务尚未就绪。' };
+        return {
+          ok: false,
+          roles: [],
+          // 这条文案必须与真实原因一致：不是「配置文件损坏」，而是**远程通道没取到**。
+          // 两者混淆过一次，让排查方向完全跑偏（实测教训）。
+          error:
+            '取不到 remote.settings 通道（这不是配置文件的问题）。' +
+            '请确认 @deepseek-ai/dsh-api-settings-controller 已启用，然后重启应用。',
+        };
       }
       try {
         const rows = await channel.describe();
@@ -651,13 +653,16 @@ window.__ModuleLoader__.load({
       }
       if (status.startsWith('error:')) {
         // 读取失败必须显式呈现原因，而不是显示成「尚未配置」——后者会让用户以为配置丢了。
+        // ⚠️ 这里只显示 `fetchRoles` 给出的**具体**原因，不再附一句猜测性的通用建议：
+        //    曾经写死「这通常是配置文件损坏」，而真实原因是远程通道取不到，把排查方向
+        //    完全带偏（实测教训）。宁可少说，也不要说不符合实际的话。
         return wrap(
           h(
             'div',
             { style: { color: 'var(--dsw-alias-label-error, var(--dsw-alias-label-secondary))' } },
             `读取角色配置失败：${status.slice('error:'.length)}`,
             h('br'),
-            '这通常是配置文件损坏。修好或删除它之后点「放弃改动」重试。',
+            '点「放弃改动」可重试。',
           ),
         );
       }
@@ -691,11 +696,16 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      // ⚠️ **只注入 `slots`**。绝不能把 `remote.*` 放进来 —— 那是**必需**依赖，
-      //    而远程命名空间的可用时机不由我们决定，二者矛盾会让本插件永远 pending 并导致
-      //    整页启动失败（实测报错：`pending (waiting for service: remote.roleConfig)`）。
-      //    settings 通道改为「用时检查」，见 `settingsChannel`。
-      inject: ['slots'],
+      // `remote.settings` 由内核插件 `dsh-api-settings-controller` 提供，客户端每次启动
+      // 都有；官方 `ui-settings-general` 同样把它写进 inject（见其 client.js）。
+      // 它是**唯一**能让 UI 写入角色数据的通道：客户端没有写文件的能力
+      // （`workspaceFiles` 只有 read/stat/list），而外部插件无法新增自己的远程命名空间
+      // （客户端只装载构建期生成的静态贡献清单，且没有 Proxy）。
+      //
+      // ⚠️ 只声明真正必需且**由内核保证**的依赖。曾经声明的 `remote.roleConfig` 是我们
+      //    自己延迟注册的服务，声明成必需依赖后客户端永远 pending，整页起不来
+      //    （`web boot: 1 entry did not activate`）。不要把那种东西放进 inject。
+      inject: ['slots', 'remote.settings'],
       apply(ctx) {
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(

@@ -260,11 +260,15 @@ section('本插件不再注册任何 Cordis 服务（消除启动风险面）');
   );
 }
 
-section('客户端必需注入不得声明可能晚到的服务');
+section('客户端必需注入只许声明内核保证存在的服务');
 {
-  // 客户端的 `inject` 是**必需**依赖：声明了就必须在装载期存在。而 `remote.*` 命名空间
-  // 由别的插件（构建期清单）决定是否提供，不由我们控制。因此客户端**不能**把
-  // `remote.<ns>` 写进 inject —— 一旦它没就绪，客户端就永远 pending，整页启动失败。
+  // 客户端的 `inject` 是**必需**依赖：声明了就必须在装载期存在，否则客户端永远 pending、
+  // 整页启动失败（实测：`web boot: 1 entry did not activate`）。
+  //
+  // 判据**不是**「不许出现 remote.*」—— `remote.settings` 由内核插件
+  // `dsh-api-settings-controller` 提供，每次启动都在，官方 `ui-settings-general` 也注入它。
+  // 真正的判据是：**只许注入内核保证存在的依赖，不许注入我们自己提供的服务**
+  // （曾把自建且延迟注册的 `remote.roleConfig` 写成必需注入，直接导致整页起不来）。
   const clientSrc = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
   const m = /inject:\s*\[([^\]]*)\]/.exec(clientSrc);
   const declared = (m?.[1] ?? '')
@@ -272,8 +276,13 @@ section('客户端必需注入不得声明可能晚到的服务');
     .map((s) => s.trim().replace(/^['"]|['"]$/g, ''))
     .filter((s) => s.length > 0);
   console.log(`       客户端 inject = ${JSON.stringify(declared)}`);
-  check('客户端 inject 里没有 remote.* 项', !declared.some((n) => n.startsWith('remote.')), declared.join(','));
-  check('客户端 inject 含 slots（它唯一的真实必需依赖）', declared.includes('slots'), declared.join(','));
+  check('客户端 inject 含 slots', declared.includes('slots'), declared.join(','));
+  check('客户端 inject 含 remote.settings（UI 唯一可写通道）', declared.includes('remote.settings'), declared.join(','));
+  check(
+    '客户端 inject 里没有自建的 remote 命名空间',
+    !declared.includes('remote.roleConfig'),
+    declared.join(','),
+  );
 
   // 客户端只能走已存在的通道：settings（唯一可写）与 workspaceFiles（只读）。
   check(

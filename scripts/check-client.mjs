@@ -58,11 +58,11 @@ section('模块可被真跑：桩化 window/require 后 factory 返回合法插�
   const registered = [];
   /** 桩化的 cordis ctx。 */
   const fakeCtx = {
-    // 角色配置走**插件自己的远程服务**，不再经过 settings / configForms（见 D13）。
+    // 角色配置走**插件自己的 ctx** 上的 settings 远程命名空间（唯一可写通道）。
     remote: {
-      roleConfig: {
-        read: () => Promise.resolve({ ok: true, roles: [] }),
-        write: () => Promise.resolve({ ok: true, roleCount: 0 }),
+      settings: {
+        describe: () => Promise.resolve([{ ns: 'agent-switchboard', value: { roles: [] }, revision: 1 }]),
+        mutate: () => Promise.resolve({ ok: true }),
       },
     },
     slots: {
@@ -117,19 +117,27 @@ section('模块可被真跑：桩化 window/require 后 factory 返回合法插�
     }
     if (plugin) {
       check('插件导出了 inject', Array.isArray(plugin.inject));
-      check('inject 含 slots（唯一的真实必需依赖）', plugin.inject.includes('slots'), plugin.inject.join(','));
-      // ⚠️ 这条锁死一次真实启动失败：客户端曾把 `remote.roleConfig` 写成必需注入，
-      //    而 Host 侧该服务当时是延迟注册的 → 客户端永远 pending → 整页启动失败
-      //    （`web boot: 1 entry did not activate`）。`inject` 是必需依赖，不能用来
-      //    声明「可能晚到的服务」；那类依赖要改为用时检查。
+      check('inject 含 slots', plugin.inject.includes('slots'), plugin.inject.join(','));
+      // `remote.settings` 由内核插件 `dsh-api-settings-controller` 提供，客户端每次启动
+      // 都有，官方 `ui-settings-general` 同样把它写进 inject。它是 UI 写入角色数据的
+      // **唯一**通道（客户端没有写文件能力）。
       check(
-        'inject 不含任何 remote.* （必需依赖不能声明可能晚到的服务）',
-        !plugin.inject.some((n) => String(n).startsWith('remote.')),
+        'inject 含 remote.settings（UI 唯一的写入通道）',
+        plugin.inject.includes('remote.settings'),
+        plugin.inject.join(','),
+      );
+      // ⚠️ 这条锁死一次真实启动失败：客户端曾把 `remote.roleConfig`（我们自己延迟注册的
+      //    服务）写成必需注入 → 客户端永远 pending → 整页启动失败
+      //    （`web boot: 1 entry did not activate`）。
+      //    判据不是「不许有 remote.*」，而是「**只许注入内核保证存在的那些**」。
+      check(
+        'inject 里没有自建的 remote 命名空间',
+        !plugin.inject.includes('remote.roleConfig'),
         plugin.inject.join(','),
       );
       check(
-        '不再依赖 configForms / remote.settings（角色配置已不走 settings）',
-        !plugin.inject.includes('configForms') && !plugin.inject.includes('remote.settings'),
+        'inject 不含 configForms（角色配置不走 configForms）',
+        !plugin.inject.includes('configForms'),
         plugin.inject.join(','),
       );
       check('插件导出了 apply', typeof plugin.apply === 'function');
