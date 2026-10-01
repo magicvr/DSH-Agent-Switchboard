@@ -1,0 +1,221 @@
+// 修正 CLI 角色的 model，并确保根条目有 `cwd`。
+//
+// ## 为什么需要
+//
+// 1. **模型**：UI 的驱动选择器**不会**自动填模型（每个 CLI 有自己的模型命名空间，
+//    插件给不出通用默认值），因此换驱动后模型很可能还是旧的内置路由名。实测：
+//      - grok + `gpt-6-luna`   → 退出 1，`unknown model id`
+//      - grok + `grok-4.7`     → 退出 0
+//      - codex + `gpt-6.1-sol` → 退出 0（自报 `model: gpt-6.1-sol`）
+// 2. **cwd**：CLI 角色必须有工作目录，`normalizeRole` 在 `cliCwd` 与全局 `cwd` 都为空时
+//    报错并**不挂载该角色**。根条目 config 原本没有 `cwd`，于是「从 UI 新建 CLI 角色」
+//    必然带空 `cliCwd`，到装载期才失败。
+//
+// ## 实现约束（都是踩过的坑）
+//
+// - **按行处理，不用 `indexOf` 猜位置**：上一版用 `out.indexOf('provider:')` 结果匹配到了
+//   文件里**另一处**无缩进的 `provider:`，插入 `cwd` 时缩进错位、把 YAML 写坏。
+//   现在先按缩进确定根条目 config 块的范围，只在该范围内操作。
+// - **文本层修改**，不用 `yaml.stringify` 整体重写：整体重写会把 `!!js` 表达式降级成
+//   普通字符串，使 platform 条件静默失效。
+// - **先断言后写盘**：任何一条断言不过就完全不写。
+//
+// 用法：
+//   node scripts/fix-cli-models.mjs --check
+//   node scripts/fix-cli-models.mjs --apply
+import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
+import { parse } from 'yaml';
+
+const PATCH = 'C:/Users/magicvr/.dsh/profiles/desktop/cordis.patch.yml';
+const ROLES_FILE = 'C:/Users/magicvr/.dsh/agent-switchboard/roles.json';
+const CWD_VALUE = 'C:\\Users\\magicvr\\Documents\\Code\\DSH-Agent-Switchboard';
+const mode = process.argv.includes('--apply') ? 'apply' : 'check';
+
+/** 期望的「角色 → 模型」修正表。只列需要改的；`worker` 已实测可用故不动。 */
+const WANTED = {
+  scout: { driver: 'grok', model: 'grok-4.7' },
+};
+
+let pass = 0;
+let fail = 0;
+/**
+ * 断言。
+ *
+ * @param {string} label - 说明。
+ * @param {boolean} c - 条件。
+ * @param {string} [d] - 详情。
+ */
+function check(label, c, d = '') {
+  if (c) {
+    pass++;
+    console.log(`  PASS  ${label}`);
+  } else {
+    fail++;
+    console.log(`  FAIL  ${label}${d ? ` — ${d}` : ''}`);
+  }
+}
+
+const original = readFileSync(PATCH, 'utf8').replace(/\r\n/g, '\n');
+const lines = original.split('\n');
+const doc = parse(original);
+const root = doc.find((o) => o && o.id === 'agent-switchboard');
+if (root === undefined) {
+  console.error('FAIL  找不到根条目 agent-switchboard');
+  process.exit(1);
+}
+const roles = root.config?.roles ?? [];
+
+console.log('当前角色：');
+for (const r of roles) {
+  console.log(
+    `  ${String(r.id).padEnd(11)} backend=${String(r.backend).padEnd(6)} driver=${String(r.cliDriver ?? '-').padEnd(8)} model=${r.model}`,
+  );
+}
+
+/** 根条目那一行（顶层数组项）。 */
+const rootLine = lines.findIndex((l) => /^-\s*id:\s*agent-switchboard\s*$/.test(l));
+if (rootLine === -1) {
+  console.error('FAIL  按行定位根条目失败');
+  process.exit(1);
+}
+// 根条目块 = 从该行到下一个顶层 `- ` 之前。
+let rootEnd = lines.length;
+for (let i = rootLine + 1; i < lines.length; i++) {
+  if (/^-\s/.test(lines[i])) {
+    rootEnd = i;
+    break;
+  }
+}
+console.log(`\n根条目位于第 ${rootLine + 1}..${rootEnd} 行`);
+
+const next = [...lines];
+
+// --- 改动 1：根条目补 `cwd`（若缺）-------------------------------------------
+const rootSeg = next.slice(rootLine, rootEnd);
+const hasCwd = rootSeg.some((l) => /^\s+cwd:/.test(l));
+let cwdChange = false;
+if (!hasCwd) {
+  // 插在根条目的 `provider:` 行之后；缩进沿用该行（`config:` 下两级）。
+  const provRel = rootSeg.findIndex((l) => /^\s+provider:\s*/.test(l));
+  if (provRel === -1) {
+    console.error('FAIL  根条目里找不到 provider: 行，无法安全插入 cwd');
+    process.exit(1);
+  }
+  const provAbs = rootLine + provRel;
+  const indent = /^(\s*)/.exec(lines[provAbs])[1];
+  next.splice(provAbs + 1, 0, `${indent}cwd: ${CWD_VALUE}`);
+  cwdChange = true;
+  console.log(`  计划：在第 ${provAbs + 2} 行插入 cwd（缩进 ${indent.length} 空格）`);
+} else {
+  console.log('  根条目已有 cwd，无需插入');
+}
+
+// --- 改动 2：角色 model（只在根条目块内）--------------------------------------
+const modelChanges = [];
+{
+  // 先找出每个角色在文件里的行号（只搜根条目块）。
+  for (const r of roles) {
+    const want = WANTED[r.id];
+    if (want === undefined || r.model === want.model) continue;
+    const idRel = next.slice(rootLine).findIndex((l) => new RegExp(`^\\s*-\\s*id:\\s*${r.id}\\s*$`).test(l));
+    if (idRel === -1) {
+      console.error(`FAIL  按行定位角色 ${r.id} 失败`);
+      process.exit(1);
+    }
+    const idAbs = rootLine + idRel;
+    // 该角色的 `- id:` 之后、下一个 `- id:` 之前，找 `model:`。
+    let modelAbs = -1;
+    for (let i = idAbs + 1; i < next.length && i < rootEnd + 1; i++) {
+      if (/^\s*-\s*id:\s*/.test(next[i])) break;
+      if (/^\s*model:\s*/.test(next[i])) {
+        modelAbs = i;
+        break;
+      }
+    }
+    if (modelAbs === -1) {
+      console.error(`FAIL  按行定位 ${r.id} 的 model 行失败`);
+      process.exit(1);
+    }
+    const indent = /^(\s*)/.exec(next[modelAbs])[1];
+    modelChanges.push({ id: r.id, from: r.model, to: want.model, line: modelAbs });
+    next[modelAbs] = `${indent}model: ${want.model}`;
+  }
+}
+
+console.log('\n将要做出的改动：');
+for (const c of modelChanges) console.log(`  ${c.id}: model ${c.from} → ${c.to}（第 ${c.line + 1} 行）`);
+if (cwdChange) console.log(`  根条目补上 cwd: ${CWD_VALUE}`);
+if (modelChanges.length === 0 && !cwdChange) console.log('  （无改动）');
+
+if (mode === 'check') {
+  console.log('\n未写盘（加 --apply 才写）。');
+  process.exit(0);
+}
+
+// --- 断言（写盘前）-----------------------------------------------------------
+const out = next.join('\n');
+const jsBefore = (original.match(/!!js /g) ?? []).length;
+const jsAfter = (out.match(/!!js /g) ?? []).length;
+check(`!!js 表达式数量不变（${jsBefore} → ${jsAfter}）`, jsBefore === jsAfter);
+check('根条目仍带 mount:false', root.config?.mount === false, JSON.stringify(root.config?.mount));
+
+// ⚠️ 最关键的一条：**产物必须能解析**。上一版就是没验这个才把 YAML 写坏。
+let after;
+try {
+  after = parse(out);
+  check('产物可解析', true);
+} catch (error) {
+  check('产物可解析', false, error.message);
+  console.error('\n未写盘 —— 产物不可解析。');
+  process.exit(1);
+}
+const afterRoot = after.find((o) => o && o.id === 'agent-switchboard');
+check('顶层仍是数组', Array.isArray(after));
+check('根条目仍存在', afterRoot !== undefined);
+check(
+  '根条目已有 cwd',
+  typeof afterRoot?.config?.cwd === 'string' && afterRoot.config.cwd.length > 0,
+  JSON.stringify(afterRoot?.config?.cwd),
+);
+for (const [id, want] of Object.entries(WANTED)) {
+  const r = (afterRoot?.config?.roles ?? []).find((x) => x.id === id);
+  check(`${id} 的 model == ${want.model}`, r?.model === want.model, String(r?.model));
+  check(`${id} 仍是 cli 后端`, r?.backend === 'cli', String(r?.backend));
+  check(`${id} 的 driver 未被改动`, r?.cliDriver === want.driver, String(r?.cliDriver));
+}
+const architect = (afterRoot?.config?.roles ?? []).find((x) => x.id === 'architect');
+check('未列出的角色未被改动', architect?.model === 'gpt-6-astra', String(architect?.model));
+check('角色数量不变', (afterRoot?.config?.roles ?? []).length === roles.length, String(afterRoot?.config?.roles?.length));
+
+// 端到端判据：修正后的配置必须能通过规范化 —— 这才是「实验能不能跑」的真正条件。
+const { normalizeRoles } = await import('../src/roles.js');
+const norm = normalizeRoles(afterRoot.config.roles, afterRoot.config.provider, afterRoot.config.cwd);
+check('修正后规范化无错', norm.errors.length === 0, norm.errors.join('; '));
+const cliCount = norm.roles.filter((r) => r.cli !== undefined).length;
+check('两个 CLI 角色都能挂载', cliCount === 2, String(cliCount));
+
+if (fail > 0) {
+  console.error('\n有断言失败，未写盘。');
+  process.exit(1);
+}
+
+// --- 写盘 --------------------------------------------------------------------
+copyFileSync(PATCH, `${PATCH}.bak-fix-cli-models-${Date.now()}`);
+writeFileSync(PATCH, out, 'utf8');
+console.log(`\n已写入 ${PATCH}`);
+
+// 同步到插件文件（preset 会话从那里回落 cwd / 默认值）。
+if (existsSync(ROLES_FILE)) {
+  const fileCfg = JSON.parse(readFileSync(ROLES_FILE, 'utf8'));
+  const fileRoles = Array.isArray(fileCfg.roles) ? fileCfg.roles : [];
+  fileCfg.roles = fileRoles.map((r) => {
+    const want = WANTED[r.id];
+    return want === undefined ? r : { ...r, model: want.model };
+  });
+  if (typeof fileCfg.cwd !== 'string' || fileCfg.cwd.length === 0) fileCfg.cwd = CWD_VALUE;
+  copyFileSync(ROLES_FILE, `${ROLES_FILE}.bak-fix-cli-models`);
+  writeFileSync(ROLES_FILE, `${JSON.stringify(fileCfg, null, 2)}\n`, 'utf8');
+  console.log(`已同步到 ${ROLES_FILE}（cwd=${fileCfg.cwd}）`);
+}
+
+console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
