@@ -562,10 +562,35 @@ function resolveFallbackDshHome() {
 /**
  * 插件入口。
  *
+ * ⚠️ **整个函数体被一层兜底 try/catch 包住**，这是硬要求，不是保险起见。
+ *
+ * 实测教训：本插件曾因自身缺陷导致应用**无法启动**，用户只能禁用插件才进得来。
+ * 一个插件的失败绝不能升级成「应用不可用」—— 让应用起来、把问题写进诊断，永远优于
+ * 让用户进不去。因此这里保证：无论 `apply` 内部发生什么，都只记录一行诊断并返回。
+ *
  * @param {object} ctx - Cordis 上下文。
  * @param {object} [config] - 已校验的配置。
  */
 export function apply(ctx, config) {
+  try {
+    applyInner(ctx, config);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    // 不用 console.error 之外的手段：此刻上下文可能已经不可用，能吐出一行日志就够。
+    console.error(
+      `[${name}] 装载失败，已降级（应用不受影响，本插件本次不生效）：${detail}`,
+      error instanceof Error ? error.stack : undefined,
+    );
+  }
+}
+
+/**
+ * `apply` 的实际实现。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} [config] - 已校验的配置。
+ */
+function applyInner(ctx, config) {
   const resolved = config ?? {};
 
   // 每次激活一份独立记录。preset 机制下同一插件会被多次加载，共享模块级状态
@@ -600,48 +625,91 @@ export function apply(ctx, config) {
   const roleConfigPath = configPathFor(dshHome);
   diagnostics.roleConfigPath = roleConfigPath;
 
-  // 服务在**每个作用域**都注册（含根条目），这样设置页在任何会话里都能读配置。
+  // --- 是否在本作用域挂载角色工具（同时也是「是不是根条目」的判据）----------------
   //
-  // ⚠️ 但同一作用域链上服务名唯一：preset 作用域会继承根作用域已注册的 `roleConfig`，
-  //    此时**跳过**注册（而不是尝试再注册一次 —— 那会因重名抛错）。这也正是我们要的
-  //    语义：配置服务由最外层那个实例提供，所有会话共用同一份配置。
-  const existingRoleConfig = typeof ctx.get === 'function' ? ctx.get(ROLE_CONFIG_SERVICE) : undefined;
-  if (existingRoleConfig !== undefined) {
-    console.error(`[${name}] roleConfig 已由外层作用域提供，本作用域跳过注册`);
-  } else {
-    try {
-      new RoleConfigService(ctx, {
-        path: roleConfigPath,
-        provider: resolved.provider,
-        cwd: resolved.cwd,
-        maxDepth: typeof resolved.maxDepth === 'number' ? resolved.maxDepth : undefined,
-        log: (msg) => console.error(`[${name}] ${msg}`),
-      });
-    } catch (error) {
-      diagnostics.roleConfigError = error instanceof Error ? error.message : String(error);
-      console.error(`[${name}] roleConfig 服务注册失败：${diagnostics.roleConfigError}`);
-    }
-  }
-
-  // --- 是否在本作用域挂载角色工具 ------------------------------------------------
-  //
-  // 只有显式声明 `mount: true` 的作用域才挂载。根条目（bundle 的 insert）不带这个
-  // 标记，preset 声明带上 —— 于是：
+  // 只有显式声明 `mount: true` 的作用域才挂载。根条目（bundle 的 insert）不带这个标记，
+  // preset 声明带上 —— 于是：
   //   - 配置服务在根作用域常驻 → 设置页随时可用，且**不注册任何角色工具**；
-  //   - 角色工具只在 preset 会话里出现 → 其他 preset 不受污染。
+  //   - 角色工具只在 preset 会话里出现 → 其他 preset 的会话不受污染。
   //
   // 「子代理也会继承 preset、因而可能重复挂载」这一点不必额外防护：`mountRoleTool`
   // 在挂载后用 `ctx.get('tools').get(name)` **核实**工具是否可见，而子代理的 agent
   // 作用域查不到父作用域注册的工具（这正是角色工具不重复出现的实测机制）。
   const mountHere = readVolatileField(resolved, 'mount') === true;
+
+  // --- roleConfig 服务：**只在根作用域、且延迟到首次使用时注册** -------------------
+  //
+  // ⚠️ 这里曾写成「每个作用域都注册，若外层已提供则跳过」，结果让**应用无法启动**，
+  //    只能禁用插件才进得来。两个教训：
+  //
+  //   1. **`Service` 的构造函数会同步调用 `ctx.reflect.provide()`**（已核实 cordis 源码）。
+  //      在**每个会话都会走的 preset 路径**上做服务注册，等于把「注册失败」升级成
+  //      「会话起不来」。现在 preset 侧完全不注册 —— 设置页是全局 UI，它解析到的
+  //      就是根实例的服务。
+  //   2. 曾用「`ctx.get(服务名)` 已存在就跳过」当守卫。那是**基于对作用域继承语义的
+  //      推理**，而不是实测事实；一旦推理不成立就会重复注册并抛错。现在改为
+  //      **延迟注册**：把注册推迟到设置页第一次真正读写时，正常浏览/对话路径根本不碰它。
+  //
+  // 于是「插件装载」与「设置页可用」被解耦：即使注册真的失败，代价也只是设置页报错，
+  // 而不是应用起不来。
   if (!mountHere) {
-    console.error(
-      `[${name}] 本作用域未声明 mount:true，只提供配置服务，不挂载角色工具（路径：${
-        roleConfigPath ?? '不可用'
-      }）`,
-    );
+    diagnostics.roleConfigEnsure = () => ensureRoleConfigService(ctx, roleConfigPath, resolved, diagnostics);
+    console.error(`[${name}] 根条目：只提供配置服务（延迟注册），不挂载角色工具`);
     return;
   }
+
+  mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics });
+}
+
+/**
+ * 确保 `roleConfig` 服务已注册（幂等、延迟）。
+ *
+ * 为什么延迟：`Service` 的构造函数会同步调用 `ctx.reflect.provide()`，因此「注册」
+ * 本身是一个可能抛错的**副作用**。把它推迟到设置页第一次真正读写时，正常的浏览与
+ * 对话路径完全不碰它 —— 于是「插件装载」与「设置页可用」解耦，注册失败最多让设置页
+ * 报错，而不会让应用起不来。
+ *
+ * 导出是为了让自检工具能主动触发一次，把注册结果带进诊断，而不是等用户打开设置页
+ * 才发现。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {string} path - 配置文件绝对路径。
+ * @param {object} [resolved] - 已校验的配置。
+ * @param {object} [diagnostics] - 诊断记录（可省略）。
+ * @returns {{ok: boolean, error?: string}} 注册结果。
+ */
+export function ensureRoleConfigService(ctx, path, resolved = {}, diagnostics = undefined) {
+  // 已注册过就直接复用：同一 ctx 上重复构造会因服务名冲突抛错。
+  const existing = typeof ctx.get === 'function' ? ctx.get(ROLE_CONFIG_SERVICE) : undefined;
+  if (existing !== undefined) return { ok: true };
+  try {
+    new RoleConfigService(ctx, {
+      path,
+      provider: resolved.provider,
+      cwd: resolved.cwd,
+      maxDepth: typeof resolved.maxDepth === 'number' ? resolved.maxDepth : undefined,
+      log: (msg) => console.error(`[${name}] ${msg}`),
+    });
+    console.error(`[${name}] roleConfig 服务已注册（路径：${path}）`);
+    return { ok: true };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (diagnostics !== undefined) diagnostics.roleConfigError = detail;
+    console.error(`[${name}] roleConfig 服务注册失败（设置页将不可用，插件其余部分不受影响）：${detail}`);
+    return { ok: false, error: detail };
+  }
+}
+
+/**
+ * 在**本作用域**挂载角色工具（只有 `mount: true` 的 preset 作用域会走到这里）。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} options - 选项。
+ * @param {string} options.roleConfigPath - 配置文件绝对路径。
+ * @param {object} options.resolved - 已校验的配置。
+ * @param {object} options.diagnostics - 诊断记录。
+ */
+function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
 
   // 从文件读角色；读不到就如实报错，**绝不用空默认值覆盖**（那是用户的配置）。
   const roleConfig = readRoleConfigFile(roleConfigPath);
