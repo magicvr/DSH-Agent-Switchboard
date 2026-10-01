@@ -105,7 +105,7 @@ const CLI_DRIVER_OPTIONS = [
     ],
   },
   // 说明：**不再提供 Claude Code 预设**（用户已长期不用，明确要求排除）。
-  // 取证记录保留在 `docs/cli-backends.md` §3.0；想用回它可选「自定义命令」。
+  // 取证记录保留在 `docs/cli-backends.md` §3.0。
   {
     id: 'grok',
     label: 'Grok CLI',
@@ -563,6 +563,7 @@ window.__ModuleLoader__.load({
     function RoleRow(props) {
       const { role, index, onChange, onRemove, disabled } = props;
       const isCli = role.backend === 'cli';
+      const isBuiltin = ['spawn', 'fork'].includes(role.backend ?? 'spawn');
       // 当前驱动由**字段反推**，而不是读 `cliDriver` —— 这样即使用户手工改了参数，
       // 下拉框会如实显示「需重选预设」。浏览器无本机路径解析器，未知形态不猜测。
       const currentDriver = isCli ? inferCliDriver(role) : undefined;
@@ -570,7 +571,7 @@ window.__ModuleLoader__.load({
       const driverHint =
         driverDef === undefined
           ? '需重选预设：当前配置无法识别为 codex / grok'
-          : `${driverDef.description}${
+          : `${driverDef.label}${
               driverDef.modelPlaceholder ? ` 模型示例：${driverDef.modelPlaceholder}` : ''
             }`;
 
@@ -602,13 +603,13 @@ window.__ModuleLoader__.load({
         );
 
       /** 统一样式的文本输入。 */
-      const text = (key, placeholder) =>
+      const text = (key, placeholder, trim = false) =>
         h('input', {
           type: 'text',
           value: role[key] ?? '',
           placeholder,
           disabled,
-          onChange: (e) => set(key, e.target.value),
+          onChange: (e) => set(key, trim ? e.target.value.trim() || undefined : e.target.value),
           style: inputStyle(),
         });
 
@@ -720,7 +721,10 @@ window.__ModuleLoader__.load({
               ),
             ),
           ),
-          h('div', { style: { flex: '1 1 150px' } }, field('模型', text('model', 'gpt-6-luna'))),
+          isBuiltin
+            ? h('div', { style: { flex: '1 1 150px' } }, field('Provider', text('provider', '留空使用默认 provider', true)))
+            : null,
+          h('div', { style: { flex: '1 1 150px' } }, field(isCli ? '外部 CLI 模型' : '模型', text('model', 'gpt-6-luna'))),
           h('div', { style: { flex: '0 0 100px' } }, field('思考强度', select('effort', EFFORTS))),
         ),
         h(
@@ -730,6 +734,17 @@ window.__ModuleLoader__.load({
           checkbox('allowNestedDispatch', '允许再派发'),
         ),
         field('描述（主代理据此判断何时派给谁）', text('description', '这个角色负责什么')),
+        field(
+          '角色指令（必填，发送给子代理）',
+          h('textarea', {
+            rows: 5,
+            value: role.instructions ?? '',
+            placeholder: '填写角色职责、约束与输出要求',
+            disabled,
+            onChange: (e) => set('instructions', e.target.value),
+            style: monoStyle(),
+          }),
+        ),
         isCli
           ? h(
               'div',
@@ -750,7 +765,7 @@ window.__ModuleLoader__.load({
               ),
               // ⚠️ 这里是「选**哪个** CLI」，不是笼统的「外部 CLI」。
               //    选中后会把该 CLI 的 command / prefixArgs / args / promptDelivery
-              //    一键填好；它们仍是可编辑的权威数据（驱动只是填默认值，不是覆盖层）。
+              //    一键填好；命令细节隐藏，保留已保存的数据供 Host 校验。
               field(
                 'CLI',
                 h(
@@ -790,56 +805,12 @@ window.__ModuleLoader__.load({
                 { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
                 driverHint,
               ),
-              h(
-                'span',
-                { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
-                '参数（占位符：{prompt} / {cwd} / {model} / {effort}）',
-              ),
-              h(
-                'div',
-                { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } },
-                h('div', { style: { flex: '0 0 120px' } }, field('命令', text('cliCommand', 'node'))),
-                h(
-                  'div',
-                  { style: { flex: '0 0 150px' } },
-                  field('提示词传递', select('cliPromptDelivery', ['stdin', 'argv', 'promptFile'])),
-                ),
-                h(
-                  'div',
-                  { style: { flex: '1 1 240px' } },
-                  field('工作目录', text('cliCwd', 'C:\\path\\to\\workspace')),
-                ),
-              ),
-              field(
-                '前缀参数（JSON 字符串数组）',
-                h('textarea', {
-                  rows: 2,
-                  value: JSON.stringify(role.cliPrefixArgs ?? []),
-                  disabled,
-                  onChange: (e) => {
-                    const parsed = parseJsonArray(e.target.value);
-                    if (parsed !== undefined) set('cliPrefixArgs', parsed);
-                  },
-                  style: monoStyle(),
-                }),
-              ),
-              field(
-                '参数模板（JSON 字符串数组）',
-                h('textarea', {
-                  rows: 3,
-                  value: JSON.stringify(role.cliArgs ?? []),
-                  disabled,
-                  onChange: (e) => {
-                    const parsed = parseJsonArray(e.target.value);
-                    if (parsed !== undefined) set('cliArgs', parsed);
-                  },
-                  style: monoStyle(),
-                }),
-              ),
+              field('包裹会话 Provider（LLM route）', text('agentProvider', '留空继承父代理路由', true)),
+              field('包裹会话模型（非外部 CLI 模型）', text('agentModel', '留空继承父代理模型', true)),
               h(
                 'span',
                 { style: { fontSize: '10px', color: 'var(--dsw-alias-label-secondary)' } },
-                '⚠️ 外部 CLI 会在本机真的执行命令。只读约束由 CLI 自身的沙箱参数实现（例如 codex 的 -s read-only），插件无法越过 CLI 强制。',
+                '⚠️ 外部 CLI 会在本机真的执行命令。只读约束由 CLI 自身的沙箱参数实现，插件无法越过 CLI 强制。',
               ),
             )
           : null,

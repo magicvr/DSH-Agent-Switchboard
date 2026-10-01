@@ -88,6 +88,7 @@ section('正则用例：两边判定必须一致');
 parity('合法内置角色', [{ ...builtin }]);
 parity('内置角色留空 provider（跟随默认值）', [{ ...builtin, provider: undefined }]);
 parity('内置角色 provider 为空串', [{ ...builtin, provider: '' }]);
+parity('内置角色 provider 为空白', [{ ...builtin, provider: '   ' }]);
 parity('合法 CLI 角色', [{ ...cli }]);
 parity('CLI 角色缺命令', [{ ...cli, cliCommand: undefined }]);
 parity('CLI 角色缺参数模板', [{ ...cli, cliArgs: [] }]);
@@ -113,6 +114,16 @@ section('反例：确保 parity 断言不是恒真');
   // 构造一个两边都应该拒绝的输入。若 parity 恒真，这条会暴露出来。
   const r = parity('两边都拒绝的输入（反例）', [{ ...builtin, description: '' }]);
   check('反例确实被两边都拒绝', r.hostOk === false && r.clientOk === false);
+}
+
+section('面板新增输入：默认 provider 回落与指令必填');
+{
+  check('Host 将空白 provider 回落插件默认值',
+    normalizeRoles([{ ...builtin, provider: '   ' }], DEFAULT_PROVIDER, DEFAULT_CWD).roles[0]?.provider === DEFAULT_PROVIDER);
+  for (const role of [builtin, cli]) {
+    const { hostOk, clientOk } = parity(`${role.backend} 空指令`, [{ ...role, instructions: '' }]);
+    check(`${role.backend} 指令必填：Host 与客户端均拒绝`, !hostOk && !clientOk);
+  }
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

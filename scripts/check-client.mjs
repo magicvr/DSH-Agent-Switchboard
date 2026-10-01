@@ -254,7 +254,7 @@ section('validateRoles：与 Host 的 normalizeRole 规则一致，且能给出�
     String(validateRoles([{ ...good, provider: undefined }])),
   );
   check(
-    '内置后端 provider 为空串也通过（Host 用 ?? 判空，不区分 undefined 与空串）',
+    '内置后端 provider 为空串也通过（Host 回落默认 provider）',
     validateRoles([{ ...good, provider: '' }]) === null,
     String(validateRoles([{ ...good, provider: '' }])),
   );
@@ -481,8 +481,10 @@ section('RoleRow 真实事件回调：预设与只读切换原子更新');
   const unknown = { backend: 'cli', cliDriver: 'custom', ...cliFieldsFor('grok', true), cliArgs: ['--other'], readOnly: true };
   const writes = [];
   const elements = rowElements(unknown, writes);
-  check('未知客户端配置反推 undefined，呈现需重选预设占位',
-    clientData.inferCliDriver(unknown) === undefined && elements.some((n) => n.type === 'option' && n.props.value === '' && n.props.disabled && n.children.includes('需重选预设')));
+  check('未知客户端配置安全渲染，空值下拉明确提示需重选预设、不伪装 codex',
+    clientData.inferCliDriver(unknown) === undefined && elements.some((n) => n.type === 'select' && n.props.value === '') &&
+    elements.some((n) => n.type === 'option' && n.props.value === '' && n.props.disabled && n.children.includes('需重选预设')) &&
+    elements.some((n) => n.children.includes('需重选预设：当前配置无法识别为 codex / grok')));
   elements.find((n) => n.type === 'input' && n.props.type === 'checkbox').props.onChange({ target: { checked: false } });
   check('未知配置切换只读不伪装有效驱动、不改写执行字段',
     writes.length === 1 && writes[0].value.readOnly === false && writes[0].value.cliDriver === 'custom' &&
@@ -492,6 +494,81 @@ section('RoleRow 真实事件回调：预设与只读切换原子更新');
     .find((n) => n.type === 'input' && n.props.type === 'checkbox').props.onChange({ target: { checked: true } });
   check('内置角色只读切换不写 CLI 执行字段',
     builtinWrites.length === 1 && builtinWrites[0].value.readOnly === true && !('cliArgs' in builtinWrites[0].value));
+}
+
+section('面板字段：源码结构与桩化 RoleRow（不替代真机验收）');
+{
+  const rowSource = CLIENT_SRC.slice(CLIENT_SRC.indexOf('    function RoleRow('), CLIENT_SRC.indexOf('    function SwitchboardSettings('));
+  const renderSource = rowSource.slice(rowSource.indexOf('      return h('));
+  // 用条件分支锚点约束控件位置；再对 spawn / fork / cli 的元素树验证显示条件。
+  check('Provider 输入位于 builtin 条件分支',
+    rowSource.includes("const isBuiltin = ['spawn', 'fork'].includes(role.backend ?? 'spawn');") &&
+    /isBuiltin\s*\? h\([^\n]*field\('Provider', text\('provider', '留空使用默认 provider', true\)\)\)\s*: null/.test(renderSource));
+  const cliBranch = renderSource.slice(renderSource.indexOf('        isCli\n'));
+  check('CLI 分支无 provider 输入', !/text\('provider'/.test(cliBranch));
+  for (const key of ['agentProvider', 'agentModel']) {
+    check(`${key} 输入仅在 CLI 分支源码中出现`,
+      (renderSource.match(new RegExp(`text\\('${key}'`, 'g')) ?? []).length === 1 && cliBranch.includes(`text('${key}'`));
+  }
+  check('instructions 恒显且为多行输入',
+    /h\('textarea', \{\s*rows: 5,\s*value: role\.instructions \?\? '',[\s\S]*?set\('instructions', e\.target\.value\)/.test(renderSource.slice(0, renderSource.indexOf('        isCli\n'))));
+  for (const key of ['cliCommand', 'cliPrefixArgs', 'cliArgs', 'cliPromptDelivery', 'cliCwd']) {
+    check(`${key} 命令编辑控件已从源码移除`,
+      !new RegExp(`(?:text|select|set)\\('${key}'|value:.*role\\.${key}\\b`).test(renderSource));
+  }
+  check('参数占位符提示已移除', !renderSource.includes('参数（占位符：'));
+  check('预设说明不再显示命令参数细节',
+    !rowSource.includes('driverDef.description') && !renderSource.includes('-s read-only'));
+  check('外部模型与包裹模型标签明确区分',
+    renderSource.includes("isCli ? '外部 CLI 模型' : '模型'") && cliBranch.includes('包裹会话模型（非外部 CLI 模型）'));
+  for (const backend of ['spawn', 'fork', 'cli']) {
+    const role = {
+      id: 'r', backend, description: '描述', instructions: '原始指令\n第二行',
+      model: 'external-model', effort: 'high', provider: 'route', agentProvider: 'wrapper-route', agentModel: 'wrapper-model',
+      cliDriver: 'custom', cliCommand: 'original-command', cliPrefixArgs: ['prefix'], cliArgs: ['original-args'],
+      cliPromptDelivery: 'argv', cliCwd: 'saved-cwd',
+    };
+    const before = JSON.stringify(role);
+    const writes = [];
+    const elements = rowElements(role, writes);
+    const textInput = (placeholder) => elements.find((n) => n.type === 'input' && n.props.type === 'text' && n.props.placeholder === placeholder);
+    check(`${backend}：model 文本输入与 effort 下拉仍可用`,
+      typeof textInput('gpt-6-luna')?.props.onChange === 'function' &&
+      elements.some((n) => n.type === 'select' && n.props.value === 'high' && typeof n.props.onChange === 'function'));
+    const provider = textInput('留空使用默认 provider');
+    check(`${backend}：provider 仅内置显示`, Boolean(provider) === (backend !== 'cli'));
+    for (const [key, placeholder] of [['agentProvider', '留空继承父代理路由'], ['agentModel', '留空继承父代理模型']]) {
+      const control = textInput(placeholder);
+      check(`${backend}：${key} 仅 CLI 显示`, Boolean(control) === (backend === 'cli'));
+      if (control) {
+        control.props.onChange({ target: { value: '  ' } });
+        check(`${key}：空白输入写为未设置且保留其他字段`,
+          JSON.stringify(writes.at(-1)?.value) === JSON.stringify({ ...role, [key]: undefined }));
+      }
+    }
+    if (provider) {
+      provider.props.onChange({ target: { value: '  other-route  ' } });
+      check(`${backend}：provider 输入 trim`, writes.at(-1)?.value.provider === 'other-route');
+      provider.props.onChange({ target: { value: '   ' } });
+      check(`${backend}：provider 空白写为未设置且保留其他字段`,
+        JSON.stringify(writes.at(-1)?.value) === JSON.stringify({ ...role, provider: undefined }));
+    }
+    const instructions = elements.find((n) => n.type === 'textarea' && n.props.value === role.instructions);
+    check(`${backend}：instructions 多行控件恒显且不以描述代填`,
+      instructions?.props.rows > 1 && instructions?.props.placeholder === '填写角色职责、约束与输出要求');
+    instructions?.props.onChange({ target: { value: '新指令\n保留换行' } });
+    check(`${backend}：指令编辑保留换行及全部隐藏 cli 字段，不修改旧快照`,
+      JSON.stringify(writes.at(-1)?.value) === JSON.stringify({ ...role, instructions: '新指令\n保留换行' }) && JSON.stringify(role) === before);
+    const empty = rowElements({ ...role, instructions: '' }, []);
+    check(`${backend}：空指令不自动编造，必填校验仍拒绝`,
+      empty.some((n) => n.type === 'textarea' && n.props.value === '') && /指令/.test(validateRoles([{ ...role, instructions: '' }]) ?? ''));
+    if (backend === 'cli') {
+      const preset = elements.find((n) => n.type === 'select' && n.props.value === '');
+      check('CLI 预设下拉仅 codex / grok 与禁选待重选占位',
+        JSON.stringify(preset?.children.flat().filter((n) => n.type === 'option').map((n) => [n.props.value, n.props.disabled === true])) ===
+        JSON.stringify([['', true], ['codex', false], ['grok', false]]));
+    }
+  }
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
