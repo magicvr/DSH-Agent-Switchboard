@@ -16,16 +16,18 @@
 #
 # ## 为什么**不携带 config**
 #
-# 角色定义（roles）由 profile 的 preset 声明携带，见 `presets/switchboard.patch.yml`
-# 与 profile 的 `cordis.patch.yml`。本文件若也写 config，就会与那份产生**两份真相**。
+# 角色定义（roles）的权威存储是 `$DSH_HOME/agent-switchboard/roles.json`，而它由设置页
+# **间接**写入：客户端唯一可写通道是 `settings.mutate(ns, …)`，其 `ns` 只能是根条目 id
+# （preset 内的插件声明没有 settings 行）。因此 UI 写的是**根条目的配置**，再由根实例
+# 把它同步进那个文件；preset 实例只声明 `mount: true` 并从文件读取角色。
+# 本文件若也写 config，就会与 UI 写入的那份产生**两份真相**。
 #
-# 本条目启用后，Host 半边会在根作用域被激活，但 config 为空 → `roles` 为默认的
-# 空数组 → `apply` 在 `if (roles.length === 0) return;` 处提前返回：
-#   - 不挂载任何角色工具
-#   - 不注入角色路由指引
-# 即**根作用域下它存在但不起作用**；真正生效仍在选中 preset 的会话里。
-# 唯一在根作用域可见的产物是 `switchboard_selftest` 自检工具（它刻意总是注册，
-# 以便配置出错时仍有诊断入口）。
+# 本条目启用后，Host 半边会在根作用域被激活，但 config 为空、`mount` 为默认的 `false`
+# → `apply` 走根条目分支：只把配置同步到 roles 文件，**不挂载任何角色工具、不注入角色
+# 路由指引、也不注册任何 Cordis 服务**（客户端改走 `settings`）。
+# 即**根作用域下它只承担配置桥接**；角色工具真正生效仍在声明了 `mount: true` 的
+# preset 会话里。根作用域可见的另一产物是 `switchboard_selftest` 自检工具——它刻意在
+# `mount` 判断**之前**注册，以便配置出错时仍有诊断入口。
 #
 # ## 另一个不能用错的地方
 #
