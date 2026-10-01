@@ -172,6 +172,36 @@
 
 **先做哪个 CLI：** **`codex`**（已拍板）。注意本机 `codex` 的入口是 PowerShell 脚本 `%APPDATA%\npm\codex.ps1`，而不是 `.exe`——因此 Phase 3 的**第一件事**是用 `ctx.subprocess.resolveExecutable` 验证脚本入口能否正确解析，再写 provider。`claude`（`claude -p`，干净的非交互入口）与 `grok`（`.exe`）作为后续目标。
 
+**验收结果（codex 部分真机通过）：**
+
+真机证据（在选中 `Switchboard` preset 的会话里，真实调用 `delegate_to_codex_scout`，一次真实取证任务）：
+
+```text
+[switchboard] argv=[...,"codex.js","exec","-s","read-only","--skip-git-repo-check",
+                    "-m","gpt-6-astra","-c","model_reasoning_effort=medium","-"]
+[switchboard] exit=0 duration=67.5s
+[switchboard] cli-route {"workdir":"...","model":"gpt-6-astra","provider":"openai",
+                         "approval":"never","sandbox":"read-only","reasoning effort":"medium"}
+```
+
+| # | 验收项 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 1 | 真实 CLI 完整委派，结果回到主代理 | ✅ 真机通过 | 上表 `exit=0`，codex-scout 返回了带文件与行号的答案 |
+| 2 | **模型与强度确实生效** | ✅ 真机通过 | `argv` 里的 `-m gpt-6-astra` / `model_reasoning_effort=medium` 与 codex **自报**的 `model: gpt-6-astra` / `reasoning effort: medium` 一致。这一步不可省：实测**省略 `-m` 时 codex 会静默使用它自己 `~/.codex/config.toml` 的值**（`gpt-6-luna` + `max`），外观毫无区别 |
+| 3 | 非法强度不静默降级 | ✅ 离线通过 | `normalizeRole` 对非法 `effort` 报错并列出合法档位（`check-roles.mjs` 的「非法输入」小节） |
+| 4 | 失败语义（命令不存在／非零退出／超时） | ✅ 离线通过 | 非零退出→可读失败、spawn 抛错不冒泡、模板错误在 spawn 前失败；**超时与未设超时**共 6 条（见下） |
+| 5 | `argv` 全程数组、无 shell 参与 | ✅ 真机 + 离线 | 真机日志里 `argv` 是完整 JSON 数组、`argv[0]` 为可执行文件；`{model}`/`{effort}` 替换结果是独立元素 |
+| 6 | 取消：中断时不残留孤儿进程 | ✅ 离线通过 | 新增「调用方 abort → 子进程被终止」断言 |
+
+> 第 4、6 条此前**完全没有测试**（第 4 条的超时路径是 Phase 3 才实现的，第 6 条从未测过）。
+> 本轮补了 9 条：超时真的中止进程、超时→`error` 且正文含 `timedOut=true` 与原因、
+> 诊断不因超时丢失、**未设超时时绝不计时**（否则「默认 900 秒」形同虚设）、
+> 调用方 abort 传到子进程。`check-cli-provider.mjs` 因此从 55 → 64 条。
+
+**未完成部分（如实记录）：**
+- `claude` 与 `grok` 的入口与 effort flag **仍未实测**（`docs/cli-backends.md` 已如实标注「未实测」）。
+- CLI 后端的「只读」是**声明性**的：由 CLI 自身的沙箱参数实现（codex 的 `-s read-only`，真机日志里 `sandbox: read-only` 可证），插件无法越过 CLI 强制执行。角色 `readOnly` 对 CLI 后端不产生 `toolFilter`。
+
 ## Phase 4 · 可观测性与打磨
 
 - 调度日志：谁派的、派给谁、哪条线路、耗时、退出状态、结果摘要

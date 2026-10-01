@@ -325,5 +325,126 @@ section('角色指令被前置进提示词');
   check('空角色指令时不加分隔线', s3.calls[0].stdio.stdin.data === 'ONLY TASK', s3.calls[0].stdio.stdin.data);
 }
 
+// ---------------------------------------------------------------------------
+// 超时：Phase 3 新实现的路径，此前完全未测。
+//
+// 背景：`ctx.subprocess.spawn` 的 spec **没有** `timeoutMs` 字段（实测
+// dsh-bash-local 传的是 `{argv, cwd, stdio, graceMs, signal, env}`），所以超时
+// 必须由 provider 自己用 AbortController + setTimeout 实现。既然是自己实现的，
+// 就绝不能让它是唯一没测的失败路径 —— 验收第 4 条明确要求「超时产生可读错误」。
+// ---------------------------------------------------------------------------
+section('超时：provider 自己的计时器真的会中止子进程');
+{
+  /**
+   * 一个「永不自然结束」的假 spawn：只有收到 abort 才结算。
+   *
+   * @returns {{spawn: Function, calls: object[], aborted: () => boolean}} 测试句柄。
+   */
+  function makeHangingSpawn() {
+    const calls = [];
+    let aborted = false;
+    const spawn = (spec) => {
+      calls.push(spec);
+      const done = new Promise((resolve) => {
+        const finish = () => {
+          aborted = true;
+          resolve({ exitCode: null, signal: 'SIGTERM' });
+        };
+        if (spec.signal?.aborted) finish();
+        else spec.signal?.addEventListener('abort', finish, { once: true });
+      });
+      return {
+        collected: {
+          stdout: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        },
+        done,
+        terminate() {},
+        waitForExit: async () => true,
+      };
+    };
+    return { spawn, calls, aborted: () => aborted };
+  }
+
+  const h = makeHangingSpawn();
+  const p = createCliProvider({ role: codexRole(), spawn: h.spawn, timeoutMs: 20 });
+  const run = await p.start({ prompt: textPrompt('HANG') });
+  const result = await run.result;
+  check('超时后子进程被中止（signal 收到 abort）', h.aborted());
+  check('超时 → stopReason error', result.stopReason === 'error', result.stopReason);
+  check(
+    '超时正文含 timedOut=true',
+    result.output[0].text.includes('timedOut=true'),
+    result.output[0].text.slice(0, 240),
+  );
+  check(
+    '超时正文说明原因是 timeout',
+    result.output[0].text.includes('超时') || result.output[0].text.includes('timeout'),
+    result.output[0].text.slice(0, 240),
+  );
+  check('仍有 argv 审计行（诊断不因超时丢失）', result.output[0].text.includes('[switchboard] argv='));
+
+  // 未设超时时，计时器必须**完全不存在**：否则「默认 900 秒」会形同虚设。
+  //
+  // 收尾方式：用一个**稍后才 abort** 的调用方信号让 hanging spawn 结算。
+  // 必须在等待窗口之后才 abort —— 若一开始就 abort，就分不清「没有被超时中止」
+  // 与「被我自己的收尾中止」了。
+  const h2 = makeHangingSpawn();
+  const p2 = createCliProvider({ role: codexRole(), spawn: h2.spawn });
+  const ac2 = new AbortController();
+  const started = p2.start({ prompt: textPrompt('HANG'), signal: ac2.signal });
+  // 等足够久，任何 20ms 级别的超时都会在此期间触发。
+  await new Promise((r) => setTimeout(r, 60));
+  check('未设超时（timeoutMs 为空）→ 不会被中止', !h2.aborted());
+  ac2.abort();
+  await (await started).result;
+}
+
+// ---------------------------------------------------------------------------
+// 取消：验收第 6 条要求「中断主代理时子进程被终止」。此前后者完全未测。
+// ---------------------------------------------------------------------------
+section('取消：调用方 abort 会传到子进程，且不被误报为超时');
+{
+  /** @returns {{spawn: Function, aborted: () => boolean}} 测试句柄。 */
+  function makeAbortableSpawn() {
+    let aborted = false;
+    const spawn = (spec) => {
+      const done = new Promise((resolve) => {
+        const finish = () => {
+          aborted = true;
+          resolve({ exitCode: null, signal: 'SIGTERM' });
+        };
+        if (spec.signal?.aborted) finish();
+        else spec.signal?.addEventListener('abort', finish, { once: true });
+      });
+      return {
+        collected: {
+          stdout: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        },
+        done,
+        terminate() {},
+        waitForExit: async () => true,
+      };
+    };
+    return { spawn, aborted: () => aborted };
+  }
+
+  const ac = new AbortController();
+  const h = makeAbortableSpawn();
+  // 刻意**不设** timeoutMs：这样 timedOut 只可能来自调用方信号。
+  const p = createCliProvider({ role: codexRole(), spawn: h.spawn });
+  const started = p.start({ prompt: textPrompt('CANCEL ME'), signal: ac.signal });
+  ac.abort();
+  const result = await (await started).result;
+  check('调用方 abort → 子进程被终止', h.aborted());
+  check('取消后不当作成功', result.stopReason === 'error', result.stopReason);
+  check(
+    '取消被如实报为 timedOut=true（信令层无法区分取消与超时，故如实标注）',
+    result.output[0].text.includes('timedOut=true'),
+    result.output[0].text.slice(0, 240),
+  );
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);
