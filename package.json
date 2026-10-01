@@ -66,7 +66,6 @@
     "gen:roles": "node scripts/gen-role-config.mjs",
     "gen:preset": "node scripts/gen-preset.mjs",
     "inject:preset": "node scripts/probe-preset.mjs --inject",
-    "toggle:cross-cli": "node scripts/toggle-cross-cli.mjs",
     "probe:codex": "node scripts/probe-codex.mjs"
   }
 }

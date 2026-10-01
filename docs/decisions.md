@@ -227,8 +227,12 @@ minimal | low | medium | high | xhigh | max
 
 | 层 | 内容 | 存储 | GUI 可编辑 |
 | --- | --- | --- | --- |
-| 角色定义 | 角色列表：id、标题、职责提示词、backend、CLI 参数 | `cordis.patch.yml` 的插件 config | 见下 |
-| 运行时旋钮 | `allowCrossCli` 总开关、超时、输出上限、CLI 可执行文件路径 | 插件 `Config`，标 `.volatile()` | ✅ |
+| 角色定义 | 角色列表：id、标题、职责提示词、backend、CLI 参数 | 根条目的插件 `config.roles` | ✅（自建设置页，见 D14） |
+| 运行时旋钮 | `cliTimeoutSec`、输出上限、CLI 可执行文件路径 | 插件 `Config`，标 `.volatile()` | ✅ |
+
+> ⚠️ 本表曾包含 `allowCrossCli` 总开关。**该字段已移除**（见 D14 与本文件末的说明）：
+> 它后来在面板上被拿掉、却仍在执行期拦截 CLI 角色的挂载，于是角色永远挂不上而界面只显示
+> 「工具不存在」。现在「走不走外部 CLI」由角色的 `backend` 显式表达。
 
 **依据（已核实）：** `dsh-settings` **只暴露 volatile 字段**（「Forms expose only volatile fields」）。不标 `.volatile()` 的字段在设置页不会出现——这是「在插件面板配置」这条需求的硬技术前提。
 
@@ -238,7 +242,10 @@ minimal | low | medium | high | xhigh | max
 
 ## D10 · Client 半边职责
 
-**决策：** 第一期 Client 半边只做一件事——在 `conversation.composer.dock` 注入一个**只读**的开关/状态指示（`allowCrossCli` 是否开启、当前线路）。
+**决策：** 第一期 Client 半边只做一件事——在 `conversation.composer.dock` 注入一个**只读**的开关/状态指示（当时是 `allowCrossCli` 是否开启、当前线路）。
+
+> ⚠️ 该只读指示所反映的 `allowCrossCli` **已移除**，因此这一期形态已被 D13（角色设置页）
+> 取代。保留本节是为了记录当时的取舍依据。
 
 **依据（已核实）：**
 - 官方四文件模板（`templates/decoration/`）可直接照抄结构。

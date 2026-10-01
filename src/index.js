@@ -183,9 +183,22 @@ export const Config = z.object({
   // 这里曾漏调用一次，注释写着 volatile、代码却没有，是典型「文档与实现脱节」。
   volatile: z
     .object({
-      /** 跨 CLI 派发的总开关。Phase 3 使用。 */
-      allowCrossCli: z.boolean().default(false).description('允许把角色派发给本机外部 CLI（会执行本地命令）'),
-      /** 单次 CLI 派发的超时（秒）。Phase 3 使用。 */
+      // ⚠️ 这里曾经有一个 `allowCrossCli: z.boolean().default(false)` 作为「跨 CLI 派发总开关」。
+      //    **已移除**，原因两条：
+      //
+      //    1. 它是**在 UI 上无法打开、却能让角色静默不挂载**的开关。面板上的那个开关后来
+      //       被移除（角色工具改由 `mount` 控制作用域），但这个执行期的门禁留着，于是
+      //       CLI 角色永远挂不上，而界面上只看到「工具不存在」。实测踩到：
+      //           scout=失败(allowCrossCli 未开启，故未挂载（provider 也未注册）)
+      //       这正是本项目一路在消灭的「静默不存在」。
+      //    2. **它是冗余的**。「要不要走外部 CLI」已经由每个角色自己的 `backend: 'cli'`
+      //       显式表达，而角色只在声明了 `mount: true` 的 Switchboard preset 会话里挂载。
+      //       再加一道隐藏的全局闸门，只增加了状态与失败面，没有增加判断力。
+      //
+      //    取舍说明：「会执行本机命令」这件事的可控性现在依赖两点 —— 角色的 `backend`
+      //    必须被显式设为 `cli`，且该角色只在 Switchboard preset 会话里存在。这比一个
+      //    看不见的全局开关更容易理解和审计。
+      /** 单次 CLI 派发的超时（秒）。 */
       cliTimeoutSec: z.number().step(1).min(1).default(900).description('单次 CLI 派发的超时（秒）'),
     })
     .default({})
@@ -785,22 +798,22 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
 
   const maxDepth = typeof resolved.maxDepth === 'number' ? resolved.maxDepth : 3;
 
-  // 跨 CLI 派发的总开关。**默认关闭**：CLI 后端会真的在本机执行本地命令，
-  // 因此必须显式开启（`volatile.allowCrossCli`）。判定逻辑在纯函数
-  // `planCliMounts()` 里，以便离线测试覆盖。
+  // CLI 派发的超时。
   //
-  // ⚠️ 必须经 `readVolatile()` 取值，不能直接读 `resolved.volatile.xxx`
-  //    （那恒为 undefined，曾导致本开关从未真正生效）。
+  // ⚠️ 必须经 `readVolatile()` 取值，不能直接读 `resolved.volatile.cliTimeoutSec`
+  //    （那恒为 undefined —— volatile 字段是**引用对象**，直接读属性拿不到真值）。
+  //
+  // 这里**没有** `allowCrossCli` 门禁了：曾经有一个全局开关挡在 CLI 角色挂载之前，
+  // 但它后来在面板上被移除、却仍在执行期拦截，于是 CLI 角色永远挂不上且界面上只看到
+  // 「工具不存在」。现在「要不要走外部 CLI」由角色自己的 `backend: 'cli'` 表达，
+  // 而角色只在声明了 `mount: true` 的 Switchboard preset 会话里挂载。
   const volatile = readVolatile(resolved);
-  const allowCrossCli = volatile.allowCrossCli === true;
   const cliTimeoutSec =
     typeof volatile.cliTimeoutSec === 'number' && volatile.cliTimeoutSec > 0
       ? volatile.cliTimeoutSec
       : 900;
-  console.error(
-    `[${name}] 跨 CLI 开关：allowCrossCli=${allowCrossCli}，cliTimeoutSec=${cliTimeoutSec}`,
-  );
-  const { active: activeCliRoles, blocked: blockedCliRoles } = planCliMounts(roles, allowCrossCli);
+  console.error(`[${name}] cliTimeoutSec=${cliTimeoutSec}`);
+  const { active: activeCliRoles, blocked: blockedCliRoles } = planCliMounts(roles);
 
   // 注册 CLI 角色各自的 provider 实例。
   //
@@ -812,9 +825,8 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
   if (blockedCliRoles.length > 0) {
     diagnostics.blocked = blockedCliRoles;
     console.error(
-      `[${name}] ${blockedCliRoles.length} 个 CLI 角色未挂载（${blockedCliRoles[0].reason}）：` +
-        blockedCliRoles.map((b) => b.id).join(', ') +
-        '。CLI 后端会在本机执行外部命令，需显式开启后才挂载（设置面板可改）。',
+      `[${name}] ${blockedCliRoles.length} 个 CLI 角色未挂载：` +
+        blockedCliRoles.map((b) => `${b.id}(${b.reason})`).join(', '),
     );
   }
 

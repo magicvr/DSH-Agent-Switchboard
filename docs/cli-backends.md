@@ -166,18 +166,28 @@ reasoning effort: ...
   cliCwd: "C:\\path\\to\\workspace"
 ```
 
-**两步都要做，缺一不可**：
+**只需要一步**：把角色的 `backend` 改为 `cli` 并填上面那些 `cli*` 字段。
+（在设置面板里更简单：`派发机制` 选「外部 CLI」，再从 CLI 下拉框选 `Codex CLI` / `Grok CLI`，
+参数模板会自动填好。）
 
-1. 把角色的 `backend` 改为 `cli` 并填上面那些 `cli*` 字段；
-2. **打开总开关** `volatile.allowCrossCli: true`（仓库自带的 `scripts/toggle-cross-cli.mjs --on` 可改，
-   面板里也能改）。**默认关闭**——CLI 后端会在本机真的执行外部命令，必须显式开启。
+> ⚠️ **曾经**还需要第二步「打开总开关 `volatile.allowCrossCli: true`」，**该开关已移除**。
+> 原因：它后来在面板上被移除、却仍在执行期拦截，于是 CLI 角色永远挂不上、界面只显示
+> 「工具不存在」，且自检里那句「因开关未挂载」是唯一的线索 —— 典型的「静默不存在」。
+> 实测踩到：`scout=失败(allowCrossCli 未开启，故未挂载（provider 也未注册）)`。
+>
+> 现在的可控性来自两点：角色的 `backend` 必须被**显式**设为 `cli`，
+> 且角色只在声明了 `mount: true` 的 Switchboard preset 会话里挂载。
+> 这比一个看不见的全局开关更容易理解和审计。
 
-> ⚠️ 只做第 1 步不做第 2 步时，该角色**既不注册 provider 也不挂载工具**（主代理看不到它），
-> 这是刻意的：宁可看不见，也不要出现「看得见、一调用就报错」的形态。
-> 自检工具（`switchboard_selftest`）的「因开关未挂载」一行会列出被挡下的角色。
+### 2.6b 换 CLI 或换模型时的两个必查项（都踩过）
 
-> `allowCrossCli` 是**全局**开关，而 `backend` 是**按角色**的。两者是叠加关系：
-> 总开关关着时，任何角色都无法走 CLI。这是「会执行本地命令」这类能力的恰当粒度。
+1. **模型必须符合该 CLI 自己的命名空间。** 驱动选择器**不会**自动改模型
+   （每个 CLI 有各自的模型列表，插件给不出通用默认值）。实测：
+   grok + `gpt-6-luna` → 退出 1 `unknown model id`；grok + `grok-4.7` → 退出 0。
+   查法：`grok models`；codex 直接试用真实模型并看它 stderr 自报的 `model:` 行。
+2. **必须有工作目录。** `normalizeRole` 在 `cliCwd` 与插件级 `cwd` 都为空时报
+   「cliCwd 未设置，且全局 cwd 也未设置」并**不挂载该角色**。
+   因此插件级 `cwd` 应当设置好，否则从面板新建的 CLI 角色会带着空 `cliCwd` 失败。
 
 ### 2.7 已知的实现约束（实测踩到，改代码前先读）
 

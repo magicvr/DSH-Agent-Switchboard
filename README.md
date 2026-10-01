@@ -46,62 +46,71 @@
 - **`builtin`** — 复用 DSH 已注册的子代理 provider（`spawn` / `fork`）。上下文、沙箱、权限、流式事件都由 DSH 统一管，行为最可预期，也是默认选项。
 - **`cli`** — 本插件**自己注册一个 `SubagentProvider`**，通过 `ctx.subprocess` 调用外部编码代理，把提示词与工作目录交给它，再把输出收回来。适合复用你已经在别处配好的模型、额度或工具链。
 
-> ⚠️ **`cli` 后端会真的在你的机器上执行本地命令。** 因此默认关闭（`allowCrossCli: false`），需要显式开启。可执行文件与参数模板全部由你提供，插件不会去猜、也不会自动发现你装了哪些 CLI。
+> ⚠️ **`cli` 后端会真的在你的机器上执行本地命令。** 可控性来自两点：角色的 `backend` 必须被**显式**设为 `cli`，且该角色只在选中了 Switchboard preset 的会话里挂载。可执行文件与参数模板全部由你提供（或在面板里从 CLI 预设一键填好），插件不会去猜、也不会自动发现你装了哪些 CLI。
 >
 > 安全上有一道结构性保障：调用走的是 **argv 数组 + 显式工作目录**（`ctx.subprocess.spawn`），全程没有 shell 参与，模型只能填充受限占位符，无法拼接出任意命令。
 
 ### 3. 配置（Plugin Panel）
 
-角色列表来自 `cordis.patch.yml`（声明式、可版本控制、便于评审），而运行时旋钮走插件面板可实时编辑。理由与取舍见 [`docs/decisions.md`](./docs/decisions.md) D9。形状如下（**示意**）：
+角色存放在**根条目的插件配置**里（即 profile patch 中 `id: agent-switchboard` 那一行的 `config.roles`），
+设置面板直接读写它；Host 侧会把角色同步一份到 `$DSH_HOME/agent-switchboard/roles.json`，
+供选中 Switchboard preset 的会话读取。形状如下（**示意**）：
 
 ```jsonc
 {
-  "dispatch": {
-    // 总开关：是否允许跨 CLI 派发。默认 false。
-    "allowCrossCli": false
-  },
+  "provider": "self",
+  "cwd": "C:\\path\\to\\workspace",
   "roles": [
     {
       "id": "scout",
       "title": "侦察员",
       "description": "只读调研：定位相关代码、给出证据路径，不做任何修改。",
-      "backend": "builtin",
+      // 派发机制：内置 spawn / fork，或外部 CLI。
+      "backend": "spawn",
       "readOnly": true,
       // 是否允许该角色再往下派发子代理。默认 false，防无限递归。
-      "allowNestedDispatch": false,
-      "resultContract": "结论 + 证据（文件:行）+ 未决问题"
+      "allowNestedDispatch": false
     },
     {
       "id": "architect",
       "title": "架构师",
       "description": "产出实现方案与接口约定，不写实现代码。",
+      // 走外部 CLI 的角色：cli* 字段是**扁平**的（便于面板当普通标量渲染）。
+      // 在面板里更简单：把「派发机制」选成「外部 CLI」，再从 CLI 下拉框选具体 CLI，
+      // 下面这组参数会被一键填好。
       "backend": "cli",
-      "cli": {
-        "provider": "codex",
-        // 参数模板：{prompt} / {cwd} / {model} / {effort}
-        // ⚠️ 下面 args 是占位示例，子命令尚未实测（Phase 3 校准）
-        "args": ["exec", "{prompt}"],
-        "modelFlag": ["-m"],
-        "effortFlag": ["-c", "model_reasoning_effort={effort}"],
-        // 模型与思考强度是角色级固定配置，主代理无权覆盖
-        "model": "gpt-6-luna",
-        "effort": "max",
-        "cwd": ".",
-        "timeoutSec": 900
-      }
+      "cliDriver": "codex",
+      "model": "gpt-6-luna",
+      "effort": "max",
+      "cliCommand": "{node}",
+      "cliPrefixArgs": ["{npmRoot}\\@openai\\codex\\bin\\codex.js"],
+      // 参数模板：只允许 {prompt} / {cwd} / {model} / {effort} 四个受限占位符。
+      "cliArgs": [
+        "exec", "-s", "read-only", "--skip-git-repo-check",
+        "-m", "{model}", "-c", "model_reasoning_effort={effort}", "-"
+      ],
+      "cliPromptDelivery": "stdin",
+      "cliCwd": "C:\\path\\to\\workspace"
     },
     {
       "id": "worker",
       "title": "实现者",
       "description": "在指定文件范围内落地实现并保证可运行。",
-      "backend": "builtin",
+      "backend": "spawn",
       "readOnly": false
     }
   ]
 }
 ```
 
-`codex` 的子命令与参数（上面那个 `["exec", "{prompt}"]`）是**占位示例，尚未实测**。Phase 3 必须对着 `codex --help` 与真实调用校准，并写入 `docs/cli-backends.md`（见 [`docs/plan.md`](./docs/plan.md) Phase 3）。
+> `cliCommand` / `cliPrefixArgs` 里的 `{node}` 与 `{npmRoot}` 由 Host 在装载期解析成真实路径，
+> 因此预设不必把本机用户名写进仓库。codex 必须以 `node <codex.js>` 形式调用
+> —— 它的 `.ps1` / `.cmd` 入口在 `shell: false` 下都无法 spawn（实测，见
+> [`docs/cli-backends.md`](./docs/cli-backends.md) §1）。
+>
+> 每个 CLI 的模型取值属于**它自己的命名空间**，插件不提供默认值：
+> codex 用 `gpt-6-luna` 这类网关模型名，grok 用 `grok-4.7`（`grok models` 可列）。
+> 换 CLI 后必须一并改模型，否则会以退出码 1 失败。
 
 ### 4. 主代理的约束
 

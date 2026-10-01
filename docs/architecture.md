@@ -106,11 +106,13 @@
     - ⚠️ **本插件为此栽过一次**：代码里写的是 `volatile: z.object({...}).default({})` —— 注释还明确写着「volatile 子对象里的字段可在设置页实时编辑」，但**代码里根本没有 `.volatile()`**。典型的文档与实现脱节。离线预检（`scripts/check-config-schema.mjs`）现在会把这条抓出来。
 
 18b. **`.volatile()` 之后，该子对象变成「引用对象」：属性不在自身上，必须用 `.get()` 取值。**
-    - 实测（`node -e` 直接跑真实 `Config`）：
+    - 实测（`node -e` 直接跑真实 `Config`；样本字段是当时的 `allowCrossCli`，
+      该字段**后来已随「跨 CLI 总开关」一并移除**，但这条机制本身不变 ——
+      现在 volatile 里只剩 `cliTimeoutSec`）：
       ```text
       r.volatile                  → {}                  （JSON.stringify 也是 {}）
-      r.volatile.allowCrossCli    → undefined           ← 直接读恒为 undefined
-      r.volatile.get()            → {"allowCrossCli":true,"cliTimeoutSec":900}
+      r.volatile.<字段>           → undefined           ← 直接读恒为 undefined
+      r.volatile.get()            → {"cliTimeoutSec":900}
       ```
     - ⚠️ **这是一个真实且长期潜伏的 bug 的根因**：`src/index.js` 曾写
       `const allowCrossCli = resolved.volatile?.allowCrossCli === true;`
@@ -118,6 +120,8 @@
     - 为什么长期没被发现：自检一直显示「allowCrossCli 未开启」，而那**恰好就是
       默认关闭时的正常表现** —— 失效与默认值的外观完全一致。直到在 preset 里显式
       写入 `volatile.allowCrossCli: true` 仍不生效，才暴露出来。
+    - **教训（与本文件 3.1f 第 38 条同一类）**：凡是 `.volatile()` 标过的字段，
+      一律经 `readVolatile()` / `readVolatileField()` 取值，**不得直接读属性**。
     - 为什么已有 103+55+55 条断言都没抓住：它们直接调用纯函数
       `planCliMounts(roles, boolean)`，**绕过了 `apply` 层的取值**。
     - 修法与防线：新增 `readVolatile(resolved)`（兼容带 `.get()` 的引用对象与普通对象，

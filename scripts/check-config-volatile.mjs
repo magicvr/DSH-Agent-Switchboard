@@ -43,33 +43,36 @@ section('自检：确认这个坑真实存在（否则本文件在测空气）')
 {
   // 这是**已知坏形态**：直接访问属性。如果它哪天变成可用的，说明 schemastery 行为
   // 变了，本文件的前提要重新核实 —— 因此把它也断言下来。
-  const resolved = Config({ volatile: { allowCrossCli: true } });
+  //
+  // 用 `cliTimeoutSec` 作样本（它现在是 volatile 里唯一的字段；`allowCrossCli` 已随
+  // 「跨 CLI 总开关」一并移除，见 src/index.js 的说明）。
+  const resolved = Config({ volatile: { cliTimeoutSec: 30 } });
   check(
-    '直接读 `resolved.volatile.allowCrossCli` 确实取不到值（这就是原 bug 的机制）',
-    resolved.volatile?.allowCrossCli === undefined,
-    `实际得到 ${JSON.stringify(resolved.volatile?.allowCrossCli)}`,
+    '直接读 `resolved.volatile.cliTimeoutSec` 确实取不到值（这就是原 bug 的机制）',
+    resolved.volatile?.cliTimeoutSec === undefined,
+    `实际得到 ${JSON.stringify(resolved.volatile?.cliTimeoutSec)}`,
   );
   check(
     '`resolved.volatile.get()` 能取到真值',
-    resolved.volatile?.get?.()?.allowCrossCli === true,
-    `实际得到 ${JSON.stringify(resolved.volatile?.get?.()?.allowCrossCli)}`,
+    resolved.volatile?.get?.()?.cliTimeoutSec === 30,
+    `实际得到 ${JSON.stringify(resolved.volatile?.get?.()?.cliTimeoutSec)}`,
   );
 }
 
 section('readVolatile：穿过真实 Config schema');
 {
   const cases = [
-    ['allowCrossCli = true', { volatile: { allowCrossCli: true } }, true],
-    ['allowCrossCli = false', { volatile: { allowCrossCli: false } }, false],
-    ['未提供 volatile（应回落到默认 false）', { provider: 'self' }, false],
-    ['volatile 为空对象（应回落到默认 false）', { provider: 'self', volatile: {} }, false],
+    ['cliTimeoutSec = 30', { volatile: { cliTimeoutSec: 30 } }, 30],
+    ['cliTimeoutSec = 1', { volatile: { cliTimeoutSec: 1 } }, 1],
+    ['未提供 volatile（应回落到默认 900）', { provider: 'self' }, 900],
+    ['volatile 为空对象（应回落到默认 900）', { provider: 'self', volatile: {} }, 900],
   ];
   for (const [label, input, expected] of cases) {
     const v = readVolatile(Config(input));
     check(
-      `${label} → allowCrossCli === ${expected}`,
-      v.allowCrossCli === expected,
-      `实际 ${JSON.stringify(v.allowCrossCli)}`,
+      `${label} → cliTimeoutSec === ${expected}`,
+      v.cliTimeoutSec === expected,
+      `实际 ${JSON.stringify(v.cliTimeoutSec)}`,
     );
   }
 }

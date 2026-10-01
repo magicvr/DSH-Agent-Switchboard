@@ -331,28 +331,24 @@ export function toolConfigFor(role, { maxDepth }) {
 }
 
 /**
- * 决定哪些 CLI 角色应该被实际挂载。
+ * 选出应该被实际挂载的 CLI 角色。
  *
- * ⚠️ 抽成纯函数是刻意的：`apply()` 里的分支在 link 安装下**无法热加载验证**
- * （docs/architecture.md 3.3），因此凡是能做成纯逻辑的判断都必须做成纯函数，
- * 才能在 Node 里离线测到。这个总开关关系到「会不会在本机执行外部命令」，
- * 更不能没有测试覆盖。
+ * 抽成纯函数是刻意的：`apply()` 里的分支在 link 安装下**无法热加载验证**
+ * （docs/architecture.md 3.3），因此凡是能做成纯逻辑的判断都做成纯函数，才能离线测到。
  *
- * `allowCrossCli` **默认关闭**：CLI 后端会真的执行本地命令，必须显式开启。
- * 关闭时 CLI 角色既不注册 provider 也不挂载工具 —— 主代理看不到它们，
- * 而不是看到一个一调用就报错的工具。
+ * ⚠️ 这里**曾经**有一个 `allowCrossCli` 全局闸门，把 CLI 角色在开关关闭时全部挡下。
+ *    已移除，原因见 `Config.volatile` 的说明：它后来在面板上被移除、却仍在执行期拦截，
+ *    于是 CLI 角色永远挂不上、界面只显示「工具不存在」（实测踩到）。
+ *    现在「要不要走外部 CLI」由角色自己的 `backend: 'cli'` 表达，而角色只在声明了
+ *    `mount: true` 的 Switchboard preset 会话里挂载。
+ *
+ * 保留 `blocked` 返回字段是为了让调用方与自检的展示形态不变（当前恒为空数组）。
  *
  * @param {Role[]} roles - 规范化后的角色列表。
- * @param {boolean} allowCrossCli - 跨 CLI 派发总开关。
  * @returns {{ active: Role[], blocked: { id: string, reason: string }[] }} 挂载计划。
  */
-export function planCliMounts(roles, allowCrossCli) {
-  const cliRoles = roles.filter((role) => role.backend === CLI_BACKEND);
-  if (allowCrossCli === true) return { active: cliRoles, blocked: [] };
-  return {
-    active: [],
-    blocked: cliRoles.map((role) => ({ id: role.id, reason: 'allowCrossCli 未开启' })),
-  };
+export function planCliMounts(roles) {
+  return { active: roles.filter((role) => role.backend === CLI_BACKEND), blocked: [] };
 }
 
 /**

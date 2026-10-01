@@ -401,54 +401,50 @@ section('backend 取值校验');
   );
 }
 
-section('planCliMounts：跨 CLI 总开关');
+section('planCliMounts：CLI 角色**无条件**挂载（闸门已删）');
 {
   const mk = (id, backend) => ({ id, backend, toolName: `delegate_to_${id}` });
   const roles = [mk('a', 'spawn'), mk('b', 'cli'), mk('c', 'cli'), mk('d', 'fork')];
 
-  const off = planCliMounts(roles, false);
-  check('开关关闭 → 无 CLI 角色被挂载', off.active.length === 0);
-  check('开关关闭 → 两个 CLI 角色被列为 blocked', off.blocked.length === 2, JSON.stringify(off.blocked));
-  check('blocked 给出原因', off.blocked.every((b) => b.reason.includes('allowCrossCli')));
-  check('blocked 记下角色 id', off.blocked.map((b) => b.id).join(',') === 'b,c', JSON.stringify(off.blocked));
+  const plan = planCliMounts(roles);
+  check(
+    '只有 CLI 角色被挂载',
+    plan.active.map((r) => r.id).join(',') === 'b,c',
+    JSON.stringify(plan.active.map((r) => r.id)),
+  );
+  check('blocked 恒为空（不再有全局闸门）', plan.blocked.length === 0, JSON.stringify(plan.blocked));
 
-  const on = planCliMounts(roles, true);
-  check('开关开启 → 只有 CLI 角色被挂载', on.active.map((r) => r.id).join(',') === 'b,c', JSON.stringify(on.active.map((r) => r.id)));
-  check('开关开启 → 无 blocked', on.blocked.length === 0);
+  const noCli = planCliMounts([mk('a', 'spawn'), mk('b', 'fork')]);
+  check('没有 CLI 角色时 active 与 blocked 都为空', noCli.active.length === 0 && noCli.blocked.length === 0);
 
-  // 非布尔值一律视为关闭（fail-safe）：开关是安全边界，不能因类型问题而放开。
-  for (const weird of [undefined, null, 0, '', 'true', 1, {}]) {
-    const r = planCliMounts(roles, weird);
-    check(`开关为 ${JSON.stringify(weird) ?? 'undefined'} 时视为关闭（fail-safe）`, r.active.length === 0 && r.blocked.length === 2);
-  }
-
-  const noCli = planCliMounts([mk('a', 'spawn')], false);
-  check('没有 CLI 角色时 blocked 为空', noCli.blocked.length === 0 && noCli.active.length === 0);
-
-  // ⚠️ 针对一个**真实发生过的 bug** 的回归断言：
+  // ⚠️ 回归断言：这里**曾经**有一个 `allowCrossCli` 全局闸门，关闭时把所有 CLI 角色
+  //    挡在挂载之外。它后来在面板上被移除、却仍在执行期拦截，于是 CLI 角色永远挂不上、
+  //    界面只显示「工具不存在」（实测：`scout=失败(allowCrossCli 未开启…)`）。
   //
-  // apply() 里我一度只 gate 了 provider 注册，却忘了 gate 工具挂载，实测结果是
-  // `codex-scout` 同时出现在「已挂载 OK」与「因开关未挂载」两处 —— 工具挂上了但
-  // provider 没注册，一调用就会失败（dsh-tool-subagent 装载时不检查 provider
-  // 是否存在）。下面的不变式锁住「一个角色不可能既 active 又 blocked」。
-  const mixed = [mk('s1', 'spawn'), mk('c1', 'cli'), mk('s2', 'fork'), mk('c2', 'cli')];
-  for (const flag of [true, false]) {
-    const plan = planCliMounts(mixed, flag);
-    const activeIds = new Set(plan.active.map((r) => r.id));
-    const blockedIds = new Set(plan.blocked.map((b) => b.id));
-    const overlap = [...activeIds].filter((id) => blockedIds.has(id));
-    check(`开关为 ${flag} 时 active 与 blocked 无交集`, overlap.length === 0, overlap.join(','));
+  //    因此这里断言**签名里不再接受开关**：函数只认一个参数，任何额外传入的值都不得
+  //    改变结果。这能防止「闸门被重新加回来」而测试却跟不上。
+  for (const stray of [false, undefined, null, 0, '', 'true', 1, {}]) {
+    const p = planCliMounts(roles, stray);
     check(
-      `开关为 ${flag} 时每个 CLI 角色恰好归入一侧`,
-      activeIds.size + blockedIds.size === 2,
-      `active=${activeIds.size} blocked=${blockedIds.size}`,
-    );
-    check(
-      `开关为 ${flag} 时非 CLI 角色永不出现在 blocked`,
-      ![...blockedIds].some((id) => id.startsWith('s')),
-      [...blockedIds].join(','),
+      `多余参数 ${JSON.stringify(stray) ?? 'undefined'} 不影响挂载（闸门已删）`,
+      p.active.length === 2 && p.blocked.length === 0,
+      `active=${p.active.length} blocked=${p.blocked.length}`,
     );
   }
+
+  // 不变式：一个角色不可能既 active 又 blocked（曾是真实 bug：provider 与工具分开 gate）。
+  const mixed = [mk('s1', 'spawn'), mk('c1', 'cli'), mk('s2', 'fork'), mk('c2', 'cli')];
+  const mixedPlan = planCliMounts(mixed);
+  const activeIds = new Set(mixedPlan.active.map((r) => r.id));
+  const blockedIds = new Set(mixedPlan.blocked.map((b) => b.id));
+  const overlap = [...activeIds].filter((id) => blockedIds.has(id));
+  check('active 与 blocked 无交集', overlap.length === 0, overlap.join(','));
+  check('两个 CLI 角色都被挂载', activeIds.size === 2, String(activeIds.size));
+  check(
+    '非 CLI 角色永不出现在 blocked',
+    ![...blockedIds].some((id) => id.startsWith('s')),
+    [...blockedIds].join(','),
+  );
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
