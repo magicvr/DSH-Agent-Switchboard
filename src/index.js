@@ -21,16 +21,19 @@
  */
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { EFFORT_VALUES, normalizeRoles, toolConfigFor } from './roles.js';
+import { EFFORT_VALUES, normalizeRoles, roleGuidanceText, toolConfigFor } from './roles.js';
 
 /** Loader 条目名，与 package.json 的 `name` 保持一致。 */
 export const name = 'agent-switchboard';
 
 /**
  * 声明式依赖。Cordis 会等到这些 Service 就绪后再调用 `apply`。
- * `subagents` 用于解析内置后端；`agents` 用于取发起本次调用的父代理。
+ * - `subagents`：解析内置后端（在挂载的工具实例里使用）。
+ * - `agents`：取发起本次调用的父代理（在被挂载的工具内部使用）。
+ * - `systemPrompt`：注册角色路由指引。**必需**——`dsh-tool-subagent` 的
+ *   工具描述不可配置，四个角色工具的描述完全相同，路由规则只能靠系统提示传达。
  */
-export const inject = ['tools', 'subagents', 'agents'];
+export const inject = ['tools', 'subagents', 'agents', 'systemPrompt'];
 
 /**
  * 装载诊断。供自检工具读取；每次 `apply` 重算。
@@ -185,6 +188,23 @@ export function apply(ctx, config) {
     return;
   }
   if (roles.length === 0) return;
+
+  // 注册角色路由指引。
+  //
+  // ⚠️ 这是必需的，不是锦上添花：`dsh-tool-subagent` 的工具描述由其内部
+  // `providerWording()` 生成，Config 里**没有**任何字段能覆盖它，因此四个角色
+  // 工具的描述逐字相同（已实测）。若不注册这段提示，主代理就只能靠工具名猜测
+  // 「何时该派谁」，而这恰恰是本插件的核心价值。
+  //
+  // 作用域说明：`ctx.systemPrompt.section()` 注册在全局层，因此**子代理也会看到**
+  // 这段文本。代价是每个子代理多占少量上下文；收益是确定性（不依赖调用时的 scope）。
+  // 若日后要收窄，可改为通过 agent 作用域注册。
+  ctx.systemPrompt.section({
+    name: 'agent-switchboard:roles',
+    // 10000 是 harness 身份段落所在的量级，放在其后以保证先读身份再读路由规则。
+    order: 10500,
+    text: roleGuidanceText(roles),
+  });
 
   const maxDepth = typeof resolved.maxDepth === 'number' ? resolved.maxDepth : 3;
 

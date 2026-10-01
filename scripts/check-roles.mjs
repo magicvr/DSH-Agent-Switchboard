@@ -5,6 +5,7 @@ import {
   WRITE_TOOLS,
   normalizeRole,
   normalizeRoles,
+  roleGuidanceText,
   toolConfigFor,
   toolDescriptionFor,
 } from '../src/roles.js';
@@ -208,6 +209,51 @@ section('toolDescriptionFor：禁止嵌套时的措辞');
 section('枚举一致性');
 {
   check('EFFORT_VALUES 与 DSH 取值一致', EFFORT_VALUES.join(',') === 'low,medium,high,xhigh,max');
+}
+
+section('roleGuidanceText：路由指引');
+{
+  check('无角色时返回空串（不注册空提示）', roleGuidanceText([]) === '');
+
+  const { roles } = normalizeRoles(
+    [
+      {
+        id: 'scout',
+        title: '侦察员',
+        description: 'Find facts about the repository.',
+        model: 'm',
+        instructions: 'SENTINEL_SCOUT_BODY',
+        readOnly: true,
+      },
+      {
+        id: 'worker',
+        title: '实现者',
+        description: 'Implement an accepted direction.',
+        model: 'm',
+        instructions: 'SENTINEL_WORKER_BODY',
+        allowNestedDispatch: true,
+      },
+    ],
+    'p',
+  );
+  const text = roleGuidanceText(roles);
+
+  check('含章节标题', text.includes('Subagent roles'));
+  check('声明主代理是 switchboard', text.includes('switchboard'));
+  check('含 scout 的 id', text.includes('**scout**'));
+  check('含 worker 的 id', text.includes('**worker**'));
+  check('含 scout 的工具名', text.includes('delegate_to_scout'));
+  check('含 worker 的工具名', text.includes('delegate_to_worker'));
+  check('含角色用途描述', text.includes('Find facts about the repository.'));
+  check('标注只读', text.includes('read-only'));
+  check('标注可继续派发', text.includes('may delegate further'));
+  check('标注不可继续派发', text.includes('cannot delegate further'));
+  check('要求不改写模型', /never attempt to choose or override/.test(text));
+  check(
+    '不泄漏 roles 的 instructions 正文',
+    !text.includes('SENTINEL_SCOUT_BODY') && !text.includes('SENTINEL_WORKER_BODY'),
+    'instructions 被带进了路由指引',
+  );
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

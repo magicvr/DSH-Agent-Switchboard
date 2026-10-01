@@ -220,3 +220,50 @@ export function toolDescriptionFor(role) {
   parts.push(`（${facts.join('；')}）`);
   return parts.join(' ');
 }
+
+// ---------------------------------------------------------------------------
+// 路由指引
+//
+// ⚠️ 为什么需要它：`dsh-tool-subagent` 的工具描述由它自己的 `providerWording()`
+// 生成，**Config 里没有任何字段可以覆盖**（Config 仅 provider / toolName /
+// modelSelectionSettings / enableRunInBackground / backgroundMode / agentOptions /
+// persona / toolFilter / maxDepth）。实测结果是四个角色工具的描述**逐字相同**，
+// 主代理只能靠工具名猜「该派谁」——「何时用哪个角色」这套核心决策规则丢失了。
+//
+// 因此改成注册一段系统提示（ctx.systemPrompt.section）。这也更贴合设计意图：
+// 主代理需要的是**路由规则**，而不是四段互不相干的工具描述。
+// ---------------------------------------------------------------------------
+
+/**
+ * 生成给主代理看的角色路由指引。
+ *
+ * 只描述「何时派给谁」与只读/嵌套约束，不复述各角色完整指令（那是 persona 的事），
+ * 以控制主代理的上下文成本。
+ *
+ * @param {Role[]} roles - 规范化后的角色列表。
+ * @returns {string} 系统提示片段；无角色时返回空串。
+ */
+export function roleGuidanceText(roles) {
+  if (roles.length === 0) return '';
+  const lines = [
+    '## Subagent roles (Agent Switchboard)',
+    '',
+    'You are the switchboard: you integrate information and delegate the work. Do not perform',
+    'role work yourself when a role below fits. Pick one role per task and delegate through its',
+    '`delegate_to_<role>` tool. Each role already has its own model, reasoning effort and',
+    'instructions fixed by configuration, so never attempt to choose or override them.',
+    '',
+    'Route by asking what kind of question you have:',
+    '',
+  ];
+  for (const role of roles) {
+    const flags = [];
+    if (role.readOnly) flags.push('read-only');
+    flags.push(role.allowNestedDispatch ? 'may delegate further' : 'cannot delegate further');
+    lines.push(`- **${role.id}**${role.title ? ` (${role.title})` : ''} — ${role.description.trim()}`);
+    lines.push(`  \`${role.toolName}\` · ${flags.join(' · ')}`);
+  }
+  lines.push('');
+  lines.push('Report what the results establish, not the raw process.');
+  return lines.join('\n');
+}
