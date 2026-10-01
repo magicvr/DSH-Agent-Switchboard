@@ -61,6 +61,7 @@
       "description": "只读调研：定位相关代码、给出证据路径，不做任何修改。",
       "backend": "builtin",
       "readOnly": true,
+      // 是否允许该角色再往下派发子代理。默认 false，防无限递归。
       "allowNestedDispatch": false,
       "resultContract": "结论 + 证据（文件:行）+ 未决问题"
     },
@@ -70,10 +71,10 @@
       "description": "产出实现方案与接口约定，不写实现代码。",
       "backend": "cli",
       "cli": {
-        "provider": "claude",
-        "command": "claude",
+        "provider": "codex",
         // 参数模板占位符：{prompt} / {cwd}
-        "args": ["-p", "{prompt}"],
+        // ⚠️ 下面这行是占位示例，参数尚未实测（Phase 3 校准）
+        "args": ["exec", "{prompt}"],
         "cwd": ".",
         // 单次派发的超时（秒）
         "timeoutSec": 900
@@ -90,7 +91,7 @@
 }
 ```
 
-上面 `claude`、`codex`、`grok` 的命令名与参数都是**占位示例，没有经过核实**。实现该后端时必须逐个对着各自 CLI 的真实 `--help` 与真实调用校准，并把已验证的参数写进 `docs/cli-backends.md`（见 [`docs/plan.md`](./docs/plan.md) Phase 3）。
+`codex` 的子命令与参数（上面那个 `["exec", "{prompt}"]`）是**占位示例，尚未实测**。Phase 3 必须对着 `codex --help` 与真实调用校准，并写入 `docs/cli-backends.md`（见 [`docs/plan.md`](./docs/plan.md) Phase 3）。
 
 ### 4. 主代理的约束
 
@@ -111,7 +112,7 @@
 
 **最关键的一条：** DSH 的 `ctx.subagents` 是一个**具名 provider 注册表**，`registerProvider()` 是公开扩展点，而 `SubagentRun.localAgent` 的类型是 `Agent | undefined`。这个 `undefined` 分支就是「非 DSH 子代理」的官方预留位——**跨 CLI 派发不需要绕开内置机制，它就是内置机制的一个 provider。**
 
-> 本仓库目前还没有 `package.json`，因此现在**不可安装**。包名与插件 id 待定，见 [`docs/decisions.md`](./docs/decisions.md) 文末。
+> 包名定为 `@magicvr/dsh-agent-switchboard`。本仓库目前还没有 `package.json`，因此现在**不可安装**。决策清单见 [`docs/decisions.md`](./docs/decisions.md)。
 
 ## 路线图
 

@@ -73,7 +73,7 @@
 - `id` / `title` / `description`
 - `systemPrompt` — 子代理的角色提示词
 - `readOnly` — 是否允许修改文件
-- `allowNestedDispatch` — 是否允许该子代理再往下派发（防无限递归）
+- `allowNestedDispatch` — 是否允许该子代理再往下派发（**默认 `false`**，防无限递归，见 `decisions.md` D11）
 - `backend` — `builtin` 或 `cli`
 - `cli` — 当 `backend` 为 `cli` 时的可执行文件、参数模板、工作目录、超时
 - `resultContract` — 期望的回传结构

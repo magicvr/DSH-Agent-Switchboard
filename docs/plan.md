@@ -112,7 +112,7 @@
 3. `argv` 全程是数组，日志中可证明没有任何 shell 参与。
 4. 取消：中断主代理时子进程被终止，不残留孤儿进程。
 
-**先做哪个 CLI：** 建议 `claude`（`claude -p` 是干净的非交互入口）。`codex` 与 `grok` 在本机分别以 `.ps1` 与 `.exe` 形式存在，解析路径的行为可能不同，需要 `ctx.subprocess.resolveExecutable` 逐个验证。
+**先做哪个 CLI：** **`codex`**（已拍板）。注意本机 `codex` 的入口是 PowerShell 脚本 `%APPDATA%\npm\codex.ps1`，而不是 `.exe`——因此 Phase 3 的**第一件事**是用 `ctx.subprocess.resolveExecutable` 验证脚本入口能否正确解析，再写 provider。`claude`（`claude -p`，干净的非交互入口）与 `grok`（`.exe`）作为后续目标。
 
 ## Phase 4 · 可观测性与打磨
 

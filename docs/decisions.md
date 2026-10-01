@@ -34,7 +34,7 @@
 
 **依据（已核实）：** dual-face 是官方形态（`exports` 子路径 + `dsh.client`）；`peerDependencies` 上的 `@deepseek-ai/dsh*` 会被运行时校验而 `engines.dsh` 不会；`icon` 支持顶层声明（≤256 KiB）。
 
-**待验证：** 包名与插件 id（见文末「需要拍板」）。
+**待验证：** 无。包名已定为 `@magicvr/dsh-agent-switchboard`（见「已拍板」Q1/Q2）。
 
 ---
 
@@ -161,11 +161,29 @@ const inheritsParentContext = false;
 
 ---
 
-## 需要你拍板（阻塞实施）
+## 已拍板（2026-02，阻塞项已解除）
 
-| # | 事项 | 我的建议 | 为什么需要你 |
+| # | 事项 | 决定 | 影响 |
 | --- | --- | --- | --- |
-| Q1 | 包名 | `@magicvr/dsh-agent-switchboard` | 发布形态是你的决定 |
-| Q2 | 插件 id（`dsh.client` 与 `__ModuleLoader__.load` 必须严格等于包名，Cordis 条目 id 另取） | 包名同名，条目 id 用 `agent-switchboard` | 影响 profile 与装载 |
-| Q3 | 角色列表放 `cordis.patch.yml`（D9 第一期方案）是否可接受 | 可接受 | 直接决定工期 |
-| Q4 | `cli` 后端第一期先只支持一个 CLI（建议 `claude`，因为它有干净的 `-p` 非交互模式）还是三个一起 | 先一个 | 三个一起的实测成本高 |
+| Q1 | 包名 | **`@magicvr/dsh-agent-switchboard`** | 写入 `package.json` |
+| Q2 | 插件 id | 包名同名用于 `dsh.client` 与 `__ModuleLoader__.load`；Cordis 条目 id 用 `agent-switchboard` | 两者必须区分：前者**严格等于包名**，后者是 profile 里的条目标识 |
+| Q3 | 角色列表位置 | **`cordis.patch.yml`（D9 第一期方案）**，面板只管运行时旋钮 | 增删角色需改配置并重载；Phase 4 再评估可写面板 |
+| Q4 | CLI 首个目标 | **`codex`** | 本机入口是 `codex.ps1`，因此 Phase 3 必须先用 `ctx.subprocess.resolveExecutable` 验证脚本入口解析（风险 R3 由「可能」升级为「必经」） |
+| Q5 | 嵌套派发 | **默认禁止，按角色逐个放开** | 详见下方 D11 |
+
+## D11 · 嵌套派发默认关闭，逐角色放开
+
+**决策：** 新增角色字段 `allowNestedDispatch`，**默认 `false`**。默认情况下角色子代理不得再往下派发子代理，需按角色显式开启。
+
+**依据与收益：**
+
+1. **成本可控**：默认状态下不可能因一次派发意外炸出指数级的子代理调用与额度消耗。
+2. **与 D4/D7 自洽**：`cli` provider 本就声明 `depthLimit: false`（无法强制递归上限），而 `builtin` provider 的 `depthLimit: true` 意味着它**可以**强制。默认关闭 + 显式放开，让「谁被允许递归」成为一个清晰的人工决定，而不是继承来的默认值。
+3. **实现更简单**：默认路径只涉及一层 `ctx.subagents.start()`。
+
+**落地方式：**
+- `builtin` 后端：通过 `SubagentStartRequest.maxDepth` 传给provider（`spawn`/`fork` 都支持 `depthLimit`），值为 `0` 即禁止再派发。
+- `cli` 后端：无法由 provider 强制，因此**由本插件在构造 prompt 时不注入任何委派能力**，并在角色提示词里明确禁止；这是「提示词级」而非「机制级」约束，必须在文档与界面上如实标注。
+- 主代理自身的委派总深度仍受 DSH 的 `subagentModelSelection` / 工具侧 `maxDepth` 约束（Host 默认 `1`）。
+
+> ⚠️ 诚实标注：`cli` 后端下嵌套禁止的强度**弱于** `builtin`。外部 CLI 是否真的会去派发子代理，本插件无法从机制上阻止，只能从提示词与环境上限制。这是选择 `cli` 后端本身带来的固有代价。
