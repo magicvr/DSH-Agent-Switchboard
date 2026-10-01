@@ -300,6 +300,31 @@ export function toolConfigFor(role, { maxDepth }) {
 }
 
 /**
+ * 决定哪些 CLI 角色应该被实际挂载。
+ *
+ * ⚠️ 抽成纯函数是刻意的：`apply()` 里的分支在 link 安装下**无法热加载验证**
+ * （docs/architecture.md 3.3），因此凡是能做成纯逻辑的判断都必须做成纯函数，
+ * 才能在 Node 里离线测到。这个总开关关系到「会不会在本机执行外部命令」，
+ * 更不能没有测试覆盖。
+ *
+ * `allowCrossCli` **默认关闭**：CLI 后端会真的执行本地命令，必须显式开启。
+ * 关闭时 CLI 角色既不注册 provider 也不挂载工具 —— 主代理看不到它们，
+ * 而不是看到一个一调用就报错的工具。
+ *
+ * @param {Role[]} roles - 规范化后的角色列表。
+ * @param {boolean} allowCrossCli - 跨 CLI 派发总开关。
+ * @returns {{ active: Role[], blocked: { id: string, reason: string }[] }} 挂载计划。
+ */
+export function planCliMounts(roles, allowCrossCli) {
+  const cliRoles = roles.filter((role) => role.backend === CLI_BACKEND);
+  if (allowCrossCli === true) return { active: cliRoles, blocked: [] };
+  return {
+    active: [],
+    blocked: cliRoles.map((role) => ({ id: role.id, reason: 'allowCrossCli 未开启' })),
+  };
+}
+
+/**
  * 生成给主代理看的工具描述。
  *
  * 主代理只需要知道「什么时候用这个角色」，不需要看到角色的完整指令

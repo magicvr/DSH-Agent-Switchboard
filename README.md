@@ -123,9 +123,9 @@
 分四期，每期都有必须真实通过的验收标准，见 [`docs/plan.md`](./docs/plan.md)。
 
 - [x] **Phase 0 · 设计与取证** — 仓库初始化、摸清 DSH 契约、技术决策与实施方案定型
-- [~] **Phase 1 · 最小可加载插件** — 已 link 进 profile；**Client 半边已在运行中的 GUI 生效**（`composer.dock` 可见）；**Host 半边待一次重启**（link 模式下 Host 模块被缓存，改动不热加载，见 [architecture.md](docs/architecture.md) 第 3.3 节）
-- [ ] **Phase 2 · builtin 后端** — 角色模型、每个角色一个委派工具、走 DSH 内置子代理
-- [ ] **Phase 3 · CLI 后端** — 自己实现 `SubagentProvider`，走 `ctx.subprocess` 调用本机 CLI
+- [x] **Phase 1 · 最小可加载插件** — Host 与 Client 两半边均已生效
+- [x] **Phase 2 · builtin 后端** — 5 条角色工具上线；模型按角色切换已用会话记录实证（详见 [`docs/plan.md`](docs/plan.md)）
+- [~] **Phase 3 · CLI 后端** — provider、参数模板、输出解析均已实现并通过**真实 codex 端到端**验证（14/14）；接入插件的人类可读验收待一次重启
 - [ ] **Phase 4 · 可观测性与打磨** — 调度日志、可写面板、并发预算
 
 ## 仓库布局

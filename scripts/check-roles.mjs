@@ -5,6 +5,7 @@ import {
   WRITE_TOOLS,
   normalizeRole,
   normalizeRoles,
+  planCliMounts,
   roleGuidanceText,
   toolConfigFor,
   toolDescriptionFor,
@@ -373,6 +374,31 @@ section('backend 取值校验');
     bad.errors.some((e) => e.includes('cli') && e.includes('spawn')),
     bad.errors.join('; '),
   );
+}
+
+section('planCliMounts：跨 CLI 总开关');
+{
+  const mk = (id, backend) => ({ id, backend, toolName: `delegate_to_${id}` });
+  const roles = [mk('a', 'spawn'), mk('b', 'cli'), mk('c', 'cli'), mk('d', 'fork')];
+
+  const off = planCliMounts(roles, false);
+  check('开关关闭 → 无 CLI 角色被挂载', off.active.length === 0);
+  check('开关关闭 → 两个 CLI 角色被列为 blocked', off.blocked.length === 2, JSON.stringify(off.blocked));
+  check('blocked 给出原因', off.blocked.every((b) => b.reason.includes('allowCrossCli')));
+  check('blocked 记下角色 id', off.blocked.map((b) => b.id).join(',') === 'b,c', JSON.stringify(off.blocked));
+
+  const on = planCliMounts(roles, true);
+  check('开关开启 → 只有 CLI 角色被挂载', on.active.map((r) => r.id).join(',') === 'b,c', JSON.stringify(on.active.map((r) => r.id)));
+  check('开关开启 → 无 blocked', on.blocked.length === 0);
+
+  // 非布尔值一律视为关闭（fail-safe）：开关是安全边界，不能因类型问题而放开。
+  for (const weird of [undefined, null, 0, '', 'true', 1, {}]) {
+    const r = planCliMounts(roles, weird);
+    check(`开关为 ${JSON.stringify(weird) ?? 'undefined'} 时视为关闭（fail-safe）`, r.active.length === 0 && r.blocked.length === 2);
+  }
+
+  const noCli = planCliMounts([mk('a', 'spawn')], false);
+  check('没有 CLI 角色时 blocked 为空', noCli.blocked.length === 0 && noCli.active.length === 0);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

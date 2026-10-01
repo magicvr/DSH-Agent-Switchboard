@@ -26,6 +26,7 @@ import {
   EFFORT_VALUES,
   cliProviderName,
   normalizeRoles,
+  planCliMounts,
   roleGuidanceText,
   toolConfigFor,
 } from './roles.js';
@@ -56,10 +57,18 @@ export const inject = ['tools', 'subagents', 'agents', 'systemPrompt', 'subproce
  *   mounts: { id: string, ok: boolean, detail: string }[],
  *   providers: { id: string, name: string, ok: boolean, detail: string }[],
  *   executables: { id: string, command: string, resolved?: string, ok: boolean, detail?: string }[],
+ *   blocked: { id: string, reason: string }[],
  *   fatal: string | undefined,
  * }}
  */
-const diagnostics = { configErrors: [], mounts: [], providers: [], executables: [], fatal: undefined };
+const diagnostics = {
+  configErrors: [],
+  mounts: [],
+  providers: [],
+  executables: [],
+  blocked: [],
+  fatal: undefined,
+};
 
 /**
  * 插件配置。
@@ -162,6 +171,7 @@ function selftestTool() {
           mounted: { type: 'string', required: true },
           providers: { type: 'string', required: true },
           executables: { type: 'string', required: true },
+          blocked: { type: 'string', required: true },
           configErrors: { type: 'string', required: true },
           fatal: { type: 'string', required: true },
         },
@@ -173,6 +183,7 @@ function selftestTool() {
           `明细：${value.mounted}`,
           `CLI provider：${value.providers}`,
           `CLI 可执行文件：${value.executables}`,
+          `因开关未挂载：${value.blocked}`,
         ];
         if (value.configErrors) lines.push(`配置错误：\n${value.configErrors}`);
         if (value.fatal) lines.push(`致命错误：${value.fatal}`);
@@ -203,6 +214,10 @@ function selftestTool() {
             : diagnostics.executables
                 .map((e) => `${e.id}:${e.command}=${e.ok ? (e.resolved ?? 'OK') : `无法解析(${e.detail})`}`)
                 .join(' '),
+        blocked:
+          diagnostics.blocked.length === 0
+            ? '（无）'
+            : diagnostics.blocked.map((b) => `${b.id}(${b.reason})`).join(' '),
         configErrors: diagnostics.configErrors.join('\n'),
         fatal: diagnostics.fatal ?? '',
       });
@@ -247,6 +262,7 @@ export function apply(ctx, config) {
   diagnostics.mounts = [];
   diagnostics.providers = [];
   diagnostics.executables = [];
+  diagnostics.blocked = [];
   diagnostics.fatal = undefined;
 
   // 自检工具总是注册：即使角色配置全错，也要能用它看到错在哪。
@@ -281,6 +297,12 @@ export function apply(ctx, config) {
 
   const maxDepth = typeof resolved.maxDepth === 'number' ? resolved.maxDepth : 3;
 
+  // 跨 CLI 派发的总开关。**默认关闭**：CLI 后端会真的在本机执行本地命令，
+  // 因此必须显式开启（`volatile.allowCrossCli`）。判定逻辑在纯函数
+  // `planCliMounts()` 里，以便离线测试覆盖。
+  const allowCrossCli = resolved.volatile?.allowCrossCli === true;
+  const { active: activeCliRoles, blocked: blockedCliRoles } = planCliMounts(roles, allowCrossCli);
+
   // 注册 CLI 角色各自的 provider 实例。
   //
   // 为什么**每个角色一个实例**而不是一个共享 provider：provider 的 `start()`
@@ -288,8 +310,16 @@ export function apply(ctx, config) {
   // 而角色级命令/参数模板/模型/强度各不相同。注册名必须与
   // `toolConfigFor()` 写进工具配置的 provider 名一致（由 check-cli.mjs 的
   // 跨模块断言锁住）。
-  const cliRoles = roles.filter((role) => role.backend === CLI_BACKEND);
-  for (const role of cliRoles) {
+  if (blockedCliRoles.length > 0) {
+    diagnostics.blocked = blockedCliRoles;
+    console.error(
+      `[${name}] ${blockedCliRoles.length} 个 CLI 角色未挂载（${blockedCliRoles[0].reason}）：` +
+        blockedCliRoles.map((b) => b.id).join(', ') +
+        '。CLI 后端会在本机执行外部命令，需显式开启后才挂载（设置面板可改）。',
+    );
+  }
+
+  for (const role of activeCliRoles) {
     try {
       const provider = createCliProvider({
         role,
@@ -307,7 +337,7 @@ export function apply(ctx, config) {
 
   // CLI 角色的**装载期**校验：把「命令根本不存在」这类问题在启动时就报出来，
   // 而不是等第一次派发。解析失败不阻断装载（可能依赖运行期 PATH），只作为诊断。
-  for (const role of cliRoles) {
+  for (const role of activeCliRoles) {
     Promise.resolve()
       .then(() => ctx.subprocess.resolveExecutable(role.cli.command, role.cli.env))
       .then((path) => {
