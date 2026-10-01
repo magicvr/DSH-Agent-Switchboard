@@ -108,13 +108,14 @@ const CLI_DRIVER_OPTIONS = [
   {
     id: 'grok',
     label: 'Grok CLI',
-    description: 'xAI Grok。非交互走 `-p/--single`，提示词是**参数**而非 stdin。只读用 `--permission-mode plan`。',
+    description:
+      'xAI Grok。非交互走 `-p/--single`；提示词写临时文件后用 `--prompt-file` 传入（`argv` 直接传多行提示词会被拒）。只读用 `--permission-mode plan`。',
     command: 'grok',
     prefixArgs: [],
-    promptDelivery: 'argv',
+    promptDelivery: 'promptFile',
     modelPlaceholder: 'grok-4.7',
     args: (readOnly) => [
-      '-p',
+      '--prompt-file',
       '{prompt}',
       '-m',
       '{model}',
@@ -804,7 +805,7 @@ window.__ModuleLoader__.load({
                 h(
                   'div',
                   { style: { flex: '0 0 150px' } },
-                  field('提示词传递', select('cliPromptDelivery', ['stdin', 'argv'])),
+                  field('提示词传递', select('cliPromptDelivery', ['stdin', 'argv', 'promptFile'])),
                 ),
                 h(
                   'div',

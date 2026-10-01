@@ -262,7 +262,10 @@ export const Config = z.object({
         cliCommand: z.string(),
         cliPrefixArgs: z.array(z.string()),
         cliArgs: z.array(z.string()),
-        cliPromptDelivery: z.union(['stdin', 'argv']),
+        // 取值必须与 `src/cli/argv.js` 的 `PROMPT_DELIVERY` 一致（有离线断言锁定）。
+        // `promptFile` 把提示词写进临时文件、只把**路径**放进 argv，因此不受
+        // 「argv 的值不得含换行」这条限制 —— 支持从文件读提示词的 CLI 应当用它。
+        cliPromptDelivery: z.union(['stdin', 'argv', 'promptFile']),
         cliCwd: z.string(),
         cliGraceMs: z.number().step(1).min(0),
         cliMaxOutputBytes: z.number().step(1).min(1),

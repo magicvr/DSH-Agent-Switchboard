@@ -17,7 +17,7 @@ import {
   resolveDriverPlaceholders,
   DRIVER_PLACEHOLDERS,
 } from '../src/cli/drivers.js';
-import { validateTemplate, buildInvocation } from '../src/cli/argv.js';
+import { validateTemplate, buildInvocation, PROMPT_DELIVERY } from '../src/cli/argv.js';
 
 let pass = 0;
 let fail = 0;
@@ -63,31 +63,33 @@ section('驱动表结构');
     check(`${d.id}：args 是函数`, typeof d.args === 'function');
     check(
       `${d.id}：promptDelivery 合法`,
-      d.promptDelivery === 'stdin' || d.promptDelivery === 'argv',
-      String(d.promptDelivery),
+      PROMPT_DELIVERY.includes(d.promptDelivery),
+      `${String(d.promptDelivery)}（合法值：${PROMPT_DELIVERY.join(' / ')}）`,
     );
   }
 }
 
 section('`{prompt}` 与传递方式必须自洽');
 {
-  // `argv` 传递要求模板里**必须**有 `{prompt}`，否则提示词永远不会被传给子进程；
-  // `stdin` 传递要求**不能**把 `{prompt}` 放进参数（会变成空参数或被误拼）。
+  // - `stdin`：模板**不能**含 `{prompt}`（否则提示词会被传两次）；
+  // - `argv` / `promptFile`：模板**必须**含 `{prompt}`
+  //   （前者传提示词本身，后者传临时文件路径）——
+  //   否则提示词永远不会到达子进程。
   for (const d of CLI_DRIVERS) {
     if (d.id === 'custom') continue;
     for (const readOnly of [true, false]) {
       const args = d.args(readOnly);
       const hasPrompt = args.some((a) => a.includes('{prompt}'));
-      if (d.promptDelivery === 'argv') {
+      if (d.promptDelivery === 'stdin') {
         check(
-          `${d.id}(readOnly=${readOnly})：argv 传递时模板含 {prompt}`,
-          hasPrompt,
+          `${d.id}(readOnly=${readOnly})：stdin 传递时模板不含 {prompt}`,
+          !hasPrompt,
           JSON.stringify(args),
         );
       } else {
         check(
-          `${d.id}(readOnly=${readOnly})：stdin 传递时模板不含 {prompt}`,
-          !hasPrompt,
+          `${d.id}(readOnly=${readOnly})：${d.promptDelivery} 传递时模板含 {prompt}`,
+          hasPrompt,
           JSON.stringify(args),
         );
       }
@@ -147,7 +149,13 @@ section('cliFieldsFor：产出完整且可用的四件套');
 
 section('占位符解析：{node} / {npmRoot} 必须变成真实路径，且不得残留');
 {
-  check('{node} 解析为 node 可执行文件', resolveDriverPlaceholders('{node}') === process.execPath);
+  // ⚠️ 断言「解析结果是一个**真实 node**」，而不是「等于 `process.execPath`」。
+  //    在 DSH 里 `process.execPath` 指向 Electron 应用本体
+  //    （`…\DeepSeek Harness.exe`），我们刻意改用 PATH 上的真实 node
+  //    （见 drivers.js 的说明），因此写死 execPath 会假失败。
+  const resolvedNode = resolveDriverPlaceholders('{node}');
+  check('{node} 解析为 node 可执行文件', /(^|[\\/])node(\.exe)?$/i.test(resolvedNode), resolvedNode);
+  check('{node} 不解析为 Electron/DSH 应用本体', !/DeepSeek Harness/i.test(resolvedNode), resolvedNode);
   check('{npmRoot} 解析为非空路径', resolveDriverPlaceholders('{npmRoot}').length > 0);
   for (const [key] of Object.entries(DRIVER_PLACEHOLDERS)) {
     check(`解析后不残留 {${key}}`, !resolveDriverPlaceholders(`x{${key}}y`).includes(`{${key}}`));
@@ -211,7 +219,7 @@ section('inferCliDriver：反推必须与选择一致，自定义不得被误认
   // 反推不能依赖这个前提（否则换一层投影就会重新「锁死」）。
   const resolvedForm = {
     ...cliFieldsFor('codex', true),
-    cliCommand: process.execPath,
+    cliCommand: resolveDriverPlaceholders('{node}'),
     cliPrefixArgs: cliFieldsFor('codex', true).cliPrefixArgs.map(resolveDriverPlaceholders),
   };
   check(
@@ -230,7 +238,11 @@ section('端到端拼装：驱动产出的字段经 buildInvocation 得到正确
     args: codex.cliArgs,
     values: { model: 'gpt-6-luna', effort: 'medium', cwd: 'C:/w', prompt: 'P' },
   }).argv;
-  check('codex：argv[0] 是 node', argv[0] === process.execPath, String(argv[0]));
+  check(
+    'codex：argv[0] 是 node',
+    /(^|[\\/])node(\.exe)?$/i.test(String(argv[0])),
+    String(argv[0]),
+  );
   check('codex：argv[1] 是 codex.js', String(argv[1]).endsWith('codex.js'), String(argv[1]));
   check('codex：含 exec 子命令', argv.includes('exec'));
   check('codex：只读时含 -s read-only', argv.includes('-s') && argv.includes('read-only'), JSON.stringify(argv));

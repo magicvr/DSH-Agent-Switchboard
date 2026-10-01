@@ -6,6 +6,7 @@ import {
   createCliProvider,
   promptText,
 } from '../src/cli/provider.js';
+import { existsSync } from 'node:fs';
 
 let pass = 0;
 let fail = 0;
@@ -166,6 +167,32 @@ section('argv 与 stdio：argv 模式');
 
   check('argv 模式：提示词进入 argv', calls[0].argv.includes('task text'), JSON.stringify(calls[0].argv));
   check('argv 模式：stdin 为 ignore', calls[0].stdio.stdin === 'ignore');
+}
+
+section('argv 与 stdio：promptFile 模式');
+{
+  // 为什么需要这个模式：`argv` 模式把提示词当命令行参数，而**参数值不得含换行**
+  // （见 cli/argv.js），真实提示词几乎都是多行的。`promptFile` 把提示词写进临时文件、
+  // 只把**路径**放进 argv，从而绕开该限制。grok 就依赖它（`--prompt-file`）。
+  const role = codexRole({ promptDelivery: 'promptFile', args: ['--prompt-file', '{prompt}'] });
+  const { spawn, calls } = makeSpawn({ stdout: 'OK' });
+  const p = createCliProvider({ role, spawn });
+  // 刻意用**多行**提示词：这正是 argv 模式会失败的输入。
+  await (await p.start({ prompt: textPrompt('第一行\n第二行') })).result;
+
+  const argv = calls[0].argv;
+  const fileIdx = argv.indexOf('--prompt-file');
+  check('promptFile 模式：含 --prompt-file', fileIdx !== -1, JSON.stringify(argv));
+  const path = fileIdx === -1 ? undefined : argv[fileIdx + 1];
+  check('promptFile 模式：其后是一个文件路径', typeof path === 'string' && path.length > 0, String(path));
+  check('promptFile 模式：提示词本体**不进** argv', !argv.some((a) => a.includes('第一行')), JSON.stringify(argv));
+  check(
+    'promptFile 模式：路径不含换行（这正是它能绕开限制的原因）',
+    typeof path === 'string' && !/[\n\r]/.test(path),
+    String(path),
+  );
+  check('promptFile 模式：stdin 为 ignore（提示词走文件，不走 stdin）', calls[0].stdio.stdin === 'ignore');
+  check('promptFile 模式：运行结束后临时文件已清理', path !== undefined && !existsSync(path), String(path));
 }
 
 section('路由事实被抽入 structured 与正文');

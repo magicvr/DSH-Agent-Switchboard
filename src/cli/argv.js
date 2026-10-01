@@ -62,19 +62,29 @@ export function findUnknownPlaceholders(template) {
 /**
  * 提示词的传送方式。
  *
- * `stdin` 是**首选**：提示词不进入命令行，因此不受命令行长度限制、不参与任何
- * 参数解析、也不可能被误当成选项。实测 `codex exec -` 即从此路径读取。
+ * - `stdin`（**首选**）：提示词不进入命令行，因此不受命令行长度限制、不参与任何参数
+ *   解析、也不可能被误当成选项。实测 `codex exec -` 即从此路径读取。
+ * - `argv`：仅在某个 CLI 既不支持 stdin、也没有「从文件读」时使用，模板必须含 `{prompt}`。
+ *   ⚠️ **此模式下提示词不能含换行**（见 `unsafeReason`），因为换行会破坏「单 argv 元素」
+ *   前提。实测踩到：grok 用 `-p <提示词>` 时，多行提示词直接报
+ *   「占位符 {prompt} 的值含换行或 NUL」。**绝大多数真实提示词都是多行的**，
+ *   因此这个模式实际上只适合单行极短提示。
+ * - `promptFile`：把提示词写进一个临时文件，模板里的 `{prompt}` 取值为**该文件路径**
+ *   （路径不含换行，因此不受 `argv` 的限制）。适用于「支持从文件读提示词」的 CLI
+ *   —— 实测 grok 有 `--prompt-file <PATH>`。
  *
- * `argv` 仅在某个 CLI 不支持从 stdin 读取时才使用，此时模板必须含 `{prompt}`。
+ * 注意 `promptFile` **复用 `{prompt}` 占位符**，不新增占位符名：这样
+ * `PLACEHOLDERS` 这套受限词汇表保持不变（`AGENTS.md` 硬规则 4），
+ * 只是同一个占位符在不同传递方式下承载的值不同。
  */
-export const PROMPT_DELIVERY = Object.freeze(['stdin', 'argv']);
+export const PROMPT_DELIVERY = Object.freeze(['stdin', 'argv', 'promptFile']);
 
 /**
  * 校验参数模板本身是否可用（与具体取值无关）。
  *
  * @param {unknown} template - 候选模板。
  * @param {object} [options] - 校验选项。
- * @param {'stdin'|'argv'} [options.promptDelivery] - 提示词传送方式，默认 stdin。
+ * @param {'stdin'|'argv'|'promptFile'} [options.promptDelivery] - 提示词传送方式，默认 stdin。
  * @returns {string[]} 错误列表；空数组表示合法。
  */
 export function validateTemplate(template, { promptDelivery = 'stdin' } = {}) {
@@ -95,11 +105,12 @@ export function validateTemplate(template, { promptDelivery = 'stdin' } = {}) {
   }
 
   const hasPromptPlaceholder = template.some((element) => element.includes('{prompt}'));
-  if (promptDelivery === 'argv' && !hasPromptPlaceholder) {
-    errors.push('promptDelivery 为 argv 时，args 必须包含 {prompt}');
+  // `argv` 与 `promptFile` 都必须把提示词（或其文件路径）放进参数里，因此都要有 `{prompt}`；
+  // `stdin` 时反过来**不应**有 —— 否则提示词会被传两次。
+  if ((promptDelivery === 'argv' || promptDelivery === 'promptFile') && !hasPromptPlaceholder) {
+    errors.push(`promptDelivery 为 ${promptDelivery} 时，args 必须包含 {prompt}`);
   }
   if (promptDelivery === 'stdin' && hasPromptPlaceholder) {
-    // 不算错误，但值得提示：两种方式同时存在会让提示词被传两次。
     errors.push('promptDelivery 为 stdin 时，args 不应包含 {prompt}（提示词会被传两次）');
   }
   return errors;

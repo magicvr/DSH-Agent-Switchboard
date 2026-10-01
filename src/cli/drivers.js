@@ -36,6 +36,10 @@
 //
 // 用占位符而不是硬编码绝对路径：`{node}` 与 `{npmRoot}` 在装载期解析，
 // 这样预设不必把本机用户名写进仓库（`AGENTS.md` 硬规则 5）。
+//
+// ⚠️ 本模块只依赖 `node:fs`，**不 import 任何 DSH 运行时**：
+// 它会被 `roles.js`（纯函数模块）与 Client 半边镜像引用，必须能在 Node 里直接单测。
+import { existsSync } from 'node:fs';
 
 /**
  * 提示词传递方式。
@@ -60,11 +64,59 @@
 
 /** `{node}` / `{npmRoot}` 的解析规则。 */
 export const DRIVER_PLACEHOLDERS = {
-  /** Node 可执行文件自身；codex 必须以 `node codex.js` 形式调用。 */
-  node: () => process.execPath,
+  /**
+   * Node 可执行文件；codex 必须以 `node codex.js` 形式调用。
+   *
+   * ⚠️ **优先用 PATH 上的真实 node，而不是 `process.execPath`。**
+   *
+   * 实测：在 DSH 里 `process.execPath` 指向的是 **Electron 应用本体**
+   * （`…\Programs\DeepSeek Harness\DeepSeek Harness.exe`）。拿它去跑 `codex.js`
+   * **确实能跑通**（Electron 在 Node 模式下执行，实测 exit=0），但那依赖应用自身的
+   * 启动方式；一旦环境变化，失败形态会很难理解（「用记事本打开 .js」那类）。
+   *
+   * 先用 PATH 上的 `node`（本机实测存在：`C:\Program Files\nodejs\node.exe`），
+   * 找不到才回落到 `process.execPath`。这样默认路径是最可预期的那个。
+   */
+  node: () => resolveNodeExecutable(),
   /** npm 全局包根目录。 */
   npmRoot: () => `${process.env.APPDATA ?? ''}\\npm\\node_modules`,
 };
+
+/**
+ * 找一个「能被 spawn 的真实 node」。
+ *
+ * @returns {string} node 可执行文件路径；找不到时回落到 `process.execPath`。
+ */
+function resolveNodeExecutable() {
+  return whichNode() ?? process.execPath;
+}
+
+/**
+ * 在 `PATH` 上查找 `node`。
+ *
+ * 刻意**手写目录扫描**而不是起 `where` / `which` 子进程：占位符解析会在
+ * `normalizeRole` 里被调用，那里必须是**纯函数**（可离线测试、无副作用）。
+ * 起子进程既慢，又会让单测依赖外部环境。
+ *
+ * @returns {string|undefined} 绝对路径，或 undefined 表示未找到。
+ */
+function whichNode() {
+  const pathValue = process.env.PATH ?? process.env.Path ?? '';
+  const separator = process.platform === 'win32' ? ';' : ':';
+  const exts = process.platform === 'win32' ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';') : [''];
+  for (const dir of pathValue.split(separator)) {
+    if (dir.trim().length === 0) continue;
+    for (const ext of exts) {
+      const candidate = `${dir.replace(/[\\/]+$/, '')}${process.platform === 'win32' ? '\\' : '/'}node${ext}`;
+      try {
+        if (existsSync(candidate)) return candidate;
+      } catch {
+        /* 路径非法或无权限：跳过 */
+      }
+    }
+  }
+  return undefined;
+}
 
 /**
  * 已知驱动。
@@ -106,16 +158,23 @@ export const CLI_DRIVERS = [
   {
     id: 'grok',
     label: 'Grok CLI',
-    description: 'xAI Grok。非交互走 `-p/--single`，提示词是**参数**而非 stdin。只读用 `--permission-mode plan`。',
+    description:
+      'xAI Grok。非交互走 `-p/--single`；提示词写临时文件后用 `--prompt-file` 传入（`argv` 直接传多行提示词会被拒）。只读用 `--permission-mode plan`。',
     command: 'grok',
     prefixArgs: [],
-    // ⚠️ grok 的 `-p/--single <PROMPT>` 需要提示词作为参数，因此 `{prompt}` 必须出现在 args 里。
-    promptDelivery: 'argv',
+    // ⚠️ 必须是 `promptFile`，不能是 `argv`。
+    //
+    // 实测：`argv` 模式下提示词作为命令行参数传入，而参数值**不得含换行**（否则破坏
+    // 「单 argv 元素」前提，插件会直接拒绝）。真实提示词几乎都是多行的，因此
+    // grok 用 `-p <提示词>` 时**必然失败**：
+    //   参数模板错误：占位符 {prompt} 的值含换行或 NUL
+    // 改用 grok 自己的 `--prompt-file <PATH>`：提示词落文件，argv 里只出现路径。
+    promptDelivery: 'promptFile',
     // 实测 `grok models`：grok-4.7（默认）/ grok-4.7-build-fast / grok-4.6 / grok-4.5
     modelPlaceholder: 'grok-4.7',
     effortValues: ['low', 'medium', 'high', 'xhigh', 'max'],
     args: (readOnly) => [
-      '-p',
+      '--prompt-file',
       '{prompt}',
       '-m',
       '{model}',

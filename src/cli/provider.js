@@ -24,6 +24,27 @@
  */
 import { buildInvocation } from './argv.js';
 import { formatRunResult } from './output.js';
+import { writeFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
+
+/**
+ * 删掉 `promptFile` 模式用的临时提示词文件。
+ *
+ * 刻意**吞掉失败**：清理失败不该覆盖真正的运行结果（用户更关心退出码与输出）。
+ * 文件名带随机 UUID，因此即使残留也不会与别的派发相撞。
+ *
+ * @param {string|undefined} path - 临时文件路径；undefined 时什么都不做。
+ */
+function cleanupPromptFile(path) {
+  if (typeof path !== 'string' || path.length === 0) return;
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    /* 清理失败不影响结果 */
+  }
+}
 
 /**
  * 一个 CLI 角色对应的 provider 实例名。
@@ -122,14 +143,34 @@ export function createCliProvider({
       // 若不在这里拼进去，CLI 子代理就完全不知道自己的角色 —— 而「带角色的子代理」
       // 正是本插件的核心。这与 builtin 后端机制不同但效果等价。
       //
-      // ⚠️ **只在 stdin 模式前置**：argv 模式的值不得含换行（见 cli/argv.js 的安全
-      // 约束），而角色指令几乎必然是多行的。因此在 argv 模式下，多行提示词**无法**
-      // 经命令行传递 —— 这是命令行传参的固有限制，不是可以绕过的实现细节。
-      // 需要多行角色的 CLI 必须支持从 stdin 读取提示词（codex 支持）。
+      // ⚠️ **`argv` 模式例外**：该模式下提示词作为**命令行参数**传入，而参数值不得含换行
+      // （见 cli/argv.js 的安全约束），角色指令几乎必然是多行的，塞进去只会让整次派发
+      // 以「占位符值含换行」失败。因此在 `argv` 模式下不前置角色指令 ——
+      // 这是命令行传参的固有限制。**要用带角色的 CLI 派发，就别用 `argv` 模式**
+      // （用 `stdin`，或 CLI 支持从文件读时的 `promptFile`）。
+      const canCarryRole = cli.promptDelivery === 'stdin' || cli.promptDelivery === 'promptFile';
       const withRole =
-        cli.promptDelivery === 'stdin' && role.instructions && role.instructions.trim().length > 0
+        canCarryRole && role.instructions && role.instructions.trim().length > 0
           ? `${role.instructions.trim()}\n\n---\n\n${taskText}`
           : taskText;
+
+      // `promptFile`：把提示词写进临时文件，模板里的 `{prompt}` 取值为**该文件路径**。
+      //
+      // 为什么需要这个模式：`argv` 模式的提示词不能含换行，而绝大多数真实提示词是多行的
+      // —— 实测 grok 用 `-p <多行提示词>` 直接报
+      // 「占位符 {prompt} 的值含换行或 NUL」。grok 支持 `--prompt-file <PATH>`，
+      // 于是把提示词落到文件、只把路径放进 argv，限制就绕开了。
+      let promptFilePath;
+      if (cli.promptDelivery === 'promptFile') {
+        try {
+          promptFilePath = join(tmpdir(), `switchboard-prompt-${randomUUID()}.txt`);
+          writeFileSync(promptFilePath, withRole, 'utf8');
+        } catch (error) {
+          return failedRun(
+            `无法写入提示词临时文件：${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
 
       // 可执行文件解析：优先交给调用方提供的解析器（它了解 DSH 的执行世界），
       // 失败则退回配置里的字面命令。
@@ -150,7 +191,13 @@ export function createCliProvider({
           prefixArgs: cli.prefixArgs ?? [],
           args: cli.args,
           values: {
-            prompt: cli.promptDelivery === 'argv' ? withRole : undefined,
+            // `argv` 传提示词本身；`promptFile` 传的是**文件路径**（不含换行，天然安全）。
+            prompt:
+              cli.promptDelivery === 'argv'
+                ? withRole
+                : cli.promptDelivery === 'promptFile'
+                  ? promptFilePath
+                  : undefined,
             cwd: cli.cwd,
             // 模型与强度取自角色顶层，与 builtin 后端共用同一组字段（见模块文档）。
             model: role.model,
@@ -158,13 +205,14 @@ export function createCliProvider({
           },
         });
       } catch (error) {
+        cleanupPromptFile(promptFilePath);
         return failedRun(`参数模板错误：${error.message}`);
       }
 
       // 组装 stdio：提示词走 stdin 时用 `{ data }` 形式，一次性写入后关闭；
       // 否则 ignore，避免外部 CLI 误等输入。
       const stdinMode =
-        cli.promptDelivery === 'argv' ? 'ignore' : { data: withRole };
+        cli.promptDelivery === 'stdin' ? { data: withRole } : 'ignore';
 
       let handle;
       // 单次派发的超时。
@@ -213,11 +261,14 @@ export function createCliProvider({
         });
       } catch (error) {
         if (timer !== undefined) clearTimeout(timer);
+        cleanupPromptFile(promptFilePath);
         return failedRun(`无法启动 CLI：${error instanceof Error ? error.message : String(error)}`);
       }
 
       const outcome = await handle.done;
       if (timer !== undefined) clearTimeout(timer);
+      // 提示词临时文件已经用不上了（进程已结束），尽早删掉。
+      cleanupPromptFile(promptFilePath);
       const durationMs = now() - startedAt;
       const stdout = readCollected(handle.collected?.stdout);
       const stderr = readCollected(handle.collected?.stderr);

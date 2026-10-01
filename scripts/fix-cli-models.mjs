@@ -25,15 +25,24 @@
 //   node scripts/fix-cli-models.mjs --apply
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { parse } from 'yaml';
+// 用**驱动表本身**产出参数模板，而不是在这里再写一份 ——
+// 界面「一键填好」用的也是这个函数，因此脚本改出来的值与界面一致（有漂移断言锁定）。
+import { cliFieldsFor } from '../src/cli/drivers.js';
 
 const PATCH = 'C:/Users/magicvr/.dsh/profiles/desktop/cordis.patch.yml';
 const ROLES_FILE = 'C:/Users/magicvr/.dsh/agent-switchboard/roles.json';
 const CWD_VALUE = 'C:\\Users\\magicvr\\Documents\\Code\\DSH-Agent-Switchboard';
 const mode = process.argv.includes('--apply') ? 'apply' : 'check';
 
-/** 期望的「角色 → 模型」修正表。只列需要改的；`worker` 已实测可用故不动。 */
+/**
+ * 期望的「角色 → 字段修正」。只列需要改的；`worker` 的模型已实测可用故不动。
+ *
+ * `promptDelivery: 'promptFile'` 是**必须**的（不是偏好）：实测 grok 用 `argv` 模式传
+ * 多行提示词会直接报「占位符 {prompt} 的值含换行或 NUL」，而真实提示词几乎都是多行的。
+ * 改用 grok 自己的 `--prompt-file`（已实测支持多行）后该限制消失。
+ */
 const WANTED = {
-  scout: { driver: 'grok', model: 'grok-4.7' },
+  scout: { driver: 'grok', model: 'grok-4.7', promptDelivery: 'promptFile' },
 };
 
 let pass = 0;
@@ -110,42 +119,95 @@ if (!hasCwd) {
   console.log('  根条目已有 cwd，无需插入');
 }
 
-// --- 改动 2：角色 model（只在根条目块内）--------------------------------------
-const modelChanges = [];
+// --- 改动 2：角色字段（model / cliPromptDelivery / cliArgs）--------------------
+//
+// 都**只在根条目块内**按行定位：先前用 `indexOf` 猜位置时匹配到了文件里另一处同名字段，
+// 把 YAML 写坏过（见文件头的说明）。
+const fieldChanges = [];
 {
-  // 先找出每个角色在文件里的行号（只搜根条目块）。
   for (const r of roles) {
     const want = WANTED[r.id];
-    if (want === undefined || r.model === want.model) continue;
+    if (want === undefined) continue;
     const idRel = next.slice(rootLine).findIndex((l) => new RegExp(`^\\s*-\\s*id:\\s*${r.id}\\s*$`).test(l));
     if (idRel === -1) {
       console.error(`FAIL  按行定位角色 ${r.id} 失败`);
       process.exit(1);
     }
     const idAbs = rootLine + idRel;
-    // 该角色的 `- id:` 之后、下一个 `- id:` 之前，找 `model:`。
-    let modelAbs = -1;
-    for (let i = idAbs + 1; i < next.length && i < rootEnd + 1; i++) {
-      if (/^\s*-\s*id:\s*/.test(next[i])) break;
-      if (/^\s*model:\s*/.test(next[i])) {
-        modelAbs = i;
+    // 该角色的范围：`- id:` 之后到下一个 `- id:` 之前。
+    let segEnd = next.length;
+    for (let i = idAbs + 1; i < next.length; i++) {
+      if (/^\s*-\s*id:\s*/.test(next[i])) {
+        segEnd = i;
         break;
       }
     }
-    if (modelAbs === -1) {
-      console.error(`FAIL  按行定位 ${r.id} 的 model 行失败`);
-      process.exit(1);
+    /** 在角色段内找某个顶层字段的行号。 */
+    const findField = (name) => {
+      for (let i = idAbs + 1; i < segEnd; i++) {
+        if (new RegExp(`^\\s*${name}:\\s*`).test(next[i])) return i;
+      }
+      return -1;
+    };
+    const setScalar = (name, value) => {
+      const at = findField(name);
+      if (at === -1) {
+        console.error(`FAIL  ${r.id} 里找不到 ${name}: 行`);
+        process.exit(1);
+      }
+      const indent = /^(\s*)/.exec(next[at])[1];
+      const from = next[at].trim();
+      next[at] = `${indent}${name}: ${value}`;
+      fieldChanges.push({ id: r.id, field: name, from, to: `${name}: ${value}`, line: at });
+    };
+
+    if (want.model !== undefined && r.model !== want.model) setScalar('model', want.model);
+    if (want.promptDelivery !== undefined && r.cliPromptDelivery !== want.promptDelivery) {
+      setScalar('cliPromptDelivery', want.promptDelivery);
     }
-    const indent = /^(\s*)/.exec(next[modelAbs])[1];
-    modelChanges.push({ id: r.id, from: r.model, to: want.model, line: modelAbs });
-    next[modelAbs] = `${indent}model: ${want.model}`;
+    // `cliArgs` 必须与驱动模板一致；否则界面反推不出驱动（会显示「自定义命令」）。
+    if (want.model !== undefined) {
+      const fields = cliFieldsFor(want.driver, r.readOnly === true);
+      if (fields !== undefined && JSON.stringify(r.cliArgs) !== JSON.stringify(fields.cliArgs)) {
+        const at = findField('cliArgs');
+        if (at === -1) {
+          console.error(`FAIL  ${r.id} 里找不到 cliArgs: 行`);
+          process.exit(1);
+        }
+        // 该数组可能是多行块；找到它的结束位置（缩进回到同级或更浅）。
+        const indent = /^(\s*)/.exec(next[at])[1];
+        let end = at + 1;
+        while (end < segEnd) {
+          const l = next[end];
+          if (l.trim().length === 0) {
+            end++;
+            continue;
+          }
+          if (l.length - l.trimStart().length <= indent.length) break;
+          end++;
+        }
+        const replacement = [`${indent}cliArgs:`, ...fields.cliArgs.map((a) => `${indent}  - ${JSON.stringify(a)}`)];
+        next.splice(at, end - at, ...replacement);
+        // 插删之后，后面记录的行号会偏移，但本脚本只用一次，故不修正已记录的 line。
+        fieldChanges.push({
+          id: r.id,
+          field: 'cliArgs',
+          from: `${r.cliArgs?.length ?? 0} 项`,
+          to: `${fields.cliArgs.length} 项`,
+          line: at,
+        });
+        segEnd += replacement.length - (end - at);
+      }
+    }
   }
 }
 
 console.log('\n将要做出的改动：');
-for (const c of modelChanges) console.log(`  ${c.id}: model ${c.from} → ${c.to}（第 ${c.line + 1} 行）`);
+for (const c of fieldChanges) {
+  console.log(`  ${c.id}.${c.field}: ${c.from} → ${c.to}`);
+}
 if (cwdChange) console.log(`  根条目补上 cwd: ${CWD_VALUE}`);
-if (modelChanges.length === 0 && !cwdChange) console.log('  （无改动）');
+if (fieldChanges.length === 0 && !cwdChange) console.log('  （无改动）');
 
 if (mode === 'check') {
   console.log('\n未写盘（加 --apply 才写）。');
@@ -182,6 +244,22 @@ for (const [id, want] of Object.entries(WANTED)) {
   check(`${id} 的 model == ${want.model}`, r?.model === want.model, String(r?.model));
   check(`${id} 仍是 cli 后端`, r?.backend === 'cli', String(r?.backend));
   check(`${id} 的 driver 未被改动`, r?.cliDriver === want.driver, String(r?.cliDriver));
+  if (want.promptDelivery !== undefined) {
+    check(
+      `${id} 的 cliPromptDelivery == ${want.promptDelivery}`,
+      r?.cliPromptDelivery === want.promptDelivery,
+      String(r?.cliPromptDelivery),
+    );
+  }
+  // 参数模板必须与驱动表**逐项一致**，否则界面反推不出驱动（会显示「自定义命令」）。
+  const expectFields = cliFieldsFor(want.driver, r?.readOnly === true);
+  if (expectFields !== undefined) {
+    check(
+      `${id} 的 cliArgs 与驱动表一致`,
+      JSON.stringify(r?.cliArgs) === JSON.stringify(expectFields.cliArgs),
+      JSON.stringify(r?.cliArgs),
+    );
+  }
 }
 const architect = (afterRoot?.config?.roles ?? []).find((x) => x.id === 'architect');
 check('未列出的角色未被改动', architect?.model === 'gpt-6-astra', String(architect?.model));
@@ -210,7 +288,14 @@ if (existsSync(ROLES_FILE)) {
   const fileRoles = Array.isArray(fileCfg.roles) ? fileCfg.roles : [];
   fileCfg.roles = fileRoles.map((r) => {
     const want = WANTED[r.id];
-    return want === undefined ? r : { ...r, model: want.model };
+    if (want === undefined) return r;
+    const fields = cliFieldsFor(want.driver, r.readOnly === true);
+    return {
+      ...r,
+      ...(want.model === undefined ? {} : { model: want.model }),
+      ...(want.promptDelivery === undefined ? {} : { cliPromptDelivery: want.promptDelivery }),
+      ...(fields === undefined ? {} : { cliPrefixArgs: fields.cliPrefixArgs, cliArgs: fields.cliArgs }),
+    };
   });
   if (typeof fileCfg.cwd !== 'string' || fileCfg.cwd.length === 0) fileCfg.cwd = CWD_VALUE;
   copyFileSync(ROLES_FILE, `${ROLES_FILE}.bak-fix-cli-models`);
