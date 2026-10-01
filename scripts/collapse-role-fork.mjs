@@ -16,12 +16,16 @@
 //   node scripts/collapse-role-fork.mjs --apply [--drop <id>]
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { parse } from 'yaml';
+import { parsePathArgs, resolvePaths, printPaths } from './lib/paths.mjs';
 
-const PROFILE = 'C:/Users/magicvr/.dsh/profiles/desktop/cordis.patch.yml';
+const pathFlags = ['home', 'profile', 'patch', 'roles-file'];
+const options = parsePathArgs(process.argv.slice(2).filter(a => !['--apply', '--check'].includes(a)), [...pathFlags, 'drop']);
+const paths = resolvePaths({ argv: Object.entries(options).filter(([k]) => pathFlags.includes(k)).flatMap(([k, v]) => [`--${k}`, v]) });
+printPaths(paths);
+const PROFILE = paths.patch;
 const SELF = '@magicvr/dsh-agent-switchboard';
 const mode = process.argv.includes('--apply') ? 'apply' : 'check';
-const dropIdx = process.argv.indexOf('--drop');
-const dropId = dropIdx === -1 ? 'codex-scout' : process.argv[dropIdx + 1];
+const dropId = options.drop ?? 'codex-scout';
 
 if (!existsSync(PROFILE)) {
   console.error(`FAIL  找不到 ${PROFILE}`);

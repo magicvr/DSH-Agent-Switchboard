@@ -28,10 +28,17 @@ import { parse } from 'yaml';
 // 用**驱动表本身**产出参数模板，而不是在这里再写一份 ——
 // 界面「一键填好」用的也是这个函数，因此脚本改出来的值与界面一致（有漂移断言锁定）。
 import { cliFieldsFor } from '../src/cli/drivers.js';
+import { parsePathArgs, resolvePaths, printPaths } from './lib/paths.mjs';
 
-const PATCH = 'C:/Users/magicvr/.dsh/profiles/desktop/cordis.patch.yml';
-const ROLES_FILE = 'C:/Users/magicvr/.dsh/agent-switchboard/roles.json';
-const CWD_VALUE = 'C:\\Users\\magicvr\\Documents\\Code\\DSH-Agent-Switchboard';
+const pathArgv = process.argv.slice(2).filter(a => !['--apply', '--check'].includes(a));
+const options = parsePathArgs(pathArgv, ['home', 'profile', 'patch', 'roles-file', 'cwd']);
+const paths = resolvePaths({ argv: pathArgv });
+printPaths(paths);
+const PATCH = paths.patch;
+const ROLES_FILE = paths.roles;
+if (Object.hasOwn(options, 'roles-file') && !existsSync(ROLES_FILE)) {
+  throw new Error(`找不到显式 roles 文件：${ROLES_FILE}`);
+}
 const mode = process.argv.includes('--apply') ? 'apply' : 'check';
 
 /**
@@ -73,6 +80,8 @@ if (root === undefined) {
   process.exit(1);
 }
 const roles = root.config?.roles ?? [];
+const CWD_VALUE = Object.hasOwn(options, 'cwd') ? paths.cwd : root.config?.cwd || paths.repoRoot;
+console.log(`配置 cwd: ${CWD_VALUE} [${Object.hasOwn(options, 'cwd') ? '--cwd' : root.config?.cwd ? '目标配置已有 cwd' : '仓库根（模块 URL）'}]`);
 
 console.log('当前角色：');
 for (const r of roles) {
@@ -101,18 +110,28 @@ const next = [...lines];
 
 // --- 改动 1：根条目补 `cwd`（若缺）-------------------------------------------
 const rootSeg = next.slice(rootLine, rootEnd);
-const hasCwd = rootSeg.some((l) => /^\s+cwd:/.test(l));
+// 只定位 config 的直接子字段，不能把角色或其他子树的 cwd 当作根 cwd。
+const configRel = rootSeg.findIndex(l => /^  config:\s*$/.test(l));
+if (configRel === -1) throw new Error('FAIL  找不到根条目的 config: 行');
+const configIndent = /^(\s*)/.exec(rootSeg[configRel])[1].length + 2;
+let configEnd = configRel + 1;
+while (configEnd < rootSeg.length && (rootSeg[configEnd].trim() === '' || rootSeg[configEnd].length - rootSeg[configEnd].trimStart().length >= configIndent)) configEnd++;
+const cwdRel = rootSeg.findIndex((l, i) => i > configRel && i < configEnd && new RegExp(`^ {${configIndent}}cwd:`).test(l));
+const hasCwd = cwdRel !== -1;
 let cwdChange = false;
-if (!hasCwd) {
+if (hasCwd && (Object.hasOwn(options, 'cwd') || !root.config?.cwd)) {
+  next[rootLine + cwdRel] = `${' '.repeat(configIndent)}cwd: ${JSON.stringify(CWD_VALUE)}`;
+  cwdChange = true;
+} else if (!hasCwd) {
   // 插在根条目的 `provider:` 行之后；缩进沿用该行（`config:` 下两级）。
-  const provRel = rootSeg.findIndex((l) => /^\s+provider:\s*/.test(l));
+  const provRel = rootSeg.findIndex((l, i) => i > configRel && i < configEnd && new RegExp(`^ {${configIndent}}provider:\\s*`).test(l));
   if (provRel === -1) {
     console.error('FAIL  根条目里找不到 provider: 行，无法安全插入 cwd');
     process.exit(1);
   }
   const provAbs = rootLine + provRel;
   const indent = /^(\s*)/.exec(lines[provAbs])[1];
-  next.splice(provAbs + 1, 0, `${indent}cwd: ${CWD_VALUE}`);
+  next.splice(provAbs + 1, 0, `${indent}cwd: ${JSON.stringify(CWD_VALUE)}`);
   cwdChange = true;
   console.log(`  计划：在第 ${provAbs + 2} 行插入 cwd（缩进 ${indent.length} 空格）`);
 } else {
@@ -297,7 +316,7 @@ if (existsSync(ROLES_FILE)) {
       ...(fields === undefined ? {} : { cliPrefixArgs: fields.cliPrefixArgs, cliArgs: fields.cliArgs }),
     };
   });
-  if (typeof fileCfg.cwd !== 'string' || fileCfg.cwd.length === 0) fileCfg.cwd = CWD_VALUE;
+  if (Object.hasOwn(options, 'cwd') || typeof fileCfg.cwd !== 'string' || fileCfg.cwd.length === 0) fileCfg.cwd = CWD_VALUE;
   copyFileSync(ROLES_FILE, `${ROLES_FILE}.bak-fix-cli-models`);
   writeFileSync(ROLES_FILE, `${JSON.stringify(fileCfg, null, 2)}\n`, 'utf8');
   console.log(`已同步到 ${ROLES_FILE}（cwd=${fileCfg.cwd}）`);

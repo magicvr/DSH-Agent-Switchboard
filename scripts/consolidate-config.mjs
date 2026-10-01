@@ -13,8 +13,11 @@
 //   node scripts/consolidate-config.mjs --apply
 import { readFileSync, writeFileSync, copyFileSync } from 'node:fs';
 import { parse } from 'yaml';
+import { resolvePaths, printPaths } from './lib/paths.mjs';
 
-const PROFILE = 'C:/Users/magicvr/.dsh/profiles/desktop/cordis.patch.yml';
+const paths = resolvePaths({ argv: process.argv.slice(2).filter(a => !['--apply', '--check'].includes(a)) });
+printPaths(paths);
+const PROFILE = paths.patch;
 const mode = process.argv.includes('--apply') ? 'apply' : 'check';
 
 const original = readFileSync(PROFILE, 'utf8').replace(/\r\n/g, '\n');

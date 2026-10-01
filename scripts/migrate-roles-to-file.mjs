@@ -24,15 +24,21 @@
 //    角色就已经被替换掉了。此时只能从备份里取回角色。实测踩到过这一步。
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { parse } from 'yaml';
-import { configPathFor, readConfigFile, writeConfigFile, initialConfig } from '../src/config-file.js';
+import { readConfigFile, writeConfigFile, initialConfig } from '../src/config-file.js';
+import { join } from 'node:path';
+import { parsePathArgs, pathValue, resolvePaths, printPaths } from './lib/paths.mjs';
 
-const PROFILE = 'C:/Users/magicvr/.dsh/profiles/desktop/cordis.patch.yml';
-const DSH_HOME = 'C:/Users/magicvr/.dsh';
+const pathFlags = ['home', 'profile', 'patch', 'roles-file'];
+const options = parsePathArgs(process.argv.slice(2).filter(a => !['--apply', '--check'].includes(a)), [...pathFlags, 'seed-from']);
+const paths = resolvePaths({ argv: Object.entries(options).filter(([k]) => pathFlags.includes(k)).flatMap(([k, v]) => [`--${k}`, v]) });
+printPaths(paths);
+const PROFILE = paths.patch;
+// patch 是输入：即便有备份也不能绕过缺失的显式目标。
+if (!existsSync(PROFILE)) throw new Error(`找不到 patch：${PROFILE}`);
 const SELF = '@magicvr/dsh-agent-switchboard';
 const mode = process.argv.includes('--apply') ? 'apply' : 'check';
-const seedIdx = process.argv.indexOf('--seed-from');
 /** 显式指定的角色来源（用于从备份救援）。 */
-const seedFrom = seedIdx === -1 ? undefined : process.argv[seedIdx + 1];
+const seedFrom = options['seed-from'] === undefined ? undefined : pathValue(options['seed-from'], '--seed-from', process.cwd());
 
 /**
  * 从某个 patch 文件里取出本包的角色与默认值。
@@ -55,7 +61,7 @@ function readRolesFrom(path) {
   return { roles: self.config.roles, extra };
 }
 
-const configPath = configPathFor(DSH_HOME);
+const configPath = paths.roles;
 console.log(`配置文件目标：${configPath}`);
 
 // --- 1) 确定角色来源 -----------------------------------------------------------
@@ -68,12 +74,12 @@ if (source === undefined) {
   } else {
     console.log('当前 profile 里没有角色。尝试从最近的备份里取回……');
     const { readdirSync, statSync } = await import('node:fs');
-    const dir = 'C:/Users/magicvr/.dsh/profiles/desktop';
+    const dir = paths.profile;
     // ⚠️ 按**修改时间**倒序，不要按体积 —— 实测按体积会选中更早、更大的那份备份，
     //    从而把一个已经收敛掉的旧角色（codex-scout）又带了回来。
     const baks = readdirSync(dir)
       .filter((f) => f.startsWith('cordis.patch.yml') && f !== 'cordis.patch.yml')
-      .map((f) => `${dir}/${f}`)
+      .map((f) => join(dir, f))
       .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
     for (const candidate of baks) {
       const got = readRolesFrom(candidate);

@@ -14,12 +14,15 @@
 //   node scripts/seed-root-roles.mjs --apply
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { parse, stringify } from 'yaml';
+import { join } from 'node:path';
+import { resolvePaths, printPaths } from './lib/paths.mjs';
 
-const PROFILE_DIR = 'C:/Users/magicvr/.dsh/profiles/desktop';
-const PATCH = `${PROFILE_DIR}/cordis.patch.yml`;
-const PKG = `${PROFILE_DIR}/package.json`;
+const paths = resolvePaths({ argv: process.argv.slice(2).filter(a => !['--apply', '--check'].includes(a)) });
+printPaths(paths);
+const PATCH = paths.patch;
+const PKG = join(paths.profile, 'package.json');
 const SELF = '@magicvr/dsh-agent-switchboard';
-const ROLES_FILE = 'C:/Users/magicvr/.dsh/agent-switchboard/roles.json';
+const ROLES_FILE = paths.roles;
 const mode = process.argv.includes('--apply') ? 'apply' : 'check';
 
 let pass = 0;
@@ -49,7 +52,11 @@ if (!Array.isArray(doc)) {
   process.exit(1);
 }
 
+if (paths.explicitTarget && !existsSync(ROLES_FILE)) throw new Error(`FAIL  找不到显式目标 roles 文件：${ROLES_FILE}`);
 const roles = existsSync(ROLES_FILE) ? JSON.parse(readFileSync(ROLES_FILE, 'utf8')).roles : [];
+// package 也是输入；缺失或旧结构不符必须在写 patch 前失败。
+const pkg = JSON.parse(readFileSync(PKG, 'utf8'));
+if (!Array.isArray(pkg?.dsh?.profile?.bundles)) throw new Error('FAIL  package 缺少 dsh.profile.bundles 数组');
 console.log(`来源角色（${ROLES_FILE}）：${roles.length} 个 —— ${roles.map((r) => r.id).join(', ') || '（无）'}`);
 
 const existing = doc.find((op) => op?.id === 'agent-switchboard');
@@ -122,7 +129,6 @@ writeFileSync(PATCH, outText, 'utf8');
 console.log(`\n已写入 ${PATCH}`);
 
 // --- 写 package.json 的 bundles ------------------------------------------------
-const pkg = JSON.parse(readFileSync(PKG, 'utf8'));
 if (!pkg.dsh.profile.bundles.includes(SELF)) {
   pkg.dsh.profile.bundles.push(SELF);
   copyFileSync(PKG, `${PKG}.bak-seed-root`);

@@ -15,8 +15,11 @@
 //   node scripts/experiment-dormant.mjs --restore   用存档还原
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { parse } from 'yaml';
+import { resolvePaths, printPaths } from './lib/paths.mjs';
 
-const PROFILE = 'C:/Users/magicvr/.dsh/profiles/desktop/cordis.patch.yml';
+const paths = resolvePaths({ argv: process.argv.slice(2).filter(a => !['--apply', '--check', '--restore'].includes(a)) });
+printPaths(paths);
+const PROFILE = paths.patch;
 const ARCHIVE = `${PROFILE}.before-dormant-experiment`;
 const SELF = '@magicvr/dsh-agent-switchboard';
 const mode = process.argv.includes('--apply')

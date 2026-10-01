@@ -22,10 +22,11 @@
 //   node scripts/probe-preset.mjs --check   只校验将要注入的内容（不写盘）
 //   node scripts/probe-preset.mjs --inject  写盘（自动备份）
 import { readFileSync, writeFileSync } from 'node:fs';
+import { resolvePaths, printPaths } from './lib/paths.mjs';
 
-const PATCH = process.argv.includes('--patch')
-  ? process.argv[process.argv.indexOf('--patch') + 1]
-  : 'C:/Users/magicvr/.dsh/profiles/desktop/cordis.patch.yml';
+const paths = resolvePaths({ argv: process.argv.slice(2).filter(a => !['--check', '--inject'].includes(a)) });
+printPaths(paths);
+const PATCH = paths.patch;
 const PKG = '@magicvr/dsh-agent-switchboard';
 const PRESET_ID = 'preset-switchboard';
 

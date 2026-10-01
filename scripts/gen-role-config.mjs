@@ -3,9 +3,29 @@
 // 用法：node scripts/gen-role-config.mjs
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { parsePathArgs, pathValue, resolvePaths, printPaths } from './lib/paths.mjs';
 
-const ROOT = process.cwd();
-const AGENTS_DIR = join(ROOT, 'raw', 'agents');
+const pathFlags = ['home', 'profile', 'patch', 'roles-file'];
+const options = parsePathArgs(process.argv.slice(2).filter(a => a !== '--dry-run'), [...pathFlags, 'agents-dir', 'output', 'inject']);
+const pathArgv = Object.entries(options).filter(([k]) => pathFlags.includes(k)).flatMap(([k, v]) => [`--${k}`, v]);
+if (options.inject !== undefined) {
+  if (options.patch !== undefined && pathValue(options.patch, '--patch', process.cwd()) !== pathValue(options.inject, '--inject', process.cwd())) {
+    throw new Error('--patch 与 --inject 指向不同目标');
+  }
+  if (options.patch === undefined) pathArgv.push('--patch', options.inject);
+}
+const paths = resolvePaths({ argv: pathArgv });
+if (options.inject !== undefined && options.patch === undefined) paths.sources.patch = '--inject';
+printPaths(paths);
+const ROOT = paths.repoRoot;
+const AGENTS_DIR = options['agents-dir'] === undefined ? join(ROOT, 'raw', 'agents') : pathValue(options['agents-dir'], '--agents-dir', process.cwd());
+const OUTPUT = options.output === undefined ? join(ROOT, 'raw', 'roles-block.yml') : pathValue(options.output, '--output', process.cwd());
+const dryRun = process.argv.includes('--dry-run');
+console.log(`agents: ${AGENTS_DIR} [${options['agents-dir'] === undefined ? '仓库根推导' : '--agents-dir'}]`);
+console.log(`output: ${OUTPUT} [${options.output === undefined ? '仓库根推导' : '--output'}]`);
+// 注入目标必须先读成功，不能在失败前留下生成产物。
+const injectOriginal = options.inject === undefined ? undefined : readFileSync(paths.patch, 'utf8');
 
 /** 角色 TOML 里的模型名 → DSH 的 LLM route。经与 profile 的 llm-pi-ai 模型列表核对。 */
 const ROUTE = { provider: 'self' };
@@ -96,8 +116,13 @@ for (const name of ORDER) {
 // 绝对路径在仓库配置里不可移植，而 `node` 由 `ctx.subprocess.resolveExecutable`
 // 解析。`codex.js` 的路径必须绝对，因为它是 node 的脚本参数。
 // ---------------------------------------------------------------------------
+const roaming = Object.hasOwn(process.env, 'APPDATA')
+  ? pathValue(process.env.APPDATA, 'APPDATA', process.cwd())
+  : process.platform === 'win32' ? join(homedir(), 'AppData', 'Roaming') : undefined;
+if (roaming === undefined) throw new Error('请设置 APPDATA 以指定 Codex npm 安装目录');
+console.log(`npm roaming: ${roaming} [${Object.hasOwn(process.env, 'APPDATA') ? 'APPDATA' : 'os.homedir() 推导'}]`);
 const CODEX_JS = join(
-  process.env.APPDATA ?? '',
+  roaming,
   'npm',
   'node_modules',
   '@openai',
@@ -163,9 +188,9 @@ for (const r of roles) {
 }
 
 const body = out.join('\n') + '\n';
-writeFileSync(join(ROOT, 'raw', 'roles-block.yml'), body, 'utf8');
+if (!dryRun) writeFileSync(OUTPUT, body, 'utf8');
 
-console.log('已生成 raw/roles-block.yml');
+console.log(dryRun ? '--dry-run：未写入配置块。' : `已生成 ${OUTPUT}`);
 console.log(`角色数：${roles.length}`);
 for (const r of roles) {
   console.log(
@@ -180,16 +205,10 @@ for (const r of roles) {
 // 用法：node scripts/gen-role-config.mjs --inject <patch 路径> [--dry-run]
 // 会先备份为 <patch>.bak-<时间戳>。只替换 agent-switchboard 条目的 config。
 // ---------------------------------------------------------------------------
-const injectIndex = process.argv.indexOf('--inject');
-if (injectIndex !== -1) {
-  const patchPath = process.argv[injectIndex + 1];
-  const dryRun = process.argv.includes('--dry-run');
-  if (!patchPath) {
-    console.error('--inject 需要一个路径参数');
-    process.exit(1);
-  }
+if (options.inject !== undefined) {
+  const patchPath = paths.patch;
 
-  const original = readFileSync(patchPath, 'utf8');
+  const original = injectOriginal;
   const lines = original.replace(/\r\n/g, '\n').split('\n');
 
   // 定位我们的条目，并圈定它所属的顶层条目范围。
@@ -304,4 +323,3 @@ if (injectIndex !== -1) {
     process.exitCode = 1;
   }
 }
-
