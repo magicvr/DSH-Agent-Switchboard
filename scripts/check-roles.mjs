@@ -399,6 +399,31 @@ section('planCliMounts：跨 CLI 总开关');
 
   const noCli = planCliMounts([mk('a', 'spawn')], false);
   check('没有 CLI 角色时 blocked 为空', noCli.blocked.length === 0 && noCli.active.length === 0);
+
+  // ⚠️ 针对一个**真实发生过的 bug** 的回归断言：
+  //
+  // apply() 里我一度只 gate 了 provider 注册，却忘了 gate 工具挂载，实测结果是
+  // `codex-scout` 同时出现在「已挂载 OK」与「因开关未挂载」两处 —— 工具挂上了但
+  // provider 没注册，一调用就会失败（dsh-tool-subagent 装载时不检查 provider
+  // 是否存在）。下面的不变式锁住「一个角色不可能既 active 又 blocked」。
+  const mixed = [mk('s1', 'spawn'), mk('c1', 'cli'), mk('s2', 'fork'), mk('c2', 'cli')];
+  for (const flag of [true, false]) {
+    const plan = planCliMounts(mixed, flag);
+    const activeIds = new Set(plan.active.map((r) => r.id));
+    const blockedIds = new Set(plan.blocked.map((b) => b.id));
+    const overlap = [...activeIds].filter((id) => blockedIds.has(id));
+    check(`开关为 ${flag} 时 active 与 blocked 无交集`, overlap.length === 0, overlap.join(','));
+    check(
+      `开关为 ${flag} 时每个 CLI 角色恰好归入一侧`,
+      activeIds.size + blockedIds.size === 2,
+      `active=${activeIds.size} blocked=${blockedIds.size}`,
+    );
+    check(
+      `开关为 ${flag} 时非 CLI 角色永不出现在 blocked`,
+      ![...blockedIds].some((id) => id.startsWith('s')),
+      [...blockedIds].join(','),
+    );
+  }
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

@@ -354,13 +354,31 @@ export function apply(ctx, config) {
   import('@deepseek-ai/dsh-tool-subagent')
     .then((toolModule) => {
       for (const role of roles) {
+        // ⚠️ 必须**按角色**复用同一个判定，不能只 gate provider 注册。
+        //
+        // `dsh-tool-subagent` 装载时**不检查** provider 是否存在：它拿 provider 名
+        // 去查，查不到也不会在装载期抛错。因此「provider 没注册但工具挂上了」会
+        // 形成最糟的形态 —— 主代理看得见这个工具，一调用就失败。
+        //
+        // 这是 Phase 2 记录过的同类故障（`4/4 OK` 但只有 1 个能用），当时靠真实
+        // 派发才发现；这里必须在挂载前就拦住。
+        const blocked = blockedCliRoles.find((b) => b.id === role.id);
+        if (blocked) {
+          diagnostics.mounts.push({
+            id: role.id,
+            ok: false,
+            detail: `${blocked.reason}，故未挂载（provider 也未注册）`,
+          });
+          continue;
+        }
         const outcome = mountRoleTool(ctx, role, toolModule, maxDepth);
         diagnostics.mounts.push({ id: role.id, ok: outcome.ok, detail: outcome.detail });
         if (!outcome.ok) console.error(`[${name}] 角色 "${role.id}" 挂载失败：${outcome.detail}`);
       }
       const okCount = diagnostics.mounts.filter((m) => m.ok).length;
       console.error(
-        `[${name}] 已挂载 ${okCount}/${roles.length} 个角色工具：${roles.map((r) => r.toolName).join(', ')}`,
+        `[${name}] 已挂载 ${okCount}/${roles.length} 个角色工具：` +
+          diagnostics.mounts.filter((m) => m.ok).map((m) => m.id).join(', '),
       );
     })
     .catch((error) => {
