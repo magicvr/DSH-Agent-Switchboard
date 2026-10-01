@@ -181,11 +181,81 @@ function detectPresetScope(ctx) {
 }
 
 /**
+ * 读取 preset roster 与构成清单，用于诊断「我们的 preset 为什么加载失败」。
+ *
+ * 为什么在插件里读而不是靠外部工具：GUI 只显示「加载失败」四个字，而
+ * `AgentPresetRow.broken` / `AgentPresetComposition.broken` 携带具体诊断。
+ * Host 半边在 link 安装下无法热加载，每次排错都要重启，所以必须让**一次**
+ * 自检调用就能把失败原因带出来。
+ *
+ * `compositionInventory()` 与 `list()` 都是异步的，而 `apply()` 是同步的，
+ * 因此这里返回的是「稍后可读」的惰性取值 —— 自检工具在 `execute` 里 await。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @returns {{ roster: () => Promise<string>, broken: () => Promise<string> }}
+ */
+function presetDiagnostics(ctx) {
+  const service = typeof ctx.get === 'function' ? ctx.get('agentPresets') : undefined;
+
+  /** 把任意异常压成一行文本。 */
+  const brief = (error) => (error instanceof Error ? error.message : String(error));
+
+  return {
+    /** @returns {Promise<string>} roster 摘要（含 broken 说明）。 */
+    async roster() {
+      if (service === undefined || typeof service.list !== 'function') {
+        return 'agentPresets.list 不可用';
+      }
+      try {
+        const list = await service.list();
+        return (
+          list
+            .map((p) => `${p.id}${p.isDefault ? '*' : ''}${p.broken ? `<broken: ${p.broken}>` : ''}`)
+            .join(' ') || '（空）'
+        );
+      } catch (error) {
+        return `读取失败：${brief(error)}`;
+      }
+    },
+    /** @returns {Promise<string>} 构成清单里非 active 的行。 */
+    async broken() {
+      if (service === undefined || typeof service.compositionInventory !== 'function') {
+        return 'agentPresets.compositionInventory 不可用';
+      }
+      try {
+        const inventory = await service.compositionInventory();
+        const out = [];
+        for (const comp of inventory) {
+          // FiberState.ACTIVE === 2（见 dsh-agent-presets 的类型声明）。
+          const bad = (comp.rows ?? []).filter(
+            (row) => typeof row.fiberState === 'number' && row.fiberState !== 2,
+          );
+          if (comp.broken || bad.length > 0) {
+            out.push(
+              `${comp.id}` +
+                (comp.broken ? ` broken=${comp.broken}` : '') +
+                (bad.length > 0
+                  ? ` 非active: ${bad.map((r) => `${r.entryId ?? r.moduleName}(state=${r.fiberState})`).join(', ')}`
+                  : ''),
+            );
+          }
+        }
+        return out.length > 0 ? out.join(' | ') : '（无异常行）';
+      } catch (error) {
+        return `读取失败：${brief(error)}`;
+      }
+    },
+  };
+}
+
+/**
  * 自检工具：一次调用即可看清装载结果，避免为每个问题重启一次 dsh。
  *
+ * @param {object} ctx - Cordis 上下文（用于读取 preset 诊断）。
  * @returns {object} ToolDefinition
  */
-function selftestTool() {
+function selftestTool(ctx) {
+  const presets = presetDiagnostics(ctx);
   return defineTool({
     name: 'switchboard_selftest',
     description:
@@ -205,6 +275,8 @@ function selftestTool() {
           executables: { type: 'string', required: true },
           blocked: { type: 'string', required: true },
           presetScope: { type: 'string', required: true },
+          presetRoster: { type: 'string', required: true },
+          presetBroken: { type: 'string', required: true },
           configErrors: { type: 'string', required: true },
           fatal: { type: 'string', required: true },
         },
@@ -215,6 +287,8 @@ function selftestTool() {
           `已挂载角色工具：${value.roleCount}`,
           `明细：${value.mounted}`,
           `preset 作用域：${value.presetScope}`,
+          `preset roster：${value.presetRoster}`,
+          `preset 异常行：${value.presetBroken}`,
           `CLI provider：${value.providers}`,
           `CLI 可执行文件：${value.executables}`,
           `因开关未挂载：${value.blocked}`,
@@ -224,8 +298,13 @@ function selftestTool() {
         return [{ type: 'text', text: lines.join('\n') }];
       },
     },
-    execute() {
-      return Promise.resolve({
+    async execute() {
+      // preset 诊断是异步的，且可能失败；失败不应让整个自检失败。
+      const [presetRoster, presetBroken] = await Promise.all([
+        presets.roster().catch((e) => `读取异常：${e?.message ?? e}`),
+        presets.broken().catch((e) => `读取异常：${e?.message ?? e}`),
+      ]);
+      return {
         ok:
           diagnostics.fatal === undefined &&
           diagnostics.configErrors.length === 0 &&
@@ -258,9 +337,11 @@ function selftestTool() {
             : diagnostics.presetScope === null
               ? '根作用域（未挂载到任何 preset）'
               : `${diagnostics.presetScope}`,
+        presetRoster,
+        presetBroken,
         configErrors: diagnostics.configErrors.join('\n'),
         fatal: diagnostics.fatal ?? '',
-      });
+      };
     },
     presentCall: () => ({ card: 'generic', title: 'Agent Switchboard self-test', kind: 'other' }),
   });
@@ -322,7 +403,7 @@ export function apply(ctx, config) {
   );
 
   // 自检工具总是注册：即使角色配置全错，也要能用它看到错在哪。
-  ctx.tools.register(selftestTool());
+  ctx.tools.register(selftestTool(ctx));
 
   const { roles, errors } = normalizeRoles(resolved.roles, resolved.provider, resolved.cwd);
   diagnostics.configErrors = errors;
