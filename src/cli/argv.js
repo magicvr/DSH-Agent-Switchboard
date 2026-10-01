@@ -142,21 +142,27 @@ export function buildArgs(template, values) {
 /**
  * 把模板与取值拼成一次完整调用。
  *
- * ⚠️ **不在这里做任何字符串拼接**：返回的是「命令 + argv 数组」两部分，
- * 调用方必须用数组形式 spawn（`shell: false`），不要join 成字符串。
+ * ⚠️ 返回的 `argv[0]` **就是可执行文件**，整体可直接交给
+ * `ctx.subprocess.spawn({ argv, ... })`（其 `argv` 是完整命令行，不额外接受命令名）。
+ * 这是刻意设计：
+ *   - 只有一种表示（完整 argv），不存在「命令名 + argv」不一致的可能；
+ *   - `resolveExecutable` 的结果因此可以简单地替换 `argv[0]`；
+ *   - 调用方不需要记住「要不要自己把 command 拼到前面」。
+ *
+ * ⚠️ **不做任何字符串拼接**：返回数组，调用方必须以数组形式 spawn（`shell: false`）。
  *
  * @param {object} spec - 调用规格。
- * @param {string} spec.command - 可执行文件路径或命令名（来自用户配置）。
- * @param {string[]} [spec.prefixArgs] - 命令与模板之间的固定参数
- *   （例如 codex 需要的 `node <cli.js>` 形态里，`prefixArgs` 放脚本路径）。
+ * @param {string} spec.command - 可执行文件路径或命令名（来自用户配置），将成为 `argv[0]`。
+ * @param {string[]} [spec.prefixArgs] - 可执行文件之后、模板之前的固定参数
+ *   （例如 `node <cli.js>` 形态里，`command` 是 node，`prefixArgs` 是脚本路径）。
  * @param {readonly string[]} spec.args - 参数模板。
  * @param {Record<string, string | undefined>} spec.values - 占位符取值。
- * @returns {{ command: string, argv: string[] }} 可直接 spawn 的二元组。
+ * @returns {{ argv: string[] }} 可直接 spawn 的完整 argv。
  */
 export function buildInvocation({ command, prefixArgs = [], args, values }) {
   if (typeof command !== 'string' || command.trim().length === 0) {
-    throw new Error('command 必须是非空字符串');
+    throw new Error('command 必须是非空字符串（它将作为 argv[0]）');
   }
   const templated = buildArgs(args, values);
-  return { command, argv: [...prefixArgs, ...templated] };
+  return { argv: [command, ...prefixArgs, ...templated] };
 }

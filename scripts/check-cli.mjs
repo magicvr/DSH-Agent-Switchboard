@@ -126,14 +126,22 @@ section('buildInvocation');
     args: ['exec', '-m', '{model}', '-'],
     values: { model: 'gpt-6-luna' },
   });
-  check('command 原样保留', inv.command === 'C:/node.exe');
   check(
-    'argv = prefixArgs + 模板结果',
-    JSON.stringify(inv.argv) === JSON.stringify(['C:/codex.js', 'exec', '-m', 'gpt-6-luna', '-']),
+    'argv[0] 就是可执行文件',
+    inv.argv[0] === 'C:/node.exe',
+    JSON.stringify(inv.argv),
+  );
+  check(
+    'argv = [command, ...prefixArgs, ...模板结果]',
+    JSON.stringify(inv.argv) === JSON.stringify(['C:/node.exe', 'C:/codex.js', 'exec', '-m', 'gpt-6-luna', '-']),
     JSON.stringify(inv.argv),
   );
   check('返回的是数组而非拼接字符串', Array.isArray(inv.argv));
   check('空 command 被拒', throws(() => buildInvocation({ command: '  ', args: ['{prompt}'], values: {} })) !== null);
+
+  // 只有一种表示：调用方不需要自己把 command 拼到前面。
+  const noPrefix = buildInvocation({ command: 'codex', args: ['exec', '-'], values: {} });
+  check('无 prefixArgs 时 argv 仍以 command 开头', noPrefix.argv[0] === 'codex' && noPrefix.argv.length === 3, JSON.stringify(noPrefix.argv));
 }
 
 section('parseRouteFacts：codex 的真实 stderr');

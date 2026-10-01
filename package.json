@@ -43,10 +43,12 @@
     "yaml": "^2.6.0"
   },
   "scripts": {
-    "check": "node scripts/check-roles.mjs && node scripts/check-cli.mjs && node scripts/check-config-schema.mjs",
+    "check": "node scripts/check-roles.mjs && node scripts/check-cli.mjs && node scripts/check-cli-provider.mjs && node scripts/check-config-schema.mjs",
     "check:roles": "node scripts/check-roles.mjs",
     "check:cli": "node scripts/check-cli.mjs",
+    "check:cli-provider": "node scripts/check-cli-provider.mjs",
     "check:schema": "node scripts/check-config-schema.mjs",
+    "check:live": "node scripts/check-cli-live.mjs",
     "gen:roles": "node scripts/gen-role-config.mjs",
     "probe:codex": "node scripts/probe-codex.mjs"
   }
