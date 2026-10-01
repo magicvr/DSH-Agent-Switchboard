@@ -126,16 +126,6 @@ const CLI_DRIVER_OPTIONS = [
       readOnly ? 'plan' : 'acceptEdits',
     ],
   },
-  {
-    id: 'custom',
-    label: '自定义命令',
-    description: '自行填写命令与参数。适用于本表未收录的 CLI。',
-    command: '',
-    prefixArgs: [],
-    promptDelivery: 'stdin',
-    modelPlaceholder: '',
-    args: (readOnly) => [],
-  },
 ];
 
 /**
@@ -147,7 +137,7 @@ const CLI_DRIVER_OPTIONS = [
  */
 function cliFieldsFor(id, readOnly) {
   const d = CLI_DRIVER_OPTIONS.find((x) => x.id === id);
-  if (d === undefined || d.id === 'custom') return undefined;
+  if (d === undefined) return undefined;
   return {
     cliCommand: d.command,
     cliPrefixArgs: [...d.prefixArgs],
@@ -159,24 +149,23 @@ function cliFieldsFor(id, readOnly) {
 /**
  * 反推角色当前属于哪个驱动（与 Host 的 `inferCliDriver` 行为一致）。
  *
- * 若用户手工改过 `cli*` 字段导致与任何驱动都不一致，返回 `custom` ——
+ * 若用户手工改过 `cli*` 字段导致与任何驱动都不一致，返回 undefined ——
  * 避免界面把用户的自定义配置**显示**成某个预设（那会误导）。
  *
  * @param {object} role - 角色。
- * @returns {string} 驱动 id。
+ * @returns {string|undefined} 驱动 id。
  */
 function inferCliDriver(role) {
   for (const d of CLI_DRIVER_OPTIONS) {
-    if (d.id === 'custom') continue;
     if (role?.cliCommand !== d.command) continue;
-    if (JSON.stringify(role.cliPrefixArgs ?? []) !== JSON.stringify(d.prefixArgs)) continue;
-    if ((role.cliPromptDelivery ?? 'stdin') !== d.promptDelivery) continue;
+    if (JSON.stringify(role.cliPrefixArgs) !== JSON.stringify(d.prefixArgs)) continue;
+    if (role.cliPromptDelivery !== d.promptDelivery) continue;
     const args = role.cliArgs ?? [];
     for (const readOnly of [true, false]) {
       if (JSON.stringify(args) === JSON.stringify(d.args(readOnly))) return d.id;
     }
   }
-  return 'custom';
+  return undefined;
 }
 
 /**
@@ -575,12 +564,12 @@ window.__ModuleLoader__.load({
       const { role, index, onChange, onRemove, disabled } = props;
       const isCli = role.backend === 'cli';
       // 当前驱动由**字段反推**，而不是读 `cliDriver` —— 这样即使用户手工改了参数，
-      // 下拉框也会如实显示成「自定义命令」，不会把一个改过的配置显示成某个预设。
-      const currentDriver = isCli ? inferCliDriver(role) : 'custom';
+      // 下拉框会如实显示「需重选预设」。浏览器无本机路径解析器，未知形态不猜测。
+      const currentDriver = isCli ? inferCliDriver(role) : undefined;
       const driverDef = CLI_DRIVER_OPTIONS.find((d) => d.id === currentDriver);
       const driverHint =
         driverDef === undefined
-          ? ''
+          ? '需重选预设：当前配置无法识别为 codex / grok'
           : `${driverDef.description}${
               driverDef.modelPlaceholder ? ` 模型示例：${driverDef.modelPlaceholder}` : ''
             }`;
@@ -672,7 +661,13 @@ window.__ModuleLoader__.load({
             type: 'checkbox',
             checked: role[key] === true,
             disabled,
-            onChange: (e) => set(key, e.target.checked),
+            onChange: (e) => {
+              const checked = e.target.checked;
+              if (key === 'readOnly' && isCli) {
+                const fields = cliFieldsFor(currentDriver, checked);
+                setMany({ readOnly: checked, ...(fields ? { cliDriver: currentDriver, ...fields } : {}) });
+              } else set(key, checked);
+            },
           }),
           h('span', { style: { color: 'var(--dsw-alias-label-secondary)' } }, label),
         );
@@ -751,7 +746,7 @@ window.__ModuleLoader__.load({
               h(
                 'span',
                 { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
-                '外部 CLI —— 选一个具体 CLI，或自定义',
+                '外部 CLI —— 选择 Codex CLI / Grok CLI 预设',
               ),
               // ⚠️ 这里是「选**哪个** CLI」，不是笼统的「外部 CLI」。
               //    选中后会把该 CLI 的 command / prefixArgs / args / promptDelivery
@@ -764,7 +759,7 @@ window.__ModuleLoader__.load({
                   h(
                     'select',
                     {
-                      value: currentDriver,
+                      value: currentDriver ?? '',
                       disabled,
                       onChange: (e) => {
                         const id = e.target.value;
@@ -785,6 +780,7 @@ window.__ModuleLoader__.load({
                       },
                       style: selectStyle(),
                     },
+                    currentDriver === undefined ? h('option', { value: '', disabled: true }, '需重选预设') : null,
                     CLI_DRIVER_OPTIONS.map((d) => h('option', { key: d.id, value: d.id }, d.label)),
                   ),
                 ),

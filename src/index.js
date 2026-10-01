@@ -290,6 +290,8 @@ export const Config = z.object({
         description: z.string().required(),
         // --- builtin 后端需要：DSH 的 LLM route ---
         provider: z.string(),
+        agentProvider: z.string().description('包裹该 CLI 角色的内置子代理所用的 LLM route；留空表示继承父代理路由'),
+        agentModel: z.string().description('包裹该 CLI 角色的内置子代理所用的模型；留空表示继承父代理模型'),
         // model 对 CLI 后端是「外部 CLI 的模型 id」，对 builtin 后端是 DSH route 的
         // model。两者共用一个字段是有意的：同一个角色只应有一个模型来源（见 D12）。
         model: z.string(),
@@ -302,10 +304,8 @@ export const Config = z.object({
         // --- cli 后端需要：可执行文件与参数模板 ---
         // 放在角色**顶层**而非嵌套对象，是为了让设置面板把每一项当普通标量字段渲染。
         //
-        // `cliDriver` 只是「用户选了哪个 CLI 预设」的**记录**，不参与执行：真正生效的是
-        // 下面四个字段。这样既不引入「预设 vs 手工覆盖」两套真相，又能在界面上把选中的
-        // 预设显示出来（反推失败时显示为 custom）。取值不设 enum，允许用户自定义。
-        cliDriver: z.string().description('所选 CLI 预设的标识（仅记录用；执行以 cliCommand / cliArgs 为准）'),
+        // 保留字符串以读入旧 custom；执行前必须与下面四个字段及 readOnly 一致。
+        cliDriver: z.string().description('所选 CLI 预设（codex / grok）；旧配置仅无损识别，否则该角色待迁移并阻止启动'),
         cliCommand: z.string(),
         cliPrefixArgs: z.array(z.string()),
         cliArgs: z.array(z.string()),
@@ -490,7 +490,7 @@ export function selftestTool(ctx, diagnostics) {
           `CLI provider：${value.providers}`,
           `CLI 可执行文件：${value.executables}`,
           // 「跨 CLI 总开关」已移除，因此这里不再是「因开关未挂载」，而是
-          // 「因**别的原因**被拦下」（目前该列表恒为空，保留以便将来有新的前置条件）。
+          // 「因预设兼容性或执行一致性校验被拦下」。
           `未挂载的角色：${value.blocked}`,
         ];
         if (value.configErrors) lines.push(`配置错误：\n${value.configErrors}`);

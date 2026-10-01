@@ -38,6 +38,24 @@ function section(title) {
 }
 
 const CLIENT_SRC = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
+// 执行真实客户端源码，仅在测试副本中暴露 RoleRow；生产模块不增加测试导出。
+const clientWindow = { __ModuleLoader__: { load: (spec) => { clientWindow.spec = spec; } } };
+new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleRow, // **读**走'))(clientWindow);
+const clientData = new Function(`${CLIENT_SRC.slice(0, CLIENT_SRC.indexOf('\nwindow.__ModuleLoader__.load'))}\nreturn { CLI_DRIVER_OPTIONS, DEFAULT_CLI_DRIVER, cliFieldsFor, inferCliDriver };`)();
+const rowReact = { createElement: (type, props, ...children) => ({ type, props, children }) };
+const { RoleRow } = clientWindow.spec.factory(() => rowReact);
+function rowElements(role, writes) {
+  const tree = RoleRow({ role, index: 3, onChange: (index, value) => writes.push({ index, value }), onRemove: () => {}, disabled: false });
+  const all = [];
+  const walk = (node) => {
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    if (!node || typeof node !== 'object') return;
+    all.push(node);
+    node.children?.forEach(walk);
+  };
+  walk(tree);
+  return all;
+}
 
 section('注册契约：必须调用 __ModuleLoader__.load 且 id 严格等于包名');
 {
@@ -382,12 +400,16 @@ section('CLI 驱动表：Client 镜像必须与 Host 权威一致');
     );
   }
   check(
-    '客户端驱动数量与 Host 一致（codex / grok / custom）',
-    CLI_DRIVERS.length === 3,
-    String(CLI_DRIVERS.length),
+    '客户端驱动集合与 Host 一致且恰为 codex / grok',
+    JSON.stringify(clientData.CLI_DRIVER_OPTIONS.map((d) => d.id).sort()) === JSON.stringify(CLI_DRIVERS.map((d) => d.id).sort()) &&
+      clientData.CLI_DRIVER_OPTIONS.map((d) => d.id).sort().join(',') === 'codex,grok',
+    JSON.stringify(clientData.CLI_DRIVER_OPTIONS.map((d) => d.id)),
   );
   // 反向断言：被移除的预设**不得**残留在客户端镜像里（漏删一半会造成「界面有、Host 没有」）。
   check('客户端不含 claude 预设', !CLIENT_SRC.includes("id: 'claude'"));
+  check('客户端不含 custom 预设且不产出 custom 字段',
+    !clientData.CLI_DRIVER_OPTIONS.some((d) => d.id === 'custom') && clientData.cliFieldsFor('custom', true) === undefined);
+  check('客户端未知 id 不产出字段', clientData.cliFieldsFor('unknown', false) === undefined);
 }
 
 section('多字段写入必须原子（锁死「锁死在自定义命令」这个故障）');
@@ -423,14 +445,53 @@ section('多字段写入必须原子（锁死「锁死在自定义命令」这�
     /const changeBackend = \(next\) =>/.test(CLIENT_SRC) && /DEFAULT_CLI_DRIVER/.test(CLIENT_SRC),
   );
   check(
-    '默认驱动不是 custom（custom 不带模板，会留下空命令）',
-    /const DEFAULT_CLI_DRIVER = '(?!custom)[a-z]+'/.test(CLIENT_SRC),
-    'DEFAULT_CLI_DRIVER 指向了 custom 或不合法',
+    '默认驱动为 codex 且属于允许集合',
+    clientData.DEFAULT_CLI_DRIVER === 'codex' && clientData.CLI_DRIVER_OPTIONS.some((d) => d.id === clientData.DEFAULT_CLI_DRIVER),
+    clientData.DEFAULT_CLI_DRIVER,
   );
   check(
     'backend 下拉不再复用通用 select（它只改一个字段）',
     !/field\('派发机制', select\('backend'/.test(CLIENT_SRC),
   );
+}
+
+section('RoleRow 真实事件回调：预设与只读切换原子更新');
+{
+  const { cliFieldsFor, validateCliPreset } = await import('../src/cli/drivers.js');
+  for (const driver of ['codex', 'grok']) {
+    for (const readOnly of [true, false]) {
+      const role = { id: 'r', backend: 'cli', model: 'external-model', cliCwd: 'C:/w', cliDriver: driver, readOnly, ...cliFieldsFor(driver, readOnly) };
+      const before = JSON.stringify(role);
+      const writes = [];
+      const inputs = rowElements(role, writes);
+      inputs.find((n) => n.type === 'input' && n.props.type === 'checkbox').props.onChange({ target: { checked: !readOnly } });
+      check(`${driver}/${readOnly}：只读切换只提交一次且携带角色索引`, writes.length === 1 && writes[0].index === 3);
+      const next = writes[0]?.value;
+      check(`${driver}/${readOnly}：只读与沙箱参数同步通过 Host 校验`,
+        next?.readOnly === !readOnly && validateCliPreset(next).errors.length === 0);
+      check(`${driver}/${readOnly}：只读切换保留模型/cwd 且不修改旧快照`,
+        next?.model === role.model && next?.cliCwd === role.cliCwd && JSON.stringify(role) === before);
+      const target = driver === 'codex' ? 'grok' : 'codex';
+      writes.length = 0;
+      inputs.find((n) => n.type === 'select' && n.props.value === driver).props.onChange({ target: { value: target } });
+      check(`${driver}/${readOnly}：预设切换一次提交完整执行字段`,
+        writes.length === 1 && writes[0].value.cliDriver === target && validateCliPreset(writes[0].value).errors.length === 0);
+    }
+  }
+  const unknown = { backend: 'cli', cliDriver: 'custom', ...cliFieldsFor('grok', true), cliArgs: ['--other'], readOnly: true };
+  const writes = [];
+  const elements = rowElements(unknown, writes);
+  check('未知客户端配置反推 undefined，呈现需重选预设占位',
+    clientData.inferCliDriver(unknown) === undefined && elements.some((n) => n.type === 'option' && n.props.value === '' && n.props.disabled && n.children.includes('需重选预设')));
+  elements.find((n) => n.type === 'input' && n.props.type === 'checkbox').props.onChange({ target: { checked: false } });
+  check('未知配置切换只读不伪装有效驱动、不改写执行字段',
+    writes.length === 1 && writes[0].value.readOnly === false && writes[0].value.cliDriver === 'custom' &&
+    JSON.stringify(writes[0].value.cliArgs) === JSON.stringify(unknown.cliArgs) && validateCliPreset(writes[0].value).errors.length > 0);
+  const builtinWrites = [];
+  rowElements({ backend: 'spawn', readOnly: false }, builtinWrites)
+    .find((n) => n.type === 'input' && n.props.type === 'checkbox').props.onChange({ target: { checked: true } });
+  check('内置角色只读切换不写 CLI 执行字段',
+    builtinWrites.length === 1 && builtinWrites[0].value.readOnly === true && !('cliArgs' in builtinWrites[0].value));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

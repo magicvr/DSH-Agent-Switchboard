@@ -206,6 +206,8 @@ const expectedRoleFields = [
   'title',
   'description',
   'provider',
+  'agentProvider',
+  'agentModel',
   'model',
   'effort',
   'instructions',
@@ -213,6 +215,7 @@ const expectedRoleFields = [
   'backend',
   'allowNestedDispatch',
   // cli 后端的字段。放在角色顶层是为了让设置面板按普通标量字段渲染它们。
+  'cliDriver',
   'cliCommand',
   'cliPrefixArgs',
   'cliArgs',
@@ -227,6 +230,16 @@ for (const want of expectedRoleFields) {
     console.log(`      ${want.padEnd(20)} ${describeNode(roleFields[want])}`);
   } else {
     console.error(`FAIL  roles[] 缺字段 ${want}`);
+    process.exitCode = 1;
+  }
+}
+
+for (const key of ['agentProvider', 'agentModel']) {
+  const node = deref(roleFields[key]);
+  if (node?.type === 'string' && !node.meta?.required && /继承父代理/.test(node.meta?.description ?? '')) {
+    console.log(`PASS  ${key} 为可选字符串，留空继承父代理路由`);
+  } else {
+    console.error(`FAIL  ${key} 必须是带继承说明的可选字符串`);
     process.exitCode = 1;
   }
 }

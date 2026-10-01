@@ -454,9 +454,13 @@ section('backend 取值校验');
   );
 }
 
-section('planCliMounts：CLI 角色**无条件**挂载（闸门已删）');
+section('planCliMounts：有效 CLI 预设挂载（无全局闸门）');
 {
-  const mk = (id, backend) => ({ id, backend, toolName: `delegate_to_${id}` });
+  const { cliFieldsFor } = await import('../src/cli/drivers.js');
+  const mk = (id, backend) => normalizeRole({
+    id, backend, description: 'd', instructions: 'i', model: 'm', provider: 'p',
+    readOnly: true, cliDriver: 'grok', ...cliFieldsFor('grok', true), cliCwd: 'C:/w',
+  }, 0).role;
   const roles = [mk('a', 'spawn'), mk('b', 'cli'), mk('c', 'cli'), mk('d', 'fork')];
 
   const plan = planCliMounts(roles);
@@ -465,7 +469,7 @@ section('planCliMounts：CLI 角色**无条件**挂载（闸门已删）');
     plan.active.map((r) => r.id).join(',') === 'b,c',
     JSON.stringify(plan.active.map((r) => r.id)),
   );
-  check('blocked 恒为空（不再有全局闸门）', plan.blocked.length === 0, JSON.stringify(plan.blocked));
+  check('有效预设的 blocked 为空（不再有全局闸门）', plan.blocked.length === 0, JSON.stringify(plan.blocked));
 
   const noCli = planCliMounts([mk('a', 'spawn'), mk('b', 'fork')]);
   check('没有 CLI 角色时 active 与 blocked 都为空', noCli.active.length === 0 && noCli.blocked.length === 0);

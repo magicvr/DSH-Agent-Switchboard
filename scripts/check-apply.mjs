@@ -696,6 +696,35 @@ section('诊断边界：不可查询、零角色、非法配置与服务注册 s
     spy.provided.join(','));
 }
 
+section('CLI 逐角色阻塞：未知配置不注册 provider、不解析命令、不执行');
+{
+  const { cliFieldsFor } = await import('../src/cli/drivers.js');
+  const ctx = makeCtx();
+  const providers = [];
+  const resolved = [];
+  let spawned = 0;
+  let guidance = '';
+  ctx.subagents.registerProvider = (provider) => { providers.push(provider); return { dispose() {} }; };
+  ctx.subprocess.resolveExecutable = (command) => { resolved.push(command); return Promise.resolve('C:/fake/grok.exe'); };
+  ctx.subprocess.spawn = () => { spawned++; throw new Error('离线测试禁止启动 CLI'); };
+  ctx.systemPrompt.section = (section) => { guidance = section.text; return { dispose() {} }; };
+  const base = { description: 'd', instructions: 'i', backend: 'cli', model: 'external-model', readOnly: true, cliCwd: 'C:/w' };
+  const legacy = { ...base, id: 'legacy', cliDriver: 'custom', ...cliFieldsFor('codex', true), cliCommand: 'unknown-executable' };
+  const valid = { ...base, id: 'valid', cliDriver: 'custom', ...cliFieldsFor('grok', true) };
+  const before = JSON.stringify([legacy, valid]);
+  apply(ctx, { mount: true, provider: 'self', cwd: 'C:/w', roles: [legacy, valid, { ...fixtureRole, id: 'builtin' }] });
+  await import('@deepseek-ai/dsh-tool-subagent');
+  await new Promise(setImmediate);
+  check('未知配置不注册 provider 且不解析/启动其命令',
+    providers.length === 1 && resolved.join(',') === 'grok' && spawned === 0);
+  check('旧 custom 阻塞不影响有效 CLI 和内置角色工具',
+    !ctx.registered.includes('delegate_to_legacy') && ctx.registered.includes('delegate_to_valid') && ctx.registered.includes('delegate_to_builtin'));
+  const result = await ctx.tools.get('switchboard_selftest').execute({});
+  check('自检与主代理指引都显示旧配置待迁移',
+    result.blocked.includes('legacy') && result.blocked.includes('待迁移') && guidance.includes('不得派发'));
+  check('装载后旧 custom 原始配置保持不变', JSON.stringify([legacy, valid]) === before);
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 } finally {
   if (previousDshHome === undefined) delete process.env.DSH_HOME;

@@ -160,8 +160,9 @@ reasoning effort: ...
   backend: cli                                  # ← 从默认的 spawn 改为 cli
   model: gpt-6-astra
   effort: medium
-  cliCommand: node
-  cliPrefixArgs: ["C:\\Users\\<你>\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js"]
+  cliDriver: codex
+  cliCommand: "{node}"
+  cliPrefixArgs: ["{npmRoot}\\@openai\\codex\\bin\\codex.js"]
   cliArgs: ["exec", "-s", "read-only", "--skip-git-repo-check",
             "-m", "{model}", "-c", "model_reasoning_effort={effort}", "-"]
   cliPromptDelivery: stdin
@@ -171,6 +172,13 @@ reasoning effort: ...
 **只需要一步**：把角色的 `backend` 改为 `cli` 并填上面那些 `cli*` 字段。
 （在设置面板里更简单：`派发机制` 选「外部 CLI」，再从 CLI 下拉框选 `Codex CLI` / `Grok CLI`，
 参数模板会自动填好。）
+
+**当前仅支持 codex / grok 预设。** Host 在挂载前核对 command / prefixArgs / args / delivery
+完整形态，并独立核对 `readOnly` 与沙箱参数。切换只读会原子更新预设参数。
+旧 `custom` 是历史配置：仅完整匹配模板或本机解析后形态时无损识别；否则保留原数据，
+在自检「未挂载的角色」及主代理指引中显示待迁移、禁止派发，其他有效角色仍可挂载。
+`agentProvider` / `agentModel` 为每角色可选包裹路由，留空继承父代理；本批次只保存这些字段，
+实际 spawn 包裹执行留后续批次。命令输入控件也留待后续面板改造。
 
 > ⚠️ **曾经**还需要第二步「打开总开关 `volatile.allowCrossCli: true`」，**该开关已移除**。
 > 原因：它后来在面板上被移除、却仍在执行期拦截，于是 CLI 角色永远挂不上、界面只显示
@@ -208,7 +216,7 @@ reasoning effort: ...
 
 > **状态：本插件的驱动预设已移除**（用户长期不用，明确要求排除）。
 > 「角色 → CLI」下拉框里**不会出现** Claude Code。
-> 想临时用它：选「自定义命令」，`command` 填 `claude`，参数按下面 §3.0 的形态填。
+> 历史上可选「自定义命令」接入；当前该入口已移除，恢复支持需要另行决策。
 >
 > **本节刻意保留**：这些是真实取证，证明「已排查过、卡在哪一层」。删掉等于丢失证据，
 > 日后有人想恢复时会重复踩一遍同样的坑。
@@ -243,8 +251,8 @@ claude 自己给出的官方出路是**把未知模型映射到它认识的模�
 不由本插件代劳。
 
 > **历史状态：** 驱动表曾保留 `claude` 预设，调用形态按上述实测编写，当时本机端到端不可用。
-> **当前状态：** 内置预设已移除（`src/cli/drivers.js:150`），驱动表只含 `codex` / `grok` / `custom`。
-> 用户仍可通过 custom CLI 配置自行接入；模型映射如何配置及配置后是否跑通仍未实测。
+> **当前状态：** Claude 内置预设已移除，驱动表只含 `codex` / `grok`。
+> 旧 custom Claude 配置会阻塞为待迁移；模型映射如何配置及配置后是否跑通仍未实测。
 
 #### 3.1 调用形态（`--help` + 上表实测）
 
@@ -321,7 +329,7 @@ claude 自己给出的官方出路是**把未知模型映射到它认识的模�
 - [ ] grok：其它模型/强度组合、强度别名及 CLI 路由生效对照（见 §4.2）。
 - [ ] claude：模型别名成功路由、强度逐档生效及回退模型行为（见 §3.2；当前无内置预设）。
 - [ ] claude：**如何让它的模型目录接受网关模型**（`behavesAs` / `modelOverrides` 的具体写法）。
-      这是该 CLI 的配置工作，不由本插件代劳；配置后可通过 custom CLI 自行接入，能否跑通仍未实测。
+      这是该 CLI 的配置工作，不由本插件代劳；本插件当前不支持 custom 接入，能否跑通仍未实测。
 
 ## 7. 已关闭的历史实测清单（从原「尚未实测的项」移入，保留记录）
 

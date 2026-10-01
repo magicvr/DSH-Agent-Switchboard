@@ -9,7 +9,7 @@
  * @module @magicvr/dsh-agent-switchboard/roles
  */
 import { validateTemplate } from './cli/argv.js';
-import { resolveDriverPlaceholders } from './cli/drivers.js';
+import { resolveDriverPlaceholders, validateCliPreset } from './cli/drivers.js';
 
 /** 思考强度的统一枚举。与 DSH 的 `ReasoningEffortId` 取值一致。 */
 export const EFFORT_VALUES = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']);
@@ -140,20 +140,24 @@ export function normalizeRole(raw, index, defaultProvider, defaultCwd) {
   // CLI 后端专属配置。放在角色**顶层**而非嵌套对象里，是为了让插件面板能把它
   // 当普通标量字段渲染；嵌套结构在设置表单里难编辑（见 decisions.md D9）。
   let cli;
+  const preset = isCli ? validateCliPreset(raw) : undefined;
   if (isCli) {
+    // 兼容性阻塞不是整份 roles 的致命错误。原始配置由调用方保留，不回写。
+    // 仅无法识别的旧 custom 将字段错误转入角色阻塞；其余保留既有字段校验。
+    const cliErrors = [];
     const cliCommand = read('cliCommand');
     if (!cliCommand) {
-      errors.push(`${at}.cliCommand 必填（backend 为 cli 时必须给出可执行文件）`);
+      cliErrors.push(`${at}.cliCommand 必填（backend 为 cli 时必须给出可执行文件）`);
     }
 
     const cliArgs = raw.cliArgs;
     if (!Array.isArray(cliArgs) || cliArgs.length === 0) {
-      errors.push(`${at}.cliArgs 必填，且必须是字符串数组（给出该 CLI 的参数模板）`);
+      cliErrors.push(`${at}.cliArgs 必填，且必须是字符串数组（给出该 CLI 的参数模板）`);
     }
 
     const cliPrefixArgs = raw.cliPrefixArgs;
     if (cliPrefixArgs !== undefined && !Array.isArray(cliPrefixArgs)) {
-      errors.push(`${at}.cliPrefixArgs 必须是字符串数组`);
+      cliErrors.push(`${at}.cliPrefixArgs 必须是字符串数组`);
     }
 
     const cliPromptDelivery = read('cliPromptDelivery') ?? 'stdin';
@@ -163,7 +167,7 @@ export function normalizeRole(raw, index, defaultProvider, defaultCwd) {
       // 模板校验放到这里（而不是只在运行时）：配置错误应在装载期就报出来，
       // 而不是等第一次派发才失败。
       const templateErrors = validateTemplate(cliArgs, { promptDelivery: cliPromptDelivery });
-      for (const line of templateErrors) errors.push(`${at}.cliArgs：${line}`);
+      for (const line of templateErrors) cliErrors.push(`${at}.cliArgs：${line}`);
     }
 
     // ⚠️ CLI 角色**必须显式给出模型**。
@@ -175,7 +179,7 @@ export function normalizeRole(raw, index, defaultProvider, defaultCwd) {
     // CLI 填。这里只做「缺失就报错」，不给默认值。
     const cliModel = read('model');
     if (!cliModel) {
-      errors.push(
+      cliErrors.push(
         `${at}.model 必填（backend 为 cli 时必须显式给出模型，否则该 CLI 会静默使用它自己的配置）`,
       );
     }
@@ -196,7 +200,9 @@ export function normalizeRole(raw, index, defaultProvider, defaultCwd) {
     };
 
     // CLI 后端不承载 DSH 的 provider/model route，因此上面没有强制它们。
-    if (!cliCwd) errors.push(`${at}.cliCwd 未设置，且全局 cwd 也未设置`);
+    if (!cliCwd) cliErrors.push(`${at}.cliCwd 未设置，且全局 cwd 也未设置`);
+    if (raw.cliDriver === 'custom' && preset.errors.length > 0) preset.errors.push(...cliErrors);
+    else errors.push(...cliErrors);
   }
 
   if (errors.length > 0) return { role: null, errors };
@@ -207,13 +213,15 @@ export function normalizeRole(raw, index, defaultProvider, defaultCwd) {
       title: read('title'),
       description,
       provider,
+      agentProvider: read('agentProvider') || undefined,
+      agentModel: read('agentModel') || undefined,
       model,
       effort,
       instructions,
       readOnly: raw.readOnly === true,
       backend,
       allowNestedDispatch: raw.allowNestedDispatch === true,
-      ...(cli ? { cli } : {}),
+      ...(cli ? { cli, cliDriver: preset.driver, cliBlockReason: preset.errors.join('；') || undefined } : {}),
       toolName: `delegate_to_${id.replace(/-/g, '_')}`,
     },
     errors,
@@ -342,13 +350,30 @@ export function toolConfigFor(role, { maxDepth }) {
  *    现在「要不要走外部 CLI」由角色自己的 `backend: 'cli'` 表达，而角色只在声明了
  *    `mount: true` 的 Switchboard preset 会话里挂载。
  *
- * 保留 `blocked` 返回字段是为了让调用方与自检的展示形态不变（当前恒为空数组）。
+ * 兼容性与预设一致性失败只阻塞对应角色；provider 与工具共用同一计划。
  *
  * @param {Role[]} roles - 规范化后的角色列表。
  * @returns {{ active: Role[], blocked: { id: string, reason: string }[] }} 挂载计划。
  */
 export function planCliMounts(roles) {
-  return { active: roles.filter((role) => role.backend === CLI_BACKEND), blocked: [] };
+  const active = [];
+  const blocked = [];
+  for (const role of roles) {
+    if (role.backend !== CLI_BACKEND) continue;
+    // 对规范化后实际交给 provider 的字段再校验，不能只信标签或早期识别结果。
+    const preset = validateCliPreset({
+      cliDriver: role.cliDriver,
+      readOnly: role.readOnly,
+      cliCommand: role.cli?.command,
+      cliPrefixArgs: role.cli?.prefixArgs,
+      cliArgs: role.cli?.args,
+      cliPromptDelivery: role.cli?.promptDelivery,
+    });
+    const reason = role.cliBlockReason || preset.errors.join('；');
+    if (reason) blocked.push({ id: role.id, reason });
+    else active.push(role);
+  }
+  return { active, blocked };
 }
 
 /**
@@ -406,7 +431,13 @@ export function roleGuidanceText(roles) {
     'Route by asking what kind of question you have:',
     '',
   ];
+  const { blocked } = planCliMounts(roles);
   for (const role of roles) {
+    const block = blocked.find((b) => b.id === role.id);
+    if (block) {
+      lines.push(`- **${role.id}** — unavailable / 待迁移：${block.reason}；不得派发。`);
+      continue;
+    }
     const flags = [];
     if (role.readOnly) flags.push('read-only');
     flags.push(role.allowNestedDispatch ? 'may delegate further' : 'cannot delegate further');

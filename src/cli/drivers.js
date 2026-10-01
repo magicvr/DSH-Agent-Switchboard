@@ -10,12 +10,11 @@
 //
 // 驱动产出一组 `cli*` 字段的**具体默认值**，由 UI 在用户选择驱动（或切换只读）时写进
 // 角色配置。也就是说 `cliCommand` / `cliPrefixArgs` / `cliArgs` / `cliPromptDelivery`
-// 仍然是**权威数据**，可见、可改、可审计；驱动只是「一键填好这些字段」。
+// 仍然是执行数据；Host 必须验证它们与所选预设及 readOnly 完全一致。
 //
 // 这样做的理由：
 //   - 不引入「预设 vs 手工覆盖」两套真相，避免「到底哪个生效」的歧义；
-//   - 保留全部高级用例（用户可改成 `custom` 后随便填）；
-//   - 装载期校验仍然只认 `cli*` 字段，不需要额外分支；
+//   - 当前仅支持 codex / grok；旧 custom 仅在无损匹配时识别，否则逐角色阻塞；
 //   - **只读状态被解析成各家的具体参数**，因此 `argv.js` 的占位符契约不必扩张
 //     （仍只有 `{prompt}` / `{cwd}` / `{model}` / `{effort}`），不破坏
 //     `AGENTS.md` 硬规则 4「模型只能填充受限占位符」。
@@ -154,7 +153,7 @@ export const CLI_DRIVERS = [
   // （`[claude-code:unrecognized_model]`），而本机已经很久不用它了。用户明确要求排除。
   //
   // 取证记录**保留**在 `docs/cli-backends.md` §3.0 —— 那证明「已排查过」，删掉等于丢失证据。
-  // 用户若日后想用回它，选「自定义命令」填 `claude` 即可，或按 §3.0 恢复一个预设。
+  // 恢复支持需要另行决策，不能通过旧 custom 配置绕过预设校验。
   {
     id: 'grok',
     label: 'Grok CLI',
@@ -184,17 +183,6 @@ export const CLI_DRIVERS = [
       readOnly ? 'plan' : 'acceptEdits',
     ],
   },
-  {
-    id: 'custom',
-    label: '自定义命令',
-    description: '自行填写命令与参数。适用于本表未收录的 CLI。',
-    command: '',
-    prefixArgs: [],
-    promptDelivery: 'stdin',
-    modelPlaceholder: '',
-    effortValues: ['low', 'medium', 'high', 'xhigh', 'max'],
-    args: (readOnly) => [],
-  },
 ];
 
 /** 驱动 id 列表（含 None 之外的全部）。 */
@@ -221,7 +209,7 @@ export function cliDriverFor(id) {
  */
 export function cliFieldsFor(id, readOnly) {
   const d = cliDriverFor(id);
-  if (d === undefined || d.id === 'custom') return undefined;
+  if (d === undefined) return undefined;
   return {
     cliCommand: d.command,
     cliPrefixArgs: [...d.prefixArgs],
@@ -234,7 +222,7 @@ export function cliFieldsFor(id, readOnly) {
  * 判断角色当前「恰好等于某个驱动」。
  *
  * 用途：UI 反推下拉框该选中哪一项。只读状态会影响 `cliArgs`，因此对两种只读状态都试。
- * 若用户手工改过 `cli*` 字段导致与任何驱动都不一致，返回 `'custom'`，
+ * 若用户手工改过 `cli*` 字段导致与任何驱动都不一致，返回 undefined，
  * 避免界面把用户的自定义配置**显示**成某个预设（那会误导）。
  *
  * ⚠️ **必须同时接受「模板」与「已解析」两种形态**。
@@ -245,21 +233,41 @@ export function cliFieldsFor(id, readOnly) {
  * 两种形态都试一遍，问题就不依赖「值到底经过哪一层」这个不确定前提。
  *
  * @param {object} role - 角色（含 `cli*` 字段）。
- * @returns {string} 驱动 id。
+ * @returns {string|undefined} 驱动 id。
  */
 export function inferCliDriver(role) {
   for (const d of CLI_DRIVERS) {
-    if (d.id === 'custom') continue;
     // 命令与前缀参数：模板形态与解析后形态都算匹配。
     if (!matchesCommandText(role?.cliCommand, d.command)) continue;
     if (!matchesList(role?.cliPrefixArgs, d.prefixArgs)) continue;
-    if ((role?.cliPromptDelivery ?? 'stdin') !== d.promptDelivery) continue;
+    if (role?.cliPromptDelivery !== d.promptDelivery) continue;
     const args = role?.cliArgs ?? [];
     for (const readOnly of [true, false]) {
       if (JSON.stringify(args) === JSON.stringify(d.args(readOnly))) return d.id;
     }
   }
-  return 'custom';
+  return undefined;
+}
+
+/**
+ * 预设执行一致性校验（无写入、无进程执行）。识别驱动不代表权限一致。
+ * 旧 custom / 未记录驱动仅按完整执行形态识别；未知标签不静默降级。
+ * @param {object} role 顶层 CLI 配置，支持模板与解析后形态。
+ * @returns {{driver: string|undefined, errors: string[]}} 判定及逐角色阻塞原因。
+ */
+export function validateCliPreset(role) {
+  const inferred = inferCliDriver(role);
+  const selected = role?.cliDriver;
+  const driver = selected === undefined || selected === '' || selected === 'custom' ? inferred : selected;
+  const d = cliDriverFor(driver);
+  if (!d) return { driver: undefined, errors: ['CLI 配置待迁移：需重选 codex / grok 预设（无法无损识别或预设未知）'] };
+  if (inferred !== driver) {
+    return { driver, errors: [`CLI 预设 ${driver} 与实际 command / prefixArgs / args / delivery 不一致，需重选预设`] };
+  }
+  if (JSON.stringify(role.cliArgs) !== JSON.stringify(d.args(role.readOnly === true))) {
+    return { driver, errors: [`CLI 预设 ${driver} 的 readOnly 与沙箱参数不一致，需重选预设`] };
+  }
+  return { driver, errors: [] };
 }
 
 /**

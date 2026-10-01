@@ -530,3 +530,25 @@ npm 入口、文档及脚本用法与运行时命令同步更新。离线 `check
 根目录保留 12 个 `check-*.mjs`（`package.json:52` 的主链）、`dsh-probe.mjs`、
 `dsh-cat.mjs`、`inline-asar-probe.mjs`、`gen-preset.mjs`、`inspect-sessions.mjs` 及 CLI 探针配置示例。
 模块依据：`scripts/lib/paths.mjs:43`、`cli-config.mjs:50`、`capture.mjs:55`、`probe-cli.mjs:37`。
+
+---
+
+## D16 · CLI 收敛为两种预设与每角色包裹路由
+
+**决策：** 当前只支持 `codex` / `grok`，移除 `custom` 兜底。可执行文件与参数仍来自用户配置，
+沿用已验证的预设模板；Host 必须核对实际 command / prefixArgs / args / delivery，不能只信
+`cliDriver` 标签，并独立校验 `readOnly` 与沙箱参数。客户端切换只读时原子同步预设字段。
+命令细节将由预设承载并在后续面板批次隐藏，本批次保留现有输入控件与全部 `cli*` schema 字段。
+
+**旧配置迁移：** 旧 `custom` 仅完整匹配模板或解析后预设形态时识别为对应驱动，不按文件名猜。
+无法识别时保留原始数据，仅阻塞该角色；自检和主代理指引显示待迁移，其他有效角色继续可用。
+重复 id 等全局结构错误继续整体拒绝。
+
+**包裹路由：** 每角色新增可选字符串 `agentProvider` / `agentModel`，留空继承父代理路由与模型；
+它们与外部 CLI 的 `model` 分离。本批次只完成 schema 与规范化保存，spawn 包裹与路由应用
+在后续批次实施。实时输出采用 DSH Jobs 面板，进程执行器及去超时同样留后续批次。
+
+**依据与代价：** 用户已裁决收敛预设、逐角色迁移阻塞及每角色包裹路由。
+完整形态校验避免隐藏命令借预设标签执行；代价是任意 CLI 自定义参数不再可挂载，需要重选预设。
+离线纯函数与客户端真实回调断言验证迁移、安全边界及原子更新，变异实验验证关键断言判别力；
+本批次不新增真实 CLI 调用或真机验收结论。
