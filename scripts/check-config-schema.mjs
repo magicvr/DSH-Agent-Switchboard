@@ -36,6 +36,42 @@ if (missing.length > 0) {
 console.log(`      name   = ${JSON.stringify(mod.name)}`);
 console.log(`      inject = ${JSON.stringify(mod.inject)}`);
 
+// ---------------------------------------------------------------------------
+// 深层依赖可解析性检查。
+//
+// 这是被真实故障教会的：`import('@deepseek-ai/dsh-tool-subagent')` 在运行中的
+// 应用里失败，因为 app 的解析器只对「出现在某个祖先 package.json 的
+// peerDependencies 键集合里」的包启用拦截路由（见 dsh-app-boot 的
+// readPeerNames / routeUrl 判据）。所以每个运行时需要的包都必须显式声明为 peer。
+// 一旦漏声明，插件照样能装载、自检也有响应，但角色工具会**全部**挂载失败 —— 很难察觉。
+// ---------------------------------------------------------------------------
+const { readFileSync } = await import('node:fs');
+const selfManifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+const declaredPeers = new Set(Object.keys(selfManifest.peerDependencies ?? {}));
+const RUNTIME_IMPORTS = [
+  '@deepseek-ai/schemastery',
+  '@deepseek-ai/dsh-tools',
+  '@deepseek-ai/dsh-tool-subagent',
+];
+
+for (const spec of RUNTIME_IMPORTS) {
+  const declared = declaredPeers.has(spec);
+  try {
+    const imported = await import(spec);
+    const count = Object.keys(imported).length;
+    if (declared) console.log(`PASS  ${spec} 已声明 peer 且可 import（导出 ${count} 项）`);
+    else {
+      console.error(`FAIL  ${spec} 可 import 但**未声明 peerDependencies** —— 应用内拦截路由会拒绝它`);
+      process.exitCode = 1;
+    }
+  } catch (error) {
+    console.error(
+      `FAIL  ${spec} 无法 import${declared ? '（已声明 peer）' : '（且未声明 peer）'}：${error.code ?? error.message}`,
+    );
+    process.exitCode = 1;
+  }
+}
+
 /**
  * 与 `dsh-app-boot` 的 `isNativeConfigSchema` 同构的判定。
  * 单独抽出来是为了能先用**已知正确**的 schema 自检这个判定本身。
