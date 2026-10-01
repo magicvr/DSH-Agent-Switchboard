@@ -21,6 +21,7 @@
  */
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
+import { scopeOf } from '@deepseek-ai/dsh-scope';
 import { join } from 'node:path';
 import {
   CLI_BACKEND,
@@ -41,7 +42,7 @@ import { configPathFor, readConfigFile, writeConfigFile, initialConfig } from '.
  * 这是**装载期的内部读取**：返回可直接交给 `normalizeRoles` 的归一化结果与一句诊断。
  *
  * @param {string|undefined} path - 配置文件绝对路径；不可用时为 undefined。
- * @returns {{ok: boolean, value?: object, detail: string}} 读取结果。
+ * @returns {{ok: boolean, value?: object, missing?: boolean, detail: string}} 读取结果。
  */
 function readRoleConfigFile(path) {
   if (path === undefined) {
@@ -53,7 +54,7 @@ function readRoleConfigFile(path) {
   }
   if (read.missing) {
     // 「文件不存在」不是错误：用户还没配过角色。如实说明，不冒充成功。
-    return { ok: true, value: { roles: [] }, detail: `尚未创建角色配置文件（${path}）` };
+    return { ok: true, missing: true, value: { roles: [] }, detail: `尚未创建角色配置文件（${path}）` };
   }
   return { ok: true, value: read.value, detail: `已从 ${path} 读取 ${read.value.roles.length} 个角色` };
 }
@@ -164,6 +165,10 @@ function newDiagnostics() {
     blocked: [],
     /** 本作用域解析出的角色（`{id, toolName}`）。用于自检在「本作用域不挂载工具」时说清原因。 */
     configuredRoles: [],
+    /** normalization 前的角色数量；非法配置也不能被误报为零角色。 */
+    configuredRoleCount: 0,
+    /** 本实例是否负责挂载；配置角色数与工具挂载状态分别记录。 */
+    mountHere: false,
     roleConfigPath: undefined,
     roleConfigRead: undefined,
     roleConfigSync: undefined,
@@ -180,15 +185,25 @@ function newDiagnostics() {
  *
  * @param {object} ctx - Cordis 上下文。
  * @param {{id: string, toolName: string}[]} roles - 本作用域配置的角色。
- * @returns {{id: string, ok: boolean, detail: string}[]} 实时结果；查不到时返回空数组。
+ * @returns {{id: string, ok: boolean, detail: string, unverified?: boolean}[]} 实时结果；零角色返回空数组，不可查询逐角色标记未核实。
  */
 export function liveRoleTools(ctx, roles) {
-  const tools = typeof ctx.get === 'function' ? ctx.get('tools') : undefined;
-  if (tools === undefined || typeof tools.get !== 'function') return [];
+  // 三态：零角色无需查询；服务可查询则逐角色核实；不可查询不能当作健康。
+  if (roles.length === 0) return [];
+  const unverified = (detail) => roles.map((role) => ({ id: role.id, ok: false, unverified: true, detail }));
+  let tools;
+  try {
+    tools = typeof ctx.get === 'function' ? ctx.get('tools') : undefined;
+  } catch (error) {
+    return unverified(`无法核实：工具服务读取抛错：${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (tools == null || typeof tools.get !== 'function') {
+    return unverified('无法核实：工具服务不可查询');
+  }
   return roles.map((role) => {
     let found;
     try {
-      found = tools.get(role.toolName);
+      found = tools.get(role.toolName, scopeOf(ctx));
     } catch (error) {
       return { id: role.id, ok: false, detail: `查询抛错：${error instanceof Error ? error.message : String(error)}` };
     }
@@ -432,7 +447,7 @@ function presetDiagnostics(ctx) {
  * @param {object} diagnostics - 本激活实例的诊断记录。
  * @returns {object} ToolDefinition
  */
-function selftestTool(ctx, diagnostics) {
+export function selftestTool(ctx, diagnostics) {
   const presets = presetDiagnostics(ctx);
   return defineTool({
     name: 'switchboard_selftest',
@@ -465,9 +480,8 @@ function selftestTool(ctx, diagnostics) {
         const lines = [
           `Agent Switchboard · ${value.phase}`,
           `已挂载角色工具：${value.roleCount}`,
-          `明细：${value.mounted}`,
-          // 实时查询结果与异步快照分开显示：两者不一致本身就是有价值的诊断信息
-          // （快照空、实时有 = 挂载还没跑完，或者你正在别的作用域里查）。
+          `明细（当前挂载状态）：${value.mounted}`,
+          // 明细保留首次核验失败的信息；实时恢复后标注「曾延迟注册」，不再判为失败。
           `实时工具查询：${value.liveTools}`,
           `preset roster：${value.presetRoster}`,
           `preset 异常行：${value.presetBroken}`,
@@ -500,34 +514,46 @@ function selftestTool(ctx, diagnostics) {
       //   2. 同一个插件会被**多次激活**（根条目 + 每个 preset 会话）。在别的作用域调用
       //      自检时，读到的是**那个作用域**的快照，因此报「工具未出现在工具注册表中」。
       //
-      // 「工具到底在不在」本来就可以当场查到（`ctx.get('tools').get(name)`），
-      // 因此不要再依赖快照 —— 快照只用于解释「为什么没挂上」。
-      const live = liveRoleTools(ctx, diagnostics.configuredRoles);
-      const mounted = live.length > 0 ? live : diagnostics.mounts;
+      // 「工具到底在不在」本来就可以当场查到（`ctx.get('tools').get(name, scopeOf(ctx))`），
+      // 因此实时结果决定当前健康；快照只解释仍缺失的角色或曾延迟注册的历史。
+      // 根实例只报告配置数量，不负责挂载，也不把配置角色当作应当可见的工具。
+      const live = diagnostics.mountHere ? liveRoleTools(ctx, diagnostics.configuredRoles) : [];
+      // 快照仅解释历史，当前健康与挂载数量只能由实时查询证明。
+      const mounted = live;
       const okCount = mounted.filter((m) => m.ok).length;
 
       return {
         ok:
           diagnostics.fatal === undefined &&
           diagnostics.configErrors.length === 0 &&
-          // 只把**明确失败**的记入 ok：异步挂载可能尚未完成，或者某个作用域本来就不挂载
-          // 角色工具（根条目），把这些当成失败会产生误导性的「不 ok」。
-          !diagnostics.mounts.some((m) => m.ok === false) &&
-          !live.some((m) => m.ok === false),
+          // 不可查询也逐角色返回失败；零角色不要求工具服务可查询。
+          !mounted.some((m) => m.ok === false),
         phase: 'phase-3',
         roleCount: okCount,
         mounted:
-          mounted.length === 0
-            ? diagnostics.configuredRoles.length === 0
-              ? '（本插件尚未配置任何角色）'
-              : `（本作用域不挂载角色工具；已配置 ${diagnostics.configuredRoles.length} 个角色：${diagnostics.configuredRoles
-                  .map((r) => r.id)
-                  .join(', ')}）`
-            : mounted.map((m) => `${m.id}=${m.ok ? 'OK' : `失败(${m.detail})`}`).join(' '),
+          !diagnostics.mountHere
+            ? `（本作用域不挂载角色工具；配置中有 ${diagnostics.configuredRoleCount} 个角色）`
+            : mounted.length === 0
+              ? diagnostics.configuredRoleCount === 0
+                ? '（本插件尚未配置任何角色）'
+                : '（角色配置非法，未挂载任何角色工具）'
+              : mounted.map((m) => {
+                  const snapshot = diagnostics.mounts.find((entry) => entry.id === m.id);
+                  const initial = snapshot?.ok === false ? snapshot : undefined;
+                  if (m.ok) {
+                    return `${m.id}=OK${live.length > 0 && initial ? `（曾延迟注册：${initial.detail}）` : ''}`;
+                  }
+                  const history = m.unverified && snapshot
+                    ? `；历史快照：${snapshot.ok ? '成功' : '失败'}(${snapshot.detail})`
+                    : initial ? `；首次核验：${initial.detail}` : '';
+                  return `${m.id}=失败(${m.detail}${history})`;
+                }).join(' '),
         liveTools:
-          live.length === 0
-            ? '（本作用域查不到角色工具）'
-            : live.map((m) => `${m.id}=${m.ok ? 'OK' : '缺失'}`).join(' '),
+          !diagnostics.mountHere
+            ? '（本作用域不挂载角色工具）'
+            : live.length === 0
+              ? '（本作用域查不到角色工具）'
+              : live.map((m) => `${m.id}=${m.unverified ? `未核实(${m.detail})` : m.ok ? 'OK' : '缺失'}`).join(' '),
         providers:
           diagnostics.providers.length === 0
             ? '（无 CLI 角色）'
@@ -585,8 +611,8 @@ function selftestTool(ctx, diagnostics) {
  * `unknown tool "delegate_to_codex_scout"`。这是「配置通过 ≠ 能力可用」的又一例，
  * 而且比缺工具更糟 —— 诊断在骗人。
  *
- * 因此这里注册后**核实工具名是否真的出现**在 `ctx.tools` 上。`undefined` 一律
- * 视为失败：宁可少一个工具并如实报告，也不要报 OK 而实际没有。
+ * 因此这里注册后通过 `ctx.get('tools')` 按注册时的 scope **核实工具名是否真的出现**。`undefined` 一律
+ * 视为首次核验失败：宁可如实记录暂未出现，也不要报 OK 而实际没有；后续健康由自检实时查询判定。
  *
  * @param {object} ctx - Cordis 上下文。
  * @param {object} role - 规范化后的角色。
@@ -604,7 +630,8 @@ async function mountRoleTool(ctx, role, toolModule, maxDepth) {
     return { ok: false, detail: error instanceof Error ? error.message : String(error) };
   }
 
-  // 让 fiber 完成激活（`ctx.plugin` 之后插件在当前 tick 内运行），再核实注册结果。
+  // 给 fiber 两个微任务的激活机会，再记录首次核验快照；注入/provider 可能稍后才就绪。
+  // 此处失败不代表永久失败，自检以调用时的实时注册表为准。
   await Promise.resolve();
   await Promise.resolve();
 
@@ -617,17 +644,17 @@ async function mountRoleTool(ctx, role, toolModule, maxDepth) {
   }
   let registered;
   try {
-    registered = tools.get(role.toolName);
+    registered = tools.get(role.toolName, scopeOf(ctx));
   } catch (error) {
     return {
       ok: false,
       detail: `核实注册时抛错：${error instanceof Error ? error.message : String(error)}`,
     };
   }
-  if (registered === undefined) {
+  if (registered === undefined || registered === null) {
     return {
       ok: false,
-      detail: '工具未出现在工具注册表中（插件 fiber 内的装载很可能抛错了；见 Host 日志）',
+      detail: '工具尚未出现在工具注册表中（可能等待注入/provider 就绪，或 fiber 装载失败；见 Host 日志）',
     };
   }
   return { ok: true, detail: '已挂载并核实' };
@@ -722,10 +749,11 @@ function applyInner(ctx, config) {
   //   - 配置服务在根作用域常驻 → 设置页随时可用，且**不注册任何角色工具**；
   //   - 角色工具只在 preset 会话里出现 → 其他 preset 的会话不受污染。
   //
-  // 「子代理也会继承 preset、因而可能重复挂载」这一点不必额外防护：`mountRoleTool`
-  // 在挂载后用 `ctx.get('tools').get(name)` **核实**工具是否可见，而子代理的 agent
-  // 作用域查不到父作用域注册的工具（这正是角色工具不重复出现的实测机制）。
+  // scope 视图会继承祖先层的工具；无 scope 查询只看 global，不能用来判断子代理
+  // 是否可见父作用域工具，也不能作为防止重复挂载的机制。`mountRoleTool` 只核实
+  // 当前 scope 的可见性，是否挂载仍由 `mount` 决定。
   const mountHere = readVolatileField(resolved, 'mount') === true;
+  diagnostics.mountHere = mountHere;
 
   // --- 根条目：做「配置 → 文件」的同步，不挂载角色工具 -----------------------------
   //
@@ -759,18 +787,31 @@ function applyInner(ctx, config) {
  */
 function syncRolesToFile({ resolved, roleConfigPath, diagnostics }) {
   const cordisRoles = readVolatileField(resolved, 'roles');
+  const current = readRoleConfigFile(roleConfigPath);
+  diagnostics.roleConfigRead = current.detail;
+  // 根实例保留原始数量与校验错误，但不挂载、不查询这些角色的工具可见性。
+  const rawRoles = Array.isArray(cordisRoles) && cordisRoles.length > 0
+    ? cordisRoles : current.ok ? current.value.roles : [];
+  diagnostics.configuredRoleCount = rawRoles.length;
+  const { roles, errors } = normalizeRoles(rawRoles,
+    (current.ok && current.value.provider) || resolved.provider,
+    (current.ok && current.value.cwd) || resolved.cwd);
+  diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName }));
+  diagnostics.configErrors = errors;
   if (!Array.isArray(cordisRoles) || cordisRoles.length === 0) {
-    const current = readRoleConfigFile(roleConfigPath);
+    // 根条目没有角色时实际依赖文件；读取失败不能被空数组的校验结果覆盖。
+    if (!current.ok) diagnostics.configErrors.push(current.detail);
     diagnostics.roleConfigSync =
-      current.ok && current.missing !== true
-        ? `根条目无角色；文件已有 ${current.value.roles.length} 个，保持不变`
-        : '根条目无角色，文件也没有 —— 等待 UI 写入';
+      !current.ok
+        ? `根条目无角色；文件读取失败，未同步：${current.detail}`
+        : current.missing === true
+          ? '根条目无角色，文件尚未创建 —— 等待 UI 写入'
+          : `根条目无角色；文件已有 ${current.value.roles.length} 个，保持不变`;
     console.error(`[${name}] ${diagnostics.roleConfigSync}`);
     return;
   }
 
   // 与文件比对后再写，避免每次启动都做一次无意义写盘。
-  const current = readRoleConfigFile(roleConfigPath);
   if (current.ok && current.missing !== true) {
     const same = JSON.stringify(current.value.roles) === JSON.stringify(cordisRoles);
     if (same) {
@@ -791,6 +832,8 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics }) {
   diagnostics.roleConfigSync = written.ok
     ? `已把 ${cordisRoles.length} 个角色从配置同步到文件`
     : `同步失败：${written.error}`;
+  // 成功同步可修复本次的读取失败；只把当前写入失败加入健康门禁，不锁存历史。
+  if (!written.ok) diagnostics.configErrors.push(diagnostics.roleConfigSync);
   console.error(`[${name}] ${diagnostics.roleConfigSync}`);
 }
 
@@ -823,6 +866,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
   // 优先用 Cordis 配置（那是 UI 能写的地方）；为空时回落到文件。
   // 这样「UI 改了但文件还没同步」与「文件是权威」两种时序都不会丢角色。
   let rawRoles = cordisRoles.length > 0 ? cordisRoles : fromFile.ok ? fromFile.value.roles : [];
+  diagnostics.configuredRoleCount = rawRoles.length;
   const defaults = {
     provider: (fromFile.ok && fromFile.value.provider) || resolved.provider,
     cwd: (fromFile.ok && fromFile.value.cwd) || resolved.cwd,

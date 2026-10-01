@@ -2,8 +2,12 @@
 //
 // 为什么必须做：本插件曾让应用无法启动。必须在不重启的前提下，用假 ctx 把
 // 根路径与 preset 路径都真跑一遍 —— 重启一次的成本太高，而且失败会让用户进不去。
-import { readFileSync } from 'node:fs';
-import { apply, Config, liveRoleTools } from '../src/index.js';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { createScope, scopeOf } from '@deepseek-ai/dsh-scope';
+import { apply, Config, liveRoleTools, selftestTool } from '../src/index.js';
+import { configPathFor, initialConfig, writeConfigFile } from '../src/config-file.js';
 
 let pass = 0;
 let fail = 0;
@@ -38,15 +42,24 @@ function section(title) {
  * @param {object} options - 选项。
  * @param {boolean} options.provideProfileContext - 是否提供 profileContext。
  * @param {boolean} options.provideReflect - 是否提供 reflect.provide。
+ * @param {object} [options.scope] - 注册工具的 scope；省略时写入 global。
  * @returns {object} 假 ctx。
  */
-function makeCtx({ provideProfileContext = true, provideReflect = true } = {}) {
+function makeCtx({ provideProfileContext = true, provideReflect = true, scope } = {}) {
   const registered = [];
   const provided = [];
-  const ctx = {
+  const globalTools = new Map();
+  const scopedTools = new Map();
+  let ctx = {
     registered,
     provided,
+    // Cordis 的 ctx.provide 混入入口与 reflect.provide 共用同一调用记录。
+    provide(name, instance) {
+      this.reflect.provide(name, instance);
+      return () => {};
+    },
     get(key) {
+      if (key === 'tools') return this.tools;
       if (key === 'profileContext') {
         return provideProfileContext ? { home: 'C:/tmp/dsh-home', dir: 'C:/tmp/profile' } : undefined;
       }
@@ -66,15 +79,25 @@ function makeCtx({ provideProfileContext = true, provideReflect = true } = {}) {
       : undefined,
     tools: {
       register(def) {
+        const key = scopeOf(ctx);
+        const layer = key === undefined ? globalTools : scopedTools;
+        if (layer.has(def.name)) throw new Error(`重复工具：${def.name}`);
+        layer.set(def.name, def);
         registered.push(def?.name);
-        return () => {};
+        return () => layer.delete(def.name);
       },
-      get(name) {
-        return registered.includes(name) ? { name } : undefined;
+      get(name, viewingScope) {
+        return (viewingScope !== undefined && viewingScope === scopeOf(ctx) ? scopedTools.get(name) : undefined)
+          ?? globalTools.get(name);
       },
     },
-    plugin() {
-      return { dispose() {} };
+    // createScope 借助 extend 写入真实的私有 scope 标签；角色插件只模拟注册副作用。
+    extend(properties) {
+      return Object.assign(Object.create(this), properties);
+    },
+    plugin(_module, config) {
+      if (config?.toolName) this.tools.register({ name: config.toolName });
+      return { ctx: this, dispose() {} };
     },
     subagents: {
       registerProvider() {
@@ -95,6 +118,7 @@ function makeCtx({ provideProfileContext = true, provideReflect = true } = {}) {
       },
     },
   };
+  if (scope !== undefined) ctx = createScope(ctx, scope).ctx;
   return ctx;
 }
 
@@ -111,7 +135,7 @@ section('Config：mount 字段与内置 roles 字段是否冲突');
   check('带角色的旧配置可解析', d !== undefined);
 }
 
-section('根条目路径（无 mount）：只注册自检工具，服务延迟注册');
+section('根条目路径（无 mount）：只注册自检工具，不注册服务');
 {
   const ctx = makeCtx();
   let threw = false;
@@ -125,12 +149,11 @@ section('根条目路径（无 mount）：只注册自检工具，服务延迟�
   check('apply 不抛错', !threw, error?.message);
   check('注册了自检工具', ctx.registered.includes('switchboard_selftest'), ctx.registered.join(','));
   check('未注册任何角色工具', !ctx.registered.some((n) => String(n).startsWith('delegate_to')), ctx.registered.join(','));
-  // 关键：服务注册被**推迟**，因此装载期不会执行 `ctx.reflect.provide()`。
-  // 这正是「注册失败不会让应用起不来」的机制。
+  // 根条目已不再注册任何 Cordis 服务；直接检查实际副作用，不使用恒真兜底。
   check(
-    '服务注册被推迟（不是装载期副作用）',
-    typeof ctx.diagnostics?.roleConfigEnsure === 'function' || true,
-    '（此断言由下面的 preset 路径断言间接覆盖）',
+    '根条目装载期未调用服务注册',
+    ctx.provided.length === 0,
+    ctx.provided.join(','),
   );
 }
 
@@ -154,10 +177,11 @@ section('preset 路径（mount:true）：读角色文件并挂载工具，不该
   // 用真 profileContext 指向真实配置目录（迁移已播种 4 个角色）。
   const makeRealCtx = () => {
     const c = makeCtx();
+    const get = c.get.bind(c);
     c.get = (key) =>
       key === 'profileContext'
         ? { home: 'C:/Users/magicvr/.dsh', dir: 'C:/Users/magicvr/.dsh/profiles/desktop' }
-        : undefined;
+        : get(key);
     return c;
   };
 
@@ -203,7 +227,6 @@ section('同步到文件失败时必须降级而不是抛出');
 
 section('异常输入不得让 apply 抛出（兜底边界）');
 {
-  const ctx = makeCtx();
   for (const [label, cfg] of [
     ['undefined', undefined],
     ['null', null],
@@ -215,7 +238,7 @@ section('异常输入不得让 apply 抛出（兜底边界）');
     let threw = false;
     let error;
     try {
-      apply(ctx, cfg);
+      apply(makeCtx(), cfg);
     } catch (e) {
       threw = true;
       error = e;
@@ -311,10 +334,7 @@ section('自检必须「实时查询」工具注册表，不能只读异步快�
   //    另外同一插件会被多次激活，在别的作用域读快照也会得到误导性结果。
   //
   //    「工具到底在不在」本来就能当场查到，因此断言必须基于**实时查询**。
-  const installed = new Set();
   const ctx = makeCtx();
-  ctx.get = (key) =>
-    key === 'tools' ? { get: (name) => (installed.has(name) ? { name } : undefined) } : undefined;
 
   const roles = [
     { id: 'worker', toolName: 'delegate_to_worker' },
@@ -323,13 +343,13 @@ section('自检必须「实时查询」工具注册表，不能只读异步快�
 
   check('一个都没装时报告缺失', liveRoleTools(ctx, roles).every((m) => m.ok === false));
 
-  installed.add('delegate_to_worker');
-  installed.add('delegate_to_scout');
+  ctx.tools.register({ name: 'delegate_to_worker' });
+  ctx.tools.register({ name: 'delegate_to_scout' });
   const live = liveRoleTools(ctx, roles);
   check('装上后实时查询报告 OK', live.every((m) => m.ok === true), JSON.stringify(live));
   check('实时结果按角色给出 id', live.map((m) => m.id).join(',') === 'worker,scout', JSON.stringify(live));
 
-  // 工具服务不可用时返回空数组（由调用方回落到快照），而不是抛错。
+  // 工具服务不可查询时，必须逐角色标为未核实，而不是抛错或返回空数组。
   const noTools = makeCtx();
   noTools.get = () => undefined;
   let threw = false;
@@ -339,7 +359,9 @@ section('自检必须「实时查询」工具注册表，不能只读异步快�
     threw = true;
   }
   check('工具服务不可用时不抛错', !threw);
-  check('工具服务不可用时返回空数组', liveRoleTools(noTools, roles).length === 0);
+  check('工具服务不可用时逐角色报告未核实',
+    liveRoleTools(noTools, roles).length === roles.length
+      && liveRoleTools(noTools, roles).every((m) => m.ok === false && m.unverified === true));
 
   // 查询本身抛错时按「该角色失败」处理，不影响其它角色。
   const throwing = makeCtx();
@@ -351,6 +373,323 @@ section('自检必须「实时查询」工具注册表，不能只读异步快�
   });
   const mixed = liveRoleTools(throwing, roles);
   check('单个角色查询抛错不影响其它', mixed[0].ok === false && mixed[1].ok === true, JSON.stringify(mixed));
+}
+
+section('scope 层注册成功时，自检与挂载核验必须使用同一视图');
+{
+  const home = mkdtempSync(join(tmpdir(), 'switchboard-check-scope-'));
+  try {
+    const roles = [{ id: 'scout', description: '侦察', instructions: '核实事实', model: 'test-model' }];
+    const written = writeConfigFile(configPathFor(home), initialConfig(roles, { provider: 'self' }));
+    if (!written.ok) throw new Error(written.error);
+    const scope = {};
+    const ctx = makeCtx({ scope });
+    const get = ctx.get.bind(ctx);
+    ctx.get = (key) => key === 'profileContext' ? { home, dir: home } : get(key);
+    apply(ctx, { provider: 'self', mount: true });
+    // 等待动态 import 与 mountRoleTool 的微任务核验完成，不能只测 live 查询绕过快照失败。
+    await import('@deepseek-ai/dsh-tool-subagent');
+    await new Promise(setImmediate);
+
+    const name = 'delegate_to_scout';
+    check('假工具注册写入 scope 层', ctx.tools.get(name, scope)?.name === name);
+    check('无 scope 查询看不到 scope 层工具', ctx.tools.get(name) === undefined);
+    check('其它 scope 查询看不到本层工具', ctx.tools.get(name, {}) === undefined);
+    const live = liveRoleTools(ctx, [{ id: 'scout', toolName: name }]);
+    check('无 scope 的缺失不能作为实时挂载判据', live[0]?.ok === true, JSON.stringify(live));
+    const selftest = ctx.tools.get('switchboard_selftest', scope);
+    const result = await selftest.execute({});
+    check('scope 注册成功时自检报告已挂载一个角色', result.roleCount === 1, JSON.stringify(result));
+    check('scope 注册成功时自检角色标为 OK 而非失败', result.mounted === 'scout=OK', result.mounted);
+    check('scope 注册成功时挂载核验快照不产生假失败', result.ok === true, JSON.stringify(result));
+
+    const global = makeCtx();
+    const definition = { name };
+    global.tools.register(definition);
+    check('scope 为 undefined 时查询与原 global 查询一致',
+      global.tools.get(name) === definition && global.tools.get(name, undefined) === definition
+        && liveRoleTools(global, [{ id: 'scout', toolName: name }])[0]?.ok === true);
+    check('带 scope 的视图仍能看到 global 工具', global.tools.get(name, scope) === definition);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+section('首次核验失败后 provider 延迟就绪：当前健康覆盖失败快照');
+{
+  const home = mkdtempSync(join(tmpdir(), 'switchboard-check-delayed-'));
+  try {
+    const written = writeConfigFile(configPathFor(home), initialConfig([
+      { id: 'scout', description: '侦察', instructions: '核实事实', model: 'test-model' },
+    ], { provider: 'self' }));
+    if (!written.ok) throw new Error(written.error);
+    const scope = {};
+    const ctx = makeCtx({ scope });
+    const get = ctx.get.bind(ctx);
+    ctx.get = (key) => key === 'profileContext' ? { home, dir: home } : get(key);
+    let providerReady;
+    ctx.plugin = (_module, config) => {
+      // 模拟真实插件等待 provider-added 后才注册工具；首次微任务核验必定看不到它。
+      providerReady = () => ctx.tools.register({ name: config.toolName });
+      return { ctx, dispose() {} };
+    };
+    apply(ctx, { provider: 'self', mount: true });
+    await import('@deepseek-ai/dsh-tool-subagent');
+    await new Promise(setImmediate);
+    const selftest = ctx.tools.get('switchboard_selftest', scope);
+    const before = await selftest.execute({});
+    check('延迟注册前自检失败且已挂载数为零', before.ok === false && before.roleCount === 0, JSON.stringify(before));
+    check('延迟注册前保留首次核验失败原因', before.mounted.includes('首次核验：工具尚未出现在工具注册表中'), before.mounted);
+    if (typeof providerReady !== 'function') throw new Error('未启动角色插件');
+    const unregister = providerReady();
+    const after = await selftest.execute({});
+    check('provider 就绪后自检恢复健康', after.ok === true, JSON.stringify(after));
+    check('provider 就绪后角色计为已挂载', after.roleCount === 1, JSON.stringify(after));
+    check('provider 就绪后角色标为已挂载而非失败', after.mounted.startsWith('scout=OK') && !after.mounted.includes('=失败'), after.mounted);
+    check('恢复健康后仍记录曾延迟注册', after.mounted.includes('曾延迟注册：工具尚未出现在工具注册表中'), after.mounted);
+    const rendered = selftest.output.render({}, after).map((block) => block.text).join('\n');
+    check('自检渲染展示当前状态与延迟历史', rendered.includes('明细（当前挂载状态）：scout=OK') && rendered.includes('曾延迟注册'), rendered);
+    // 反向保护：成功快照/恢复历史都不能让后来消失的工具继续 OK。
+    unregister();
+    const removed = await selftest.execute({});
+    check('provider 再移除后自检重新失败', removed.ok === false && removed.roleCount === 0, JSON.stringify(removed));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+section('工具始终未注册：不抛错的 fiber 不能被当作可用工具');
+{
+  const home = mkdtempSync(join(tmpdir(), 'switchboard-check-missing-'));
+  try {
+    const written = writeConfigFile(configPathFor(home), initialConfig([
+      { id: 'worker', description: '执行', instructions: '完成任务', model: 'test-model' },
+    ], { provider: 'self' }));
+    if (!written.ok) throw new Error(written.error);
+    const scope = {};
+    const ctx = makeCtx({ scope });
+    const get = ctx.get.bind(ctx);
+    ctx.get = (key) => key === 'profileContext' ? { home, dir: home } : get(key);
+    ctx.plugin = () => ({ ctx, dispose() {} });
+    apply(ctx, { provider: 'self', mount: true });
+    await import('@deepseek-ai/dsh-tool-subagent');
+    await new Promise(setImmediate);
+    const result = await ctx.tools.get('switchboard_selftest', scope).execute({});
+    check('工具始终未注册时自检仍失败', result.ok === false, JSON.stringify(result));
+    check('工具始终未注册时已挂载数仍为零', result.roleCount === 0, JSON.stringify(result));
+    check('真实缺失角色同时标为失败与实时缺失', result.mounted.startsWith('worker=失败(工具未注册') && result.liveTools === 'worker=缺失', JSON.stringify(result));
+    check('真实缺失角色保留首次核验诊断', result.mounted.includes('首次核验：工具尚未出现在工具注册表中'), result.mounted);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+section('根实例只报告配置数量：不挂载与未配置分别表达');
+{
+  const home = mkdtempSync(join(tmpdir(), 'switchboard-check-root-'));
+  try {
+    const path = configPathFor(home);
+    const written = writeConfigFile(path, initialConfig([
+      { id: 'scout', description: '侦察', instructions: '核实事实', model: 'test-model' },
+      { id: 'worker', description: '执行', instructions: '完成任务', model: 'test-model' },
+    ], { provider: 'self' }));
+    if (!written.ok) throw new Error(written.error);
+    const original = readFileSync(path, 'utf8');
+    const ctx = makeCtx();
+    const get = ctx.get.bind(ctx);
+    ctx.get = (key) => key === 'profileContext' ? { home, dir: home } : get(key);
+    apply(ctx, { provider: 'self', mount: false });
+    const selftest = ctx.tools.get('switchboard_selftest');
+    const result = await selftest.execute({});
+    check('根实例不挂载配置角色且健康', result.roleCount === 0 && result.ok === true && !ctx.registered.some((n) => n.startsWith('delegate_to')), JSON.stringify(result));
+    check('根实例显示不挂载及文件中的两个角色', result.mounted === '（本作用域不挂载角色工具；配置中有 2 个角色）', result.mounted);
+    check('根实例已有角色时不声称未配置', !result.mounted.includes('尚未配置'), result.mounted);
+    check('根实例实时查询说明不负责挂载', result.liveTools === '（本作用域不挂载角色工具）', result.liveTools);
+    const rendered = selftest.output.render({}, result).map((block) => block.text).join('\n');
+    check('根实例渲染同时展示零挂载和两个配置角色', rendered.includes('已挂载角色工具：0') && rendered.includes('配置中有 2 个角色'), rendered);
+    check('根实例只读现有角色文件未改变内容', readFileSync(path, 'utf8') === original);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+section('根实例配置桥：缺文件、读取失败、同步失败与恢复');
+{
+  const home = mkdtempSync(join(tmpdir(), 'switchboard-check-root-gates-'));
+  try {
+    const roles = [{ id: 'scout', description: '侦察', instructions: '核实事实', model: 'test-model' }];
+    // 每次 apply 都是一轮激活；恢复使用新 ctx，避免假注册表的重复名称干扰结果。
+    const activate = async (fixtureHome, extra = {}) => {
+      const ctx = makeCtx();
+      const get = ctx.get.bind(ctx);
+      ctx.get = (key) => key === 'profileContext' ? { home: fixtureHome, dir: fixtureHome } : get(key);
+      let threw = false;
+      try {
+        apply(ctx, { provider: 'self', mount: false, ...extra });
+      } catch {
+        threw = true;
+      }
+      const tool = ctx.tools.get('switchboard_selftest');
+      return { ctx, threw, result: tool ? await tool.execute({}) : {} };
+    };
+
+    const missingHome = join(home, 'missing');
+    const missing = (await activate(missingHome)).result;
+    check('J1：缺文件是合法初始状态且不写入文件',
+      missing.ok === true && missing.configErrors === '' && !existsSync(configPathFor(missingHome)), JSON.stringify(missing));
+    check('J2：missing 透传后同步文案明确尚未创建而非已有或损坏',
+      missing.roleConfigStatus?.includes('同步=根条目无角色，文件尚未创建')
+        && !missing.roleConfigStatus.includes('文件已有') && !missing.roleConfigStatus.includes('失败'), JSON.stringify(missing));
+
+    const jsonHome = join(home, 'json');
+    const jsonPath = configPathFor(jsonHome);
+    mkdirSync(dirname(jsonPath), { recursive: true });
+    const brokenJson = '{invalid-json';
+    writeFileSync(jsonPath, brokenJson);
+    const bad = (await activate(jsonHome)).result;
+    check('J3：根实例依赖坏 JSON 时配置错误阻止健康',
+      bad.ok === false && bad.configErrors?.includes('JSON 解析失败'), JSON.stringify(bad));
+    check('J4：坏 JSON 的同步文案说明读取失败且原文件保持不变',
+      bad.roleConfigStatus?.includes('同步=根条目无角色；文件读取失败，未同步：')
+        && !bad.roleConfigStatus.includes('文件也没有') && !bad.roleConfigStatus.includes('文件尚未创建')
+        && readFileSync(jsonPath, 'utf8') === brokenJson, JSON.stringify(bad));
+
+    // 目标是目录，实际 readFileSync 必须失败；不依赖本机权限或非法路径猜测。
+    const ioHome = join(home, 'io');
+    mkdirSync(configPathFor(ioHome), { recursive: true });
+    const unreadable = (await activate(ioHome, { roles: [] })).result;
+    check('J5：空 Cordis 角色依赖不可读文件时不健康并明确读取失败',
+      unreadable.ok === false && unreadable.configErrors?.includes('读取失败：')
+        && unreadable.roleConfigStatus?.includes('同步=根条目无角色；文件读取失败，未同步：')
+        && !unreadable.roleConfigStatus.includes('文件尚未创建'), JSON.stringify(unreadable));
+
+    // 私有目录的位置放一个普通文件，真实 mkdir/write 必须失败；apply 仍返回。
+    const syncHome = join(home, 'sync');
+    mkdirSync(syncHome);
+    const blocker = dirname(configPathFor(syncHome));
+    writeFileSync(blocker, 'block-directory-creation');
+    const failedSync = await activate(syncHome, { roles });
+    check('J6：真实同步写入失败进入配置错误并阻止健康',
+      failedSync.result.ok === false && failedSync.result.configErrors?.includes('同步失败：')
+        && failedSync.result.roleConfigStatus?.includes('同步=同步失败：'), JSON.stringify(failedSync.result));
+    check('J7：真实同步失败时 apply 不抛错且自检仍可调用',
+      !failedSync.threw && failedSync.ctx.registered.includes('switchboard_selftest')
+        && failedSync.result.phase === 'phase-3', JSON.stringify(failedSync.result));
+
+    const repaired = writeConfigFile(jsonPath, initialConfig([], { provider: 'self' }));
+    if (!repaired.ok) throw new Error(repaired.error);
+    const legal = (await activate(jsonHome)).result;
+    check('J8：坏文件修为合法空文件后重新激活恢复健康',
+      legal.ok === true && legal.configErrors === ''
+        && legal.roleConfigStatus?.includes('文件已有 0 个，保持不变'), JSON.stringify(legal));
+
+    rmSync(blocker);
+    const synced = (await activate(syncHome, { roles })).result;
+    check('J9：移除写入阻碍后同步成功恢复健康且角色落盘',
+      synced.ok === true && synced.configErrors === ''
+        && synced.roleConfigStatus?.includes('已把 1 个角色从配置同步到文件')
+        && JSON.stringify(JSON.parse(readFileSync(configPathFor(syncHome), 'utf8')).roles) === JSON.stringify(roles), JSON.stringify(synced));
+
+    writeFileSync(jsonPath, brokenJson);
+    const recovered = (await activate(jsonHome, { roles })).result;
+    check('J10：同次激活成功同步修复坏文件时历史读取错误不锁存不健康',
+      recovered.ok === true && recovered.configErrors === ''
+        && recovered.roleConfigStatus?.includes('JSON 解析失败')
+        && recovered.roleConfigStatus?.includes('已把 1 个角色从配置同步到文件')
+        && JSON.stringify(JSON.parse(readFileSync(jsonPath, 'utf8')).roles) === JSON.stringify(roles), JSON.stringify(recovered));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+section('诊断边界：不可查询、零角色、非法配置与服务注册 spy');
+{
+  // 直接给自检传入快照，避免动态 import 的微任务时序决定边界测试是否命中。
+  const roles = ['scout', 'worker', 'architect', 'reviewer']
+    .map((id) => ({ id, toolName: `delegate_to_${id}` }));
+  const diagnostics = (mounts) => ({
+    mountHere: true,
+    configuredRoles: roles,
+    configuredRoleCount: roles.length,
+    mounts,
+    configErrors: [],
+    providers: [],
+    executables: [],
+    blocked: [],
+  });
+  const noTools = makeCtx();
+  noTools.get = () => undefined;
+  const empty = await selftestTool(noTools, diagnostics([])).execute({});
+  check('F1-a：有角色但工具不可查询且快照为空时失败并说明未核实',
+    empty.ok === false && empty.roleCount === 0
+      && roles.every((r) => empty.mounted.includes(`${r.id}=失败(无法核实：工具服务不可查询`))
+      && empty.liveTools.includes('未核实'), JSON.stringify(empty));
+
+  const partialTools = makeCtx();
+  partialTools.get = (key) => key === 'tools' ? { register() {} } : undefined;
+  const partial = await selftestTool(partialTools, diagnostics([
+    { id: 'scout', ok: true, detail: '已挂载并核实' },
+    { id: 'worker', ok: true, detail: '已挂载并核实' },
+  ])).execute({});
+  check('F1-b：四角色不可查询时两个成功快照不能证明当前健康',
+    partial.ok === false && partial.roleCount === 0
+      && roles.every((r) => partial.mounted.includes(`${r.id}=失败(无法核实：工具服务不可查询`))
+      && partial.mounted.includes('历史快照：成功') && !partial.mounted.includes('=OK'), JSON.stringify(partial));
+
+  const home = mkdtempSync(join(tmpdir(), 'switchboard-check-boundaries-'));
+  try {
+    const path = configPathFor(home);
+    const withHome = () => {
+      const ctx = makeCtx();
+      const get = ctx.get.bind(ctx);
+      ctx.get = (key) => key === 'profileContext' ? { home, dir: home } : get(key);
+      return ctx;
+    };
+    const write = (rawRoles) => {
+      const written = writeConfigFile(path, initialConfig(rawRoles, { provider: 'self' }));
+      if (!written.ok) throw new Error(written.error);
+    };
+    write([]);
+    const zeroCtx = withHome();
+    apply(zeroCtx, { mount: true, provider: 'self' });
+    const zeroTool = zeroCtx.tools.get('switchboard_selftest');
+    zeroCtx.get = () => undefined;
+    const zero = await zeroTool.execute({});
+    check('F1-c：零角色 preset 即使工具不可查询也保持健康',
+      zero.ok === true && zero.roleCount === 0 && zero.mounted === '（本插件尚未配置任何角色）', JSON.stringify(zero));
+
+    write([
+      { id: 'scout', description: '侦察', instructions: '核实事实', model: 'test-model' },
+      { id: 'worker', description: '执行', instructions: '完成任务' },
+    ]);
+    const original = readFileSync(path, 'utf8');
+    const root = withHome();
+    apply(root, { mount: false, provider: 'self' });
+    const rootTool = root.tools.get('switchboard_selftest');
+    const invalid = await rootTool.execute({});
+    const rendered = rootTool.output.render({}, invalid).map((block) => block.text).join('\n');
+    check('F2：根实例保留两个原始角色并显示 model 错误且不健康',
+      invalid.ok === false && invalid.mounted.includes('配置中有 2 个角色')
+        && !invalid.mounted.includes('配置中有 0 个角色')
+        && invalid.configErrors.includes('roles[1].model 必填')
+        && rendered.includes('roles[1].model 必填') && readFileSync(path, 'utf8') === original, JSON.stringify(invalid));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  const spy = makeCtx();
+  const instance = {};
+  let disposer;
+  let threw = false;
+  try {
+    disposer = spy.provide('testService', instance);
+    spy.reflect.provide('reflectService', instance);
+  } catch {
+    threw = true;
+  }
+  check('F3：ctx.provide 与 reflect.provide 共用 spy 且返回 disposer',
+    !threw && spy.provided.join(',') === 'testService,reflectService' && typeof disposer === 'function',
+    spy.provided.join(','));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
