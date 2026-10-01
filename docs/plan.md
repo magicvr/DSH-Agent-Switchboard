@@ -33,7 +33,8 @@
 ```
 .
 ├── package.json                 契约字段：exports["."] / exports["./client"] / dsh.*
-├── cordis.patch.yml             插件条目 + 角色列表（声明式）
+├── cordis.patch.yml             启用 bundle 根条目，不携带角色列表
+├── presets/switchboard.patch.yml  preset 声明，本插件只带 mount: true
 ├── README.md                    用户视角
 ├── AGENTS.md  CONTRIBUTING.md  LICENSE  .gitignore  .gitattributes  .editorconfig
 ├── docs/
@@ -42,22 +43,19 @@
 │   ├── plan.md                  本文件
 │   └── cli-backends.md          三个 CLI 的实测参数表（Phase 3 产出）
 ├── src/
-│   ├── index.js                 Host 半边入口：apply / inject / Config / name
-│   ├── schema.js                角色与全局配置的 schemastery schema（两半边共用）
+│   ├── index.js                 Host 入口、Config、配置桥接、角色工具挂载与自检
+│   ├── config-file.js           roles.json 路径、读取、原子写入与格式校验
 │   ├── roles.js                 角色解析与校验：id/标题/提示词/backend → 工具定义
-│   ├── dispatch.js              统一派发：解析 backend → providerName → start()
-│   ├── host/
-│   │   ├── tools.js             按角色注册模型可见工具（ctx.tools.register）
-│   │   └── prompt.js            角色提示词拼装 + 结果契约包装
 │   ├── cli/
 │   │   ├── provider.js          SubagentProvider 实现（name/capabilities/start）
-│   │   ├── run.js               单次 CLI 运行的完整生命周期
+│   │   ├── drivers.js           codex / grok / custom 驱动预设
 │   │   ├── argv.js              参数模板 → argv 数组（占位符替换，无 shell）
 │   │   └── output.js            stdout/stderr/退出码 → ContentBlock[]
 │   └── client/
-│       └── index.js             __ModuleLoader__.load + composer.dock 只读指示
-├── scripts/
-│   ├── lib/                     路径解析与本地 CLI 配置校验共享模块
+│       ├── index.js             __ModuleLoader__.load + 角色与派发设置页
+│       └── logic.js             可离线检查的客户端校验逻辑
+└── scripts/
+│   ├── lib/                     paths / cli-config / capture / probe-cli 共享模块
 │   ├── ops/                     写入、迁移、修复脚本（批次 2d-2 已归类）
 │   │   ├── migrate-roles-to-file.mjs  角色文件迁移
 │   │   ├── fix-cli-models.mjs         CLI 模型与 cwd 修复
@@ -75,14 +73,21 @@
 │   │   ├── probe-clis.mjs            CLI 入口发现与显式探针
 │   │   ├── probe-codex.mjs           Codex 非交互探针
 │   │   └── check-cli-live.mjs        可选真实 CLI 派发检查
-│   ├── check-*.mjs              可移植离线检查及显式目标预检
+│   ├── check-*.mjs              12 个检查入口，串联在 npm run check
+│   ├── cli-probes.example.json / cli-probes.example.md  CLI 探针配置示例与说明
 │   ├── dsh-probe.mjs            只读 asar 取证（已完成）
 │   ├── dsh-cat.mjs              只读读取归档内单文件（已完成）
 │   ├── inline-asar-probe.mjs    底层解析器（已完成）
 │   ├── gen-preset.mjs           preset 声明生成
 │   └── inspect-sessions.mjs     会话记录取证
-└── test/                        Phase 2 起
 ```
+
+上表是当前布局，不是初期拆分设想。原拟 `schema.js` 的 Host schema 合并进
+`src/index.js`；原拟 `dispatch.js` / `host/tools.js` 的路由配置与挂载分由
+`src/roles.js`（`toolConfigFor`）和 `src/index.js`（`mountRoleTool`）承担，未另建
+`host/`。原拟 `host/prompt.js` 的角色指引在 `roles.js`，CLI 提示词拼装及原拟
+`cli/run.js` 的进程生命周期在 `cli/provider.js`。客户端另抽出 `client/logic.js`。
+未创建 `test/`；检查由 `scripts/check-*.mjs` 承担（`package.json` 的 `scripts.check`）。
 
 脚本按副作用与环境依赖分类：`lib/` 只提供共享解析和校验，`ops/` 承载业务允许的写入，
 `probes/` 承载安装环境与外部 CLI 取证；离线检查保留在 `scripts/`。批次 1 仅新增
@@ -93,7 +98,7 @@
 
 **目标：** 证明这个包能被 DSH 装载、Host 与 Client 两半边都活着。不实现任何派发。
 
-**状态：代码已完成并通过静态与离线验证；真机激活待一次应用重启。**
+**状态：已完成并真机验收；修复后的应用重启与真实派发均已完成。**
 
 **产出（已落地）：**
 
@@ -115,11 +120,11 @@
 7. ✅ **Client 半边已在运行中的 GUI 生效**（不依赖 Host 半边，有自己的 HMR）。`cordis_inspect_query`（Client `Slots`，root `conversation.composer.dock`）的 `occupants` 现有两项：官方 `stats`（order 0）与我们的 `id: "agent-switchboard"`（order 5），`active: true`。**这条即验收第 4 条，已通过。**
 8. ✅ 顺带确认：`dsh.client.platform: "web"` **在桌面版下是正确的**——profile 目录名为 `desktop`，但渲染层就是这套 Web 客户端。
 
-**待完成（阻塞条件明确）：**
+**历史阻塞（已解除，保留排障记录）：**
 
-- **Host 半边仍为 `failed`。** 第一次重启后模块确实被重新加载（`fiberPhase` 由 `null` 变为 `failed`，`Config` 状态变为 `status: "schema"`），并暴露出真实错误 `schema.required is not supported by the value schema DSL`。该错误已修复——`output.schema` 是 value schema DSL，必需性必须写成**属性级 `required: true`**（见 `architecture.md` 第 3.1 节第 12 条）。
-- **修复的真机生效仍需重启。** link 模式下模块被缓存，`set_plugin` 开关与 `install_bundle` 都不重新加载源码（已用落地文件探针证实新代码从未执行）。Client 半边不受此限。
-- 重启后跑完验收第 1–3、5 条。
+- **Host 半边曾为 `failed`。** 第一次重启后模块确实被重新加载（`fiberPhase` 由 `null` 变为 `failed`，`Config` 状态变为 `status: "schema"`），并暴露出真实错误 `schema.required is not supported by the value schema DSL`。该错误已修复——`output.schema` 是 value schema DSL，必需性必须写成**属性级 `required: true`**（见 `architecture.md` 第 3.1 节第 12 条）。
+- **当时修复需重启才生效。** link 模式下模块被缓存，`set_plugin` 开关与 `install_bundle` 都不重新加载源码（当时已用落地文件探针证实新代码尚未执行）。Client 半边不受此限；这仍是后续 Host 改动的验证约束，不是本阶段的待办。
+- **重启后已验收。** 已有真机记录显示四个角色全部 `OK`、`已挂载角色工具：4`，并完成真实派发（`exit=0`）。自检当前实时查询工具注册表（`src/index.js` 的 `liveRoleTools` / `selftestTool`）；本轮文档校准未重新执行真机派发。
 
 ### 教训：验证方法本身出过错
 
@@ -129,7 +134,7 @@
 
 **验收（重启后逐条真实通过）：**
 1. `plugin_manager install_bundle` 能把包装进 profile。
-2. 插件出现在 Loader 条目列表里，`Config` schema 被 `cordis_inspect_query`（Provider `Config`）读到（当前该条目**没有** config 说明，正是因为未激活）。
+2. 插件出现在 Loader 条目列表里，`Config` schema 被 `cordis_inspect_query`（Provider `Config`）读到；此前未激活时没有 config 说明的状态已解除。
 3. `switchboard_selftest` 工具在 `cordis_inspect_query`（Provider `Tool`）的清单里出现。
 4. GUI 刷新后 `composer.dock` 能看到那个只读状态条。
 5. `.volatile()` 字段在设置页可编辑；非 volatile 字段**不**出现（这条用来确认 D9 的前提）。
@@ -183,9 +188,11 @@
 
 **目标：** 至少一个外部 CLI 能作为角色后端跑通。
 
+**状态：核心实现已落地，codex 已完成角色派发真机验收；其它 CLI 的历史探针结果与未验证边界分开记录。**
+
 **产出：**
-- `docs/cli-backends.md`：三个 CLI 的**实测**参数表（非交互子命令、提示词传递方式、是否需 TTY、**模型 flag、思考强度 flag 与各自可用档位**、退出码语义、超时表现）
-- `src/cli/*`：provider 实现，含 `modelFlag` / `effortFlag` 映射与 `effortValues` 声明
+- `docs/cli-backends.md`：codex / grok 的实测参数表与 Claude 历史取证，逐项区分 help 候选、调用被接受、实际生效与仍未实测内容
+- `src/cli/*`：provider、argv 校验与输出处理；`drivers.js` 用参数模板映射 `{model}` / `{effort}` 并声明 `effortValues`
 - 插件面板可配可执行文件路径与超时
 
 **验收：**
@@ -196,7 +203,7 @@
 5. `argv` 全程是数组，日志中可证明没有任何 shell 参与；`{model}` / `{effort}` 的替换结果始终是独立 argv 元素。
 6. 取消：中断主代理时子进程被终止，不残留孤儿进程。
 
-**先做哪个 CLI：** **`codex`**（已拍板）。注意本机 `codex` 的入口是 PowerShell 脚本 `%APPDATA%\npm\codex.ps1`，而不是 `.exe`——因此 Phase 3 的**第一件事**是用 `ctx.subprocess.resolveExecutable` 验证脚本入口能否正确解析，再写 provider。`claude`（`claude -p`，干净的非交互入口）与 `grok`（`.exe`）作为后续目标。
+**首个 CLI 的历史选择与结果：** 先做 **`codex`**。入口试验已完成：`.ps1` / `.cmd` 无法在 `shell:false` 下直接执行，当前预设使用 `node <codex.js>`（见 `cli-backends.md` §1）。当前内置驱动为 `codex` / `grok` / `custom`；Claude 曾做探针取证，但预设已移除，用户可通过 custom 自行接入。
 
 **验收结果（codex 部分真机通过）：**
 
@@ -225,7 +232,9 @@
 > 调用方 abort 传到子进程。`check-cli-provider.mjs` 因此从 55 → 64 条。
 
 **未完成部分（如实记录）：**
-- `claude` 与 `grok` 的入口与 effort flag **仍未实测**（`docs/cli-backends.md` 已如实标注「未实测」）。
+- Claude 与 grok 的入口及非交互调用已做历史实测（见 `cli-backends.md` §3.0 / §4.0），不能再统称未实测。Claude 本机端到端失败，`--effort` 被接受不等于强度实际生效。
+- grok 已有 `grok-4.7` + `low` 调用成功记录及非法模型失败记录；其它模型/强度组合与路由生效对照**未实测**。当前预设改用 `promptFile`，本轮仅核对实现，不新增真机结论。
+- 超时与取消已有离线检查，但真实 CLI 进程树是否清理干净**仍未实测**（见 `cli-backends.md` §6）。
 - CLI 后端的「只读」是**声明性**的：由 CLI 自身的沙箱参数实现（codex 的 `-s read-only`，真机日志里 `sandbox: read-only` 可证），插件无法越过 CLI 强制执行。角色 `readOnly` 对 CLI 后端不产生 `toolFilter`。
 
 ## Phase 4 · 可观测性与打磨
@@ -233,10 +242,13 @@
 - 调度日志：谁派的、派给谁、哪条线路、耗时、退出状态、结果摘要
 - **角色设置页（D13 / D14）—— 已落地并实测可见。**
   页面：Client 半边 `settings.section`（`id: agent-switchboard`，标签「角色与派发」）。
-  数据：角色存在**根条目的 Cordis 配置** `config.roles`；**读**走 `configForms.describe()`
+  数据：角色文件为 `$DSH_HOME/agent-switchboard/roles.json`（`src/config-file.js`）。
+  **当前设置页仍经根条目的 volatile `roles` 桥接**：读走 `configForms.describe()`
   镜像面（`ensure()` → `getSnapshot().view.namespaces`），**写**走
   `remote.settings.mutate(ns, [{op:'set',path:['roles'],value}], revision)`；Host 侧把角色
-  同步到 `$DSH_HOME/agent-switchboard/roles.json`。落地要点与**三次失败的原因**见 `decisions.md` D14。
+  同步到角色文件，并非客户端直接写 JSON。preset 中本插件只带 `mount: true`，不得携带 `roles`
+  （`scripts/check-profile-wiring.mjs`）；挂载实例在本作用域 Cordis 角色非空时优先使用它，否则读文件。
+  保存不等于已挂载会话立即更新工具。历史路径与当前边界见 `decisions.md` D14。
 - 并发与预算上限
 - README 补真实用法示例
 
@@ -249,8 +261,7 @@
 | R3 | `ctx.subprocess` 在 Windows 上解析 `codex.ps1` 的行为未知 | CLI 后端可能在解析阶段就失败 | 用 `resolveExecutable` 先做独立小实验，再接入 provider |
 | R4 | 本机无 DSH 类型定义 | 无法获得编译期类型保障 | D1 已把风险限制在少数薄适配文件；用 `cordis_inspect_query` 作为类型的唯一权威来源 |
 | R5 | Client 半边崩溃会清空整个 slot | 可能拖垮 GUI 的一块区域 | 第一期只做只读、最小 DOM；严守「不 import Harness Client 包」 |
-| R6 | 角色列表若放 patch，用户在 GUI 里改不了 | 与「面板配置角色」的期望有落差 | **已解决（D13 / D14）**：角色放**根条目配置**（客户端唯一可读写的位置），
-设置页读 `configForms` 镜像、写 `settings.mutate`，已实测可见可改 |
+| R6 | 角色列表若仅放 patch，用户在 GUI 里改不了 | 与「面板配置角色」的期望有落差 | **已解决（D13 / D14）**：设置页经根配置桥接，Host 同步角色文件；preset 只带 `mount: true`，不带 `roles`；设置页已实测可见可改 |
 | R7 | 外部 CLI 的额度/登录状态不透明 | 派发失败原因难定位 | 结果里保留原始 stderr 与退出码（D8），不做美化丢弃 |
 | R8 | **link 模式下 Host 半边改动无法热加载** | 每次改动都需重启 dsh 才能真机验证，迭代慢 | 已实测确认（`architecture.md` 第 3.3 节）。缓解：把逻辑尽可能放进可用抽取方式验证的纯函数；Client 半边不受此限（有 HMR） |
 | R9 | **`failed to import` 会掩盖真实错误** | 排查方向被误导，可能浪费大量时间（Phase 1 已实际发生） | 已记录取证手法（`architecture.md` 第 3.2 节）：先用落地文件探针判定「模块是否已加载」，再查 `apply` 内部 |
@@ -263,6 +274,6 @@
 | --- | --- |
 | 主代理只统合、不下场 | 主代理侧只增委派工具；写文件权限不授予主代理 |
 | 跨 CLI 可指派 | Phase 3 的 `cli` provider |
-| 角色与派发方式可配置 | 角色存**根条目配置** `config.roles`（UI 可读写）+ 同步到 `$DSH_HOME/agent-switchboard/roles.json`；机制是每个角色自己的 `backend` 字段（D13 / D14） |
+| 角色与派发方式可配置 | 角色文件为 `$DSH_HOME/agent-switchboard/roles.json`；UI 经根配置读写桥接，Host 同步文件；preset 只带 `mount: true`，不得携带 `roles`；机制是每个角色自己的 `backend` 字段（D13 / D14） |
 | 模型不得自由拼装 shell 命令 | `src/cli/argv.js` 只做受限占位符替换，`argv` 数组直传 `ctx.subprocess.spawn`，全程无 shell |
 | `raw/` 不入库 | 已在 `.gitignore`，且 `AGENTS.md` 列为硬规则 |

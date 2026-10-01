@@ -3,6 +3,8 @@
 > 本文件只记录**实测过**的事实。未实测的一律标注「未实测」，不凭 `--help` 推断行为。
 >
 > 配套：[`decisions.md`](./decisions.md) D12（模型与思考强度）、[`plan.md`](./plan.md) Phase 3。
+>
+> 本轮校准依据当前代码与已有实测记录，不重新调用外部 CLI。下列版本、耗时与 help 参数为历史记录；当前探针已改为用户配置驱动，不能仅凭脚本存在复现原来的参数与结果。原始 help 全文及每个候选参数是否仍适用于当前安装版本**未核实**，保留历史原文；help 记录不等于逐项行为实测（`scripts/probes/probe-cli-help.mjs:1`、`:22`，`scripts/lib/probe-cli.mjs:19`）。
 
 ## 为什么需要这个文件
 
@@ -240,8 +242,9 @@ claude 自己给出的官方出路是**把未知模型映射到它认识的模�
 `behavesAs`（modelPicker 行）或 `modelOverrides`。这属于**该 CLI 的配置工作**，
 不由本插件代劳。
 
-> 因此驱动表里保留了 `claude` 预设（调用形态是按实测写的），但**本机尚不可用**。
-> 一旦它的模型映射配好，该预设即可直接使用 —— 不需要改插件代码。
+> **历史状态：** 驱动表曾保留 `claude` 预设，调用形态按上述实测编写，当时本机端到端不可用。
+> **当前状态：** 内置预设已移除（`src/cli/drivers.js:150`），驱动表只含 `codex` / `grok` / `custom`。
+> 用户仍可通过 custom CLI 配置自行接入；模型映射如何配置及配置后是否跑通仍未实测。
 
 #### 3.1 调用形态（`--help` + 上表实测）
 
@@ -253,13 +256,13 @@ claude 自己给出的官方出路是**把未知模型映射到它认识的模�
 - **工作目录**：`--add-dir <directories...>`。
 - 另有 `--session-id <uuid>`、`--resume`、`--system-prompt`、`--restricted`。
 
-### 3.2 模型与思考强度（仅来自 `--help`，**未实测**）
+### 3.2 仍未实测的项：模型别名、强度生效与回退（历史 `--help` 候选）
 
-| 项 | 参数 |
+| 仍未实测的项 | 历史 help 参数与边界 |
 | --- | --- |
-| 模型 | `--model <model>`（接受别名如 `opus`/`sonnet`） |
-| 思考强度 | `--effort <level>`，help 明示取值 `low, medium, high, xhigh, max` |
-| 回退模型 | `--fallback-model` |
+| 模型别名及成功路由 | `--model <model>`（help 列别名如 `opus`/`sonnet`）；§3.0 已确认传入模型被目录校验读取，未确认这些别名能成功调用 |
+| 思考强度实际生效及逐档覆盖 | `--effort <level>`，help 明示取值 `low, medium, high, xhigh, max`；§3.0 只证明参数被接受，本机端到端失败，不能证明强度生效 |
+| 回退模型行为 | `--fallback-model`；仍未实测 |
 
 **注意**：`--effort` 的取值集合是**在 help 里文档化的**，这与 codex 形成对比。
 
@@ -276,9 +279,13 @@ claude 自己给出的官方出路是**把未知模型映射到它认识的模�
 | 只读 | `--permission-mode <default\|acceptEdits\|auto\|dontAsk\|bypassPermissions\|plan>` |
 | **端到端** | ✅ **通过**：`-p <prompt> -m grok-4.7 --reasoning-effort low` → 退出 0，stdout 收到标记串 |
 
-⚠️ 因为提示词是参数，驱动模板里**必须**含 `{prompt}`（`promptDelivery: 'argv'`）。
-`scripts/check-drivers.mjs` 有一条断言锁死这个自洽性：`argv` 传递必须含 `{prompt}`，
-`stdin` 传递必须不含（否则提示词会被传两次）。
+**历史调用与当前预设需区分：** 上表实测使用 `-p <prompt>` 的 `argv` 形态。
+当前 grok 预设使用 `promptDelivery: 'promptFile'` 与 `--prompt-file {prompt}`
+（`src/cli/drivers.js:165`），`{prompt}` 承载临时文件路径；provider 写入包含角色指令的提示词并清理临时文件（`src/cli/provider.js:165`）。
+原因是 argv 值拒绝换行 / NUL，多行角色提示词不能直接放入参数。权威枚举在
+`src/cli/argv.js:21`、`:80`；`argv` / `promptFile` 模板都必须含 `{prompt}`，
+`stdin` 必须不含（`:107`），驱动检查也覆盖该约束（`scripts/check-drivers.mjs:75`）。
+本轮未新增 `promptFile` 真机实测；代码中的既有实测说明保留，不扩展成逐模型/强度验证。
 
 ### 4.1 调用形态（`--help` + 上表实测）
 
@@ -289,37 +296,44 @@ claude 自己给出的官方出路是**把未知模型映射到它认识的模�
 - `--cwd <CWD>`、`--allow` / `--deny`、`--always-approve`。
 - `grok models` 子命令可列出可用模型。
 
-### 4.2 模型与思考强度（仅来自 `--help`，**未实测**）
+### 4.2 仍未实测的项：模型/强度逐项覆盖与生效对照
 
-| 项 | 参数 |
+| 仍未实测的项 | 已有证据与边界 |
 | --- | --- |
-| 模型 | `-m, --model <MODEL>` |
-| 思考强度 | `--reasoning-effort <EFFORT>`（别名 `--effort`） |
+| 其它模型成功调用及路由对照 | `-m, --model <MODEL>`；§4.0 已有 `grok-4.7` 成功及非法模型失败记录，`grok models` 列出名称不证明每个模型均跑过 |
+| 其它强度、别名与实际生效对照 | `--reasoning-effort <EFFORT>`（历史 help 列别名 `--effort`）；已有 `low` 调用成功记录，无逐档调用或 CLI 自报强度对照。驱动声明的 `low / medium / high / xhigh / max`（`src/cli/drivers.js:175`）不等于五档已实测 |
 
 ## 5. 对实现的硬性要求
 
-1. **绝不使用 shell**：`argv` 数组直传，`shell: false`。提示词走 stdin，不拼进命令行（避免引号与长度问题）。
+1. **绝不使用 shell**：`argv` 数组直传，本地 Node 探针固定 `shell: false`（`scripts/lib/capture.mjs:55`）。提示词优先走 stdin；当前 grok 走临时文件，argv 只传路径；单行短提示才适合 `argv`（`src/cli/argv.js:63`、`src/cli/provider.js:165`）。
 2. **可执行文件与参数全部来自用户配置**，模型只能填充受限占位符（`{prompt}` / `{cwd}` / `{model}` / `{effort}`）。
 3. **入口解析必须实测**：不能假定「命令名可 spawn」。codex 的例子证明脚本入口会让整条路径失效。
 4. **必须能读到 CLI 自报的路由事实**（如 codex 的 stderr），用于验收「模型/强度确实生效」。
 5. **失败语义**：命令不存在、非零退出、超时，必须产生可读错误，绝不当作成功。
 
-## 6. 尚未实测的项
+## 6. 仍未实测的项
+
+- [ ] codex：**超时与中断的真实行为**（`terminate` 后是否残留孤儿进程）。
+      插件的**代码路径**已有离线断言（超时真的中止、调用方 abort 传到子进程），
+      但**未做真机验证** —— 离线断言用的是假 spawn，证明不了真实进程树被清理。
+- [ ] codex：`--json` 事件流的确切结构（仅在需要结构化 usage/耗时统计时才值得再查）
+- [ ] codex：非零退出码的具体语义细分（额度耗尽 vs 参数错误 vs 模型不存在）——目前只知「都会以致码 1 失败」
+- [ ] grok：其它模型/强度组合、强度别名及 CLI 路由生效对照（见 §4.2）。
+- [ ] claude：模型别名成功路由、强度逐档生效及回退模型行为（见 §3.2；当前无内置预设）。
+- [ ] claude：**如何让它的模型目录接受网关模型**（`behavesAs` / `modelOverrides` 的具体写法）。
+      这是该 CLI 的配置工作，不由本插件代劳；配置后可通过 custom CLI 自行接入，能否跑通仍未实测。
+
+## 7. 已关闭的历史实测清单（从原「尚未实测的项」移入，保留记录）
 
 - [x] ~~codex：`-m` 与 `-c model_reasoning_effort=` 是否真的生效~~ → 已实测，见 §2.4
 - [x] ~~codex：`--json` 是否比 `-o` 更适合稳定解析~~ → 已实测：`--json` 会牺牲可读路由事实，不采用
 - [x] ~~codex：端到端经角色派发是否真的跑通~~ → 已实测，见 §2.5（`exit=0`，`argv` 与自报路由一致）
 - [x] ~~codex：`ctx.subprocess.resolveExecutable` 能否解析到可用入口~~ → 已实测：最终采用
       `node` + `codex.js` 绝对路径（`codex.ps1` 与 `codex.cmd` 都不行，见 §1）
-- [ ] codex：**超时与中断的真实行为**（`terminate` 后是否残留孤儿进程）。
-      插件的**代码路径**已有离线断言（超时真的中止、调用方 abort 传到子进程），
-      但**未做真机验证** —— 离线断言用的是假 spawn，证明不了真实进程树被清理。
-- [ ] codex：`--json` 事件流的确切结构（仅在需要结构化 usage/耗时统计时才值得再查）
-- [ ] codex：非零退出码的具体语义细分（额度耗尽 vs 参数错误 vs 模型不存在）——目前只知「都会以致码 1 失败」
 - [x] ~~claude：能否直接 spawn；stdin 提示词形态；`--effort` 是否真的生效~~ → 已实测：
       入口可直接 spawn、`-p` + stdin 可用、`--model` 与 `--effort` 都被接受。
       **但本机端到端仍不可用**，原因是 claude 自己的模型目录校验（不是插件问题），见 §3.0。
 - [x] ~~grok：非交互调用形态（是否必须 TTY）~~ → 已实测：`-p/--single` 可用，无需 TTY，见 §4.0
 - [x] ~~三者：是否需要 TTY~~ → 已实测：codex 与 grok 都不需要；claude 的非交互路径也被接受。
-- [ ] claude：**如何让它的模型目录接受网关模型**（`behavesAs` / `modelOverrides` 的具体写法）。
-      这是该 CLI 的配置工作，不由本插件代劳；配好后驱动预设即可直接使用。
+
+> 上述 Claude 关闭项保留原问题「`--effort` 是否真的生效」的历史措辞；当时实际结论只是参数被接受，强度生效仍列在 §3.2 / §6，不能当作已验证。

@@ -223,6 +223,9 @@ minimal | low | medium | high | xhigh | max
 
 ## D9 · 配置分两层，且必须区分 volatile
 
+> **历史方案已被后续决策取代：** 下文「第一期角色列表来自 `cordis.patch.yml`」及复杂数组编辑器不可行的取舍，已被 D13 / D14 的自建设置页覆盖；原文保留。
+> 当前角色文件为 `$DSH_HOME/agent-switchboard/roles.json`，设置页仍经根配置桥接并由 Host 同步文件，preset 只携带 `mount: true`、不得携带 `roles`。依据见 D14 的当前实现补记。
+
 **决策：**
 
 | 层 | 内容 | 存储 | GUI 可编辑 |
@@ -266,6 +269,8 @@ minimal | low | medium | high | xhigh | max
 | Q4 | CLI 首个目标 | **`codex`** | 本机入口是 `codex.ps1`，因此 Phase 3 必须先用 `ctx.subprocess.resolveExecutable` 验证脚本入口解析（风险 R3 由「可能」升级为「必经」） |
 | Q5 | 嵌套派发 | **默认禁止，按角色逐个放开** | 详见下方 D11 |
 | Q6 | 角色的派发机制（内置 / 外部 CLI）是否可在界面配置 | **可以，但需自建设置页**（DSH 自动表单不支持变长对象数组） | 详见 D13；与风险 R6 同一件事 |
+
+> **Q3 已被后续决策取代（D13 / D14）：** 上表保留当时裁决，不代表当前待办。角色与派发设置页已落地；当前文件、根配置桥接与 preset 挂载分工见 D14，Phase 4 不再等待评估可写面板。
 
 ## D11 · 嵌套派发默认关闭，逐角色放开
 
@@ -352,9 +357,16 @@ if (rest.length === 0 && op.op === "unset") result.splice(index, 1); // 删除�
 
 ## D14 · 角色配置的存储与读写通道（对 D13 的修正，含三次失败的原因）
 
+> **记录性质与当前实现补记：** 下文保留当时落地路径与事故取证。第 1、6 条关于 profile 根条目必须携带 `config.roles`、文件仅为派生产物的描述，是历史实现路径，已由后续文件存储与配置桥接实现修订；不能据此要求 bundle / preset 再携带角色列表。
+>
+> - 当前角色文件为 `$DSH_HOME/agent-switchboard/roles.json`（`src/config-file.js:63`）。bundle 根条目启用且不携带 config；preset 中本插件只带 `mount: true`（`presets/switchboard.patch.yml:18`），不得带 `roles`（`scripts/check-profile-wiring.mjs:115`）。
+> - **设置页并未直接读写文件。** 它仍读 `configForms` 的根命名空间 `roles`，写 `settings.mutate`（`src/client/index.js:294`、`:432`）；Host 根实例对非空 Cordis 角色做校验、比对并同步文件，根配置为空时保留已有文件（`src/index.js:788`）。
+> - 挂载实例仍兼容非空的本作用域 Cordis 角色，并优先于文件；标准 preset 不携带角色，因此走文件（`src/index.js:849`）。保存不等于已挂载会话立即更新角色工具。
+> - 第 6 条所引 profile 检查的当前断言是 bundles / dependencies、bundle 条目启用、preset `mount:true` 且无 `roles`，以及角色文件可解析；不再断言 profile 根条目必须带 `config.roles`（`scripts/check-profile-wiring.mjs:58`、`:79`、`:96`、`:121`）。
+
 **为什么要有这一条：** D13 把「自建 Client 设置页 + `configForms` 写回」定为方案，但落地时连续踩到三类失败，最终**推翻了 D13 中关于存储位置与通道的具体判断**。D13 的**目标**不变（机制是角色的属性、要有 UI 配置入口），改的是**做法**。以下是已核实的事实，替代 D13 中相应的推断。
 
-### 1. 角色存在**根条目的 Cordis 配置**里，文件是派生产物
+### 1. 历史实现：角色存在**根条目的 Cordis 配置**里，文件是派生产物
 
 角色放在 profile patch 中根条目（`id: agent-switchboard`）的 `config.roles`。Host 侧在根条目装载时把角色**同步到** `$DSH_HOME/agent-switchboard/roles.json`；preset 会话优先读自己的 Cordis 配置，为空则回落该文件。
 
@@ -445,7 +457,7 @@ SettingsPathOp = { op:'set', path: readonly string[], value: unknown } | { op:'u
 **现状：本插件不再注册任何 Cordis 服务**（有测试断言 `ctx.reflect.provide` 一次都不被调用），
 且 `apply` 整体包了一层兜底 try/catch —— **插件的失败绝不能升级成「应用不可用」**。
 
-### 6. 两个 profile 层的承载点，缺一即「静默不存在」
+### 6. 历史实现：两个 profile 层的承载点，缺一即「静默不存在」
 
 | 位置 | 作用 | 缺失后果 |
 | --- | --- | --- |
@@ -511,3 +523,10 @@ homedir 的 `AppData/Local` 推导。后缀来自已有实现；非 Windows 要�
 **实施进度（批次 2d-2）：** 8 个运维脚本已移入 `scripts/ops/`；相对导入、preset 文件引用、
 npm 入口、文档及脚本用法与运行时命令同步更新。离线 `check` 主链不变，路径解析与脚本功能
 保持原样；批次 2d-1 的 7 个探针仍在 `scripts/probes/`，目录归类完成。
+
+**当前目录复核（批次 3b）：** `scripts/ops/` 8 个、`scripts/probes/` 7 个，与上述完成记录一致。
+`scripts/lib/` 当前为 `paths.mjs`（目标路径解析）、`cli-config.mjs`（CLI 配置与调用校验）、
+`capture.mjs`（无 shell 的输出采集）、`probe-cli.mjs`（配置驱动探针与提示词文件管理）。
+根目录保留 12 个 `check-*.mjs`（`package.json:52` 的主链）、`dsh-probe.mjs`、
+`dsh-cat.mjs`、`inline-asar-probe.mjs`、`gen-preset.mjs`、`inspect-sessions.mjs` 及 CLI 探针配置示例。
+模块依据：`scripts/lib/paths.mjs:43`、`cli-config.mjs:50`、`capture.mjs:55`、`probe-cli.mjs:37`。
