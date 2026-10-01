@@ -177,10 +177,12 @@
     | `settings.section` | 一个设置页。注册 `{id, order, label}`；`id` 用自己的即**并列新增**，复用已占用 id 会**替换**该格。现有占用：`account` / `general` / `models` / `plugins` / `agent-presets` |
     | `settings.general.item` | General 里的一行偏好（单设置项，无需独立页） |
     | `settings.plugins.tab` | Plugins 区里的一页 |
-    | `configForms.get(entryId)` / `.describe()` / `.mutate(ops, expectedRevision)` | 读写某插件条目的配置；`mutate` 承载数组下标路径 |
+    | `configForms.describe()` 返回的**镜像面** | **读**配置：`ensure()`（异步补全）/ `getSnapshot()`（`view.namespaces`、`view.writable`）/ `subscribe()` |
+    | `settings.mutate(ns, ops, expectedRevision)` | **写**配置（远程通道 `remote.settings`）；承载数组下标路径。⚠️ 第 27 条曾写 `.mutate(ops, expectedRevision)` 挂在 `configForms.get()` 上，**该形状未经证实**，以本行为准 |
 
-    **官方同构先例**：`agent-presets` 自己就是一个 `settings.section`，用 `configForms` 编辑预设配置。
-    ⚠️ 但本插件的 Client 半边**禁止 import 任何 Harness Client 包**（第 3 节），因此若自建页面，表单需要自绘。
+    **官方同构先例**：`agent-presets` 自己就是一个 `settings.section`；官方「模型」页
+    （`dsh-client-ui-settings-models`）是最完整的读写样本，见新增的第 3.1f 节。
+    ⚠️ 本插件的 Client 半边**禁止 import 任何 Harness Client 包**（第 3 节），因此自建页面时表单需要自绘。
 28. **写入是否受 volatile 限制，取决于用哪个方法。** `SettingsForms.write(ns, change, expected, paths)` 的 `paths` 参数**默认为空数组**，而 volatile 校验是 `for (const path of paths) if (!isVolatilePath(...))`：
 
     | 方法 | 传 paths？ | 受 volatile 限制？ |
@@ -195,7 +197,16 @@
 29. **`describe()` 是同步的**，返回**数组**（其 JSDoc 写「keyed by unique profile entry ids」，与实现不一致，以实现为准）。行的关键字段：`ns` / `schema` / `value` / `revision` / `writable` / `base` / `user` / `autoGenerate` / `applies`。**没有 `patch` 字段**。
     - 行会被**丢弃**的条件：`schema` 取不到、`entry.fiber` 不存在、`fiber.runtime === null`、`fiber.state !== 2`（ACTIVE），或 `volatileForm(schema) === undefined`。
     - 客户端读当前值：`ctx.configForms.get(ns).getSnapshot()` → `{status, value, base, user, revision, writable, mode}`；跨命名空间用 `ctx.configForms.describe().namespace(ns)`。**首帧可能是 `status: "loading"`**，因为 `ensure()` 是异步的，所以需要 `subscribe()` 后再取。
-    - 客户端 `ConfigForms.get(entryId)` 的 `entryId` **就是** `ns`，即 Loader 条目 id（本插件为 `include:agent-switchboard`；可用 `cordis_inspect_query`（Provider `Config`，`name` 过滤）权威确认，不要靠猜）。
+    - 客户端 `ConfigForms.get(entryId)` / `describe().namespace(ns)` 的 **`ns` 是
+      `entry.options.id`，不带 `include:` 前缀**（本插件为 `agent-switchboard`）。
+      **实测证据**：本机 20 个 settings 命名空间全部不带前缀（`agent-switchboard`、
+      `agent-preset-registry`、`ui-settings` …）。`plugin_manager` 显示的
+      `include:agent-switchboard` 是**展示层的组合形式**，不是 `ns`。
+      （本条曾写错成「`entryId` 就是 `include:agent-switchboard`」，已据实测修正。）
+    - **只有根条目有 settings 行。** `configEditor.entries()`（`dsh-config-editor/lib/index.js`
+      第 31 行）先筛 `entry.parent.tree.ctx.fiber.entry?.id === "include"`，再按
+      `entry.options.id` 去重。**preset 内的插件声明不在这个集合里**，因此既没有 settings 行、
+      也读不到写不到 —— 这是「角色必须放根条目配置」的根本原因（D14 第 1 条）。
 30. **`.volatile()` 只能标在数组整体，不能标在数组元素内部。** 这是第 24 条的另一面：数组元素路径经 `schema.inner` → `[...path, '*']` 变成**非固定**路径，客户端 `validateVolatileSchema` 随即抛错。
 31. **⚠️ 用 PowerShell 的 `>` 重定向采集探针输出会引入编码损坏 —— 这是本机实测踩到的坑，不是归档的问题。**
     - 实测：`node scripts/dsh-cat.mjs <path> > raw/foo.js` 产出的文件前 4 字节是 `ff fe 77 00`，即 **UTF-16LE**；而用 `execFileSync(..., {encoding:'utf8'})` 或管道（`|`）采集时同一文件是**纯 UTF-8、零 NUL**。
@@ -203,6 +214,69 @@
     - 后果很隐蔽：`read` 工具会把被写成 UTF-16 的副本判为二进制而拒读，看起来像「这个文件是二进制」。
     - 做法：采集归档内容时用 `execFileSync` 的 `encoding: 'utf8'` 或管道，**不要用 `>`**。若已用 `>`，检查头两字节是否为 `ff fe`，是则 `buf.toString('utf16le')` 可救回。
     - 教训：这处曾让我把「我的采集方式有问题」误判成「归档里编码不统一」，并据此写出过错误结论。
+
+### 3.1f 客户端可用的远程通道边界（决定「UI 能不能直接改文件」）
+
+32. **客户端可用的远程命名空间是构建期生成的静态清单，外部插件无法新增。**
+    - 客户端装配处是一个**硬编码数组**（`dsh-api-remotes/lib/client.js` 第 13512 行起）：
+      `for (const contribution of [TYPERT_REMOTE$24, …, TYPERT_REMOTE$22]) disposers.push(await ctx.remote.$mount(contribution))`。
+    - `dsh-api-gateway` 的客户端服务注释原文：**「no JavaScript Proxy participates in
+      method lookup, invocation, or type exposure」** —— 没有动态代理，`ctx.remote.<ns>`
+      只能命中已挂载的 contribution。
+    - `remote.$mount(contribution)` 还要求**严格 codec**（构建期产物）：
+      `requireStrictInputs` → `if (codec.mode !== "strict") throw … has no strict codec`。
+    - **结论：自建远程服务给自家设置页用是不可行的**（本项目曾据此实现，客户端永远调不到）。
+33. **实测客户端可用命名空间恰好 29 个**，与「配置读写」相关的只有两个方向：
+    - `workspaceFiles` = `read` / `readBytes` / `stat` / `list` / `changes` —— **只读**。
+      **客户端没有任何写文件的能力。**
+    - `settings` = `describe` / `mutate` / `replace` / `update` —— **唯一的写通道**，写的是
+      插件配置（profile patch）。
+    - 另有 `settings.openSettingsDocument` 可在 Host 桌面打开配置文件供**原生编辑**。
+    - 含义：**「UI 直接编辑那个 JSON 文件」在客户端侧做不到**。可行形态是
+      「UI 写插件配置 → Host 侧同步到文件」（Host 才有完整文件能力）。
+34. **官方「模型」页的读写分工（照抄它即可）：**
+    ```js
+    const inject = [ ..., "remote.settings", "remote.session", "configForms", ... ];
+    const controller = new ModelsSettingsStore(ctx, schema, ctx.configForms.describe());
+    ctx.remote.$on("settings/document-updated", () => { ... });
+
+    async load() {
+      await this.describeFace.ensure();                 // 异步补全镜像
+      const mirrored = this.describeFace.getSnapshot();
+      if (mirrored.view === void 0) … "settings are unavailable in this browser"
+      const views = mirrored.view.namespaces;           // ns → view
+      const writable = mirrored.view.writable;
+    }
+    // 写：ctx.remote.settings.mutate(ns, ops, expectedRevision)
+    ```
+    - **读走 `configForms` 镜像面，写走 `remote.settings.mutate`。**
+    - 只用 `remote.settings.describe()` 读是错的路子 —— 实测表现是页面报
+      「取不到 remote.settings 通道」。
+    - `ensure()` 是**异步**的，**首帧通常还没有自己的行**，必须先 `await` 再取 snapshot，
+      并订阅镜像以便补全后自动重读。
+    - `SettingsPathOp` 形状（运行时 `Service` provider 权威确认）：
+      `{op:'set', path: string[], value}` | `{op:'unset', path: string[]}`；
+      `mutate(ns, ops, expectedRevision?) => Promise<void>`，且文档确认
+      「unsetting an array index removes its element」。
+35. **`inject` 只许声明内核保证存在的依赖。** 判据是**由谁保证它在装载期存在**，不是名字里
+    有没有 `remote.`：
+    - `slots` / `configForms` / `remote.settings`：内核插件提供，官方页面也这么注入 ✅
+    - 自建且延迟注册的服务：客户端会**永远 pending**，整页起不来 ❌
+      （实测报错 `web boot: 1 entry did not activate` +
+      `pending (waiting for service: remote.roleConfig)`）
+36. **两个 profile 层承载点，缺一即「静默不存在」：**
+    - `dsh.profile.bundles` **必须含本包**（`dependencies` 里有**不够**）：Loader 只加载
+      `bundles` 列出的包。缺失后果是**应用正常启动、但插件完全不存在**，且**没有任何报错**
+      （实测踩到：Loader 条目数 187 而非 188，`include:agent-switchboard` 从未创建）。
+    - profile patch 里根条目需带 `config.roles`，否则设置页找不到配置行。
+    - 已由 `scripts/check-profile-wiring.mjs` 显式断言（找不到 profile 时优雅跳过）。
+37. **禁用/启用插件这个操作本身会重写 profile，且只保留它认识的条目。** 实测两次：一次
+    web boot 失败后，profile 的 `cordis.patch.yml` 从 41,802 字节被削到 670 字节，
+    `dsh.profile.bundles` 里本包也消失。**含义：修 bug 时不要靠「禁用插件」作为试探手段；
+    动它之前先备份 profile。**
+38. **平台能力应先读同构先例，再动手。** 本项目在「客户端如何读写配置」上连续失败三次
+    （自建远程服务 → 猜 `remote.settings.describe()` → 猜 slot ctx 上的 `remote`），
+    而官方「模型」页早已给出正确写法。**第一动作应是读官方实现。**
 
 ### 3.2 一条误导性的诊断信息（重要）
 

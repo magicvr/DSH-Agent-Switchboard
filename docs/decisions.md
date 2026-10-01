@@ -340,3 +340,127 @@ if (rest.length === 0 && op.op === "unset") result.splice(index, 1); // 删除�
 
 - **扁平化 schema**：把机制提到顶层标量（如 `dispatch: { scout: 'cli' }`）以复用自动表单。可行但要求角色 id **预先固定**，增删角色仍须改文件；且把「机制」与「角色」在配置形状上拆成两处，反而弱化了「机制是角色属性」这一诉求。故不采用。
 - **保持纯 patch 配置**（原 D9 方案）：可版本控制、可评审，但用户明确要求界面里可配机制。作为回退保留。
+
+---
+
+## D14 · 角色配置的存储与读写通道（对 D13 的修正，含三次失败的原因）
+
+**为什么要有这一条：** D13 把「自建 Client 设置页 + `configForms` 写回」定为方案，但落地时连续踩到三类失败，最终**推翻了 D13 中关于存储位置与通道的具体判断**。D13 的**目标**不变（机制是角色的属性、要有 UI 配置入口），改的是**做法**。以下是已核实的事实，替代 D13 中相应的推断。
+
+### 1. 角色存在**根条目的 Cordis 配置**里，文件是派生产物
+
+角色放在 profile patch 中根条目（`id: agent-switchboard`）的 `config.roles`。Host 侧在根条目装载时把角色**同步到** `$DSH_HOME/agent-switchboard/roles.json`；preset 会话优先读自己的 Cordis 配置，为空则回落该文件。
+
+**为什么存储位置只能是根条目**（两条实测）：
+
+- `configEditor.entries()` 只取 `parent.tree.ctx.fiber.entry?.id === "include"` 的条目
+  （源码第 31 行）。**preset 内的插件声明不在这个集合里**，因此既没有 settings 行、
+  也读不到写不到。
+- 客户端唯一的写通道是 `settings`，而它的 `ns` 就是 `entry.options.id`。因此能被 UI
+  读写的**只有根条目**。
+
+**为什么不再只用文件：** 用户希望「UI 直接编辑那个 JSON 文件」。做不到，原因是下一条。
+
+### 2. 客户端**无法写文件**，也**无法新增自己的远程命名空间**
+
+- 客户端可用的远程命名空间是**构建期生成的静态清单**（`dsh-api-remotes/lib/client.js`
+  里一个硬编码的 contribution 数组），且客户端**没有 Proxy** —— 源码注释原文：
+  「no JavaScript Proxy participates in method lookup, invocation, or type exposure」。
+  实测清点恰好 **29 个**命名空间。
+- 那份清单里 `workspaceFiles` 只有 `read` / `readBytes` / `stat` / `list` / `changes`
+  —— **客户端没有任何写文件的能力**。
+- 唯一的写通道是 `settings`（`mutate` / `replace` / `update`），写的是**插件配置**。
+
+**因此 D13 里「自建远程服务供设置页调用」这条路根本不通**。`src/config-service.js`
+（`RoleConfigService`）已删除：它注册的 `roleConfig` 远程方法客户端**调不到**，
+而它先后造成两次启动失败（见第 5 条）。
+
+### 3. 官方同构先例与**正确的读写分工**
+
+官方「模型」设置页（`@deepseek-ai/dsh-client-ui-settings-models`）就是同类页面，它的做法是：
+
+```js
+const inject = [ ..., "remote.llm", "remote.settings", "remote.session", "configForms", ... ];
+const controller = new ModelsSettingsStore(ctx, schema, ctx.configForms.describe());
+ctx.remote.$on("settings/document-updated", () => { ... });
+```
+
+其 `load()` 的读取形态：
+
+```js
+await this.describeFace.ensure();                 // 异步补全镜像
+const mirrored = this.describeFace.getSnapshot();
+if (mirrored.view === void 0) … "settings are unavailable in this browser"
+const views = mirrored.view.namespaces;           // ns → view
+const writable = mirrored.view.writable;
+```
+
+写入则是 `ctx.remote.settings.mutate(ns, ops, expectedRevision)`。
+
+**结论：读走 `configForms.describe()` 的镜像面，写走 `remote.settings.mutate`。**
+只用 `remote.settings.describe()` 读是错的 —— 实测表现是页面报「取不到 remote.settings 通道」。
+`ensure()` 是**异步**的，首帧通常还没有自己的行，必须先 `await` 再取 snapshot，
+并订阅镜像以便补全后自动重读。
+
+`settings.mutate` 的签名与路径操作形状已由运行时确认（Provider `Service`）：
+
+```
+mutate(ns, ops: readonly SettingsPathOp[], expectedRevision?) : Promise<void>
+SettingsPathOp = { op:'set', path: readonly string[], value: unknown } | { op:'unset', path: readonly string[] }
+```
+其文档同时确认「unsetting an array index removes its element」，因此增删角色可用路径操作完成。
+
+> **未验证：** `configForms.describe()` 返回的镜像面**自身**是否也提供 `mutate`
+> （即能否完全不依赖 `remote.settings` 就写回）。官方 models 页两者都注入，因此没有
+> 现成例证；本文档不对此下结论。
+
+### 4. `settings` 命名空间是 `entry.options.id`，**不带 `include:` 前缀**
+
+`plugin_manager` 显示的 `include:agent-switchboard` 是展示层的组合形式；settings 行的
+`ns` 取的是 `entry.options.id`。实测证据：本机 20 个 settings 命名空间全部不带前缀
+（`agent-switchboard`、`agent-preset-registry`、`ui-settings` …）。
+
+### 5. `inject` 只许声明**内核保证存在**的依赖 —— 这是两次启动失败的分界
+
+| 依赖 | 由谁保证装载期存在 | 能否进 `inject` |
+| --- | --- | --- |
+| `slots` / `configForms` / `remote.settings` | 内核插件 | ✅ 官方页面也这么注入 |
+| `remote.roleConfig`（自建、延迟注册） | **我们自己** | ❌ 客户端永远 pending |
+
+判据是**由谁保证它在装载期存在**，不是名字里有没有 `remote.`。两次真实事故：
+
+1. 客户端把自建的 `remote.roleConfig` 写成必需注入，而 Host 侧延迟注册 →
+   客户端永远 pending → `web boot: 1 entry did not activate`，整页起不来。
+2. Host 侧曾在**每个作用域**注册服务；`Service` 的构造函数会**同步**调用
+   `ctx.reflect.provide()`（已核实 cordis 源码），而 preset 路径每个会话都走 →
+   注册失败即会话失败 → 应用起不来，用户只能禁用插件。
+
+**现状：本插件不再注册任何 Cordis 服务**（有测试断言 `ctx.reflect.provide` 一次都不被调用），
+且 `apply` 整体包了一层兜底 try/catch —— **插件的失败绝不能升级成「应用不可用」**。
+
+### 6. 两个 profile 层的承载点，缺一即「静默不存在」
+
+| 位置 | 作用 | 缺失后果 |
+| --- | --- | --- |
+| `dsh.profile.bundles` **含本包** | Loader 才会加载本包的 patch | 条目根本不被创建；**应用正常但插件不存在**，无任何报错 |
+| profile patch 里根条目带 `config.roles` | UI 可读写的角色数据 | 设置页找不到配置行 |
+
+`dsh.profile.bundles` 与 `dependencies` 是**两处**，只加后者不够。已由
+`scripts/check-profile-wiring.mjs` 断言锁死（在找不到 profile 时优雅跳过，不污染其它环境）。
+
+### 7. 作用域：`mount` 决定「工具是否在本作用域挂载」
+
+根条目 `mount: false`（只承载配置），preset 声明 `mount: true`。因此角色工具**只在选中
+本 preset 的会话里出现**，其他 preset 的会话不会被污染。默认 `false` 是刻意的：漏配的
+后果是「工具没出现」（显式、可发现），而默认 `true` 的后果是「工具出现在所有会话」（隐性）。
+
+### 8. 教训（方法层面，比上面任何一条都重要）
+
+这一轮连续三次失败，根因不是知识不足，而是**方法错误**：
+
+> **遇到「平台能力应该怎么用」的问题，第一动作必须是读官方实现，而不是设计自己的方案。**
+
+三次都是自己试通道（自建远程服务 → 猜 `remote.settings.describe()` → 猜 slot ctx），
+而官方页面早把正确写法摆在那里。用户一句「官方『模型』页是怎么做的？」直接结束了三轮
+试错。**先读同构先例，再动手。**
+

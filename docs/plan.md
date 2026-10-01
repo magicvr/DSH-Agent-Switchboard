@@ -205,9 +205,12 @@
 ## Phase 4 · 可观测性与打磨
 
 - 调度日志：谁派的、派给谁、哪条线路、耗时、退出状态、结果摘要
-- **角色设置页（D13）：自建一个 Client 半边 `settings.section`，让用户在界面里为每个角色选择派发机制（内置 `spawn` / `fork` 或外部 CLI），并增删角色。**
-  探测已完成，结论明确：DSH 的**自动**配置表单处理不了角色数组（只支持标量，且 volatile 不能标在数组元素内），但**服务端支持 `roles[i].backend` 这类下标路径与删元素**——缺的只是 UI。
-  落地要点见 `decisions.md` D13；接入点与硬约束见 `architecture.md` 3.1e。
+- **角色设置页（D13 / D14）—— 已落地并实测可见。**
+  页面：Client 半边 `settings.section`（`id: agent-switchboard`，标签「角色与派发」）。
+  数据：角色存在**根条目的 Cordis 配置** `config.roles`；**读**走 `configForms.describe()`
+  镜像面（`ensure()` → `getSnapshot().view.namespaces`），**写**走
+  `remote.settings.mutate(ns, [{op:'set',path:['roles'],value}], revision)`；Host 侧把角色
+  同步到 `$DSH_HOME/agent-switchboard/roles.json`。落地要点与**三次失败的原因**见 `decisions.md` D14。
 - 并发与预算上限
 - README 补真实用法示例
 
@@ -220,10 +223,13 @@
 | R3 | `ctx.subprocess` 在 Windows 上解析 `codex.ps1` 的行为未知 | CLI 后端可能在解析阶段就失败 | 用 `resolveExecutable` 先做独立小实验，再接入 provider |
 | R4 | 本机无 DSH 类型定义 | 无法获得编译期类型保障 | D1 已把风险限制在少数薄适配文件；用 `cordis_inspect_query` 作为类型的唯一权威来源 |
 | R5 | Client 半边崩溃会清空整个 slot | 可能拖垮 GUI 的一块区域 | 第一期只做只读、最小 DOM；严守「不 import Harness Client 包」 |
-| R6 | 角色列表若放 patch，用户在 GUI 里改不了 | 与「面板配置角色」的期望有落差 | **已定性并给出解法（D13）**：自动配置表单不支持角色数组（只支持标量 + volatile 不能进数组元素），但服务端支持 `roles[i].backend` 下标路径与删元素，因此自建 `settings.section` 可行。Phase 4 实施 |
+| R6 | 角色列表若放 patch，用户在 GUI 里改不了 | 与「面板配置角色」的期望有落差 | **已解决（D13 / D14）**：角色放**根条目配置**（客户端唯一可读写的位置），
+设置页读 `configForms` 镜像、写 `settings.mutate`，已实测可见可改 |
 | R7 | 外部 CLI 的额度/登录状态不透明 | 派发失败原因难定位 | 结果里保留原始 stderr 与退出码（D8），不做美化丢弃 |
 | R8 | **link 模式下 Host 半边改动无法热加载** | 每次改动都需重启 dsh 才能真机验证，迭代慢 | 已实测确认（`architecture.md` 第 3.3 节）。缓解：把逻辑尽可能放进可用抽取方式验证的纯函数；Client 半边不受此限（有 HMR） |
 | R9 | **`failed to import` 会掩盖真实错误** | 排查方向被误导，可能浪费大量时间（Phase 1 已实际发生） | 已记录取证手法（`architecture.md` 第 3.2 节）：先用落地文件探针判定「模块是否已加载」，再查 `apply` 内部 |
+| R10 | **插件自身缺陷可能让应用起不来** | 用户进不去，只能禁用插件；而**禁用操作会重写 profile 并丢弃条目**（实测发生两次） | `apply` 整体包一层兜底 try/catch；**不注册任何 Cordis 服务**（有测试锁死）；客户端不用自建远程命名空间；`decisions.md` D14 第 5、6 条 |
+| R11 | **平台能力被「自己发明」而非「照官方实现」** | 连续三次失败、多次重启（实测发生） | 先读同构先例再动手（D14 第 8 条）；`scripts/check-profile-wiring.mjs` 之类的**显式断言**挡住「静默不存在」 |
 
 ## 与项目硬规则的对应
 
@@ -231,6 +237,6 @@
 | --- | --- |
 | 主代理只统合、不下场 | 主代理侧只增委派工具；写文件权限不授予主代理 |
 | 跨 CLI 可指派 | Phase 3 的 `cli` provider |
-| 角色与派发方式可配置 | `cordis.patch.yml`（角色）+ 插件面板（运行时旋钮，D9） |
+| 角色与派发方式可配置 | 角色存**根条目配置** `config.roles`（UI 可读写）+ 同步到 `$DSH_HOME/agent-switchboard/roles.json`；机制是每个角色自己的 `backend` 字段（D13 / D14） |
 | 模型不得自由拼装 shell 命令 | `src/cli/argv.js` 只做受限占位符替换，`argv` 数组直传 `ctx.subprocess.spawn`，全程无 shell |
 | `raw/` 不入库 | 已在 `.gitignore`，且 `AGENTS.md` 列为硬规则 |
