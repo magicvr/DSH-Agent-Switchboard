@@ -1,7 +1,7 @@
 // 第二轮：各 CLI 使用各自模型，并比较有/无 effort 的调用。
 // 模型/强度/参数来自本地配置；run2.* 保留有/无 effort 独立用例，不与第一轮合并。
-// 用法：node scripts/probe-cli-run2.mjs --cli-config <JSON.local>
-import { probeConfig, runProbe } from './lib/probe-cli.mjs';
+// 用法：node scripts/probes/probe-cli-run2.mjs --cli-config <JSON.local>
+import { probeConfig, runProbe } from '../lib/probe-cli.mjs';
 
 const MARK = 'CLI_PROBE_OK';
 const PROMPT = `Reply with exactly this token and nothing else: ${MARK}`;

@@ -25,7 +25,7 @@
 
 **结论（codex）**：必须以 `node <codex.js>` 形式调用，即 `argv = [node 可执行文件, <codex.js>, 'exec', ...]`。
 
-### 1b. 三个 CLI 的入口都实测过了（`scripts/probe-clis.mjs`）
+### 1b. 三个 CLI 的入口都实测过了（`scripts/probes/probe-clis.mjs`）
 
 | CLI | 本机入口 | 能否被 `spawn(shell:false)` 执行 |
 | --- | --- | --- |
@@ -38,7 +38,7 @@
 
 ### 1c. 每个 CLI 有**自己的模型命名空间**（重要，实测踩到）
 
-第一轮真机调用（`scripts/probe-cli-run.mjs`）把插件可用的 LLM 路由名 `gpt-6-luna`
+第一轮真机调用（`scripts/probes/probe-cli-run.mjs`）把插件可用的 LLM 路由名 `gpt-6-luna`
 填给三个 CLI，结果：
 
 | CLI | 结果 |
@@ -92,7 +92,7 @@ reasoning effort: ...
 
 ### 2.4 实测结果
 
-探针：`scripts/probe-codex.mjs`（全部调用使用 `-s read-only`，提示词只要求回一个标记串）。
+探针：`scripts/probes/probe-codex.mjs`（全部调用使用 `-s read-only`，提示词只要求回一个标记串）。
 判据是 codex **自己打印到 stderr 的路由事实行**，因此「参数是否生效」是可观测事实而非推断。
 
 | # | 用例 | 退出码 | 耗时 | codex 自报 `model` | 自报 `reasoning effort` |
@@ -211,7 +211,7 @@ reasoning effort: ...
 > **本节刻意保留**：这些是真实取证，证明「已排查过、卡在哪一层」。删掉等于丢失证据，
 > 日后有人想恢复时会重复踩一遍同样的坑。
 
-#### 3.0 实测结论（`scripts/probe-cli-run.mjs` / `probe-cli-run2.mjs` / `probe-claude-isolate.mjs`）
+#### 3.0 实测结论（`scripts/probes/probe-cli-run.mjs` / `scripts/probes/probe-cli-run2.mjs` / `scripts/probes/probe-claude-isolate.mjs`）
 
 | 项 | 实测结果 |
 | --- | --- |
@@ -265,7 +265,7 @@ claude 自己给出的官方出路是**把未知模型映射到它认识的模�
 
 ## 4. grok
 
-### 4.0 实测结论（`scripts/probe-cli-run.mjs` / `probe-cli-run2.mjs`）
+### 4.0 实测结论（`scripts/probes/probe-cli-run.mjs` / `scripts/probes/probe-cli-run2.mjs`）
 
 | 项 | 实测结果 |
 | --- | --- |

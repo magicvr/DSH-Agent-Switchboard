@@ -5,7 +5,7 @@
 // 「派发失败」，很难定位到预设本身。因此这里把每条驱动的形状钉死。
 //
 // ⚠️ 本文件**不声称**这些命令在本机一定能跑通：那属于真机验证，见
-// `docs/cli-backends.md` 与 `scripts/probe-cli-run*.mjs`。这里只验证**结构不变量**。
+// `docs/cli-backends.md` 与 `scripts/probes/probe-cli-run*.mjs`。这里只验证**结构不变量**。
 //
 // 用法：node scripts/check-drivers.mjs
 import {

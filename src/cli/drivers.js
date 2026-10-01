@@ -25,8 +25,8 @@
 // `cli-backends.md` §1 已证明「命令存在 ≠ 能被 spawn」：本机 codex 的三个入口里只有
 // `node codex.js` 可用（`.ps1` → ENOENT，`.cmd` → EINVAL，后者是 Node ≥19 对
 // CVE-2024-27980 的缓解）。因此本表里的每一条都必须由真机探针跑过：
-//   - `scripts/probe-cli-run.mjs`（第一轮：入口可 spawn 性 + codex 端到端）
-//   - `scripts/probe-cli-run2.mjs`（第二轮：claude / grok 用各自真实模型）
+//   - `scripts/probes/probe-cli-run.mjs`（第一轮：入口可 spawn 性 + codex 端到端）
+//   - `scripts/probes/probe-cli-run2.mjs`（第二轮：claude / grok 用各自真实模型）
 //
 // ## ⚠️ 每个 CLI 有自己的模型命名空间
 //

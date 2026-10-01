@@ -1,19 +1,19 @@
 // 读取网关模型列表，清除进程模型覆盖变量，再验证用户声明的隔离调用。
-// 用法：node scripts/probe-claude-isolate.mjs --cli-config <JSON.local> [--settings <JSON>]
+// 用法：node scripts/probes/probe-claude-isolate.mjs --cli-config <JSON.local> [--settings <JSON>]
 // cases 名称以 isolate. 开头；model 必须由用户指定并在网关列表中存在。
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { loadCliConfig } from './lib/cli-config.mjs';
-import { runProbe } from './lib/probe-cli.mjs';
-import { PATH_FLAGS, parsePathArgs, pathValue } from './lib/paths.mjs';
+import { loadCliConfig } from '../lib/cli-config.mjs';
+import { runProbe } from '../lib/probe-cli.mjs';
+import { PATH_FLAGS, parsePathArgs, pathValue } from '../lib/paths.mjs';
 
 const MARK = 'CLI_PROBE_OK';
 
 try {
   const argv = process.argv.slice(2);
   if (argv.length === 1 && argv[0] === '--help') {
-    console.log('用法：node scripts/probe-claude-isolate.mjs --cli-config <JSON.local> [--settings <JSON>] [--cwd <目录>]');
+    console.log('用法：node scripts/probes/probe-claude-isolate.mjs --cli-config <JSON.local> [--settings <JSON>] [--cwd <目录>]');
     console.log('执行 isolate.* 用例；入口、参数、模型来自 CLI 配置。settings 默认 os.homedir()/.claude/settings.json，与 DSH_HOME 无关。');
   } else {
     const options = parsePathArgs(argv, [...PATH_FLAGS, 'settings']);

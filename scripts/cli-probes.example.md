@@ -3,10 +3,10 @@
 复制同目录的 `cli-probes.example.json` 为 `cli-probes.local`，替换虚构入口、脚本路径、模型与工作目录，再显式运行：
 
 ```text
-node scripts/probe-cli-help.mjs --cli-config scripts/cli-probes.local
-node scripts/probe-cli-run.mjs --cli-config scripts/cli-probes.local
-node scripts/probe-cli-run2.mjs --cli-config scripts/cli-probes.local
-node scripts/probe-codex.mjs --cli-config scripts/cli-probes.local --out-dir raw/codex-probe
+node scripts/probes/probe-cli-help.mjs --cli-config scripts/cli-probes.local
+node scripts/probes/probe-cli-run.mjs --cli-config scripts/cli-probes.local
+node scripts/probes/probe-cli-run2.mjs --cli-config scripts/cli-probes.local
+node scripts/probes/probe-codex.mjs --cli-config scripts/cli-probes.local --out-dir raw/codex-probe
 ```
 
 也可设置 `SWITCHBOARD_CLI_CONFIG`；显式参数优先。没有配置会失败，不扫描安装位置，不读取 `.env`。样例不能直接用于真实 CLI：入口和模型均为虚构值，参数只是实验候选，**未验证适用于你的 CLI 版本**。真实入口建议填写绝对路径；Node 脚本入口的 Node 可执行文件填入 `command`，脚本路径单独填入 `prefixArgs`。

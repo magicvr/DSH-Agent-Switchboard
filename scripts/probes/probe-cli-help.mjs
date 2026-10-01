@@ -2,10 +2,10 @@
 //
 // ⚠️ 本脚本只**筛选** help 文本，不推断行为。按 `decisions.md` D12 的教训，help 里有
 // 不等于真的生效（codex 的 `model_reasoning_effort` 在 help 里完全没出现）。
-// 因此这里的输出只是**候选**，是否生效必须靠真实调用验证（见 scripts/probe-cli-run.mjs）。
+// 因此这里的输出只是**候选**，是否生效必须靠真实调用验证（见 scripts/probes/probe-cli-run.mjs）。
 //
-// 用法：node scripts/probe-cli-help.mjs --cli-config <JSON.local>
-import { probeConfig, runProbe } from './lib/probe-cli.mjs';
+// 用法：node scripts/probes/probe-cli-help.mjs --cli-config <JSON.local>
+import { probeConfig, runProbe } from '../lib/probe-cli.mjs';
 
 /** 关心的关键字。 */
 const KEYS = [

@@ -1,7 +1,7 @@
 // 第一轮：比较各 CLI 的非交互入口、提示词传递与输出。
 // 模型/强度/参数来自本地配置；共用模型实验在 run.* 用例配置相同模型。
-// 用法：node scripts/probe-cli-run.mjs --cli-config <JSON.local>
-import { probeConfig, runProbe } from './lib/probe-cli.mjs';
+// 用法：node scripts/probes/probe-cli-run.mjs --cli-config <JSON.local>
+import { probeConfig, runProbe } from '../lib/probe-cli.mjs';
 
 const MARK = 'CLI_PROBE_OK';
 const PROMPT = `Reply with exactly this token and nothing else: ${MARK}`;

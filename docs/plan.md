@@ -58,8 +58,15 @@
 │       └── index.js             __ModuleLoader__.load + composer.dock 只读指示
 ├── scripts/
 │   ├── lib/                     路径解析与本地 CLI 配置校验共享模块
-│   ├── ops/                     写入、迁移、修复脚本（批次 2 归类）
-│   ├── probes/                  环境相关取证与实机实验（批次 2 归类）
+│   ├── ops/                     写入、迁移、修复脚本（批次 2d-2 待归类，尚未创建）
+│   ├── probes/                  环境相关取证与实机实验（批次 2d-1 已归类）
+│   │   ├── probe-claude-isolate.mjs  Claude 隔离调用探针
+│   │   ├── probe-cli-help.mjs        CLI help 候选筛选
+│   │   ├── probe-cli-run.mjs         第一轮 CLI 调用探针
+│   │   ├── probe-cli-run2.mjs        第二轮 CLI 调用探针
+│   │   ├── probe-clis.mjs            CLI 入口发现与显式探针
+│   │   ├── probe-codex.mjs           Codex 非交互探针
+│   │   └── check-cli-live.mjs        可选真实 CLI 派发检查
 │   ├── check-*.mjs              可移植离线检查及显式目标预检
 │   ├── dsh-probe.mjs            只读 asar 取证（已完成）
 │   ├── dsh-cat.mjs              只读读取归档内单文件（已完成）
@@ -69,7 +76,8 @@
 
 脚本按副作用与环境依赖分类：`lib/` 只提供共享解析和校验，`ops/` 承载业务允许的写入，
 `probes/` 承载安装环境与外部 CLI 取证；离线检查保留在 `scripts/`。批次 1 仅新增
-`lib/`，已有脚本不移动，`ops/` 与 `probes/` 留待批次 2。路径契约见 D15。
+`lib/`，已有脚本不移动。批次 2d-1 已将上述 7 个探针移入 `probes/`；
+`ops/` 的 8 个运维脚本留待批次 2d-2，目前仍在 `scripts/`。路径契约见 D15。
 
 ## Phase 1 · 最小可加载插件（打通装载链路）
 

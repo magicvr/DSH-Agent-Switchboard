@@ -1,9 +1,9 @@
 // Codex 非交互探针：入口、参数、模型/强度及提示词传递均由本地配置声明。
 // 配置 codex.* 用例可重现基线、换模型、high/low、非法模型/effort、JSON 事件流实验。
-// 用法：node scripts/probe-codex.mjs --cli-config <JSON.local> [--out-dir <目录>] [--cwd <目录>]
+// 用法：node scripts/probes/probe-codex.mjs --cli-config <JSON.local> [--out-dir <目录>] [--cwd <目录>]
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { probeConfig, runProbe } from './lib/probe-cli.mjs';
+import { probeConfig, runProbe } from '../lib/probe-cli.mjs';
 
 const TIMEOUT_MS = 180_000;
 const MARKER = 'SWITCHBOARD_PROBE_OK';

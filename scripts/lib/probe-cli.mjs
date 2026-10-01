@@ -9,7 +9,7 @@ import { PATH_FLAGS, parsePathArgs, pathValue, REPO_ROOT } from './paths.mjs';
 export function probeConfig(group, { output = false } = {}) {
   const argv = process.argv.slice(2);
   if (argv.length === 1 && argv[0] === '--help') {
-    console.log(`用法：node scripts/probe-${group === 'codex' ? 'codex' : `cli-${group}`}.mjs --cli-config <JSON.local> [--cwd <目录>]${output ? ' [--out-dir <目录>]' : ''}`);
+    console.log(`用法：node scripts/probes/probe-${group === 'codex' ? 'codex' : `cli-${group}`}.mjs --cli-config <JSON.local> [--cwd <目录>]${output ? ' [--out-dir <目录>]' : ''}`);
     console.log(`配置来源：--cli-config > SWITCHBOARD_CLI_CONFIG；必须提供。执行 cases 中名称以 ${group}. 开头的用例。`);
     console.log('复制 scripts/cli-probes.example.json 为 *.local，替换虚构入口、模型与 cwd；CLI 参数候选须自行核实。');
     process.exit(0);

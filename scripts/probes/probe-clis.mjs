@@ -1,13 +1,13 @@
 // 默认只报告候选；PATH 发现不证明入口可执行，绝不自动执行候选。
-// 执行：node scripts/probe-clis.mjs --execute --cli-config <JSON.local>
+// 执行：node scripts/probes/probe-clis.mjs --execute --cli-config <JSON.local>
 // 仅执行配置中的 help.* 用例；版本/help 参数也必须由用户配置声明。
 import { execFileSync } from 'node:child_process';
 import { accessSync, constants, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { loadCliConfig } from './lib/cli-config.mjs';
-import { runProbe } from './lib/probe-cli.mjs';
-import { parsePathArgs } from './lib/paths.mjs';
+import { loadCliConfig } from '../lib/cli-config.mjs';
+import { runProbe } from '../lib/probe-cli.mjs';
+import { parsePathArgs } from '../lib/paths.mjs';
 
 export function discoverEntries(name, { platform = process.platform, env = process.env } = {}) {
   if (platform === 'win32') {
@@ -32,7 +32,7 @@ export function discoverEntries(name, { platform = process.platform, env = proce
 async function main() {
   const argv = process.argv.slice(2);
   if (argv.length === 1 && argv[0] === '--help') {
-    console.log('用法：node scripts/probe-clis.mjs [--discover] | --execute --cli-config <JSON.local> [--cwd <目录>]');
+    console.log('用法：node scripts/probes/probe-clis.mjs [--discover] | --execute --cli-config <JSON.local> [--cwd <目录>]');
     console.log('默认只发现；--discover 与 --execute 互斥。执行仅使用配置的 help.* 用例，不使用发现结果，不读取 .env。');
     return;
   }

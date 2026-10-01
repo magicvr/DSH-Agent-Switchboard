@@ -5,12 +5,12 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildInvocation } from '../src/cli/argv.js';
-import { formatRunResult } from '../src/cli/output.js';
-import { readConfigFile, normalizeConfigShape } from '../src/config-file.js';
-import { normalizeRoles } from '../src/roles.js';
-import { validateCliConfig } from './lib/cli-config.mjs';
-import { PATH_FLAGS, parsePathArgs, resolvePaths, printPaths } from './lib/paths.mjs';
+import { buildInvocation } from '../../src/cli/argv.js';
+import { formatRunResult } from '../../src/cli/output.js';
+import { readConfigFile, normalizeConfigShape } from '../../src/config-file.js';
+import { normalizeRoles } from '../../src/roles.js';
+import { validateCliConfig } from '../lib/cli-config.mjs';
+import { PATH_FLAGS, parsePathArgs, resolvePaths, printPaths } from '../lib/paths.mjs';
 
 const MARKER = 'SWITCHBOARD_LIVE_OK';
 let pass = 0;
@@ -34,7 +34,7 @@ let temp;
 try {
   const argv = process.argv.slice(2);
   if (argv.length === 1 && argv[0] === '--help') {
-    console.log('用法：node scripts/check-cli-live.mjs --role <角色 id> [--roles-file <JSON.local>] [--home <DSH home>] [--cwd <目录>]');
+    console.log('用法：node scripts/probes/check-cli-live.mjs --role <角色 id> [--roles-file <JSON.local>] [--home <DSH home>] [--cwd <目录>]');
     console.log('读取 --roles-file 或 DSH_HOME/agent-switchboard/roles.json；必须显式选择一个 CLI 角色。此命令会调用配置的 CLI。');
   } else {
     const options = parsePathArgs(argv, [...PATH_FLAGS.filter(key => key !== 'cli-config'), 'role']);
