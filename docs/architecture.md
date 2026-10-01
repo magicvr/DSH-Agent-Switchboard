@@ -51,20 +51,20 @@
 >
 > 另有一项尚未本地核实：TS 基座 `tsconfig.base.json` / `tsconfig.base.client.json` **不随安装分发**，外部作者需要去上游仓库取（上游地址 `github.com/deepseek-ai/deepseek-harness`，取自各包 `repository` 字段，**本仓库尚未联网确认**）。
 
-## 4. 待定的关键决策
+## 4. 技术决策
 
-这些问题决定了实现形态，需要先有结论再写代码：
+**已定型的决策与理由见 [`decisions.md`](./decisions.md)**（编号 D1 起，含依据与风险）。本文件不重复维护决策表，避免两处编号冲突。
 
-| # | 决策点 | 备选 | 倾向 |
-| --- | --- | --- | --- |
-| D1 | 插件半边划分 | 纯 Host 半边 / Host + Client 两半边 | 已基本确定：必须是 dual-face。调度逻辑在 Host，角色配置面板在 Client |
-| D2 | 派发后端抽象边界 | 统一接口 + 适配器 / 每个后端各写一套 | 待定。至少要能表达「一次性任务」与「可续聊会话」两种形态 |
-| D3 | 结果回传格式 | 自由文本 / 结构化契约 | 待定。倾向结构化契约，否则主代理汇总会退化成读长文 |
-| D4 | 主代理限制手段 | 工具白名单 / 提示词约束 / 沙箱权限 | 待定。可用手段已明确：`tools.guard()`（同步拒绝）、`tools.restrict()`（隐藏工具） |
-| D5 | 并发与预算 | 串行 / 有限并发 / 不限 | 待定。需要单次派发超时与总量上限 |
-| D6 | 配置存储 | DSH 插件 Config（schemastery）/ 独立配置文件 | 倾向 DSH 插件 Config，但**必须给需要 GUI 编辑的字段加 `.volatile()`**，否则面板改不动 |
-| D7 | 语言与工具链 | 纯 JS / TS + 自选打包器 | 待定。纯 JS 零构建、上手最快；TS 需要自己保证 `__ModuleLoader__.load` 产物格式 |
-| D8 | 跨 CLI 后端子进程如何落地 | 直接子进程 / 复用 DSH 子进程设施 | 待定。DSH 侧存在 `dsh-subprocess-local` 包，是否可复用需先确认 |
+与本文档第 3 节契约直接对应的几条结论，速览：
+
+| 决策 | 结论 | 依据小节 |
+| --- | --- | --- |
+| 语言与工具链 | 纯 ESM JavaScript，零构建 | 第 3 节第 1、4 条（无 `.d.ts`、产物格式硬约束） |
+| 插件形态 | dual-face 单包 | 第 3 节第 2 条 |
+| 派发抽象 | 统一走 `ctx.subagents`，两类后端收敛到 `SubagentProvider` | 第 3 节补充：`subagents` 是具名 provider 注册表 |
+| 角色 → 工具 | 自己注册工具，内部调 `ctx.subagents.start()` | 第 3 节第 7 条 |
+| 子进程 | `ctx.subprocess.spawn`（argv 数组，无 shell） | `subprocess` 服务契约 |
+| 配置 | 分两层；GUI 可编辑字段必须 `.volatile()` | 第 3 节第 5 条 |
 
 ## 5. 角色模型（草案）
 

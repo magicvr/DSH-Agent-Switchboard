@@ -2,7 +2,7 @@
 
 > 把 DSH 主代理降级为「信息流统合器」，把具体工作委派给带角色的子代理——并且允许这些子代理活在本机的其他 CLI 里。
 
-[![status](https://img.shields.io/badge/status-early%20design-orange)](#-项目状态)
+[![status](https://img.shields.io/badge/status-early%20design-orange)](#路线图)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 ---
@@ -35,16 +35,18 @@
 
 ### 2. 派发方式（Dispatch）
 
-每个角色独立选择派发后端。目前规划两种：
+每个角色独立选择派发后端。两种后端**收敛到同一个 `SubagentProvider` 抽象**，主代理与工具层看不到线路差异：
 
-- **`builtin`** — 走 DSH 自身的子代理机制。上下文、沙箱、权限、流式事件都由 DSH 统一管，行为最可预期，也是默认选项。
-- **`cli`** — 通过本机命令行调用外部编码代理，把提示词与工作目录交给它，再把它的输出收回来。适合复用你已经在别处配好的模型、额度或工具链。
+- **`builtin`** — 复用 DSH 已注册的子代理 provider（`spawn` / `fork`）。上下文、沙箱、权限、流式事件都由 DSH 统一管，行为最可预期，也是默认选项。
+- **`cli`** — 本插件**自己注册一个 `SubagentProvider`**，通过 `ctx.subprocess` 调用外部编码代理，把提示词与工作目录交给它，再把输出收回来。适合复用你已经在别处配好的模型、额度或工具链。
 
-> ⚠️ **`cli` 后端会真的在你的机器上执行本地命令。** 因此默认关闭，需要显式开启，并且每个 CLI 后端都要你自己声明可执行文件路径与参数模板。插件不会去猜、也不会自动发现你装了哪些 CLI。
+> ⚠️ **`cli` 后端会真的在你的机器上执行本地命令。** 因此默认关闭（`allowCrossCli: false`），需要显式开启。可执行文件与参数模板全部由你提供，插件不会去猜、也不会自动发现你装了哪些 CLI。
+>
+> 安全上有一道结构性保障：调用走的是 **argv 数组 + 显式工作目录**（`ctx.subprocess.spawn`），全程没有 shell 参与，模型只能填充受限占位符，无法拼接出任意命令。
 
 ### 3. 配置（Plugin Panel）
 
-以上全部通过插件面板配置，不写死在代码里。配置的形状大致如下（**示意，字段名与结构尚未定稿**）：
+角色列表来自 `cordis.patch.yml`（声明式、可版本控制、便于评审），而运行时旋钮走插件面板可实时编辑。理由与取舍见 [`docs/decisions.md`](./docs/decisions.md) D9。形状如下（**示意**）：
 
 ```jsonc
 {
@@ -88,7 +90,7 @@
 }
 ```
 
-上面 `claude`、`codex`、`grok` 的命令名与参数都是**占位示例**，没有经过核实。实现该后端时必须逐个对着各自 CLI 的真实 `--help` 校准，并把已验证的参数写进文档。
+上面 `claude`、`codex`、`grok` 的命令名与参数都是**占位示例，没有经过核实**。实现该后端时必须逐个对着各自 CLI 的真实 `--help` 与真实调用校准，并把已验证的参数写进 `docs/cli-backends.md`（见 [`docs/plan.md`](./docs/plan.md) Phase 3）。
 
 ### 4. 主代理的约束
 
@@ -104,37 +106,36 @@
 
 - **外部插件不需要构建工具链。** 最小可用插件只有两个文件（`package.json` + `cordis.patch.yml`），纯 JS 即可安装运行。目录结构本身没有强制约定。
 - 真正有约束力的是 `package.json` 里的三个契约字段：`exports["."]`（Host 半边）、`exports["./client"]` + `dsh.client`（Client 半边）、`dsh.bundle.patch`。
-- **角色配置面板必须走 Client 半边**，且要能在 GUI 里实时编辑的字段必须标 `.volatile()`——DSH 的设置页只暴露 volatile 字段。这决定了「在插件面板配置角色」这条需求的技术路径。
+- **角色配置面板必须走 Client 半边**，且要能在 GUI 里实时编辑的字段必须标 `.volatile()`——DSH 的设置页只暴露 volatile 字段。
 - 运行时强制校验的是 `peerDependencies` 里的 `@deepseek-ai/dsh*`；`engines.dsh` 不被校验，不要写。
 
-> **安装包名、插件 id 均为占位，尚未定稿。** 本仓库目前还没有 `package.json`，因此现在**不可安装**。上面三个契约字段一旦确定就会落进代码。
+**最关键的一条：** DSH 的 `ctx.subagents` 是一个**具名 provider 注册表**，`registerProvider()` 是公开扩展点，而 `SubagentRun.localAgent` 的类型是 `Agent | undefined`。这个 `undefined` 分支就是「非 DSH 子代理」的官方预留位——**跨 CLI 派发不需要绕开内置机制，它就是内置机制的一个 provider。**
 
-## 项目状态
+> 本仓库目前还没有 `package.json`，因此现在**不可安装**。包名与插件 id 待定，见 [`docs/decisions.md`](./docs/decisions.md) 文末。
 
-**这是早期设计阶段，尚无可用实现。** 本仓库目前只有仓库骨架与设计文档。
+## 路线图
 
-- [x] 仓库初始化（`.gitignore`、许可证、文档骨架）
-- [x] 摸清 DSH 插件的硬性契约（见上方「实现约束」）
-- [ ] 语言与工具链选型（纯 JS 还是 TS）
-- [ ] `package.json` 契约字段与最小可加载插件骨架
-- [ ] 角色配置的数据模型与插件面板 UI
-- [ ] `builtin` 派发后端
-- [ ] `cli` 派发后端（先支持一个 CLI，再抽象）
-- [ ] 调度日志与可观测性
-- [ ] 端到端示例
+分四期，每期都有必须真实通过的验收标准，见 [`docs/plan.md`](./docs/plan.md)。
 
-详细设计见 [`docs/architecture.md`](./docs/architecture.md)。
+- [x] **Phase 0 · 设计与取证** — 仓库初始化、摸清 DSH 契约、技术决策与实施方案定型
+- [ ] **Phase 1 · 最小可加载插件** — 打通装载链路：`package.json` 契约字段、Host/Client 两半边都活着、`.volatile()` 字段确认可在面板编辑
+- [ ] **Phase 2 · builtin 后端** — 角色模型、每个角色一个委派工具、走 DSH 内置子代理
+- [ ] **Phase 3 · CLI 后端** — 自己实现 `SubagentProvider`，走 `ctx.subprocess` 调用本机 CLI
+- [ ] **Phase 4 · 可观测性与打磨** — 调度日志、可写面板、并发预算
 
 ## 仓库布局
 
 ```
 .
-├── docs/          设计与用户文档
-├── scripts/       仓库级脚本（校验、发布辅助等）
-└── raw/           临时草稿区，已被 git 忽略，不进入历史
+├── docs/
+│   ├── architecture.md   已核实的 DSH 插件契约与取证
+│   ├── decisions.md      技术决策记录 D1–D10
+│   └── plan.md           目录结构、分期实施方案、验收标准、风险登记
+├── scripts/              只读取证探针（见 AGENTS.md）
+└── raw/                  临时草稿区，已被 git 忽略，不进入历史
 ```
 
-`src/`、`test/` 等实现相关目录**刻意暂不创建**——它们取决于尚未定型的语言与工具链选型，等决策确定后一次性落地，避免先摆一堆空目录。
+`src/`、`test/` 在 Phase 1 落地，结构与理由见 [`docs/plan.md`](./docs/plan.md#目录结构)。
 
 ## 本地约定
 
