@@ -58,13 +58,25 @@ section('模块可被真跑：桩化 window/require 后 factory 返回合法插�
   const registered = [];
   /** 桩化的 cordis ctx。 */
   const fakeCtx = {
-    // 角色配置走**插件自己的 ctx** 上的 settings 远程命名空间（唯一可写通道）。
-    remote: {
-      settings: {
-        describe: () => Promise.resolve([{ ns: 'agent-switchboard', value: { roles: [] }, revision: 1 }]),
-        mutate: () => Promise.resolve({ ok: true }),
-      },
+    // **读**走 configForms 镜像（官方「模型」页的做法）：`describe()` 返回一个面，
+    // 提供 `ensure()`（异步补全）/ `getSnapshot()`（`view.namespaces` 与 `view.writable`）
+    // / `subscribe()`。只靠 `remote.settings.describe()` 读是错的路子。
+    configForms: {
+      describe: () => ({
+        ensure: () => Promise.resolve(),
+        getSnapshot: () => ({
+          view: {
+            writable: true,
+            namespaces: [
+              { ns: 'agent-switchboard', value: { roles: [] }, revision: 1, writable: true },
+            ],
+          },
+        }),
+        subscribe: () => () => {},
+      }),
     },
+    // **写**走 remote.settings.mutate。
+    remote: { settings: { mutate: () => Promise.resolve({ ok: true }) } },
     slots: {
       inject: (_slot, fn) => {
         fn();
@@ -122,6 +134,11 @@ section('模块可被真跑：桩化 window/require 后 factory 返回合法插�
       // 都有，官方 `ui-settings-general` 同样把它写进 inject。它是 UI 写入角色数据的
       // **唯一**通道（客户端没有写文件能力）。
       check(
+        'inject 含 configForms（读配置的镜像）',
+        plugin.inject.includes('configForms'),
+        plugin.inject.join(','),
+      );
+      check(
         'inject 含 remote.settings（UI 唯一的写入通道）',
         plugin.inject.includes('remote.settings'),
         plugin.inject.join(','),
@@ -133,11 +150,6 @@ section('模块可被真跑：桩化 window/require 后 factory 返回合法插�
       check(
         'inject 里没有自建的 remote 命名空间',
         !plugin.inject.includes('remote.roleConfig'),
-        plugin.inject.join(','),
-      );
-      check(
-        'inject 不含 configForms（角色配置不走 configForms）',
-        !plugin.inject.includes('configForms'),
         plugin.inject.join(','),
       );
       check('插件导出了 apply', typeof plugin.apply === 'function');

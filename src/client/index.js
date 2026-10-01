@@ -124,52 +124,66 @@ window.__ModuleLoader__.load({
     const { useState, useEffect, useRef, useCallback } = React;
 
     /**
-     * 取 settings 远程通道。
+     * 取「配置镜像」——**读**角色配置的正规入口。
      *
-     * ⚠️ **必须从插件 ctx 取，不能从 slot 的 props.ctx 取**。`remote.settings` 是
-     * `dsh-api-settings-controller` 生成的命名空间，挂在客户端根上下文上；slot 注入的
-     * ctx 看不到它 —— 实测现象就是界面报「settings 服务尚未就绪」。
+     * ⚠️ 这里曾经走 `ctx.remote.settings.describe()`，那是**错的路子**，实测现象是界面
+     * 报「取不到 remote.settings 通道」。官方「模型」设置页
+     * （`dsh-client-ui-settings-models`）给出的正确形态是：
      *
-     * 本插件因此把 `remote.settings` 写进了 `inject`（官方 `ui-settings-general` 也是
-     * 这么做的，见其 client.js 的 `inject = [..., "remote.settings"]`）。它与之前失败的
-     * `remote.roleConfig` 有本质区别：**前者由内核插件提供、每次启动都在**；后者是我们
-     * 自己延迟注册的，因此会被声明成必需依赖后永远等不到。
+     *     await this.describeFace.ensure();                 // 异步补全镜像
+     *     const mirrored = this.describeFace.getSnapshot();
+     *     if (mirrored.view === void 0) … "settings are unavailable in this browser"
+     *     const views = mirrored.view.namespaces;           // ns → view
+     *     const writable = mirrored.view.writable;
      *
-     * 这里仍做一次运行时检查而不是直接点属性：取不到时给界面一句可读诊断，比抛错好。
+     * 即：**读走 `configForms` 镜像（`describe()` 返回的那个面），写才走
+     * `remote.settings.mutate`**。两者都要写进 `inject`（官方 models 页的 inject 里
+     * `configForms` 与 `remote.settings` 都在）。
      *
-     * @param {object} ctx - Client 插件上下文（**不是** slot props 里的那个）。
-     * @returns {object|undefined} settings 远程命名空间，未就绪时返回 undefined。
+     * `ensure()` 是异步的，因此**首帧通常读不到值**，必须先 await 再取 snapshot ——
+     * 这正是此前反复「读不到」的原因之一。
+     *
+     * @param {object} ctx - Client 插件上下文。
+     * @returns {object|undefined} 镜像面，未就绪时返回 undefined。
      */
-    function settingsChannel(ctx) {
+    function describeFace(ctx) {
       try {
-        return ctx?.remote?.settings;
+        return ctx?.configForms?.describe?.();
       } catch {
         return undefined;
       }
     }
 
     /**
-     * 读出本插件的配置快照（含 roles）。
+     * 读出本插件的配置（含 roles）。
      *
      * @param {object} ctx - Client 插件上下文。
-     * @returns {Promise<{ok: boolean, roles: object[], revision?: number, missing?: boolean, error?: string}>} 读取结果。
+     * @returns {Promise<{ok: boolean, roles: object[], revision?: number, missing?: boolean, writable?: boolean, error?: string}>} 读取结果。
      */
     async function fetchRoles(ctx) {
-      const channel = settingsChannel(ctx);
-      if (channel === undefined || typeof channel.describe !== 'function') {
+      const face = describeFace(ctx);
+      if (face === undefined || typeof face.getSnapshot !== 'function') {
         return {
           ok: false,
           roles: [],
-          // 这条文案必须与真实原因一致：不是「配置文件损坏」，而是**远程通道没取到**。
-          // 两者混淆过一次，让排查方向完全跑偏（实测教训）。
           error:
-            '取不到 remote.settings 通道（这不是配置文件的问题）。' +
-            '请确认 @deepseek-ai/dsh-api-settings-controller 已启用，然后重启应用。',
+            '取不到 configForms 镜像（这不是配置文件的问题）。' +
+            '请确认 @deepseek-ai/dsh-api-settings-controller 与界面外壳均已启用，然后重启应用。',
         };
       }
       try {
-        const rows = await channel.describe();
-        const row = (Array.isArray(rows) ? rows : []).find((r) => r?.ns === CONFIG_NS);
+        // `ensure()` 异步补全镜像；首帧往往还没有我们的行，必须先等它。
+        if (typeof face.ensure === 'function') await face.ensure();
+        const snapshot = face.getSnapshot();
+        const view = snapshot?.view;
+        if (view === undefined) {
+          return {
+            ok: false,
+            roles: [],
+            error: snapshot?.error ?? '设置镜像不可用（settings are unavailable in this browser）。',
+          };
+        }
+        const row = (view.namespaces ?? []).find((v) => v?.ns === CONFIG_NS);
         if (row === undefined) {
           return {
             ok: false,
@@ -178,14 +192,27 @@ window.__ModuleLoader__.load({
           };
         }
         const roles = Array.isArray(row.value?.roles) ? row.value.roles : [];
-        return { ok: true, roles, revision: row.revision, missing: roles.length === 0 };
+        return {
+          ok: true,
+          roles,
+          revision: row.revision,
+          writable: row.writable,
+          missing: roles.length === 0,
+        };
       } catch (error) {
         return { ok: false, roles: [], error: error instanceof Error ? error.message : String(error) };
       }
     }
 
+
     /**
      * 写入角色到本插件配置。
+     *
+     * **写**走 `remote.settings.mutate`（读走 `configForms` 镜像）—— 这是官方「模型」页的
+     * 分工：`ctx.remote.settings.mutate(ns, ops, expectedRevision)`。
+     *
+     * `response.ok === false` 时 `response.error` 是**结构化**的（官方代码取
+     * `.error.message`），因此这里先取 `.message` 再退回整体，避免界面显示 `[object Object]`。
      *
      * 整块 `set(['roles'], value)`：角色是变长数组，整体提交语义明确，不必算易错的
      * 逐字段 diff。`roles` 在 Host schema 上标了 `.volatile()`，因此这条路径操作可写
@@ -197,9 +224,19 @@ window.__ModuleLoader__.load({
      * @returns {Promise<{ok: boolean, message: string}>} 结果。
      */
     async function saveRoles(ctx, roles, revision) {
-      const channel = settingsChannel(ctx);
+      let channel;
+      try {
+        channel = ctx?.remote?.settings;
+      } catch {
+        channel = undefined;
+      }
       if (channel === undefined || typeof channel.mutate !== 'function') {
-        return { ok: false, message: 'settings 服务尚未就绪，无法保存。' };
+        return {
+          ok: false,
+          message:
+            '取不到 remote.settings 通道（这不是配置文件的问题）。' +
+            '请确认 @deepseek-ai/dsh-api-settings-controller 已启用，然后重启应用。',
+        };
       }
       try {
         const response = await channel.mutate(
@@ -502,11 +539,29 @@ window.__ModuleLoader__.load({
         });
       }, [ctx]);
 
-      // 首次挂载时读取一次。这里**不订阅** configForms 镜像：我们的可写通道是
-      // `settings` 远程服务，订阅镜像只会带来无关的重渲染。外部改动由「放弃改动」按钮刷新。
+      // 首次挂载读一次，并**订阅镜像**：`configForms.describe()` 的镜像面带 `subscribe()`，
+      // 且 `ensure()` 是异步的，因此首帧通常还看不到我们的行 —— 订阅能让镜像补全后自动
+      // 重读。官方「模型」页也是靠订阅（`ctx.remote.$on("settings/document-updated", …)`）
+      // 来跟随外部改动的。
       useEffect(() => {
         if (!ctx) return undefined;
         refresh();
+        const face = describeFace(ctx);
+        if (face !== undefined && typeof face.subscribe === 'function') {
+          let dispose;
+          try {
+            dispose = face.subscribe(() => refresh());
+          } catch {
+            /* 订阅失败只是失去自动刷新，页面本身仍可用 */
+          }
+          return () => {
+            try {
+              if (typeof dispose === 'function') dispose();
+            } catch {
+              /* 释放失败不影响其它订阅 */
+            }
+          };
+        }
         return undefined;
       }, [ctx, refresh]);
 
@@ -696,16 +751,20 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      // `remote.settings` 由内核插件 `dsh-api-settings-controller` 提供，客户端每次启动
-      // 都有；官方 `ui-settings-general` 同样把它写进 inject（见其 client.js）。
-      // 它是**唯一**能让 UI 写入角色数据的通道：客户端没有写文件的能力
-      // （`workspaceFiles` 只有 read/stat/list），而外部插件无法新增自己的远程命名空间
-      // （客户端只装载构建期生成的静态贡献清单，且没有 Proxy）。
+      // **读**走 `configForms` 镜像，**写**走 `remote.settings` —— 这是官方「模型」设置页
+      // （`dsh-client-ui-settings-models`）的分工，其 inject 里两者都在：
+      //     const inject = [..., "remote.credentials", "remote.llm", "remote.settings",
+      //                     "remote.session", "configForms", ...];
       //
-      // ⚠️ 只声明真正必需且**由内核保证**的依赖。曾经声明的 `remote.roleConfig` 是我们
-      //    自己延迟注册的服务，声明成必需依赖后客户端永远 pending，整页起不来
-      //    （`web boot: 1 entry did not activate`）。不要把那种东西放进 inject。
-      inject: ['slots', 'remote.settings'],
+      // `configForms.describe()` 返回的镜像面提供 `ensure()`（异步补全）/
+      // `getSnapshot()`（`view.namespaces` 与 `view.writable`）/ `subscribe()`。
+      // 只用 `remote.settings.describe()` 读是错的路子 —— 实测报「取不到 remote.settings 通道」。
+      //
+      // ⚠️ 这两个都是**内核插件提供**、每次启动都在的依赖，因此写进 inject 是安全的。
+      //    曾经注入的 `remote.roleConfig` 是我们自己延迟注册的服务，声明成必需依赖后
+      //    永远等不到，导致整页起不来（`web boot: 1 entry did not activate`）。
+      //    判据是「由谁保证它在装载期存在」，而不是名字里有没有 `remote.`。
+      inject: ['slots', 'configForms', 'remote.settings'],
       apply(ctx) {
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(

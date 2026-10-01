@@ -277,18 +277,29 @@ section('客户端必需注入只许声明内核保证存在的服务');
     .filter((s) => s.length > 0);
   console.log(`       客户端 inject = ${JSON.stringify(declared)}`);
   check('客户端 inject 含 slots', declared.includes('slots'), declared.join(','));
-  check('客户端 inject 含 remote.settings（UI 唯一可写通道）', declared.includes('remote.settings'), declared.join(','));
+  check('客户端 inject 含 configForms（读配置的镜像）', declared.includes('configForms'), declared.join(','));
+  check(
+    '客户端 inject 含 remote.settings（UI 唯一可写通道）',
+    declared.includes('remote.settings'),
+    declared.join(','),
+  );
   check(
     '客户端 inject 里没有自建的 remote 命名空间',
     !declared.includes('remote.roleConfig'),
     declared.join(','),
   );
 
-  // 客户端只能走已存在的通道：settings（唯一可写）与 workspaceFiles（只读）。
+  // 读走 configForms 镜像（官方「模型」页的做法），写走 remote.settings。
+  // 只用 `remote.settings.describe()` 读是错的路子 —— 实测报「取不到 remote.settings 通道」。
   check(
-    '客户端使用 settings 通道读写角色配置',
-    /remote\.settings|remote\?\.settings|remote\[.settings.\]/.test(clientSrc),
-    '未找到对 remote.settings 的引用',
+    '客户端读配置走 configForms 镜像（ensure/getSnapshot）',
+    /configForms\?\.describe|configForms\.describe/.test(clientSrc) && /\.ensure\(\)/.test(clientSrc),
+    '未找到对 configForms.describe().ensure() 的引用',
+  );
+  check(
+    '客户端写配置走 remote.settings.mutate',
+    /remote\?\.settings|remote\.settings/.test(clientSrc) && /\.mutate\(/.test(clientSrc),
+    '未找到对 remote.settings.mutate 的引用',
   );
 }
 
