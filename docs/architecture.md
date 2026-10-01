@@ -47,6 +47,43 @@
    - ⚠️ **禁止 import 任何 Harness Client 包**（官方明令）；只用 `--dsw-alias-*` 主题 token。Client 半边崩溃会让整个 slot 空掉。
 10. **安装走 `plugin_manager install_bundle`**，不要手写 profile 的 `package.json` / `cordis.patch.yml`，也不要手动跑 pnpm。
 
+### 3.1 Phase 1 实测新增的装载期约束
+
+以下两条是写 Phase 1 代码时**被真实装载过程教会的**，比上面任何一条都更容易踩：
+
+11. **`@deepseek-ai/*` 可以被外部插件 import，这个 import 是对的。**
+    - 它们在磁盘上**不存在**于 profile 或安装目录的任何 `node_modules`（只在 `app.asar` 内）。从磁盘用原生 node 解析**必然失败**（实测 `ERR_MODULE_NOT_FOUND`）。
+    - 但运行时由 dsh 安装处以「**双锚点解析**」供给（官方措辞：module resolution is two-anchor by construction — 先从 dsh 安装的 launcher 包解析，再从 profile 解析），并由 `dsh-app-boot` 把这套解析注入 Node 的 ESM/CJS 解析器。
+    - **教训：不要用「磁盘上能不能找到」来判断插件能否 import 某个包。**
+
+12. **`dsh-tools` 的 `output.schema` 只接受受限 JSON Schema 子集，`required` 必须是字符串数组。**
+    - 合法关键字仅：`type` / `oneOf` / `properties` / `required` / `additionalProperties` / `items` / `enum` / `const`，外加注解 `description` / `title` / `default` / `examples`。其他任何键都被拒绝。
+    - `required` **只允许出现在 `type: "object"` 的节点上**，且必须是**属性名字符串数组**：`required: ['a','b']`。
+    - 写成字段级布尔标记 `{ a: { type: 'string', required: true } }` 会报
+      `schema.properties.a.required is not supported on type "string"`。
+    - ⚠️ **极易踩的坑**：`parameters` 用的是**另一套**更宽松的 schema 规格（那里字段级 `required: true` 是合法的），而 `output.schema` 用这一套。同一份工具定义里两套规则并存。`dsh-tool-todo` 的 `lib/index.js` 里形如 `output: { schema: { … required: true … } }` 的片段是 **JSDoc 注释里的文档示例，不是可运行代码**——照抄它就会踩这个坑（本插件第一版正是如此失败的）。
+    - 校验器实现位置：`dsh-tools/lib/index.js` 的 `checkSchemaNode` / `checkObjectSchemaTail` / `assertSupportedJsonSchema`。
+
+### 3.2 一条误导性的诊断信息（重要）
+
+**加载器会把「插件激活失败」一律显示为 `failed to import`。**
+
+已核实其来源：`dsh-app-boot` 的 `inactiveEntries()` 在 `entry.fiber === undefined` 时产出字面量 `"failed to import"`。而 `fiber === undefined` **并不等于**「模块没加载成功」——本插件第一版就是**模块加载完全成功、`apply` 正常进入**（报错堆栈里可见 `src/index.js` 行号），却在 `apply` 内抛错，最终仍被报告为 `failed to import`。
+
+**教训：遇到 `failed to import` 不要只往模块解析方向查。** 取真实错误的办法按可靠性排序：
+
+1. 让模块在 evaluate 时写一个落地文件 —— 文件出现即证明模块已加载，问题在激活阶段。
+2. 在 `apply` 里加临时 `console.error`。
+3. 用 `cordis_inspect_query` 的 `Config.listConfigs`（`name` 过滤）看条目 `status` 是否为 `inactive`。
+
+### 3.3 link 模式下的模块缓存
+
+**以 `link:` 方式安装的插件，改动源码后 `set_plugin` 开关或 `install_bundle` 都不会重新加载模块。**
+
+实证：修改源码后 `set_plugin` 禁用再启用，报错堆栈里的**行号仍是旧代码的行号**；在模块顶层加落地文件探针后重复开关，**文件始终未生成**——证明新代码从未被执行。官方文档已说明：「replacing an installed package requires restart to load a fresh JavaScript module generation」。
+
+**后果：** 开发迭代中每次 Host 半边改动都需重启 dsh 才能被真实装载验证。无法重启时可用这个办法取得客观结论——把 `dsh-tools` 的校验器逻辑抽取出来对 schema 单独跑。本插件 Phase 1 即以此证明修复有效：抽取版对新 schema 报 0 violations，且能**逐字复现**线上对旧写法的报错文案。
+
 > 参考位置（**仅存在于安装归档内，不是本仓库文件**）：内置 Skill `dsh-agent-preset/skills/cordis-plugin-development/`，含 `SKILL.md`、`references/*.md` 与 `templates/{decoration,mcp}/` 六个模板文件。官方**没有** `create-dsh-plugin` 脚手架，也没有示例插件仓库。
 >
 > 另有一项尚未本地核实：TS 基座 `tsconfig.base.json` / `tsconfig.base.client.json` **不随安装分发**，外部作者需要去上游仓库取（上游地址 `github.com/deepseek-ai/deepseek-harness`，取自各包 `repository` 字段，**本仓库尚未联网确认**）。

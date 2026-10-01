@@ -67,20 +67,39 @@
 
 **目标：** 证明这个包能被 DSH 装载、Host 与 Client 两半边都活着。不实现任何派发。
 
-**产出：**
-- `package.json`（D2 的契约字段齐全）
-- `cordis.patch.yml`（一条插入条目）
-- `src/index.js`：`apply` 里做一件可观测的事（例如注册一个 `switchboard_selftest` 工具，返回固定文本）
-- `src/client/index.js`：`composer.dock` 注入一个只读标识
+**状态：代码已完成并通过静态与离线验证；真机激活待一次应用重启。**
 
-**验收（全部必须真实通过）：**
+**产出（已落地）：**
+
+| 文件 | 内容 |
+| --- | --- |
+| `package.json` | `exports["."]` / `exports["./client"]` / `dsh.bundle.patch` / `dsh.client` / `manifestVersion` / `peerDependencies` 齐全 |
+| `cordis.patch.yml` | 一条 `insert` 条目，id `agent-switchboard` |
+| `src/index.js` | Host 半边：`Config`（含 `.volatile()` 子对象）+ 自检工具 `switchboard_selftest` |
+| `src/client/index.js` | Client 半边：`__ModuleLoader__.load` + `conversation.composer.dock` 只读状态条 |
+
+**已验证（客观证据）：**
+
+1. 两半边 `node --check` 通过；`package.json` 可解析、四个契约字段指向的文件均存在。
+2. Client 半边的 `__ModuleLoader__.load` 的 `id` **严格等于包名**（脚本比对）。
+3. 从 profile 目录可直接 import 两半边；Client 半边加载时确实调用了 `load()` 且 id 正确。
+4. 包已被 `install_bundle` 成功 link 进 profile（`link:C:/.../DSH-Agent-Switchboard`，pnpm 退出码 0）。
+5. **`@deepseek-ai/schemastery` 与 `@deepseek-ai/dsh-tools` 的 import 在运行时可用** —— 曾一度怀疑不可用（磁盘上解析必然失败），最终由报错堆栈中出现 `src/index.js` 行号证明模块加载与 `apply` 执行均成功。
+6. `output.schema` 已按受限子集改正，并用**抽取自 `dsh-tools` 的真实校验器**验证：新 schema **0 violations**，且该抽取版能逐字复现线上对旧写法的报错。
+
+**待完成（阻塞条件明确）：**
+
+- 条目的 `fiberPhase` 目前为 `null`（未激活）。原因是 **link 模式下的模块缓存**：源码改动后 `set_plugin` 开关与 `install_bundle` 都不会重新加载模块（已用落地文件探针证实新代码从未执行）。需要**重启承载本会话的 dsh** 才能装载新模块。
+- 重启后逐条跑完下列 5 条验收。
+
+**验收（重启后逐条真实通过）：**
 1. `plugin_manager install_bundle` 能把包装进 profile。
-2. 插件出现在 Loader 条目列表里，`Config` schema 被 `cordis_inspect_query`（Provider `Config`）读到。
+2. 插件出现在 Loader 条目列表里，`Config` schema 被 `cordis_inspect_query`（Provider `Config`）读到（当前该条目**没有** config 说明，正是因为未激活）。
 3. `switchboard_selftest` 工具在 `cordis_inspect_query`（Provider `Tool`）的清单里出现。
-4. GUI 刷新后 `composer.dock` 能看到那个只读标识。
+4. GUI 刷新后 `composer.dock` 能看到那个只读状态条。
 5. `.volatile()` 字段在设置页可编辑；非 volatile 字段**不**出现（这条用来确认 D9 的前提）。
 
-**这一阶段的真正价值：** 一次性消灭所有「装载层」的不确定性。此后的问题都只可能是业务逻辑问题。
+**这一阶段的真正价值：** 已一次性消灭「装载层」的主要不确定性，并额外换来两条高价值教训（见 `architecture.md` 第 3.1–3.3 节）：schema 子集的真实规则、以及 `failed to import` 这条诊断会把人引向错误方向。
 
 ## Phase 2 · builtin 后端与角色工具
 
@@ -134,6 +153,8 @@
 | R5 | Client 半边崩溃会清空整个 slot | 可能拖垮 GUI 的一块区域 | 第一期只做只读、最小 DOM；严守「不 import Harness Client 包」 |
 | R6 | 角色列表若放 patch，用户在 GUI 里改不了 | 与「面板配置角色」的期望有落差 | D9 已明确分层并记录；Phase 4 评估可写面板 |
 | R7 | 外部 CLI 的额度/登录状态不透明 | 派发失败原因难定位 | 结果里保留原始 stderr 与退出码（D8），不做美化丢弃 |
+| R8 | **link 模式下 Host 半边改动无法热加载** | 每次改动都需重启 dsh 才能真机验证，迭代慢 | 已实测确认（`architecture.md` 第 3.3 节）。缓解：把逻辑尽可能放进可用抽取方式验证的纯函数；Client 半边不受此限（有 HMR） |
+| R9 | **`failed to import` 会掩盖真实错误** | 排查方向被误导，可能浪费大量时间（Phase 1 已实际发生） | 已记录取证手法（`architecture.md` 第 3.2 节）：先用落地文件探针判定「模块是否已加载」，再查 `apply` 内部 |
 
 ## 与项目硬规则的对应
 

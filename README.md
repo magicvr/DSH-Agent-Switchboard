@@ -123,7 +123,7 @@
 分四期，每期都有必须真实通过的验收标准，见 [`docs/plan.md`](./docs/plan.md)。
 
 - [x] **Phase 0 · 设计与取证** — 仓库初始化、摸清 DSH 契约、技术决策与实施方案定型
-- [ ] **Phase 1 · 最小可加载插件** — 打通装载链路：`package.json` 契约字段、Host/Client 两半边都活着、`.volatile()` 字段确认可在面板编辑
+- [~] **Phase 1 · 最小可加载插件** — 代码已落地并已成功 link 进 profile；**真机激活待一次应用重启**（link 模式下 Host 半边改动不热加载，原因见 [architecture.md](docs/architecture.md) 第 3.3 节）
 - [ ] **Phase 2 · builtin 后端** — 角色模型、每个角色一个委派工具、走 DSH 内置子代理
 - [ ] **Phase 3 · CLI 后端** — 自己实现 `SubagentProvider`，走 `ctx.subprocess` 调用本机 CLI
 - [ ] **Phase 4 · 可观测性与打磨** — 调度日志、可写面板、并发预算

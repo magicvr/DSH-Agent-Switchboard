@@ -1,0 +1,41 @@
+{
+  "name": "@magicvr/dsh-agent-switchboard",
+  "version": "0.0.1",
+  "private": true,
+  "description": "DSH plugin that keeps the main agent as an information switchboard and delegates work to role-specialized subagents, including local CLI backends.",
+  "license": "MIT",
+  "author": "magicvr",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/magicvr/DSH-Agent-Switchboard.git"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2"
+  }
+}

@@ -1,0 +1,7 @@
+# Agent Switchboard 的插件条目。
+#
+# 角色列表（roles）将在 Phase 2 加入本文件的 config。
+# 现阶段只装配最小可用形态：一个 Host 半边 + 一个 Client 半边。
+- insert:
+    - id: agent-switchboard
+      name: '@magicvr/dsh-agent-switchboard'
