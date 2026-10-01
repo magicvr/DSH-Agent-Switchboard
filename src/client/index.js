@@ -287,6 +287,8 @@ window.__ModuleLoader__.load({
      * @param {object} ctx - Client 插件上下文。
      * @returns {Promise<{ok: boolean, roles: object[], revision?: number, missing?: boolean, writable?: boolean, error?: string}>} 读取结果。
      */
+    // ⚠️ 以下两个函数**不再由组件直接调用**：它们只在插件 `apply` 里被绑定成
+    //    「操作回调」，再作为 props 传给组件。理由见 `makeRoleStore` 的说明。
     async function fetchRoles(ctx) {
       const face = describeFace(ctx);
       if (face === undefined || typeof face.getSnapshot !== 'function') {
@@ -350,19 +352,89 @@ window.__ModuleLoader__.load({
      * @param {number|undefined} revision - 读取时拿到的 revision，用于并发保护。
      * @returns {Promise<{ok: boolean, message: string}>} 结果。
      */
-    async function saveRoles(ctx, roles, revision) {
-      let channel;
+    /**
+     * 找出可写的 settings 通道。
+     *
+     * **为什么要有多个候选**：读路径走 `ctx.configForms` 成功、而写路径取
+     * `ctx.remote.settings` 失败（实测现象），说明两条路并非总是同时可用。
+     * 与其赌「它一定在 `ctx.remote.settings`」，不如按可能性依次尝试，并把
+     * 「哪些路走通了」记下来 —— 这样失败时能给出可行动的信息，而不是一句「取不到」。
+     *
+     * 候选顺序与理由：
+     *   1. `ctx.remote.settings` —— 官方「模型」页的写法
+     *      （`dsh-client-ui-settings-models`：`ctx.remote.settings.mutate(ns, ops, rev)`）；
+     *   2. `ctx.get('remote.settings')` —— 某些投影下命名空间要走 `ctx.get` 取；
+     *   3. `ctx.configForms.get(ns)` 上的 `mutate` —— 读路径已经证明 `configForms` 可用
+     *      （`ctx.configForms.describe().ensure()` 成功），因此同一套东西上若有 `mutate`
+     *      就优先用它（读写成对，最不容易出现「读得到写不到」）。
+     *
+     * @param {object} ctx - Client 插件上下文。
+     * @param {string} ns - 命名空间（`entry.options.id`）。
+     * @returns {{channel: object|undefined, tried: string[]}} 通道与尝试过的路径。
+     */
+    function writeChannel(ctx, ns) {
+      const tried = [];
+      const candidates = [];
+
       try {
-        channel = ctx?.remote?.settings;
-      } catch {
-        channel = undefined;
+        candidates.push(['ctx.remote.settings', ctx?.remote?.settings]);
+      } catch (error) {
+        tried.push(`ctx.remote.settings 抛错(${error instanceof Error ? error.message : String(error)})`);
       }
-      if (channel === undefined || typeof channel.mutate !== 'function') {
+      try {
+        candidates.push(["ctx.get('remote.settings')", typeof ctx?.get === 'function' ? ctx.get('remote.settings') : undefined]);
+      } catch (error) {
+        tried.push(`ctx.get('remote.settings') 抛错(${error instanceof Error ? error.message : String(error)})`);
+      }
+      try {
+        candidates.push(['ctx.configForms.get(ns)', ctx?.configForms?.get?.(ns)]);
+      } catch (error) {
+        tried.push(`ctx.configForms.get 抛错(${error instanceof Error ? error.message : String(error)})`);
+      }
+
+      for (const [label, value] of candidates) {
+        if (value === undefined || value === null) {
+          tried.push(`${label}=无`);
+          continue;
+        }
+        if (typeof value.mutate === 'function') {
+          tried.push(`${label}=有 mutate`);
+          return { channel: value, tried };
+        }
+        tried.push(`${label}=无 mutate(方法:[${Object.keys(value).join(',')}])`);
+      }
+
+      // 全部失败：把结构也记下来，便于判断是不是「整体没挂载」而非「名字不对」。
+      const remoteKeys = (() => {
+        try {
+          return ctx?.remote === undefined || ctx?.remote === null ? '' : Object.keys(ctx.remote).join(',');
+        } catch {
+          return '(不可枚举)';
+        }
+      })();
+      tried.push(`ctx.remote 可枚举键=[${remoteKeys}]`);
+      return { channel: undefined, tried };
+    }
+
+    /**
+     * 写入角色到本插件配置。
+     *
+     * **写**走 settings 的 `mutate`（读走 `configForms` 镜像）—— 这是官方「模型」页的分工，
+     * 但实测出现过「读成功、写失败」，因此 `writeChannel` 会依次尝试多条访问路径。
+     *
+     * @param {object} ctx - Client 插件上下文。
+     * @param {object[]} roles - 角色数组。
+     * @param {number|undefined} revision - 读取时拿到的 revision，用于并发保护。
+     * @returns {Promise<{ok: boolean, message: string}>} 结果。
+     */
+    async function saveRoles(ctx, roles, revision) {
+      const { channel, tried } = writeChannel(ctx, CONFIG_NS);
+      if (channel === undefined) {
         return {
           ok: false,
           message:
-            '取不到 remote.settings 通道（这不是配置文件的问题）。' +
-            '请确认 @deepseek-ai/dsh-api-settings-controller 已启用，然后重启应用。',
+            '取不到可写的 settings 通道（这不是配置文件的问题）。' +
+            `诊断：${tried.join(' | ')}。`,
         };
       }
       try {
@@ -379,6 +451,38 @@ window.__ModuleLoader__.load({
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : String(error) };
       }
+    }
+
+    /**
+     * 把「读配置 / 写配置」绑定到**插件的 ctx**，产出一组操作回调。
+     *
+     * ## 为什么必须这么做（官方模式，实测踩到后才照做）
+     *
+     * 官方「模型」页（`dsh-client-ui-settings-models`）的注释写得很直白：
+     *
+     * > Cards receive these **instead of a context**: the outcomes name what a card
+     * > renders … so the failure codes and Remote namespaces stay in the **apply world**.
+     *
+     * 它的写法是 `createModelsOperations(ctx)` —— 传入**插件自己的 ctx**，在 `apply`
+     * 里把操作绑好，再把**操作函数**注入给 React 组件。
+     *
+     * 我原先的做法是把 `ctx` 塞进 slot 的 `inject: () => ({ ctx })`，让组件里自己读
+     * `props.ctx.remote.settings`。**那是错的**：slot 的组件侧上下文与插件上下文不是同一个，
+     * 实测表现为「读得到（`configForms` 是 slot 的注入面）、写不到
+     * （`remote.settings` 只在插件上下文里）」。
+     *
+     * 因此读与写都在这里绑定，组件只拿到两个函数，完全不需要 ctx。
+     *
+     * @param {object} ctx - **插件的** ctx（`apply` 收到的那个）。
+     * @returns {{read: Function, write: Function}} 操作回调。
+     */
+    function makeRoleStore(ctx) {
+      return {
+        /** 读角色。 */
+        read: () => fetchRoles(ctx),
+        /** 写角色；`revision` 来自上一次读。 */
+        write: (roles, revision) => saveRoles(ctx, roles, revision),
+      };
     }
 
     /** 复制一份角色数组，避免直接改读到快照里的对象。 */
@@ -756,7 +860,13 @@ window.__ModuleLoader__.load({
      * @returns {object} React 元素。
      */
     function SwitchboardSettings(props) {
-      const ctx = props.ctx ?? props.context;
+      // ⚠️ 组件**不接收 ctx**，只接收插件 `apply` 里绑定好的操作回调。
+      //    这与官方「模型」页一致：它把 `createModelsOperations(ctx)` 的结果注入给卡片，
+      //    注释原文是「Cards receive these **instead of a context** … so the failure codes
+      //    and Remote namespaces stay in the **apply world**」。
+      //    原因：slot 的组件侧上下文与插件上下文不是同一个，直接读 `props.ctx.remote`
+      //    会拿不到远程命名空间（实测：读得到 configForms、写不到 remote.settings）。
+      const store = props.store;
       const [draft, setDraft] = useState(null);
       const [status, setStatus] = useState('loading');
       const [notice, setNotice] = useState(null);
@@ -767,12 +877,12 @@ window.__ModuleLoader__.load({
 
       /** 重新读取本插件的配置。 */
       const refresh = useCallback(() => {
-        if (!ctx) {
-          setStatus('no-context');
+        if (store === undefined || typeof store.read !== 'function') {
+          setStatus('error:未取到插件操作回调（插件的 apply 未注入 store）');
           return;
         }
         setStatus('loading');
-        void fetchRoles(ctx).then((result) => {
+        void store.read().then((result) => {
           if (!result.ok) {
             // 读取失败必须如实显示：静默当作空会把用户配置「藏起来」。
             setDraft([]);
@@ -787,33 +897,15 @@ window.__ModuleLoader__.load({
           setRevision(result.revision);
           setStatus(result.roles.length > 0 ? 'ready' : result.missing === true ? 'missing' : 'empty');
         });
-      }, [ctx]);
+      }, [store]);
 
-      // 首次挂载读一次，并**订阅镜像**：`configForms.describe()` 的镜像面带 `subscribe()`，
-      // 且 `ensure()` 是异步的，因此首帧通常还看不到我们的行 —— 订阅能让镜像补全后自动
-      // 重读。官方「模型」页也是靠订阅（`ctx.remote.$on("settings/document-updated", …)`）
-      // 来跟随外部改动的。
+      // 首次挂载读一次。`ensure()` 是异步的，因此首帧通常还看不到我们的行；
+      // 但 `read` 内部已经 `await ensure()`，所以这里读一次就够，不需要再订阅镜像。
       useEffect(() => {
-        if (!ctx) return undefined;
+        if (store === undefined) return undefined;
         refresh();
-        const face = describeFace(ctx);
-        if (face !== undefined && typeof face.subscribe === 'function') {
-          let dispose;
-          try {
-            dispose = face.subscribe(() => refresh());
-          } catch {
-            /* 订阅失败只是失去自动刷新，页面本身仍可用 */
-          }
-          return () => {
-            try {
-              if (typeof dispose === 'function') dispose();
-            } catch {
-              /* 释放失败不影响其它订阅 */
-            }
-          };
-        }
         return undefined;
-      }, [ctx, refresh]);
+      }, [store, refresh]);
 
       const roles = draft ?? [];
       const dirty = draft !== null && JSON.stringify(roles) !== savedRef.current;
@@ -857,7 +949,7 @@ window.__ModuleLoader__.load({
 
       /** 保存角色列表。 */
       const save = async () => {
-        if (!ctx || busy) return;
+        if (store === undefined || typeof store.write !== 'function' || busy) return;
         const problem = validate();
         if (problem) {
           setNotice({ kind: 'error', text: problem });
@@ -865,7 +957,7 @@ window.__ModuleLoader__.load({
         }
         setBusy(true);
         // 角色是变长数组，整体提交语义明确 —— 不必算易错的逐字段 diff。
-        const result = await saveRoles(ctx, roles, revision);
+        const result = await store.write(roles, revision);
         setBusy(false);
         if (result.ok) {
           savedRef.current = JSON.stringify(roles);
@@ -1016,6 +1108,10 @@ window.__ModuleLoader__.load({
       //    判据是「由谁保证它在装载期存在」，而不是名字里有没有 `remote.`。
       inject: ['slots', 'configForms', 'remote.settings'],
       apply(ctx) {
+        // ⚠️ 在**插件上下文**里绑定读写操作，再把操作注入给组件 —— 与官方「模型」页
+        //    （`createModelsOperations(ctx)`）一致。不要把 `ctx` 本身注入给组件：
+        //    slot 的组件侧上下文与插件上下文不是同一个，实测表现为「读得到、写不到」。
+        const store = makeRoleStore(ctx);
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(
             {
@@ -1024,7 +1120,7 @@ window.__ModuleLoader__.load({
               id: 'agent-switchboard',
               order: 25,
               label: '角色与派发',
-              inject: () => ({ ctx }),
+              inject: () => ({ store }),
             },
             SwitchboardSettings,
           ),

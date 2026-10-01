@@ -169,14 +169,23 @@ section('模块可被真跑：桩化 window/require 后 factory 返回合法插�
         check('注册的 slot 是 settings.section', options.name === 'settings.section', String(options.name));
         check('注册 id 是自己的（agent-switchboard）', options.id === 'agent-switchboard', String(options.id));
         check('组件是函数', typeof component === 'function');
+        // ⚠️ 组件**不得**接收 ctx，只接收插件 `apply` 里绑定好的操作回调（`store`）。
+        //    这与官方「模型」页一致：「Cards receive these **instead of a context** … so the
+        //    failure codes and Remote namespaces stay in the **apply world**」。
+        //    原因：slot 的组件侧上下文与插件上下文**不是同一个**，直接读 `props.ctx.remote`
+        //    拿不到远程命名空间 —— 实测表现为「读得到 configForms、写不到 remote.settings」。
+        const injected = typeof options.inject === 'function' ? options.inject() : {};
+        check('inject 回调注入 store（而不是 ctx）', injected.store !== undefined, Object.keys(injected).join(','));
+        check('inject 回调不注入 ctx', injected.ctx === undefined, Object.keys(injected).join(','));
+        check(
+          'store 提供 read / write 两个操作',
+          typeof injected.store?.read === 'function' && typeof injected.store?.write === 'function',
+          Object.keys(injected.store ?? {}).join(','),
+        );
         // 渲染一次：用桩 React 走完整个组件体，验证不抛错且能返回元素。
         try {
-          const tree = component({ ctx: fakeCtx });
+          const tree = component({ store: injected.store });
           check('组件在「空角色」输入下可渲染且不抛错', tree !== null && tree !== undefined);
-          check(
-            'inject 回调返回 ctx（组件的唯一依赖）',
-            typeof options.inject === 'function' && options.inject().ctx === fakeCtx,
-          );
         } catch (error) {
           check('组件在「空角色」输入下可渲染且不抛错', false, error.message);
         }
