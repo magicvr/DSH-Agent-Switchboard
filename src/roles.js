@@ -117,7 +117,12 @@ export function normalizeRole(raw, index, defaultProvider, defaultCwd) {
   const isCli = backend === CLI_BACKEND;
 
   const model = read('model');
-  const provider = read('provider') ?? defaultProvider;
+  // ⚠️ 用 `||` 而不是 `??`：空串应当与「未设置」同义，回落插件级默认值。
+  //    用 `??` 时空串会被当成一个**有效值**而绕过默认值，接着在下面的
+  //    `if (!provider)` 处报「provider 未设置，且插件级 provider 也未设置」——
+  //    这条报错是**误导的**（插件级其实是设置了的），而且与客户端的判定不一致。
+  //    实测由 `scripts/check-validation-parity.mjs` 抓出。
+  const provider = read('provider') || defaultProvider;
   if (!isCli) {
     if (!model) errors.push(`${at}.model 必填（backend 为 ${backend} 时需要 DSH 的 LLM route）`);
     if (!provider) {

@@ -61,13 +61,26 @@ export function validateRoles(roles) {
     if (!r.description) return `${at}：描述不能为空（主代理据此判断何时派给它）`;
     if (!r.instructions) return `${at}：角色指令不能为空`;
     if (!r.model) return `${at}：模型不能为空`;
+    // ⚠️ **backend 取值必须校验**。客户端一度完全跳过这一项，于是「backend 写成别的字符串」
+    //    会被 UI 放行、到 Host 才报错，而 Host 的报错出现在装载期 —— 用户看不到它与自己
+    //    操作的关联。取值与 Host 的 `[...BUILTIN_PROVIDERS, CLI_BACKEND]` 一致
+    //    （`check-client.mjs` 有漂移断言锁定）。
+    if (!BACKENDS.includes(r.backend ?? 'spawn')) {
+      return `${at}：派发机制 "${r.backend}" 非法，只能是 ${BACKENDS.join(' / ')}`;
+    }
     if (r.backend === 'cli') {
       if (!r.cliCommand) return `${at}：CLI 后端需要「命令」`;
       if (!Array.isArray(r.cliArgs) || r.cliArgs.length === 0) return `${at}：CLI 后端需要参数模板`;
-      if (!r.cliPromptDelivery) return `${at}：CLI 后端需要提示词传递方式`;
-    } else if (!r.provider) {
-      return `${at}：内置后端需要 provider（可留空以使用顶层默认值）`;
+      // ⚠️ **不校验 `cliPromptDelivery`**：Host 侧是 `read('cliPromptDelivery') ?? 'stdin'`，
+      //    留空即取默认值 `stdin`。客户端若要求必填，就是把 Host 接受的配置拒掉。
     }
+    // ⚠️ **不校验内置后端的 `provider`**：Host 用 `read('provider') || defaultProvider`
+    //    回落插件级默认值（插件级默认 `self`），因此留空是合法的。
+    //    客户端一度要求必填，导致「角色从 CLI 切回内置后保存被拦下」，还配了一句自相矛盾的
+    //    提示（「可留空以使用顶层默认值」却因为留空而报错）。**实测踩到。**
+    //
+    // 上面几条的共性：**客户端校验不得与 Host 不一致**。逐条复刻规则很容易各自演化，
+    // 因此另有 `scripts/check-validation-parity.mjs` 用同一批输入断言两边判定一致。
   }
   return null;
 }

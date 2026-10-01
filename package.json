@@ -48,8 +48,9 @@
     "yaml": "^2.6.0"
   },
   "scripts": {
-    "check": "node scripts/check-roles.mjs && node scripts/check-drivers.mjs && node scripts/check-cli.mjs && node scripts/check-cli-provider.mjs && node scripts/check-config-schema.mjs && node scripts/check-config-volatile.mjs && node scripts/check-config-file.mjs && node scripts/check-apply.mjs && node scripts/check-client.mjs && node scripts/check-profile-wiring.mjs",
+    "check": "node scripts/check-roles.mjs && node scripts/check-drivers.mjs && node scripts/check-cli.mjs && node scripts/check-cli-provider.mjs && node scripts/check-config-schema.mjs && node scripts/check-config-volatile.mjs && node scripts/check-config-file.mjs && node scripts/check-apply.mjs && node scripts/check-validation-parity.mjs && node scripts/check-client.mjs && node scripts/check-profile-wiring.mjs",
     "check:roles": "node scripts/check-roles.mjs",
+    "check:parity": "node scripts/check-validation-parity.mjs",
     "check:drivers": "node scripts/check-drivers.mjs",
     "check:cli": "node scripts/check-cli.mjs",
     "check:cli-provider": "node scripts/check-cli-provider.mjs",

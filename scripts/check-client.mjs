@@ -12,6 +12,7 @@
 // 那些仍需一次重启 + 人工查看。
 import { readFileSync } from 'node:fs';
 import { parseJsonArray, validateRoles } from '../src/client/logic.js';
+import { normalizeRoles } from '../src/roles.js';
 
 let pass = 0;
 let fail = 0;
@@ -216,9 +217,24 @@ section('validateRoles：与 Host 的 normalizeRole 规则一致，且能给出�
   check('缺描述被拒', /描述/.test(validateRoles([{ ...good, description: '' }]) ?? ''));
   check('缺指令被拒', /指令/.test(validateRoles([{ ...good, instructions: '' }]) ?? ''));
   check('缺模型被拒', /模型/.test(validateRoles([{ ...good, model: '' }]) ?? ''));
+  // ⚠️ 这条断言**曾经是反的**：原先要求「内置后端缺 provider 被拒」，而 Host 侧的规则是
+  //    `read('provider') ?? defaultProvider`（留空就用插件级默认值）。客户端比 Host 严
+  //    会造成**假失败** —— 实测踩到：角色从 CLI 切回内置后保存被拦下，提示一句自相矛盾的话。
+  //    现在断言「留空必须通过」，并反向确认它**不是**被别的原因放过去的。
   check(
-    '内置后端缺 provider 被拒',
-    /provider/.test(validateRoles([{ ...good, provider: '' }]) ?? ''),
+    '内置后端留空 provider 必须通过（跟随插件级默认值）',
+    validateRoles([{ ...good, provider: undefined }]) === null,
+    String(validateRoles([{ ...good, provider: undefined }])),
+  );
+  check(
+    '内置后端 provider 为空串也通过（Host 用 ?? 判空，不区分 undefined 与空串）',
+    validateRoles([{ ...good, provider: '' }]) === null,
+    String(validateRoles([{ ...good, provider: '' }])),
+  );
+  // 反例：确保上面的「通过」不是因为校验整个失效了。
+  check(
+    '校验仍然有效（同一份数据把描述清空必须被拒）',
+    validateRoles([{ ...good, provider: undefined, description: '' }]) !== null,
   );
   const cli = { ...good, provider: undefined, backend: 'cli', cliCommand: 'node', cliArgs: ['x'], cliPromptDelivery: 'stdin' };
   check('合法 CLI 角色通过', validateRoles([cli]) === null, String(validateRoles([cli])));
@@ -230,10 +246,27 @@ section('validateRoles：与 Host 的 normalizeRole 规则一致，且能给出�
     'CLI 缺参数模板被拒',
     /参数模板/.test(validateRoles([{ ...cli, cliArgs: [] }]) ?? ''),
   );
+  // ⚠️ 这条断言**曾经是反的**：原先要求「CLI 缺提示词传递方式被拒」，而 Host 侧是
+  //    `read('cliPromptDelivery') ?? 'stdin'`（留空取默认值）。客户端比 Host 严会造成
+  //    假失败。现在断言「留空必须通过」——与 Host 一致。
   check(
-    'CLI 缺提示词传递方式被拒',
-    /提示词传递/.test(validateRoles([{ ...cli, cliPromptDelivery: '' }]) ?? ''),
+    'CLI 留空 cliPromptDelivery 必须通过（Host 默认 stdin）',
+    validateRoles([{ ...cli, cliPromptDelivery: undefined }]) === null,
+    String(validateRoles([{ ...cli, cliPromptDelivery: undefined }])),
   );
+  check(
+    'CLI 留空 cliPromptDelivery 时 Host 也用 stdin（两边同义）',
+    normalizeRoles([{ ...cli, cliPromptDelivery: undefined }], 'self', 'C:/w').roles?.[0]?.cli
+      ?.promptDelivery === 'stdin',
+    'Host 未回落到 stdin',
+  );
+  // 新增：backend 取值必须被校验（原先完全漏检，非法值被 UI 放行、到 Host 才报错）。
+  check(
+    '非法 backend 被拒',
+    /派发机制|backend/.test(validateRoles([{ ...good, backend: 'nope' }]) ?? ''),
+    String(validateRoles([{ ...good, backend: 'nope' }])),
+  );
+  check('合法 backend 通过', validateRoles([{ ...good, backend: 'fork' }]) === null);
 }
 
 section('防漂移：Client 内联的纯逻辑与 logic.js 必须逐字相同');
