@@ -151,7 +151,7 @@
 20c. **`ctx.plugin()` 的抛错不会传到调用方，所以「挂载成功」必须核实，不能假设。**
     - `ctx.plugin(module, config)` 只是**启动一个 fiber**，插件的 `apply` 在其后运行；插件在 `apply` 里抛的错发生在另一个调用栈上，`try/catch` **抓不到**。
     - 本仓库的 `mountRoleTool` 原先是 `try { ctx.plugin(...); return {ok:true} }` —— 无条件报成功，于是自检在骗人（`OK` + `unknown tool` 并存）。
-    - 修法：`ctx.plugin()` 之后 `await` 两个微任务让 fiber 完成激活，再用 `ctx.get('tools').get(role.toolName)` 核实工具是否真的出现；`undefined` 一律视为失败。宁可少一个工具并如实报告，也不要报 OK 而实际没有。
+    - 修法：`ctx.plugin()` 之后 `await` 两个微任务，只记录**首次核验快照**，不保证 fiber 已完成激活（注入/provider 可能稍后才就绪）。查询必须带当前作用域：`ctx.get('tools').get(role.toolName, scopeOf(ctx))`；此时未出现只记录首次核验失败。**当前健康以自检调用时的实时查询结果为准**，快照仅解释历史，不能回落为健康判据。
     - 一般化：**任何「启动型」API 的返回值都不等于「启动成功」。** 要么核实终态，要么明确标注为未核实。
 
 > **离线预检的可行性前提（重要）**：`npm install` 会把 `peerDependencies` 一并装入仓库的 `node_modules`，因此 `@deepseek-ai/schemastery`、`@deepseek-ai/dsh-tools` 等**在仓库里就装得到**，于是 import 插件模块、构造 Config、遍历 schema 都能在 Node 里离线完成，**不必重启 dsh**。这是本项目应对「Host 半边不能热加载」的主要手段。
