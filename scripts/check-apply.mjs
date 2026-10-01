@@ -3,7 +3,7 @@
 // 为什么必须做：本插件曾让应用无法启动。必须在不重启的前提下，用假 ctx 把
 // 根路径与 preset 路径都真跑一遍 —— 重启一次的成本太高，而且失败会让用户进不去。
 import { readFileSync } from 'node:fs';
-import { apply, Config } from '../src/index.js';
+import { apply, Config, liveRoleTools } from '../src/index.js';
 
 let pass = 0;
 let fail = 0;
@@ -301,6 +301,56 @@ section('客户端必需注入只许声明内核保证存在的服务');
     /remote\?\.settings|remote\.settings/.test(clientSrc) && /\.mutate\(/.test(clientSrc),
     '未找到对 remote.settings.mutate 的引用',
   );
+}
+
+section('自检必须「实时查询」工具注册表，不能只读异步快照');
+{
+  // ⚠️ 锁死一个实测 bug：挂载走 `import(...).then(...)`，是**异步**的，而自检可以被
+  //    更早调用 —— 于是它读到的快照是空的，报告「已挂载角色工具：0」，
+  //    **尽管 4 个 `delegate_to_*` 全部可用**（实验会话实测：报告 0，工具全在）。
+  //    另外同一插件会被多次激活，在别的作用域读快照也会得到误导性结果。
+  //
+  //    「工具到底在不在」本来就能当场查到，因此断言必须基于**实时查询**。
+  const installed = new Set();
+  const ctx = makeCtx();
+  ctx.get = (key) =>
+    key === 'tools' ? { get: (name) => (installed.has(name) ? { name } : undefined) } : undefined;
+
+  const roles = [
+    { id: 'worker', toolName: 'delegate_to_worker' },
+    { id: 'scout', toolName: 'delegate_to_scout' },
+  ];
+
+  check('一个都没装时报告缺失', liveRoleTools(ctx, roles).every((m) => m.ok === false));
+
+  installed.add('delegate_to_worker');
+  installed.add('delegate_to_scout');
+  const live = liveRoleTools(ctx, roles);
+  check('装上后实时查询报告 OK', live.every((m) => m.ok === true), JSON.stringify(live));
+  check('实时结果按角色给出 id', live.map((m) => m.id).join(',') === 'worker,scout', JSON.stringify(live));
+
+  // 工具服务不可用时返回空数组（由调用方回落到快照），而不是抛错。
+  const noTools = makeCtx();
+  noTools.get = () => undefined;
+  let threw = false;
+  try {
+    liveRoleTools(noTools, roles);
+  } catch {
+    threw = true;
+  }
+  check('工具服务不可用时不抛错', !threw);
+  check('工具服务不可用时返回空数组', liveRoleTools(noTools, roles).length === 0);
+
+  // 查询本身抛错时按「该角色失败」处理，不影响其它角色。
+  const throwing = makeCtx();
+  throwing.get = () => ({
+    get: (name) => {
+      if (name === 'delegate_to_worker') throw new Error('boom');
+      return { name };
+    },
+  });
+  const mixed = liveRoleTools(throwing, roles);
+  check('单个角色查询抛错不影响其它', mixed[0].ok === false && mixed[1].ok === true, JSON.stringify(mixed));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

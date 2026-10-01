@@ -161,11 +161,42 @@ function newDiagnostics() {
     providers: [],
     executables: [],
     blocked: [],
+    /** 本作用域解析出的角色（`{id, toolName}`）。用于自检在「本作用域不挂载工具」时说清原因。 */
+    configuredRoles: [],
     roleConfigPath: undefined,
     roleConfigRead: undefined,
     roleConfigSync: undefined,
     fatal: undefined,
   };
+}
+
+/**
+ * 在**当前作用域**实时查询角色工具是否真的可用。
+ *
+ * 为什么不读 `diagnostics.mounts`：那是 `import(...).then(...)` 异步写入的快照，
+ * `apply` 返回时往往还是空的；而且同一插件会被多次激活（根条目 + 各 preset 会话），
+ * 在某个作用域读到的快照未必对应当前作用域。**「工具在不在」本来就能当场查到。**
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {{id: string, toolName: string}[]} roles - 本作用域配置的角色。
+ * @returns {{id: string, ok: boolean, detail: string}[]} 实时结果；查不到时返回空数组。
+ */
+export function liveRoleTools(ctx, roles) {
+  const tools = typeof ctx.get === 'function' ? ctx.get('tools') : undefined;
+  if (tools === undefined || typeof tools.get !== 'function') return [];
+  return roles.map((role) => {
+    let found;
+    try {
+      found = tools.get(role.toolName);
+    } catch (error) {
+      return { id: role.id, ok: false, detail: `查询抛错：${error instanceof Error ? error.message : String(error)}` };
+    }
+    return {
+      id: role.id,
+      ok: found !== undefined && found !== null,
+      detail: found === undefined || found === null ? '工具未注册' : '已注册',
+    };
+  });
 }
 
 /**
@@ -417,6 +448,7 @@ function selftestTool(ctx, diagnostics) {
           phase: { type: 'string', required: true },
           roleCount: { type: 'number', required: true },
           mounted: { type: 'string', required: true },
+          liveTools: { type: 'string', required: true },
           providers: { type: 'string', required: true },
           executables: { type: 'string', required: true },
           blocked: { type: 'string', required: true },
@@ -433,13 +465,18 @@ function selftestTool(ctx, diagnostics) {
           `Agent Switchboard · ${value.phase}`,
           `已挂载角色工具：${value.roleCount}`,
           `明细：${value.mounted}`,
+          // 实时查询结果与异步快照分开显示：两者不一致本身就是有价值的诊断信息
+          // （快照空、实时有 = 挂载还没跑完，或者你正在别的作用域里查）。
+          `实时工具查询：${value.liveTools}`,
           `preset roster：${value.presetRoster}`,
           `preset 异常行：${value.presetBroken}`,
           `settings 命名空间：${value.settingsNamespaces}`,
           `roleConfig 状态：${value.roleConfigStatus}`,
           `CLI provider：${value.providers}`,
           `CLI 可执行文件：${value.executables}`,
-          `因开关未挂载：${value.blocked}`,
+          // 「跨 CLI 总开关」已移除，因此这里不再是「因开关未挂载」，而是
+          // 「因**别的原因**被拦下」（目前该列表恒为空，保留以便将来有新的前置条件）。
+          `未挂载的角色：${value.blocked}`,
         ];
         if (value.configErrors) lines.push(`配置错误：\n${value.configErrors}`);
         if (value.fatal) lines.push(`致命错误：${value.fatal}`);
@@ -452,17 +489,44 @@ function selftestTool(ctx, diagnostics) {
         presets.roster().catch((e) => `读取异常：${e?.message ?? e}`),
         presets.broken().catch((e) => `读取异常：${e?.message ?? e}`),
       ]);
+
+      // ⚠️ **实时查询工具注册表**，而不是只读 `diagnostics.mounts` 那个快照。
+      //
+      // 两个原因（都实测踩到）：
+      //   1. 挂载走 `import(...).then(...)`，是**异步**的。`apply` 返回时它往往还没跑完，
+      //      而自检可以被更早调用 —— 于是快照是空的，报告「已挂载 0 个」，
+      //      **尽管工具确实都在**（实测：报告 0，但 4 个 `delegate_to_*` 全部可调用）。
+      //   2. 同一个插件会被**多次激活**（根条目 + 每个 preset 会话）。在别的作用域调用
+      //      自检时，读到的是**那个作用域**的快照，因此报「工具未出现在工具注册表中」。
+      //
+      // 「工具到底在不在」本来就可以当场查到（`ctx.get('tools').get(name)`），
+      // 因此不要再依赖快照 —— 快照只用于解释「为什么没挂上」。
+      const live = liveRoleTools(ctx, diagnostics.configuredRoles);
+      const mounted = live.length > 0 ? live : diagnostics.mounts;
+      const okCount = mounted.filter((m) => m.ok).length;
+
       return {
         ok:
           diagnostics.fatal === undefined &&
           diagnostics.configErrors.length === 0 &&
-          diagnostics.mounts.every((m) => m.ok),
+          // 只把**明确失败**的记入 ok：异步挂载可能尚未完成，或者某个作用域本来就不挂载
+          // 角色工具（根条目），把这些当成失败会产生误导性的「不 ok」。
+          !diagnostics.mounts.some((m) => m.ok === false) &&
+          !live.some((m) => m.ok === false),
         phase: 'phase-3',
-        roleCount: diagnostics.mounts.filter((m) => m.ok).length,
+        roleCount: okCount,
         mounted:
-          diagnostics.mounts.length === 0
-            ? '（无）'
-            : diagnostics.mounts.map((m) => `${m.id}=${m.ok ? 'OK' : `失败(${m.detail})`}`).join(' '),
+          mounted.length === 0
+            ? diagnostics.configuredRoles.length === 0
+              ? '（本插件尚未配置任何角色）'
+              : `（本作用域不挂载角色工具；已配置 ${diagnostics.configuredRoles.length} 个角色：${diagnostics.configuredRoles
+                  .map((r) => r.id)
+                  .join(', ')}）`
+            : mounted.map((m) => `${m.id}=${m.ok ? 'OK' : `失败(${m.detail})`}`).join(' '),
+        liveTools:
+          live.length === 0
+            ? '（本作用域查不到角色工具）'
+            : live.map((m) => `${m.id}=${m.ok ? 'OK' : '缺失'}`).join(' '),
         providers:
           diagnostics.providers.length === 0
             ? '（无 CLI 角色）'
@@ -774,6 +838,9 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
 
   const { roles, errors } = normalizeRoles(rawRoles, defaults.provider, defaults.cwd);
   diagnostics.configErrors = errors;
+  // 记录「本作用域配置了哪些角色」——自检在解析不出工具时据此说明原因，
+  // 而不是含糊地报「工具未出现在工具注册表中」。
+  diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName }));
   if (errors.length > 0) {
     // 配置有错时不挂载任何角色工具：半挂载会让主代理看到一批语义不明的工具。
     console.error(`[${name}] 角色配置有 ${errors.length} 处错误，未挂载任何角色工具：`);
