@@ -58,6 +58,8 @@ export const inject = ['tools', 'subagents', 'agents', 'systemPrompt', 'subproce
  *   providers: { id: string, name: string, ok: boolean, detail: string }[],
  *   executables: { id: string, command: string, resolved?: string, ok: boolean, detail?: string }[],
  *   blocked: { id: string, reason: string }[],
+ *   presetScope: string | null | undefined,
+ *   presetScopeError: string | undefined,
  *   fatal: string | undefined,
  * }}
  */
@@ -67,6 +69,8 @@ const diagnostics = {
   providers: [],
   executables: [],
   blocked: [],
+  presetScope: undefined,
+  presetScopeError: undefined,
   fatal: undefined,
 };
 
@@ -149,6 +153,34 @@ function safeSpawn(ctx, spec) {
 }
 
 /**
+ * 探测「本插件当前运行在哪个 preset 作用域」。
+ *
+ * 为什么需要：DSH 的 preset 决定一个会话由哪些插件组合而成。若本插件被挂在某个
+ * preset 的 `plugins` 里，那么当该 preset 被选中时，插件会在**该会话的作用域**内
+ * 再加载一次 —— 这就是「只在使用我们的 preset 时才生效」的实现基础。
+ *
+ * `agentPresets` 的 `composedPreset(ctx)`（已核实实现：
+ * `standingMountFor(ctx)?.presetId`）能读取一个上下文所属的 preset id。
+ * 但要注意：它读的是**挂载**信息，根作用域没有挂载，因此本函数在根作用域下
+ * 预期返回 undefined —— 那正是「惰性」的判据。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @returns {{ presetId?: string, error?: string }} 探测结果。
+ */
+function detectPresetScope(ctx) {
+  const service = typeof ctx.get === 'function' ? ctx.get('agentPresets') : undefined;
+  if (service === undefined || typeof service.composedPreset !== 'function') {
+    return { error: 'agentPresets.composedPreset 不可用' };
+  }
+  try {
+    const id = service.composedPreset(ctx);
+    return id === undefined ? {} : { presetId: String(id) };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
  * 自检工具：一次调用即可看清装载结果，避免为每个问题重启一次 dsh。
  *
  * @returns {object} ToolDefinition
@@ -172,6 +204,7 @@ function selftestTool() {
           providers: { type: 'string', required: true },
           executables: { type: 'string', required: true },
           blocked: { type: 'string', required: true },
+          presetScope: { type: 'string', required: true },
           configErrors: { type: 'string', required: true },
           fatal: { type: 'string', required: true },
         },
@@ -181,6 +214,7 @@ function selftestTool() {
           `Agent Switchboard · ${value.phase}`,
           `已挂载角色工具：${value.roleCount}`,
           `明细：${value.mounted}`,
+          `preset 作用域：${value.presetScope}`,
           `CLI provider：${value.providers}`,
           `CLI 可执行文件：${value.executables}`,
           `因开关未挂载：${value.blocked}`,
@@ -218,6 +252,12 @@ function selftestTool() {
           diagnostics.blocked.length === 0
             ? '（无）'
             : diagnostics.blocked.map((b) => `${b.id}(${b.reason})`).join(' '),
+        presetScope:
+          diagnostics.presetScope === undefined
+            ? `未知（${diagnostics.presetScopeError ?? '未探测'}）`
+            : diagnostics.presetScope === null
+              ? '根作用域（未挂载到任何 preset）'
+              : `${diagnostics.presetScope}`,
         configErrors: diagnostics.configErrors.join('\n'),
         fatal: diagnostics.fatal ?? '',
       });
@@ -263,7 +303,23 @@ export function apply(ctx, config) {
   diagnostics.providers = [];
   diagnostics.executables = [];
   diagnostics.blocked = [];
+  diagnostics.presetScope = undefined;
+  diagnostics.presetScopeError = undefined;
   diagnostics.fatal = undefined;
+
+  // 探测本插件当前所处的作用域。这决定「是否只在选中我们的 preset 时才生效」。
+  const scope = detectPresetScope(ctx);
+  diagnostics.presetScope = scope.presetId ?? null;
+  diagnostics.presetScopeError = scope.error;
+  console.error(
+    `[${name}] 激活于：${
+      scope.error
+        ? `作用域探测失败（${scope.error}）`
+        : scope.presetId === undefined
+          ? '根作用域'
+          : `preset "${scope.presetId}"`
+    }`,
+  );
 
   // 自检工具总是注册：即使角色配置全错，也要能用它看到错在哪。
   ctx.tools.register(selftestTool());
