@@ -8,8 +8,13 @@
 // `planCliMounts(roles, boolean)`，**绕过了 apply 层的取值**。因此本文件刻意
 // **穿过真实的 Config schema** 取值，让同类错误无处可藏。
 //
+// 后续同一类坑又咬了两次（`roles` 标 volatile 后 `Array.isArray` 为 false 导致
+// 全部角色不挂载；preset 作用域探测读到假信号），所以这里不再逐个字段打补丁，
+// 而是断言「凡标了 volatile 的字段，经 `readVolatileField` 都能取回原类型的值」。
+//
 // 用法：node scripts/check-config-volatile.mjs
-import { Config, readVolatile } from '../src/index.js';
+import { Config, readVolatile, readVolatileField } from '../src/index.js';
+import { normalizeRoles } from '../src/roles.js';
 
 let pass = 0;
 let fail = 0;
@@ -154,6 +159,72 @@ section('可写性不变式：roles 必须整体 volatile，且数组下标路�
   // 也交给了设置页，超出 D13 的范围。
   check('provider 不在 volatile 子树下（不应被设置页改写）', !isVolatilePath(schema, ['provider']));
   check('maxDepth 不在 volatile 子树下', !isVolatilePath(schema, ['maxDepth']));
+}
+
+// ---------------------------------------------------------------------------
+// readVolatileField：同一类坑的**通用**防线。
+//
+// 这是本插件第三次被同一个机制咬到：
+//   1. `volatile.allowCrossCli === true` 恒为 false → 跨 CLI 开关从未生效；
+//   2. `roles` 标 volatile 后 `Array.isArray(resolved.roles)` 为 false
+//      → 报「roles 必须是数组」，预设里 4 个角色全部不挂载；
+//   3. preset 作用域探测读到假信号。
+//
+// 因此不再逐个字段打补丁，而是断言「凡是被标了 volatile 的字段，
+// 经 readVolatileField 都能拿回原类型的值」。
+// ---------------------------------------------------------------------------
+section('readVolatileField：标了 volatile 的字段必须能取回原类型的值');
+{
+  const roleFixture = [
+    { id: 'scout', description: 'd', instructions: 'i', model: 'm', backend: 'spawn' },
+    { id: 'worker', description: 'd', instructions: 'i', model: 'm', backend: 'spawn' },
+  ];
+  const resolved = Config({ provider: 'self', cwd: 'C:/w', roles: roleFixture });
+
+  // 先证明「直接读属性」确实是坏的 —— 否则下面的断言在测空气。
+  check(
+    '自检：直接读 `resolved.roles` 不是数组（这就是原 bug 的机制）',
+    !Array.isArray(resolved.roles),
+    `实际 ${Object.prototype.toString.call(resolved.roles)}`,
+  );
+
+  const roles = readVolatileField(resolved, 'roles');
+  check('readVolatileField(resolved, "roles") 是数组', Array.isArray(roles));
+  check('取回的角色数正确', Array.isArray(roles) && roles.length === 2, String(roles?.length));
+  check(
+    '取回的角色内容正确（id 顺序一致）',
+    Array.isArray(roles) && roles.map((r) => r.id).join(',') === 'scout,worker',
+    JSON.stringify(roles?.map((r) => r.id)),
+  );
+
+  // 未标 volatile 的字段应原样返回。
+  check('未标 volatile 的标量字段原样返回', readVolatileField(resolved, 'provider') === 'self');
+  check('未提供的字段返回 undefined（不假装是空值）', readVolatileField(resolved, 'nope') === undefined);
+
+  // 退化输入不得抛错。
+  for (const [label, input] of [
+    ['undefined', undefined],
+    ['null', null],
+    ['空对象', {}],
+  ]) {
+    let ok = true;
+    try {
+      ok = readVolatileField(input, 'roles') === undefined;
+    } catch (error) {
+      ok = false;
+    }
+    check(`readVolatileField(${label}) 返回 undefined 且不抛错`, ok);
+  }
+
+  // 端到端：修复后的取值方式必须让 normalizeRoles 通过。
+  // 这一条是真正防回归的关键 —— 它覆盖的正是线上报「roles 必须是数组」的那条路径。
+  const normalized = normalizeRoles(roles, resolved.provider, resolved.cwd);
+  check(
+    '修复后 normalizeRoles 不再报错',
+    normalized.errors.length === 0,
+    normalized.errors.join('; '),
+  );
+  check('修复后角色数正确', normalized.roles.length === 2, String(normalized.roles.length));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

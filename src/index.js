@@ -56,13 +56,52 @@ export const name = 'agent-switchboard';
  * @returns {object} volatile 字段的普通对象视图。
  */
 export function readVolatile(resolved) {
-  const raw = resolved?.volatile;
-  if (raw === null || raw === undefined) return {};
+  const value = readVolatileField(resolved, 'volatile');
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+/**
+ * 读取一个**被 `.volatile()` 标记过**的字段的实际取值。
+ *
+ * ⚠️ 这是本插件反复踩到、且症状极隐蔽的一个坑，务必用它而不是直接读属性：
+ *
+ *   ```js
+ *   const r = Config({ roles: [...] });   // roles 标了 .volatile()
+ *   typeof r.roles        // 'object'
+ *   Array.isArray(r.roles) // false   ← 不是数组！
+ *   JSON.stringify(r.roles) // '{}'   ← 看着像空对象
+ *   r.roles.get()          // 真正的数组
+ *   ```
+ *
+ * `schemastery` 的 `.volatile()` 把该字段换成**引用对象**（Volatile ref），
+ * 属性不在自身上，必须调用 `.get()`。直接读会得到一个「看起来是空对象」的东西。
+ *
+ * 本插件在三处栽过同一个坑，症状各不相同，这也是它危险的原因：
+ *   1. `volatile.allowCrossCli === true` 恒为 false → 跨 CLI 开关从未真正生效；
+ *   2. `roles` 标 volatile 后，`Array.isArray(resolved.roles)` 为 false
+ *      → 报「roles 必须是数组」，4 个角色全部不挂载；
+ *   3. preset 作用域探测读到假信号。
+ *
+ * 因此封装成通用读取：对带 `.get()` 的引用对象与普通值都兼容
+ * （Loader 经 JSON Schema 投影后可能给出普通值）。拿不到就返回 `undefined`，
+ * 由调用方决定默认值 —— 不要把「读不到」和「值是空」混为一谈。
+ *
+ * @param {object} resolved - 已校验的插件配置。
+ * @param {string} key - 字段名。
+ * @returns {unknown} 该字段的实际取值，或 undefined。
+ */
+export function readVolatileField(resolved, key) {
+  const raw = resolved?.[key];
+  if (raw === null || raw === undefined) return undefined;
   if (typeof raw.get === 'function') {
-    const value = raw.get();
-    return value !== null && typeof value === 'object' ? value : {};
+    try {
+      return raw.get();
+    } catch {
+      // 引用对象取值失败不应让插件装载失败 —— 当作未提供处理。
+      return undefined;
+    }
   }
-  return typeof raw === 'object' ? raw : {};
+  return raw;
 }
 
 /**
@@ -484,7 +523,14 @@ export function apply(ctx, config) {
   // 自检工具总是注册：即使角色配置全错，也要能用它看到错在哪。
   ctx.tools.register(selftestTool(ctx, diagnostics));
 
-  const { roles, errors } = normalizeRoles(resolved.roles, resolved.provider, resolved.cwd);
+  // ⚠️ `roles` 在 Config 里标了 `.volatile()`，因此**必须**经 readVolatileField 取值：
+  //    直接读 `resolved.roles` 得到的是引用对象，`Array.isArray` 为 false，
+  //    于是报「roles 必须是数组」并导致所有角色都不挂载（实测踩过）。
+  const { roles, errors } = normalizeRoles(
+    readVolatileField(resolved, 'roles'),
+    resolved.provider,
+    resolved.cwd,
+  );
   diagnostics.configErrors = errors;
   if (errors.length > 0) {
     // 配置有错时不挂载任何角色工具：半挂载会让主代理看到一批语义不明的工具。
