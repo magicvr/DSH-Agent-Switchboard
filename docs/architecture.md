@@ -154,6 +154,34 @@
 >
 > 注意由此产生的一个认知修正：早期曾以为「`@deepseek-ai/*` 只存在于 asar 内、外部解析必然失败」，那个结论**只对未安装依赖的仓库成立**。装上依赖后它们就是普通本地包。
 
+### 3.1e 插件配置 UI 的实测边界（决定能否「在面板里配角色」）
+
+24. **volatile 字段不得出现在数组元素内部**，所以 `roles` 只能在**数组整体**上标 volatile。
+    - 客户端的 `validateVolatileSchema` 在遍历 `schema.list` / `schema.inner` 时把 `blocked` 置为 `true`，其后任何 volatile 节点直接抛
+      `volatile fields require a fixed object path without an enclosing volatile field`。
+    - 逐行复刻该函数实测：`z.object({roles: z.array(R).volatile()})` → 通过；
+      `z.array(z.object({backend: z.union([...]).volatile()}))` → 抛错，路径 `["roles","*","backend"]`。
+    - 含义：想让 `roles` 可编辑，必须标在**数组本身**；标在元素内既不生效也会报错。
+25. **自动配置表单只处理标量字段。** `ConfigFormController.set(field, value)` / `unset(field)` 的文档原文是 `@param field - scalar field inside the namespace section`。变长对象数组（如 `roles`）**无法**由自动表单渲染。
+26. **但服务端支持数组下标路径与增删元素。** `dsh-settings` 的字段编辑识别数字下标：
+    ```js
+    if (!/^(0|[1-9][0-9]*)$/.test(head) || ...) // roles[0]
+    if (rest.length === 0 && op.op === "unset") result.splice(index, 1); // 删除该元素
+    ```
+    原文注释：「unsetting an array index removes its element」。
+    **结论：缺的只是 UI，不是机制** —— 自建设置页即可完整编辑角色数组（见 decisions.md D13）。
+27. **DSH 已提供的配置接入点（无需自造机制）：**
+
+    | Slot / 服务 | 用途 |
+    | --- | --- |
+    | `settings.section` | 一个设置页。注册 `{id, order, label}`；`id` 用自己的即**并列新增**，复用已占用 id 会**替换**该格。现有占用：`account` / `general` / `models` / `plugins` / `agent-presets` |
+    | `settings.general.item` | General 里的一行偏好（单设置项，无需独立页） |
+    | `settings.plugins.tab` | Plugins 区里的一页 |
+    | `configForms.get(entryId)` / `.describe()` / `.mutate(ops, expectedRevision)` | 读写某插件条目的配置；`mutate` 承载数组下标路径 |
+
+    **官方同构先例**：`agent-presets` 自己就是一个 `settings.section`，用 `configForms` 编辑预设配置。
+    ⚠️ 但本插件的 Client 半边**禁止 import 任何 Harness Client 包**（第 3 节），因此若自建页面，表单需要自绘。
+
 ### 3.2 一条误导性的诊断信息（重要）
 
 **加载器会把「插件激活失败」一律显示为 `failed to import`。**

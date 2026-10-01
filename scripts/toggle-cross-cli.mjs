@@ -39,16 +39,20 @@ const roles = selfRow.config?.roles ?? [];
 const cliRoles = roles.filter((r) => r.backend === 'cli');
 console.log(`preset 内角色数 = ${roles.length}，其中 CLI 后端 ${cliRoles.length} 个`);
 for (const r of cliRoles) console.log(`  - ${r.id}（model=${r.model} effort=${r.effort}）`);
-if (cliRoles.length === 0) {
-  console.error('FAIL  没有 CLI 后端角色，开启开关无意义');
-  process.exit(1);
-}
 const current = selfRow.config?.volatile?.allowCrossCli;
 console.log(`当前 volatile.allowCrossCli = ${JSON.stringify(current)}`);
 
 if (want === undefined) {
   console.log('\n未指定动作（--on / --off / --check）。');
   process.exit(0);
+}
+// ⚠️ 「必须存在 CLI 角色」只应拦住**开启**。
+//    早先这个守卫对任何动作都生效，于是当配置里一个 CLI 角色都没有时**无法关闭**该开关 ——
+//    而「没有 CLI 角色时把总开关关掉」恰恰是最该允许、也最安全的操作。
+if (want === true && cliRoles.length === 0) {
+  console.error('FAIL  没有任何 CLI 后端角色，开启该开关没有意义。');
+  console.error('      请先把某个角色的 backend 改为 "cli"（见 docs/cli-backends.md 与 decisions.md D13）。');
+  process.exit(1);
 }
 if (current === want) {
   console.log(`\n已是目标值 ${want}，无需改动。`);

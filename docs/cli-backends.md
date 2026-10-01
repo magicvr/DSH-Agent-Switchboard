@@ -100,6 +100,73 @@ reasoning effort: ...
 只有 21 字节（标记 + 换行）。两者都可用于回传；`-o` 的好处是把「最终消息」与「过程噪音」分离，
 缺点是引入一个临时文件。
 
+### 2.5 端到端实测：角色经 CLI 后端派发（真机通过）
+
+**结论：codex 后端已端到端跑通。** 一次真实取证任务（在选中 `Switchboard` preset 的会话里
+调用 `delegate_to_codex_scout`）产生如下日志，其中 `argv` 是**实际传给进程的参数**，
+`cli-route` 是 **codex 自报的生效路由**：
+
+```text
+[switchboard] role=codex-scout backend=cli command=C:\Program Files\nodejs\node.EXE
+[switchboard] argv=["C:\\Program Files\\nodejs\\node.EXE",
+                    "...\\@openai\\codex\\bin\\codex.js",
+                    "exec","-s","read-only","--skip-git-repo-check",
+                    "-m","gpt-6-astra","-c","model_reasoning_effort=medium","-"]
+[switchboard] exit=0 duration=67.5s
+[switchboard] cli-route {"model":"gpt-6-astra","provider":"openai","approval":"never",
+                         "sandbox":"read-only","reasoning effort":"medium"}
+```
+
+**这组对照是验收的核心**：`argv` 里的 `-m gpt-6-astra` / `model_reasoning_effort=medium`
+与 codex 自报的 `model: gpt-6-astra` / `reasoning effort: medium` **一致**。
+只看退出码为 0 是不够的 —— 见 §2.4 结论 4，不传 `-m` 时 codex 会静默使用它自己的配置，
+外观上毫无区别。`sandbox: read-only` 同时证明 `-s read-only` 生效。
+
+### 2.6 如何把某个角色切到 CLI 后端
+
+**机制是每个角色自己的属性**（`decisions.md` D13），不是「另建一个 CLI 角色」。
+把 `scout` 从内置改为走 codex，只需改这一个角色的字段（`id` 与工具名 `delegate_to_scout` 都不变）：
+
+```yaml
+- id: scout
+  description: ...
+  instructions: ...
+  readOnly: true
+  backend: cli                                  # ← 从默认的 spawn 改为 cli
+  model: gpt-6-astra
+  effort: medium
+  cliCommand: node
+  cliPrefixArgs: ["C:\\Users\\<你>\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js"]
+  cliArgs: ["exec", "-s", "read-only", "--skip-git-repo-check",
+            "-m", "{model}", "-c", "model_reasoning_effort={effort}", "-"]
+  cliPromptDelivery: stdin
+  cliCwd: "C:\\path\\to\\workspace"
+```
+
+**两步都要做，缺一不可**：
+
+1. 把角色的 `backend` 改为 `cli` 并填上面那些 `cli*` 字段；
+2. **打开总开关** `volatile.allowCrossCli: true`（仓库自带的 `scripts/toggle-cross-cli.mjs --on` 可改，
+   面板里也能改）。**默认关闭**——CLI 后端会在本机真的执行外部命令，必须显式开启。
+
+> ⚠️ 只做第 1 步不做第 2 步时，该角色**既不注册 provider 也不挂载工具**（主代理看不到它），
+> 这是刻意的：宁可看不见，也不要出现「看得见、一调用就报错」的形态。
+> 自检工具（`switchboard_selftest`）的「因开关未挂载」一行会列出被挡下的角色。
+
+> `allowCrossCli` 是**全局**开关，而 `backend` 是**按角色**的。两者是叠加关系：
+> 总开关关着时，任何角色都无法走 CLI。这是「会执行本地命令」这类能力的恰当粒度。
+
+### 2.7 已知的实现约束（实测踩到，改代码前先读）
+
+- **CLI 角色的工具配置必须显式写 `maxDepth: 'provider-managed'`**，省略反而会抛错：
+  `dsh-tool-subagent` 的 `resolveMaxDepth(undefined)` 会回落到它自己的数字默认值，
+  于是 depthLimit 断言触发，工具**不会注册**（而 provider 注册成功）。
+  详见 `architecture.md` 3.1d 第 20b 条。
+- **`ctx.plugin()` 的抛错抓不到**（它只是启动 fiber），因此挂载成功必须**核实**工具是否真的出现，
+  不能假设。详见 `architecture.md` 3.1d 第 20c 条。
+- **`timedOut` 无法区分「超时」与「调用方取消」**：两者在信令层都是 abort。当前如实标注为
+  `timedOut=true`，不编造区分逻辑。
+
 ## 3. claude
 
 ### 3.1 调用形态（仅来自 `--help`，**未实测**）
@@ -146,15 +213,18 @@ reasoning effort: ...
 4. **必须能读到 CLI 自报的路由事实**（如 codex 的 stderr），用于验收「模型/强度确实生效」。
 5. **失败语义**：命令不存在、非零退出、超时，必须产生可读错误，绝不当作成功。
 
-## 6. 尚未实测、Phase 3 必须补的项
+## 6. 尚未实测的项
 
 - [x] ~~codex：`-m` 与 `-c model_reasoning_effort=` 是否真的生效~~ → 已实测，见 §2.4
 - [x] ~~codex：`--json` 是否比 `-o` 更适合稳定解析~~ → 已实测：`--json` 会牺牲可读路由事实，不采用
+- [x] ~~codex：端到端经角色派发是否真的跑通~~ → 已实测，见 §2.5（`exit=0`，`argv` 与自报路由一致）
+- [x] ~~codex：`ctx.subprocess.resolveExecutable` 能否解析到可用入口~~ → 已实测：最终采用
+      `node` + `codex.js` 绝对路径（`codex.ps1` 与 `codex.cmd` 都不行，见 §1）
+- [ ] codex：**超时与中断的真实行为**（`terminate` 后是否残留孤儿进程）。
+      插件的**代码路径**已有离线断言（超时真的中止、调用方 abort 传到子进程），
+      但**未做真机验证** —— 离线断言用的是假 spawn，证明不了真实进程树被清理。
 - [ ] codex：`--json` 事件流的确切结构（仅在需要结构化 usage/耗时统计时才值得再查）
-- [ ] codex：超时与中断行为（`terminate` 后是否残留子进程）
 - [ ] codex：非零退出码的具体语义细分（额度耗尽 vs 参数错误 vs 模型不存在）——目前只知「都会以致码 1 失败」
-- [ ] codex：`ctx.subprocess.resolveExecutable` 能否接受 `codex.js` 路径；若只能给出 `codex`/`codex.cmd`，
-      则需要在插件内自行解析到 node + js 入口
 - [ ] claude：能否直接 spawn；stdin 提示词形态；`--effort` 是否真的生效（**不能只信 help**，
       codex 的教训表明未文档化/已文档化都不等于真的生效）
 - [ ] grok：非交互调用形态（是否必须 TTY）

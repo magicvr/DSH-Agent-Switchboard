@@ -205,7 +205,9 @@
 ## Phase 4 · 可观测性与打磨
 
 - 调度日志：谁派的、派给谁、哪条线路、耗时、退出状态、结果摘要
-- Client 半边升级为可写面板（需先确认 `config-editor` 对数组字段的支持程度，见 D9）
+- **角色设置页（D13）：自建一个 Client 半边 `settings.section`，让用户在界面里为每个角色选择派发机制（内置 `spawn` / `fork` 或外部 CLI），并增删角色。**
+  探测已完成，结论明确：DSH 的**自动**配置表单处理不了角色数组（只支持标量，且 volatile 不能标在数组元素内），但**服务端支持 `roles[i].backend` 这类下标路径与删元素**——缺的只是 UI。
+  落地要点见 `decisions.md` D13；接入点与硬约束见 `architecture.md` 3.1e。
 - 并发与预算上限
 - README 补真实用法示例
 
@@ -218,7 +220,7 @@
 | R3 | `ctx.subprocess` 在 Windows 上解析 `codex.ps1` 的行为未知 | CLI 后端可能在解析阶段就失败 | 用 `resolveExecutable` 先做独立小实验，再接入 provider |
 | R4 | 本机无 DSH 类型定义 | 无法获得编译期类型保障 | D1 已把风险限制在少数薄适配文件；用 `cordis_inspect_query` 作为类型的唯一权威来源 |
 | R5 | Client 半边崩溃会清空整个 slot | 可能拖垮 GUI 的一块区域 | 第一期只做只读、最小 DOM；严守「不 import Harness Client 包」 |
-| R6 | 角色列表若放 patch，用户在 GUI 里改不了 | 与「面板配置角色」的期望有落差 | D9 已明确分层并记录；Phase 4 评估可写面板 |
+| R6 | 角色列表若放 patch，用户在 GUI 里改不了 | 与「面板配置角色」的期望有落差 | **已定性并给出解法（D13）**：自动配置表单不支持角色数组（只支持标量 + volatile 不能进数组元素），但服务端支持 `roles[i].backend` 下标路径与删元素，因此自建 `settings.section` 可行。Phase 4 实施 |
 | R7 | 外部 CLI 的额度/登录状态不透明 | 派发失败原因难定位 | 结果里保留原始 stderr 与退出码（D8），不做美化丢弃 |
 | R8 | **link 模式下 Host 半边改动无法热加载** | 每次改动都需重启 dsh 才能真机验证，迭代慢 | 已实测确认（`architecture.md` 第 3.3 节）。缓解：把逻辑尽可能放进可用抽取方式验证的纯函数；Client 半边不受此限（有 HMR） |
 | R9 | **`failed to import` 会掩盖真实错误** | 排查方向被误导，可能浪费大量时间（Phase 1 已实际发生） | 已记录取证手法（`architecture.md` 第 3.2 节）：先用落地文件探针判定「模块是否已加载」，再查 `apply` 内部 |

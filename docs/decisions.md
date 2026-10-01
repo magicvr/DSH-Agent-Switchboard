@@ -258,6 +258,7 @@ minimal | low | medium | high | xhigh | max
 | Q3 | 角色列表位置 | **`cordis.patch.yml`（D9 第一期方案）**，面板只管运行时旋钮 | 增删角色需改配置并重载；Phase 4 再评估可写面板 |
 | Q4 | CLI 首个目标 | **`codex`** | 本机入口是 `codex.ps1`，因此 Phase 3 必须先用 `ctx.subprocess.resolveExecutable` 验证脚本入口解析（风险 R3 由「可能」升级为「必经」） |
 | Q5 | 嵌套派发 | **默认禁止，按角色逐个放开** | 详见下方 D11 |
+| Q6 | 角色的派发机制（内置 / 外部 CLI）是否可在界面配置 | **可以，但需自建设置页**（DSH 自动表单不支持变长对象数组） | 详见 D13；与风险 R6 同一件事 |
 
 ## D11 · 嵌套派发默认关闭，逐角色放开
 
@@ -275,3 +276,67 @@ minimal | low | medium | high | xhigh | max
 - 主代理自身的委派总深度仍受 DSH 的 `subagentModelSelection` / 工具侧 `maxDepth` 约束（Host 默认 `1`）。
 
 > ⚠️ 诚实标注：`cli` 后端下嵌套禁止的强度**弱于** `builtin`。外部 CLI 是否真的会去派发子代理，本插件无法从机制上阻止，只能从提示词与环境上限制。这是选择 `cli` 后端本身带来的固有代价。
+
+## D13 · 角色的派发机制作为可配置项，并自带设置页
+
+**背景与用户诉求：** 「希望可以让用户配置**角色**使用内置代理还是外部 CLI」，而不是让「内置角色」与「CLI 角色」成为两套并列的东西——即**角色是语义实体，机制是它的一个可切换属性**。
+
+**先澄清一个被测试配置造成的错觉：** 机制可切换这件事**今天就是成立的**。`Config.roles[].backend` 取值 `'spawn' | 'fork' | 'cli'`（默认 `'spawn'`），是**每个角色自己的字段**。仓库里一度同时存在 `scout`（`spawn`）与 `codex-scout`（`cli`）两个条目，那只是为了做 A/B 机制对比而**复制**出来的，**不是**设计要求。把 `backend` 改成 `'cli'` 并填 CLI 参数，同一角色的 `id` 与工具名（`delegate_to_scout`）都不变。**真正缺的不是能力，是编辑入口。**
+
+**决策：** 自建一个 Client 半边的 `settings.section` 页面来编辑角色及其派发机制，通过 `configForms` 写回配置。**不**依赖 DSH 的自动配置表单。
+
+### 依据：两条已实测的硬约束（决定了不能走自动表单）
+
+1. **volatile 字段不得出现在数组元素内部。** 逐行复刻客户端 `validateVolatileSchema` 验证：
+   - `roles` **数组整体** `.volatile()` → ✅ 合法（路径固定为 `["roles"]`）
+   - 元素内部标 volatile（如 `backend.volatile()`）→ ❌ 抛
+     `volatile fields require a fixed object path without an enclosing volatile field @ ["roles","*","backend"]`
+   - 机制：遍历 `schema.list` / `schema.inner` 时会把 `blocked` 置为 `true`，其后任何 volatile 节点都报错。
+2. **自动配置表单只处理标量。** `ConfigFormController.set(field, value)` / `unset(field)` 的文档原文是
+   `@param field - scalar field inside the namespace section`。变长对象数组渲染不了。
+
+### 但服务端**支持**数组编辑（这是本决策可行的关键）
+
+`dsh-settings` 的路径机制识别数字下标并支持增删：
+
+```js
+if (!/^(0|[1-9][0-9]*)$/.test(head) || ...) // 识别 roles[0]
+if (rest.length === 0 && op.op === "unset") result.splice(index, 1); // 删除元素
+```
+
+原文注释：**「unsetting an array index removes its element」**。因此 `roles[0].backend` 这类路径与增删角色都能写回。**缺的只是 UI。**
+
+### 接入点（DSH 已提供，无需自造机制）
+
+| Slot | 用途 |
+| --- | --- |
+| `settings.section` | 一个设置页。现有占用：`account` / `general` / `models` / `plugins` / `agent-presets`。注册 `{id, order, label}`，`id` 用自己的即并列新增，复用已占用 id 会**替换**该格 |
+| `settings.general.item` | General 里的一行偏好（单设置项，无需独立页）。locale→Language、ui-theme→Appearance 即此 |
+| `settings.plugins.tab` | Plugins 区里的一页 |
+| `configForms.get(entryId)` / `.describe()` / `.mutate(ops, expectedRevision)` | 读写某个插件条目的配置；`mutate` 承载数组下标路径 |
+
+**官方同构先例：** `agent-presets` 本身就是一个 `settings.section`，用 `configForms` 编辑预设配置。本决策做的是同一类事，不是新机制。
+
+### 落地方式（Phase 4）
+
+1. Client 半边新增一个 `settings.section`（`id` 用自己的，如 `agent-switchboard`）：
+   - 列出当前 `roles`，每个角色一行：`id`、`backend`（内置 spawn / fork / 外部 CLI）、`model`、`effort`、`readOnly`、`allowNestedDispatch`
+   - `backend === 'cli'` 时展开 CLI 专属字段（命令、参数模板、提示词传递方式、cwd）
+   - 提供增删角色
+2. 写入走 `configForms.get('agent-switchboard').mutate([...])`，路径形如 `roles[2].backend`。
+3. **只暴露合法值**：后端选择器只能给出 `spawn` / `fork` / `cli`；`effort` 只能给出 `EFFORT_VALUES`。装载期校验（`normalizeRole`）仍保留为最后一道防线——UI 不该是唯一校验。
+4. Client 半边**禁止 import 任何 Harness Client 包**（`docs/architecture.md` 第 3 节），表单需自绘；只可用 `--dsw-alias-*` 主题 token。
+
+### 为什么不在这一轮做
+
+- Phase 3 刚收口，而 Phase 4 本就是「可观测性与打磨」，此项与风险登记 **R6**（「角色列表放 patch，用户在 GUI 里改不了」）是同一件事的具体解法，应一并处理。
+- 自绘表单是 Client 半边的工作量，且 Client 半边抛错会让整个 slot 空掉——需要按第 3 节的约束谨慎实现与验证。
+
+### 立即执行的部分（不需重启验证）
+
+把仓库/配置里那个 A/B 测试造成的角色 fork 收敛掉：让同一语义角色通过 `backend` 表达机制，而不是复制成两个条目。这是配置改动，不是代码改动。
+
+### 未落地的替代方案（记录以免重复评估）
+
+- **扁平化 schema**：把机制提到顶层标量（如 `dispatch: { scout: 'cli' }`）以复用自动表单。可行但要求角色 id **预先固定**，增删角色仍须改文件；且把「机制」与「角色」在配置形状上拆成两处，反而弱化了「机制是角色属性」这一诉求。故不采用。
+- **保持纯 patch 配置**（原 D9 方案）：可版本控制、可评审，但用户明确要求界面里可配机制。作为回退保留。
