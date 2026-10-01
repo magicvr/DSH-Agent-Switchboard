@@ -27,9 +27,9 @@ DSH 插件 `DSH Agent Switchboard`：把主代理限制为「信息流统合器�
 | --- | --- |
 | [`README.md`](./README.md) | 项目定位、核心设计、状态 |
 | [`docs/plan.md`](./docs/plan.md) | **目录结构、分阶段实施方案、验收标准、风险登记** |
-| [`docs/decisions.md`](./docs/decisions.md) | **技术决策记录 D1–D11（含依据与代价）** |
+| [`docs/decisions.md`](./docs/decisions.md) | **技术决策记录 D1–D12（含依据与代价）** |
 | [`docs/architecture.md`](./docs/architecture.md) | 已核实的 DSH 插件契约与取证 |
-| `docs/cli-backends.md` | CLI 实测参数表（Phase 3 产出，尚未创建） |
+| [`docs/cli-backends.md`](./docs/cli-backends.md) | **CLI 后端实测参数表（入口可执行性、模型/强度 flag 及验证方式）** |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | 提交规范与自查项 |
 
 ## 取证工具
