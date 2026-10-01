@@ -58,11 +58,13 @@ section('模块可被真跑：桩化 window/require 后 factory 返回合法插�
   const registered = [];
   /** 桩化的 cordis ctx。 */
   const fakeCtx = {
-    configForms: {
-      get: () => ({ getSnapshot: () => ({ status: 'ready', value: { roles: [], volatile: {} }, revision: 1 }) }),
-      describe: () => ({ namespace: () => undefined, subscribe: () => () => {}, ensure: () => Promise.resolve() }),
+    // 角色配置走**插件自己的远程服务**，不再经过 settings / configForms（见 D13）。
+    remote: {
+      roleConfig: {
+        read: () => Promise.resolve({ ok: true, roles: [] }),
+        write: () => Promise.resolve({ ok: true, roleCount: 0 }),
+      },
     },
-    remote: { settings: { mutate: () => Promise.resolve({ ok: true }) } },
     slots: {
       inject: (_slot, fn) => {
         fn();
@@ -116,8 +118,13 @@ section('模块可被真跑：桩化 window/require 后 factory 返回合法插�
     if (plugin) {
       check('插件导出了 inject', Array.isArray(plugin.inject));
       check(
-        'inject 含 slots / configForms / remote.settings',
-        ['slots', 'configForms', 'remote.settings'].every((n) => plugin.inject.includes(n)),
+        'inject 含 slots / remote.roleConfig',
+        ['slots', 'remote.roleConfig'].every((n) => plugin.inject.includes(n)),
+        plugin.inject.join(','),
+      );
+      check(
+        '不再依赖 configForms / remote.settings（角色配置已不走 settings）',
+        !plugin.inject.includes('configForms') && !plugin.inject.includes('remote.settings'),
         plugin.inject.join(','),
       );
       check('插件导出了 apply', typeof plugin.apply === 'function');

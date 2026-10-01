@@ -17,6 +17,8 @@
         plugins:
           - id: switchboard-roles
             name: '@magicvr/dsh-agent-switchboard'
+            config:
+              mount: true
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:

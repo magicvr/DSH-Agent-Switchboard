@@ -121,9 +121,20 @@ if (entries.length !== standardPlugins.length) {
 }
 
 // 本插件自身的条目：放在最前，便于阅读。
+//
+// ⚠️ `mount: true` 是**必需**的，它是「工具不外溢」的开关（见 decisions.md D13）：
+//    根条目（bundle 的 insert）不带这个标记，因此只提供 roleConfig 配置服务、
+//    不注册任何角色工具；只有这里声明了，选中本 preset 的会话才挂载角色工具。
+//
+// 角色列表**不在这里**：它存在插件自己的文件
+// `$DSH_HOME/agent-switchboard/roles.json`，由设置页通过 roleConfig 远程服务读写。
+// 原因（实测）：`settings.describe()` 按 ns 去重、只报告根条目，因此写在这里的角色
+// 设置页读不到；而把角色移到根条目又会让工具全局可见、污染其他 preset 的会话。
 const selfEntry = [
   '- id: switchboard-roles',
   `  name: '${SELF_PACKAGE}'`,
+  '  config:',
+  '    mount: true',
 ];
 
 /**

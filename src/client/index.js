@@ -15,15 +15,23 @@
  *    整个 slot 空掉：`slot entry crashed in '<slot>'`）。因此表单**自绘**，只用
  *    原生 `React.createElement`（由 `require('react')` 取得）。
  * 3. 只使用 `--dsw-alias-*` 主题 token，不碰 app root / document.body / 别人的 DOM。
- * 4. 读写配置走 `ctx.configForms` 与 `ctx.remote.settings`，不自行发明机制。
+ * 4. 读写配置走**本插件自己的远程服务** `ctx.remote.roleConfig`（见 `src/config-service.js`），
+ *    不经过 `settings` / `configForms`。
  *
- * ## 为什么用 `remote.settings.mutate` 而不是页面自带的 `form.set`
+ * ## 为什么配置不走 `settings`（关键架构决策，见 decisions.md D13）
  *
- * 两者最终都过 `SettingsForms.write` 的 `isVolatilePath` 校验，因此**前提相同**：
- * Host 的 `roles` 必须标 `.volatile()`（已标，且有回归测试锁定）。
- * 选 `mutate` 是因为它能**一次提交多条路径操作**，从而把多处改动做成一次原子写入，
- * 并显式携带 `revision` 避免覆盖并发改动。这也是官方
- * `dsh-client-ui-permission-presets` 的写法。
+ * 角色列表一度放在 profile patch 的 `config.roles` 里。实测发现两条互相冲突的约束：
+ *   1. `settings.describe()` 按 `ns` 去重、**只报告根条目**的配置。preset 里的那份插件
+ *      声明由 agent-presets 在运行时挂载，不在 `configEditor.entries()` 里，因此设置页
+ *      读到的永远是根条目那份**空的** config —— UI 无法配置实际生效的角色。
+ *   2. 把 roles 移到根条目就会**污染**：根作用域注册的工具对其他 preset 的会话可见
+ *      （实测：一个 `standard` 会话的子代理能看到根注册的 `switchboard_selftest`），
+ *      于是所有会话都会冒出一批 `delegate_to_*`。
+ *
+ * 换成插件自己的文件 + 自己的远程方法后，两条同时解开：
+ *   - 配置只经过我们的远程服务，不受 `ns` 去重与 volatile/数组限制；
+ *   - 角色工具是否可见，只取决于**本插件在哪个会话作用域被激活**（由 preset 的
+ *     `mount: true` 决定），与配置存在哪里无关。
  *
  * ## 本文件刻意保持「不信任输入」的姿态
  *
@@ -32,22 +40,19 @@
  */
 
 /**
- * 配置命名空间的**候选**列表，按可能性排序。
+ * 远程命名空间与已知配置形态。
  *
- * ⚠️ 为什么不写死一个：`ns` 是「profile entry id」这一事实来自文档，但确切取值由
- * 运行时决定。实测踩过：设置页读不到值（显示 `empty(form:unavailable)`），而无法从
- * 外部核对该值对不对。把已知两种形态都试一遍、并用「值里有没有 `roles`」来确认，
- * 比猜一个然后失败得莫名其妙可靠。
- *
- * 首选短的：`settings.describe()` 行的 `ns` 取的是 `entry.options.id`，
- * 而插件管理器显示的 `include:agent-switchboard` 是展示层的组合形式。
+ * ⚠️ 为什么不再用 `ctx.configForms` 读配置：角色**已经不从 Cordis 配置走**了
+ * （见 `src/config-file.js` 顶部的架构说明）。`settings.describe()` 按 ns 去重、只报告
+ * 根条目，因此那里永远读不到实际生效的角色。现在改走插件自己的远程服务
+ * `ctx.remote.roleConfig`，与官方 `agent-presets` 的 `read` / `select` 同一条路。
  */
-const NS_CANDIDATES = ['agent-switchboard', 'include:agent-switchboard'];
+const REMOTE_NAMESPACE = 'roleConfig';
 
-/** 后端取值，与 Host 的 `z.union(['spawn', 'fork', 'cli'])` 保持一致。 */
+/** 已知的后端取值（必须与 Host 的 `z.union(['spawn','fork','cli'])` 一致）。 */
 const BACKENDS = ['spawn', 'fork', 'cli'];
 
-/** 思考强度取值，与 Host 的 `EFFORT_VALUES` 保持一致。 */
+/** 已知的思考强度取值（必须与 Host 的 `EFFORT_VALUES` 一致）。 */
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 /** 后端的中文说明（仅用于展示）。 */
@@ -118,108 +123,48 @@ window.__ModuleLoader__.load({
     const { useState, useEffect, useRef, useCallback } = React;
 
     /**
-     * 找出「值里含 roles 数组」的命名空间。
+     * 通过插件的远程服务读取角色配置。
      *
-     * ⚠️ 为什么不做成单一常量、也不只按名字匹配：
+     * ⚠️ 不再用 `ctx.configForms`：角色已不从 Cordis 配置走（见 `src/config-file.js`
+     * 顶部的架构说明）。`settings.describe()` 按 ns 去重、只报告根条目，因此那里永远
+     * 读不到实际生效的角色 —— 实测踩到过「命名空间对、status 为 ready、值里却没有 roles」。
      *
-     * 本插件会被**激活多次** —— profile 级的根条目一次（无 config），每个选中
-     * `Switchboard` preset 的会话作用域再一次（带 roles）。而设置页面对的是
-     * **根条目**那个命名空间，它的值里 `roles` 为空数组。若只认名字，读到的永远
-     * 是那份空的，于是页面显示「尚未配置任何角色」——这正是实测踩到的现象
-     * （命名空间对、表单 status 为 ready、但值里没有 roles）。
-     *
-     * 因此判据改为「**按值识别**」：遍历 `describe()` 报告的全部命名空间，挑出
-     * 值里含 `roles` 数组的那些，并优先返回非空的。这样无论最终生效的是哪一个
-     * 命名空间，都能找到真正的角色列表。
-     *
-     * 两条读取路径也互为兜底，因为首帧可用性取决于镜像是否已 `ensure()`。
+     * 远程方法把结果包在 envelope 里且**不抛业务异常**，因此这里只需处理
+     * 「通道失败」与「业务失败」两种形态。
      *
      * @param {object} ctx - Client 插件上下文。
-     * @returns {{ns: string, roles: object[], volatile: object, revision: number|undefined, source: string, seen: string}} 读取结果。
+     * @returns {Promise<{ok: boolean, roles: object[], error?: string, path?: string, missing?: boolean}>} 读取结果。
      */
-    function readState(ctx) {
-      const tried = [];
-      /** 命中的候选：{ns, roles, volatile, revision, source}。按 roles 长度择优选。 */
-      const hits = [];
-
-      // 读取单个命名空间的值（两条路径）。
-      const valueOf = (ns) => {
-        try {
-          const snap = ctx.configForms.get(ns).getSnapshot();
-          tried.push(`${ns}:form:${snap?.status ?? '?'}`);
-          if (snap?.value) return { value: snap.value, revision: snap.revision, source: 'form' };
-        } catch (error) {
-          tried.push(`${ns}:form-threw:${error instanceof Error ? error.message : String(error)}`);
-        }
-        try {
-          const row = ctx.configForms.describe().namespace(ns);
-          tried.push(`${ns}:mirror:${row === undefined ? 'absent' : 'present'}`);
-          if (row?.value) return { value: row.value, revision: row.revision, source: 'mirror' };
-        } catch (error) {
-          tried.push(`${ns}:mirror-threw:${error instanceof Error ? error.message : String(error)}`);
-        }
-        return undefined;
-      };
-
-      // 候选命名空间 = 已知的两个 + describe() 报告的全部（可能含作用域变体）。
-      const names = new Set(NS_CANDIDATES);
+    async function fetchRoles(ctx) {
       try {
-        const snap = ctx.configForms.describe().getSnapshot();
-        for (const row of snap?.view?.namespaces ?? []) {
-          if (typeof row?.ns === 'string') names.add(row.ns);
+        const response = await ctx.remote[REMOTE_NAMESPACE].read();
+        if (response && response.ok === false) {
+          return { ok: false, roles: [], error: String(response.error ?? '读取失败'), path: response.path };
         }
+        // 远程调用可能被包成 `{ok:true, value}` 或直接返回业务对象，两种都兼容。
+        const value = response && response.value !== undefined ? response.value : response;
+        const roles = Array.isArray(value?.roles) ? value.roles : [];
+        return { ok: true, roles, path: value?.path, missing: value?.missing === true };
       } catch (error) {
-        tried.push(`enumerate-threw:${error instanceof Error ? error.message : String(error)}`);
+        return { ok: false, roles: [], error: error instanceof Error ? error.message : String(error) };
       }
-
-      for (const ns of names) {
-        const got = valueOf(ns);
-        if (!got) continue;
-        if (Array.isArray(got.value.roles)) {
-          hits.push({
-            ns,
-            roles: got.value.roles,
-            volatile: got.value.volatile ?? {},
-            revision: got.revision,
-            source: got.source,
-          });
-        } else if (/switchboard|agent-switchboard/.test(ns)) {
-          // 与插件相关但值里没有 roles：记下来，便于诊断（这是实测踩到的那种情况）。
-          tried.push(`${ns}:no-roles(${Object.keys(got.value).join(',') || 'empty'})`);
-        }
-      }
-
-      // 优先非空；全为空时返回空的那个（界面会显示「尚未配置」+ 诊断）。
-      const best = hits.find((hit) => hit.roles.length > 0) ?? hits[0];
-      if (best) return { ...best, seen: tried.join(' ') };
-      return {
-        ns: NS_CANDIDATES[0],
-        roles: [],
-        volatile: {},
-        revision: undefined,
-        source: tried.join(' '),
-        seen: tried.join(' '),
-      };
     }
 
     /**
-     * 把一串路径操作提交到 Host。
+     * 通过插件的远程服务写入角色配置。
      *
      * @param {object} ctx - Client 插件上下文。
-     * @param {string} ns - 已确认可用的命名空间（由 `readState` 解析得出）。
-     * @param {Array<object>} ops - `{op:'set', path, value}` 或 `{op:'unset', path}`。
-     * @param {number|undefined} revision - 读取时拿到的 revision，用于并发保护。
-     * @returns {Promise<{ok: boolean, message: string}>} 结果。
+     * @param {object} payload - `{roles}`。
+     * @returns {Promise<{ok: boolean, message: string, roleCount?: number}>} 结果。
      */
-    async function submit(ctx, ns, ops, revision) {
+    async function saveRoles(ctx, payload) {
       try {
-        const response = await ctx.remote.settings.mutate(ns, ops, revision);
-        // 远程方法把失败包在 envelope 里（`{ ok: false, error }`），不抛异常。
+        const response = await ctx.remote[REMOTE_NAMESPACE].write(payload);
         if (response && response.ok === false) {
-          const err = response.error;
-          return { ok: false, message: String(err?.message ?? err ?? '未知错误') };
+          return { ok: false, message: String(response.error ?? '写入失败') };
         }
-        return { ok: true, message: '已写入' };
+        const value = response && response.value !== undefined ? response.value : response;
+        return { ok: true, message: '已写入', roleCount: value?.roleCount };
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : String(error) };
       }
@@ -458,7 +403,7 @@ window.__ModuleLoader__.load({
               h(
                 'span',
                 { style: { fontSize: '10px', color: 'var(--dsw-alias-label-secondary)' } },
-                '⚠️ 还需在下面的总开关里打开 allowCrossCli，否则该角色既不注册 provider 也不挂载工具。',
+                '⚠️ 外部 CLI 会在本机真的执行命令。只读约束由 CLI 自身的沙箱参数实现（例如 codex 的 -s read-only），插件无法越过 CLI 强制。',
               ),
             )
           : null,
@@ -479,52 +424,38 @@ window.__ModuleLoader__.load({
     function SwitchboardSettings(props) {
       const ctx = props.ctx ?? props.context;
       const [draft, setDraft] = useState(null);
-      const [revision, setRevision] = useState(undefined);
-      const [ns, setNs] = useState(NS_CANDIDATES[0]);
       const [status, setStatus] = useState('loading');
-      const [seen, setSeen] = useState('');
       const [notice, setNotice] = useState(null);
       const [busy, setBusy] = useState(false);
-      const [allowCrossCli, setAllowCrossCli] = useState(false);
       const savedRef = useRef(null);
 
-      /** 从 Host 重新读取。 */
+      /** 从 Host 重新读取（走插件的远程服务）。 */
       const refresh = useCallback(() => {
         if (!ctx) {
           setStatus('no-context');
           return;
         }
-        const state = readState(ctx);
-        setDraft(cloneRoles(state.roles));
-        setRevision(state.revision);
-        setNs(state.ns);
-        setSeen(state.seen ?? state.source ?? '');
-        setAllowCrossCli(state.volatile?.allowCrossCli === true);
-        savedRef.current = JSON.stringify(state.roles);
-        setStatus(state.roles.length > 0 ? 'ready' : `empty(${state.source})`);
+        setStatus('loading');
+        void fetchRoles(ctx).then((result) => {
+          if (!result.ok) {
+            // 读取失败必须如实显示：静默当作空会把用户配置「藏起来」。
+            setDraft([]);
+            savedRef.current = JSON.stringify([]);
+            setStatus(`error:${result.error}`);
+            return;
+          }
+          setDraft(cloneRoles(result.roles));
+          savedRef.current = JSON.stringify(result.roles);
+          setStatus(result.roles.length > 0 ? 'ready' : result.missing === true ? 'missing' : 'empty');
+        });
       }, [ctx]);
 
-      // 首次挂载 + 订阅镜像变化。订阅是必要的：`ensure()` 是异步的，首帧往往读不到值。
+      // 首次挂载时读取一次。不再订阅 configForms 镜像 —— 配置已不走 settings，
+      // 那里不会有我们的行；外部改动（例如用户直接编辑 JSON）由「重新读取」按钮处理。
       useEffect(() => {
         if (!ctx) return undefined;
         refresh();
-        const disposers = [];
-        try {
-          const mirror = ctx.configForms.describe();
-          if (typeof mirror.subscribe === 'function') disposers.push(mirror.subscribe(() => refresh()));
-          if (typeof mirror.ensure === 'function') void mirror.ensure();
-        } catch {
-          /* 订阅失败只是失去自动刷新，页面本身仍可用 */
-        }
-        return () => {
-          for (const d of disposers) {
-            try {
-              if (typeof d === 'function') d();
-            } catch {
-              /* 释放失败不影响其它订阅 */
-            }
-          }
-        };
+        return undefined;
       }, [ctx, refresh]);
 
       const roles = draft ?? [];
@@ -576,35 +507,19 @@ window.__ModuleLoader__.load({
           return;
         }
         setBusy(true);
-        // 角色是变长数组：整块 set 语义明确，不必算易错的逐字段 diff。
-        const result = await submit(ctx, ns, [{ op: 'set', path: ['roles'], value: roles }], revision);
+        // 角色是变长数组，整体提交语义明确 —— 不必算易错的逐字段 diff。
+        const result = await saveRoles(ctx, { roles });
         setBusy(false);
         if (result.ok) {
           savedRef.current = JSON.stringify(roles);
-          setNotice({ kind: 'ok', text: '已保存。角色变更实时生效，无需重载插件。' });
+          setNotice({
+            kind: 'ok',
+            text: `已保存 ${result.roleCount ?? roles.length} 个角色。选中 Switchboard preset 的新会话会使用它们。`,
+          });
           refresh();
         } else {
           setNotice({ kind: 'error', text: `保存失败：${result.message}` });
         }
-      };
-
-      /** 切换跨 CLI 总开关。 */
-      const toggleCrossCli = async (next) => {
-        if (!ctx || busy) return;
-        setBusy(true);
-        const result = await submit(
-          ctx,
-          ns,
-          [{ op: 'set', path: ['volatile', 'allowCrossCli'], value: next }],
-          revision,
-        );
-        setBusy(false);
-        setAllowCrossCli(next);
-        setNotice(
-          result.ok
-            ? { kind: 'ok', text: `已${next ? '开启' : '关闭'}跨 CLI 派发。` }
-            : { kind: 'error', text: `开关写入失败：${result.message}` },
-        );
       };
 
       // --- 渲染 ---
@@ -628,30 +543,21 @@ window.__ModuleLoader__.load({
         button('放弃改动', refresh, { disabled: busy || !dirty }),
       );
 
-      const switchRow = h(
+      // 说明性的页脚。原先这里是一个 `allowCrossCli` 总开关，现已移除：
+      // 「是否挂载角色工具」由 preset 的 `mount: true` 决定（见 D13），而某个角色是否
+      // 走 CLI 由它自己的 `backend` 决定 —— 那个总开关已经没有存在的必要，
+      // 留着反而会让用户以为「开了它才有 CLI 角色」。
+      const footer = h(
         'div',
         {
           style: {
-            display: 'flex',
-            alignItems: 'center',
-            gap: '8px',
-            flexWrap: 'wrap',
+            fontSize: '11px',
+            color: 'var(--dsw-alias-label-secondary)',
             paddingTop: '8px',
             borderTop: '1px solid var(--dsw-alias-border-l2)',
           },
         },
-        h('input', {
-          type: 'checkbox',
-          checked: allowCrossCli,
-          disabled: busy,
-          onChange: (e) => void toggleCrossCli(e.target.checked),
-        }),
-        h('span', { style: { fontSize: '12px' } }, '允许跨 CLI 派发（allowCrossCli）'),
-        h(
-          'span',
-          { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
-          '开启后，设为「外部 CLI」的角色才会注册 provider 并挂载工具。此开关会在本机执行外部命令。',
-        ),
+        '角色工具只在选中 Switchboard preset 的会话里挂载；设为「外部 CLI」的角色会在本机执行外部命令。',
       );
 
       const wrap = (children) =>
@@ -684,7 +590,7 @@ window.__ModuleLoader__.load({
               )
             : null,
           children,
-          switchRow,
+          footer,
         );
 
       if (status === 'no-context') {
@@ -693,57 +599,26 @@ window.__ModuleLoader__.load({
       if (draft === null) {
         return wrap(h('div', null, '正在读取配置…'));
       }
+      if (status.startsWith('error:')) {
+        // 读取失败必须显式呈现原因，而不是显示成「尚未配置」——后者会让用户以为配置丢了。
+        return wrap(
+          h(
+            'div',
+            { style: { color: 'var(--dsw-alias-label-error, var(--dsw-alias-label-secondary))' } },
+            `读取角色配置失败：${status.slice('error:'.length)}`,
+            h('br'),
+            '这通常是配置文件损坏。修好或删除它之后点「放弃改动」重试。',
+          ),
+        );
+      }
       if (roles.length === 0) {
         return wrap(
           h(
             'div',
             { style: { color: 'var(--dsw-alias-label-secondary)' } },
-            '尚未配置任何角色。点「新增角色」开始；每个角色会变成主代理可用的一个委派工具。',
-            // ⚠️ 始终显示读取源：如果这次仍然读不到，这行就是唯一的线索。
-            //    实测踩过「页面显示空、但没有任何可诊断信息」，只能靠重启去查，
-            //    因此把诊断直接放到界面上。
-            h(
-              'div',
-              {
-                style: {
-                  marginTop: '6px',
-                  fontSize: '10px',
-                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                  opacity: 0.75,
-                  wordBreak: 'break-all',
-                },
-              },
-              `读取源：${status}`,
-            ),
-            // 已解析到的命名空间与「看到了什么」一并显示。
-            // 实测教训：只显示「读取源」不够 —— 有一次命名空间对、status 为 ready、
-            // 但值里没有 roles，没有这几行就只能靠重启去查。
-            h(
-              'div',
-              {
-                style: {
-                  marginTop: '2px',
-                  fontSize: '10px',
-                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                  opacity: 0.75,
-                  wordBreak: 'break-all',
-                },
-              },
-              `命名空间：${ns}（候选：${NS_CANDIDATES.join(' | ')}）`,
-            ),
-            h(
-              'div',
-              {
-                style: {
-                  marginTop: '2px',
-                  fontSize: '10px',
-                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                  opacity: 0.6,
-                  wordBreak: 'break-all',
-                },
-              },
-              `探到的命名空间与结果：${seen || '（无）'}`,
-            ),
+            status === 'missing'
+              ? '尚未配置任何角色。点「新增角色」开始；每个角色会变成主代理可用的一个委派工具。'
+              : '角色列表为空。点「新增角色」开始。',
           ),
         );
       }
@@ -766,7 +641,9 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'configForms', 'remote.settings'],
+      // `remote.roleConfig` 是本插件自己的远程服务（见 src/config-service.js）。
+      // 不再需要 `configForms` / `remote.settings` —— 角色配置已不走 settings。
+      inject: ['slots', 'remote.roleConfig'],
       apply(ctx) {
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(

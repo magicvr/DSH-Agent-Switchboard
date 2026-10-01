@@ -21,6 +21,7 @@
  */
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
+import { join } from 'node:path';
 import {
   CLI_BACKEND,
   EFFORT_VALUES,
@@ -31,6 +32,33 @@ import {
   toolConfigFor,
 } from './roles.js';
 import { createCliProvider } from './cli/provider.js';
+import { configPathFor, readConfigFile } from './config-file.js';
+import { RoleConfigService, ROLE_CONFIG_SERVICE } from './config-service.js';
+
+/**
+ * 从插件自己的配置文件读取角色。
+ *
+ * 与 `RoleConfigService.read` 分开是有意的：那个是**远程方法的对外契约**（返回
+ * `{ok, roles, path}` 供界面消费），这里是**装载期的内部读取**（返回可直接交给
+ * `normalizeRoles` 的归一化结果与一句诊断）。两者的错误表述面向不同读者。
+ *
+ * @param {string|undefined} path - 配置文件绝对路径；不可用时为 undefined。
+ * @returns {{ok: boolean, value?: object, detail: string}} 读取结果。
+ */
+function readRoleConfigFile(path) {
+  if (path === undefined) {
+    return { ok: false, detail: '无法定位角色配置文件（ctx.profileContext 不可用）' };
+  }
+  const read = readConfigFile(path);
+  if (!read.ok) {
+    return { ok: false, detail: `角色配置文件无法读取（${path}）：${read.error}` };
+  }
+  if (read.missing) {
+    // 「文件不存在」不是错误：用户还没配过角色。如实说明，不冒充成功。
+    return { ok: true, value: { roles: [] }, detail: `尚未创建角色配置文件（${path}）` };
+  }
+  return { ok: true, value: read.value, detail: `已从 ${path} 读取 ${read.value.roles.length} 个角色` };
+}
 
 /** Loader 条目名，与 package.json 的 `name` 保持一致。 */
 export const name = 'agent-switchboard';
@@ -136,6 +164,9 @@ function newDiagnostics() {
     providers: [],
     executables: [],
     blocked: [],
+    roleConfigPath: undefined,
+    roleConfigError: undefined,
+    roleConfigRead: undefined,
     fatal: undefined,
   };
 }
@@ -166,6 +197,18 @@ export const Config = z.object({
   provider: z.string().description('角色默认 LLM provider'),
   /** 允许嵌套派发时，子代理可用的深度上限。 */
   maxDepth: z.number().step(1).min(0).default(3).description('允许嵌套派发时的深度上限'),
+  /**
+   * 是否在**本作用域**挂载角色工具。
+   *
+   * 这是「配置随处可编辑，但工具不外溢」的实现机制（见 D13）：
+   *   - 根条目（bundle 的 insert）**不带**这个标记 → 只提供 `roleConfig` 配置服务，
+   *     不注册任何角色工具，因此不会污染其他 preset 的会话；
+   *   - preset 声明里写 `mount: true` → 只有选中该 preset 的会话才挂载角色工具。
+   *
+   * 默认 `false` 是刻意的：漏配的后果是「工具没出现」（显式、可发现），
+   * 而默认为 true 的后果是「工具出现在所有会话里」（隐性、且无提示）。
+   */
+  mount: z.boolean().default(false).description('是否在本作用域挂载角色工具（仅 preset 声明应为 true）'),
   /** CLI 角色的默认可执行工作目录；角色自身可用 cliCwd 覆盖。 */
   cwd: z.string().description('CLI 角色的默认工作目录'),
   /** 角色列表。 */
@@ -501,6 +544,22 @@ async function mountRoleTool(ctx, role, toolModule, maxDepth) {
 }
 
 /**
+ * 在 `ctx.profileContext` 不可用时推断 `$DSH_HOME`。
+ *
+ * 依据 `dsh-home-paths` 的语义：优先 `$DSH_HOME` 环境变量，否则 `~/.dsh`。
+ * 这一层兜底是为了让 headless / sdk / acp 启动形态下角色配置仍可用 ——
+ * 那些形态下 `dsh-base` 会把依赖 `profileContext` 的行整行禁用。
+ *
+ * @returns {string} 推断出的 `$DSH_HOME`。
+ */
+function resolveFallbackDshHome() {
+  const fromEnv = process.env.DSH_HOME;
+  if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) return fromEnv.trim();
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? '.';
+  return join(home, '.dsh');
+}
+
+/**
  * 插件入口。
  *
  * @param {object} ctx - Cordis 上下文。
@@ -523,14 +582,81 @@ export function apply(ctx, config) {
   // 自检工具总是注册：即使角色配置全错，也要能用它看到错在哪。
   ctx.tools.register(selftestTool(ctx, diagnostics));
 
-  // ⚠️ `roles` 在 Config 里标了 `.volatile()`，因此**必须**经 readVolatileField 取值：
-  //    直接读 `resolved.roles` 得到的是引用对象，`Array.isArray` 为 false，
-  //    于是报「roles 必须是数组」并导致所有角色都不挂载（实测踩过）。
-  const { roles, errors } = normalizeRoles(
-    readVolatileField(resolved, 'roles'),
-    resolved.provider,
-    resolved.cwd,
-  );
+  // --- 角色配置的来源：插件自己的文件（见 src/config-file.js 顶部的架构说明）------
+  //
+  // 不再从 Cordis 配置读 `roles`，原因有两条互相冲突的约束：
+  //   1. `settings.describe()` 按 ns 去重、只报告根条目，因此设置页读不到 preset 那份；
+  //   2. 把 roles 移到根条目会让角色工具全局可见，污染其他 preset 的会话。
+  // 换成插件自己的文件后，两条同时解开：配置随处可编辑，而工具是否可见只取决于
+  // 本插件在哪个会话作用域被激活。
+  const profileContext = typeof ctx.get === 'function' ? ctx.get('profileContext') : undefined;
+  // `$DSH_HOME` 来自 profileContext。它在 profile 启动路径下一定存在；headless/sdk/acp
+  // 下 profileContext 本身不存在（dsh-base 里相关行都写成 `disabled: !!js "!ctx.get('profileContext')"`），
+  // 那种情况下退化为 `$DSH_HOME` 环境变量或默认 `~/.dsh`，保证角色配置仍然可用。
+  const dshHome =
+    typeof profileContext?.home === 'string' && profileContext.home.length > 0
+      ? profileContext.home
+      : resolveFallbackDshHome();
+  const roleConfigPath = configPathFor(dshHome);
+  diagnostics.roleConfigPath = roleConfigPath;
+
+  // 服务在**每个作用域**都注册（含根条目），这样设置页在任何会话里都能读配置。
+  //
+  // ⚠️ 但同一作用域链上服务名唯一：preset 作用域会继承根作用域已注册的 `roleConfig`，
+  //    此时**跳过**注册（而不是尝试再注册一次 —— 那会因重名抛错）。这也正是我们要的
+  //    语义：配置服务由最外层那个实例提供，所有会话共用同一份配置。
+  const existingRoleConfig = typeof ctx.get === 'function' ? ctx.get(ROLE_CONFIG_SERVICE) : undefined;
+  if (existingRoleConfig !== undefined) {
+    console.error(`[${name}] roleConfig 已由外层作用域提供，本作用域跳过注册`);
+  } else {
+    try {
+      new RoleConfigService(ctx, {
+        path: roleConfigPath,
+        provider: resolved.provider,
+        cwd: resolved.cwd,
+        maxDepth: typeof resolved.maxDepth === 'number' ? resolved.maxDepth : undefined,
+        log: (msg) => console.error(`[${name}] ${msg}`),
+      });
+    } catch (error) {
+      diagnostics.roleConfigError = error instanceof Error ? error.message : String(error);
+      console.error(`[${name}] roleConfig 服务注册失败：${diagnostics.roleConfigError}`);
+    }
+  }
+
+  // --- 是否在本作用域挂载角色工具 ------------------------------------------------
+  //
+  // 只有显式声明 `mount: true` 的作用域才挂载。根条目（bundle 的 insert）不带这个
+  // 标记，preset 声明带上 —— 于是：
+  //   - 配置服务在根作用域常驻 → 设置页随时可用，且**不注册任何角色工具**；
+  //   - 角色工具只在 preset 会话里出现 → 其他 preset 不受污染。
+  //
+  // 「子代理也会继承 preset、因而可能重复挂载」这一点不必额外防护：`mountRoleTool`
+  // 在挂载后用 `ctx.get('tools').get(name)` **核实**工具是否可见，而子代理的 agent
+  // 作用域查不到父作用域注册的工具（这正是角色工具不重复出现的实测机制）。
+  const mountHere = readVolatileField(resolved, 'mount') === true;
+  if (!mountHere) {
+    console.error(
+      `[${name}] 本作用域未声明 mount:true，只提供配置服务，不挂载角色工具（路径：${
+        roleConfigPath ?? '不可用'
+      }）`,
+    );
+    return;
+  }
+
+  // 从文件读角色；读不到就如实报错，**绝不用空默认值覆盖**（那是用户的配置）。
+  const roleConfig = readRoleConfigFile(roleConfigPath);
+  diagnostics.roleConfigRead = roleConfig.detail;
+  if (!roleConfig.ok) {
+    diagnostics.configErrors = [roleConfig.detail];
+    console.error(`[${name}] ${roleConfig.detail}`);
+    return;
+  }
+
+  const configDefaults = {
+    provider: roleConfig.value.provider ?? resolved.provider,
+    cwd: roleConfig.value.cwd ?? resolved.cwd,
+  };
+  const { roles, errors } = normalizeRoles(roleConfig.value.roles, configDefaults.provider, configDefaults.cwd);
   diagnostics.configErrors = errors;
   if (errors.length > 0) {
     // 配置有错时不挂载任何角色工具：半挂载会让主代理看到一批语义不明的工具。
