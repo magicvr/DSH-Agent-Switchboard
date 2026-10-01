@@ -187,12 +187,14 @@ if (volSelfMarked) {
   process.exitCode = 1;
 }
 
-// 同时确认 volatile 下的字段确实都在（否则「父节点标了但没字段」是空壳）
+// volatile 只保留兼容容器；运行期限字段必须从 schema 消失。
 for (const key of Object.keys(volDict)) {
   console.log(`      volatile.${key}：由父节点的 volatile 标记覆盖`);
 }
-if (Object.keys(volDict).length === 0) {
-  console.error('FAIL  volatile 对象没有任何字段');
+if (!Object.hasOwn(volDict, 'cliTimeoutSec')) {
+  console.log('PASS  volatile 不再声明运行期限字段 cliTimeoutSec');
+} else {
+  console.error('FAIL  cliTimeoutSec 仍在 schema 中');
   process.exitCode = 1;
 }
 

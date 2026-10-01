@@ -68,11 +68,13 @@ export function parseRouteFacts(stderr, scanLines = 25) {
  * @param {object} run - 运行原始结果。
  * @param {number | null} run.exitCode - 退出码。
  * @param {NodeJS.Signals | null} [run.signal] - 终止信号。
- * @param {boolean} [run.timedOut] - 是否因超时被终止。
+ * @param {boolean} [run.cancelled] - 是否被调用方取消。
+ * @param {boolean} [run.startFailed] - 是否在启动前失败。
  * @returns {{ ok: boolean, reason?: string }} 判定结果。
  */
-export function classifyRun({ exitCode, signal, timedOut }) {
-  if (timedOut === true) return { ok: false, reason: 'timeout' };
+export function classifyRun({ exitCode, signal, cancelled, startFailed }) {
+  if (cancelled === true) return { ok: false, reason: 'cancelled' };
+  if (startFailed === true) return { ok: false, reason: 'start-failed' };
   if (signal) return { ok: false, reason: `terminated by ${signal}` };
   if (exitCode === null || exitCode === undefined) return { ok: false, reason: 'no exit code' };
   if (exitCode !== 0) return { ok: false, reason: `exit code ${exitCode}` };
@@ -96,7 +98,10 @@ export function classifyRun({ exitCode, signal, timedOut }) {
  * @param {string} [input.routeSummary] - 线路摘要，形如 `backend=cli(codex) model=… effort=…`。
  * @param {number | null} input.exitCode - 退出码。
  * @param {NodeJS.Signals | null} [input.signal] - 终止信号。
- * @param {boolean} [input.timedOut] - 是否超时。
+ * @param {boolean} [input.cancelled] - 是否取消。
+ * @param {boolean} [input.startFailed] - 是否在启动前失败。
+ * @param {boolean} [input.stdoutTruncated] - 标准输出是否丢失或截断。
+ * @param {boolean} [input.stderrTruncated] - 标准错误是否丢失或截断。
  * @param {string} input.stdout - 标准输出。
  * @param {string} input.stderr - 标准错误。
  * @param {number} [input.durationMs] - 耗时。
@@ -111,14 +116,17 @@ export function formatRunResult(input) {
     routeSummary,
     exitCode,
     signal,
-    timedOut,
+    cancelled,
+    startFailed,
+    stdoutTruncated,
+    stderrTruncated,
     stdout,
     stderr,
     durationMs,
     stderrTailBytes = 4000,
   } = input;
 
-  const verdict = classifyRun({ exitCode, signal, timedOut });
+  const verdict = classifyRun({ exitCode, signal, cancelled, startFailed });
   const route = parseRouteFacts(stderr);
 
   const lines = [];
@@ -131,7 +139,7 @@ export function formatRunResult(input) {
   lines.push(
     `[switchboard] exit=${exitCode === null ? 'null' : exitCode}` +
       `${signal ? ` signal=${signal}` : ''}` +
-      `${timedOut ? ' timedOut=true' : ''}` +
+      `${cancelled ? ' cancelled=true' : ''}` +
       `${typeof durationMs === 'number' ? ` duration=${(durationMs / 1000).toFixed(1)}s` : ''}`,
   );
   if (Object.keys(route).length > 0) {
@@ -141,6 +149,9 @@ export function formatRunResult(input) {
     lines.push('[switchboard] cli-route (CLI 未自报路由事实)');
   }
   lines.push('');
+
+  if (stdoutTruncated) lines.push('[switchboard] stdout 已截断（输出容量上限）');
+  if (stderrTruncated) lines.push('[switchboard] stderr 已截断（输出容量上限）');
 
   const body = (stdout ?? '').trim();
   if (body.length > 0) {

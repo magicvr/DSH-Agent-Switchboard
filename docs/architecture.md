@@ -106,7 +106,7 @@
 18b. **`.volatile()` 之后，该子对象变成「引用对象」：属性不在自身上，必须用 `.get()` 取值。**
     - 实测（`node -e` 直接跑真实 `Config`；样本字段是当时的 `allowCrossCli`，
       该字段**后来已随「跨 CLI 总开关」一并移除**，但这条机制本身不变 ——
-      现在 volatile 里只剩 `cliTimeoutSec`）：
+      批次 2a 又移除了 `cliTimeoutSec`，现在仅保留空容器兼容旧配置；以下为历史样本）：
       ```text
       r.volatile                  → {}                  （JSON.stringify 也是 {}）
       r.volatile.<字段>           → undefined           ← 直接读恒为 undefined
@@ -329,7 +329,7 @@
 - `allowNestedDispatch` — 是否允许该子代理再往下派发（**默认 `false`**，防无限递归，见 `decisions.md` D11）
 - `backend` — `spawn` / `fork`（内置）或 `cli`
 - `model` / `effort` — 角色顶层的模型与思考强度
-- `cliCommand` / `cliPrefixArgs` / `cliArgs` / `cliPromptDelivery` / `cliCwd` — CLI 角色的扁平配置；归一化后生成内部 `cli` 对象。提示词传递支持 `stdin` / `argv` / `promptFile`；超时由插件的 `volatile.cliTimeoutSec` 配置。
+- `cliCommand` / `cliPrefixArgs` / `cliArgs` / `cliPromptDelivery` / `cliCwd` — CLI 角色的扁平配置；归一化后生成内部 `cli` 对象。提示词传递支持 `stdin` / `argv` / `promptFile`；不设置运行期限。旧 `cliTimeoutSec` 不再声明或执行，残留值不阻止加载。
 
 早期草案的 `systemPrompt`、嵌套 `cli.model` / `cli.effort`、`modelFlag` / `effortFlag` 已被当前 schema 与参数模板取代；`resultContract` 尚未成为配置字段，统一结构化结果契约仍是目标。
 
@@ -344,7 +344,7 @@
 3. **工作目录与沙箱**：外部 CLI 自己的沙箱与权限需要单独配置，不能假设它与 DSH 的沙箱一致。`codex` 有独立的 `-s/--sandbox` 与审批策略，必须由用户显式声明，不可与 DSH 的沙箱策略混为一谈。
 4. **输出解析**：是否支持结构化输出（如 JSON），不支持时如何从文本里稳定提取结果。
 5. **模型与思考强度**：三者 flag 形态完全不同（`codex` 走未文档化的 `-c model_reasoning_effort=`、`claude` 走 `--effort`、`grok` 走 `--reasoning-effort`），且可用档位随模型变化。由本插件的 `model` / `effort` 结构化字段映射，见 `decisions.md` D12。
-6. **超时与中断**：长任务如何取消；子进程被杀后残留状态如何处理。
+6. **手动中断**：长任务由调用方取消；子进程被杀后残留状态如何处理。
 7. **失败语义**：命令不存在、未登录、额度耗尽、非零退出码，分别如何上报给主代理与用户。
 8. **安全**：命令与参数必须来自用户配置，不能由模型自由拼装，否则等于开放任意命令执行。
 
@@ -394,3 +394,26 @@
 
 设计取舍：**不为了形式上的对称去伪造一条内置后端日志**。宁可如实说明这条不对称，
 也不输出无法验证的「看起来在汇报」的行。
+
+### CLI 执行器与取消（批次 2a）
+
+`src/cli/runner.js` 的 `runCli({ role, prompt, spawn, resolveExecutable?, signal?, routeSummary?, onOutput?, now? })`
+负责模板、提示词传递、进程等待、输出与路由解析，以及所有终态的清理。
+`provider.js` 只转换 ContentBlock 与包装 SubagentRun。`onOutput({ stream, text, lossy })`
+可接异步 sink，通过非消费型收集器增量读取；本批次不依赖 Jobs，批次 3 可接输出回流。
+输出 sink 失败记诊断；采集容量仍由 subprocess 与执行器限制，截断显式标记。
+
+调用方 `request.signal` 原样传入 spawn；已取消信号不启动进程，解析期间取消也在启动前拦截。
+`done` 被观察到时固定终态；此前取消优先，之后取消不能改写完成结果。
+执行器只返回一个 Promise 终态，并在 finally 清理监听器、回流轮询及提示词文件；
+`done` 拒绝时也执行终止与等待。分类区分 `start-failed` / `process-failed` / `cancelled`，
+取消在 provider 映射为 `stopReason: 'aborted'`，不再报 timeout。
+
+旧配置兼容：schemastery 非 strict 对象保留未知字段；空 volatile 容器可取回旧值，
+`readConfigFile` 不拒绝额外字段。弃用日志每次模块加载最多一次，相关实例自检保留提示，
+不进入配置错误或健康门禁。真实 Config 与隔离 DSH_HOME 的 apply 路径已有离线断言。
+
+现有停止链的源码依据：本地 `dsh-agent/lib/index.js` 的 `workspace/session-stop`
+调用 `agent.cancel({ kind: 'user' })`；`dsh-tool-subagent/lib/index.js` 的前台派发
+把 `exec.signal` 传给 `subagents.start`。假进程验证取消能终止并清理；
+DSH GUI 的完整按钮链与 codex/grok 进程树清理仍需真机验收，本批次不新增 UI。

@@ -177,7 +177,9 @@ section('classifyRun');
 {
   check('退出码 0 → ok', classifyRun({ exitCode: 0 }).ok === true);
   check('退出码 1 → 失败并说明', classifyRun({ exitCode: 1 }).reason === 'exit code 1');
-  check('超时 → timeout', classifyRun({ exitCode: null, timedOut: true }).reason === 'timeout');
+  check('取消 → cancelled（不再冒充 timeout）', classifyRun({ exitCode: null, cancelled: true }).reason === 'cancelled');
+  check('启动失败有独立分类', classifyRun({ exitCode: null, startFailed: true }).reason === 'start-failed');
+  check('取消优先于零退出码', classifyRun({ exitCode: 0, cancelled: true }).reason === 'cancelled');
   check('信号 → 说明信号', classifyRun({ exitCode: null, signal: 'SIGTERM' }).reason === 'terminated by SIGTERM');
   check('无退出码 → 失败', classifyRun({ exitCode: null }).ok === false);
 }

@@ -6,7 +6,12 @@ import {
   createCliProvider,
   promptText,
 } from '../src/cli/provider.js';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, openSync, closeSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawn as nodeSpawn } from 'node:child_process';
+import { getEventListeners } from 'node:events';
+import { runCli } from '../src/cli/runner.js';
 
 let pass = 0;
 let fail = 0;
@@ -379,125 +384,224 @@ section('角色指令被前置进提示词');
   check('空角色指令时不加分隔线', s3.calls[0].stdio.stdin.data === 'ONLY TASK', s3.calls[0].stdio.stdin.data);
 }
 
-// ---------------------------------------------------------------------------
-// 超时：Phase 3 新实现的路径，此前完全未测。
-//
-// 背景：`ctx.subprocess.spawn` 的 spec **没有** `timeoutMs` 字段（实测
-// dsh-bash-local 传的是 `{argv, cwd, stdio, graceMs, signal, env}`），所以超时
-// 必须由 provider 自己用 AbortController + setTimeout 实现。既然是自己实现的，
-// 就绝不能让它是唯一没测的失败路径 —— 验收第 4 条明确要求「超时产生可读错误」。
-// ---------------------------------------------------------------------------
-section('超时：provider 自己的计时器真的会中止子进程');
-{
-  /**
-   * 一个「永不自然结束」的假 spawn：只有收到 abort 才结算。
-   *
-   * @returns {{spawn: Function, calls: object[], aborted: () => boolean}} 测试句柄。
-   */
-  function makeHangingSpawn() {
-    const calls = [];
-    let aborted = false;
-    const spawn = (spec) => {
-      calls.push(spec);
-      const done = new Promise((resolve) => {
-        const finish = () => {
-          aborted = true;
-          resolve({ exitCode: null, signal: 'SIGTERM' });
-        };
-        if (spec.signal?.aborted) finish();
-        else spec.signal?.addEventListener('abort', finish, { once: true });
-      });
-      return {
-        collected: {
-          stdout: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
-          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
-        },
-        done,
-        terminate() {},
-        waitForExit: async () => true,
-      };
-    };
-    return { spawn, calls, aborted: () => aborted };
-  }
-
-  const h = makeHangingSpawn();
-  const p = createCliProvider({ role: codexRole(), spawn: h.spawn, timeoutMs: 20 });
-  const run = await p.start({ prompt: textPrompt('HANG') });
-  const result = await run.result;
-  check('超时后子进程被中止（signal 收到 abort）', h.aborted());
-  check('超时 → stopReason error', result.stopReason === 'error', result.stopReason);
-  check(
-    '超时正文含 timedOut=true',
-    result.output[0].text.includes('timedOut=true'),
-    result.output[0].text.slice(0, 240),
-  );
-  check(
-    '超时正文说明原因是 timeout',
-    result.output[0].text.includes('超时') || result.output[0].text.includes('timeout'),
-    result.output[0].text.slice(0, 240),
-  );
-  check('仍有 argv 审计行（诊断不因超时丢失）', result.output[0].text.includes('[switchboard] argv='));
-
-  // 未设超时时，计时器必须**完全不存在**：否则「默认 900 秒」会形同虚设。
-  //
-  // 收尾方式：用一个**稍后才 abort** 的调用方信号让 hanging spawn 结算。
-  // 必须在等待窗口之后才 abort —— 若一开始就 abort，就分不清「没有被超时中止」
-  // 与「被我自己的收尾中止」了。
-  const h2 = makeHangingSpawn();
-  const p2 = createCliProvider({ role: codexRole(), spawn: h2.spawn });
-  const ac2 = new AbortController();
-  const started = p2.start({ prompt: textPrompt('HANG'), signal: ac2.signal });
-  // 等足够久，任何 20ms 级别的超时都会在此期间触发。
-  await new Promise((r) => setTimeout(r, 60));
-  check('未设超时（timeoutMs 为空）→ 不会被中止', !h2.aborted());
-  ac2.abort();
-  await (await started).result;
+// 取消代替旧超时保护，并覆盖清理、退出竞态和未来工具的回流接口。
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+function controlledSpawn() {
+  let finish;
+  let reject;
+  let aborted = false;
+  const calls = [];
+  let cleanups = 0;
+  const spawn = spec => {
+    calls.push(spec);
+    const done = new Promise((resolve, fail) => { finish = resolve; reject = fail; });
+    const onAbort = () => { aborted = true; finish({ exitCode: null, signal: 'SIGTERM' }); };
+    spec.signal?.addEventListener('abort', onAbort, { once: true });
+    // 假适配器也履行 subprocess 的监听器所有权，避免测桩自身泄漏。
+    const settled = done.finally(() => {
+      cleanups++;
+      spec.signal?.removeEventListener('abort', onAbort);
+    });
+    return { done: settled, collected: {}, terminate() { finish({ exitCode: null, signal: 'SIGTERM' }); },
+      waitForExit: async () => true };
+  };
+  return { spawn, calls, finish: () => finish({ exitCode: 0, signal: null }),
+    reject: () => reject(new Error('done failed')), aborted: () => aborted, cleanups: () => cleanups };
 }
 
-// ---------------------------------------------------------------------------
-// 取消：验收第 6 条要求「中断主代理时子进程被终止」。此前后者完全未测。
-// ---------------------------------------------------------------------------
-section('取消：调用方 abort 会传到子进程，且不被误报为超时');
+section('无运行期限：源码不含期限参数或计时终止');
 {
-  /** @returns {{spawn: Function, aborted: () => boolean}} 测试句柄。 */
-  function makeAbortableSpawn() {
-    let aborted = false;
-    const spawn = (spec) => {
-      const done = new Promise((resolve) => {
-        const finish = () => {
-          aborted = true;
-          resolve({ exitCode: null, signal: 'SIGTERM' });
-        };
-        if (spec.signal?.aborted) finish();
-        else spec.signal?.addEventListener('abort', finish, { once: true });
-      });
-      return {
-        collected: {
-          stdout: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
-          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
-        },
-        done,
-        terminate() {},
-        waitForExit: async () => true,
-      };
-    };
-    return { spawn, aborted: () => aborted };
-  }
+  const runner = readFileSync(new URL('../src/cli/runner.js', import.meta.url), 'utf8');
+  const provider = readFileSync(new URL('../src/cli/provider.js', import.meta.url), 'utf8');
+  const host = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+  check('执行器和 provider 无 timeoutMs / setTimeout / timedOutByUs',
+    !/timeoutMs|setTimeout|timedOutByUs/.test(runner + provider));
+  check('Host 不读取或注入运行期限', !/const cliTimeoutSec|timeoutMs:|cliTimeoutSec:\s*z\./.test(host));
+}
 
+section('取消：信号直通、终止、分类、审计与资源清理');
+{
   const ac = new AbortController();
-  const h = makeAbortableSpawn();
-  // 刻意**不设** timeoutMs：这样 timedOut 只可能来自调用方信号。
-  const p = createCliProvider({ role: codexRole(), spawn: h.spawn });
+  const h = controlledSpawn();
+  const role = codexRole({ promptDelivery: 'promptFile', args: ['--prompt-file', '{prompt}'] });
+  const p = createCliProvider({ role, spawn: h.spawn });
   const started = p.start({ prompt: textPrompt('CANCEL ME'), signal: ac.signal });
+  const path = h.calls[0].argv.at(-1);
+  check('运行中提示词文件存在', existsSync(path));
+  check('request.signal 原样传入 spawn', h.calls[0].signal === ac.signal);
   ac.abort();
   const result = await (await started).result;
-  check('调用方 abort → 子进程被终止', h.aborted());
-  check('取消后不当作成功', result.stopReason === 'error', result.stopReason);
-  check(
-    '取消被如实报为 timedOut=true（信令层无法区分取消与超时，故如实标注）',
-    result.output[0].text.includes('timedOut=true'),
-    result.output[0].text.slice(0, 240),
-  );
+  check('调用方取消 → 子进程被中止', h.aborted());
+  check('取消 → stopReason aborted', result.stopReason === 'aborted');
+  check('取消正文标注 cancelled=true', result.output[0].text.includes('cancelled=true'));
+  check('取消原因是 cancelled 而不是 timeout', result.structured.status === 'cancelled'
+    && result.output[0].text.includes('失败原因：cancelled') && !/timeout|timedOut/.test(result.output[0].text));
+  check('取消仍有 argv 审计行', result.output[0].text.includes('[switchboard] argv='));
+  check('取消后临时提示词文件已清理', !existsSync(path));
+  check('取消后全部 abort 监听器已移除', getEventListeners(ac.signal, 'abort').length === 0);
+}
+
+section('已取消信号与解析期间取消：不得启动新进程');
+{
+  const ac = new AbortController();
+  ac.abort();
+  const h = makeSpawn();
+  const result = await runCli({ role: codexRole(), prompt: 'T', signal: ac.signal, spawn: h.spawn });
+  check('预取消不 spawn 且终态 cancelled', h.calls.length === 0 && result.status === 'cancelled');
+  check('预取消不留监听器', getEventListeners(ac.signal, 'abort').length === 0);
+  const ac2 = new AbortController();
+  let release;
+  let promptPath;
+  const { readdirSync } = await import('node:fs');
+  const before = new Set(readdirSync(tmpdir()));
+  const role = codexRole({ promptDelivery: 'promptFile', args: ['--prompt-file', '{prompt}'] });
+  const task = runCli({ role, prompt: 'T', signal: ac2.signal, spawn: h.spawn,
+    resolveExecutable: () => new Promise(resolve => {
+      release = resolve;
+      promptPath = readdirSync(tmpdir()).find(name => name.startsWith('switchboard-prompt-') && !before.has(name));
+    }) });
+  ac2.abort();
+  release('fake');
+  const r2 = await task;
+  check('解析期间取消不 spawn 且终态 cancelled', h.calls.length === 0 && r2.status === 'cancelled');
+  check('解析期间取消清除监听器', getEventListeners(ac2.signal, 'abort').length === 0);
+  check('解析期间取消清理提示词文件', Boolean(promptPath) && !existsSync(join(tmpdir(), promptPath)));
+}
+
+section('失败路径统一清理：模板、启动和 done 拒绝');
+{
+  for (const [name, args, spawn, status] of [
+    ['模板失败', ['{bad}'], () => { throw new Error('不应 spawn'); }, 'start-failed'],
+    ['启动失败', ['{prompt}'], () => { throw new Error('ENOENT'); }, 'start-failed'],
+    ['done 拒绝', ['{prompt}'], () => ({ done: Promise.reject(new Error('done failed')),
+      terminate() {}, waitForExit: async () => true }), 'process-failed'],
+  ]) {
+    let file;
+    const ac = new AbortController();
+    const role = codexRole({ promptDelivery: 'promptFile', args });
+    // 文件名从临时目录的新增文件获取，模板失败时没有 spawn argv 可查。
+    const { readdirSync } = await import('node:fs');
+    const before = new Set(readdirSync(tmpdir()));
+    const r = await runCli({ role, prompt: 'T', signal: ac.signal,
+      resolveExecutable: async command => {
+        file = readdirSync(tmpdir()).find(name => name.startsWith('switchboard-prompt-') && !before.has(name));
+        return command;
+      }, spawn });
+    check(`${name}：独立终态分类`, r.status === status);
+    check(`${name}：临时提示词已清理`, Boolean(file) && !existsSync(join(tmpdir(), file)));
+    check(`${name}：监听器已移除`, getEventListeners(ac.signal, 'abort').length === 0);
+  }
+}
+
+section('取消与正常退出竞态：只有一个终态，不被后续取消改写');
+{
+  for (const order of ['cancel-first', 'done-observed', 'same-turn']) {
+    const label = { 'cancel-first': '取消先发生', 'done-observed': '完成先被观察', 'same-turn': '退出与取消同一轮发生' }[order];
+    const ac = new AbortController();
+    const h = controlledSpawn();
+    let terminals = 0;
+    const task = runCli({ role: codexRole(), prompt: 'T', signal: ac.signal, spawn: h.spawn });
+    task.then(() => { terminals++; });
+    if (order === 'cancel-first') { ac.abort(); h.finish(); }
+    else if (order === 'same-turn') { h.finish(); ac.abort(); }
+    else { h.finish(); await task; ac.abort(); }
+    const result = await task;
+    await delay(0);
+    check(`${label}：终态只产生一次`, terminals === 1 && h.cleanups() === 1);
+    check(`${label}：终态分类固定`, result.status === (order === 'done-observed' ? 'completed' : 'cancelled'));
+    check(`${label}：无残留监听器`, getEventListeners(ac.signal, 'abort').length === 0);
+  }
+}
+
+section('输出容量和回流：截断标志、sink 隔离与完成后取消');
+{
+  const ac = new AbortController();
+  const role = codexRole({ maxOutputBytes: 4, maxErrorBytes: 8 });
+  const base = makeSpawn({ stdout: '0123456789', stderr: 'model: abc\n' });
+  let events = 0;
+  const result = await runCli({ role, prompt: 'T', signal: ac.signal, spawn: base.spawn,
+    onOutput: async () => { events++; ac.abort(); throw new Error('sink offline'); } });
+  check('输出上限仍传入 subprocess', base.calls[0].stdio.stdout.maxBytes === 4 && base.calls[0].stdio.stderr.maxBytes === 8);
+  check('stdout 和 stderr 均受容量限制', Buffer.byteLength(result.stdout) <= 4 && Buffer.byteLength(result.stderr) <= 8);
+  check('两路截断在结果和正文标记', result.stdoutTruncated && result.stderrTruncated
+    && result.text.includes('stdout 已截断') && result.text.includes('stderr 已截断'));
+  check('sink 接收两路输出，失败只记诊断', events === 2 && result.diagnostic.includes('sink offline'));
+  check('done 后 sink 期间取消不改写 completed', result.status === 'completed');
+  check('sink 失败也清除监听器', getEventListeners(ac.signal, 'abort').length === 0);
+  const lossy = await runCli({ role: codexRole(), prompt: 'T', spawn: () => ({
+    done: Promise.resolve({ exitCode: 0, signal: null }),
+    collected: { stdout: { readFrom: () => ({ text: 'tail', nextOffset: 0, lossy: true }) } },
+  }) });
+  check('收集器 lossy 标志保留为截断', lossy.stdoutTruncated && lossy.text.includes('stdout 已截断'));
+  const unicode = await runCli({ role, prompt: 'T', spawn: makeSpawn({ stdout: '中文字符' }).spawn });
+  check('UTF-8 截断不切坏字符或超过容量', unicode.stdout === '中' && Buffer.byteLength(unicode.stdout) <= 4);
+}
+
+section('假 CLI 真进程：长时无自行终止，手动取消与成功清理');
+{
+  const dir = mkdtempSync(join(tmpdir(), 'switchboard-runner-'));
+  const script = join(dir, 'fake-cli.mjs');
+  writeFileSync(script, `import { existsSync, readFileSync } from 'node:fs';
+console.log('READY ' + process.pid + ' ' + readFileSync(process.argv[2], 'utf8'));
+console.error('model: fake-model');
+const timer = setInterval(() => { if (existsSync(process.argv[3])) { clearInterval(timer); console.log('FINISHED'); } }, 10);
+`);
+  let active;
+  const spawn = spec => {
+    const out = join(dir, 'stdout');
+    const err = join(dir, 'stderr');
+    const fds = [openSync(out, 'w'), openSync(err, 'w')];
+    const child = nodeSpawn(spec.argv[0], spec.argv.slice(1), { cwd: dir, shell: false, windowsHide: true,
+      stdio: ['ignore', ...fds] });
+    active = child;
+    const onAbort = () => child.kill();
+    spec.signal?.addEventListener('abort', onAbort, { once: true });
+    const reader = path => ({ readFrom: from => {
+      const bytes = readFileSync(path);
+      return { text: bytes.subarray(from).toString('utf8'), nextOffset: bytes.length, lossy: false };
+    } });
+    const done = new Promise((resolve, reject) => {
+      let error;
+      child.on('error', e => { error = e; });
+      child.on('close', (exitCode, signal) => {
+        spec.signal?.removeEventListener('abort', onAbort);
+        fds.forEach(closeSync);
+        if (error) reject(error); else resolve({ exitCode, signal });
+      });
+    });
+    return { done, collected: { stdout: reader(out), stderr: reader(err) },
+      terminate: () => child.kill(), waitForExit: () => done.then(() => true, () => true) };
+  };
+  try {
+    for (const cancel of [false, true]) {
+      const flag = join(dir, cancel ? 'cancel-run' : 'exit-run');
+      const ac = new AbortController();
+      const role = codexRole({ command: process.execPath, prefixArgs: [script],
+        promptDelivery: 'promptFile', args: ['{prompt}', flag], cwd: dir });
+      let terminals = 0;
+      let streamed = '';
+      const task = runCli({ role, prompt: 'MULTI\nLINE', spawn, signal: ac.signal,
+        onOutput: event => { streamed += event.text; } });
+      task.then(() => { terminals++; });
+      // 超过旧配置最小期限 1 秒；没有自然退出指令时必须仍存活。
+      await delay(1150);
+      check(`${cancel ? '取消运行' : '正常运行'}：长时进程仍存活`, active.exitCode === null && active.signalCode === null && terminals === 0);
+      check(`${cancel ? '取消运行' : '正常运行'}：终态前已回流输出`, streamed.includes('READY') && streamed.includes('fake-model'));
+      const output = readFileSync(join(dir, 'stdout'), 'utf8');
+      // 直接从适配器 argv 捕获提示词路径，而不解析输出中的用户内容。
+      const promptPath = active.spawnargs[2];
+      check(`${cancel ? '取消运行' : '正常运行'}：假 CLI 已读多行提示词`, output.includes('MULTI\nLINE') && existsSync(promptPath));
+      if (cancel) ac.abort(); else writeFileSync(flag, 'exit');
+      const result = await task;
+      check(`${cancel ? '取消运行' : '正常运行'}：分类正确`, result.status === (cancel ? 'cancelled' : 'completed'));
+      check(`${cancel ? '取消运行' : '正常运行'}：进程确已退出`, active.exitCode !== null || active.signalCode !== null);
+      check(`${cancel ? '取消运行' : '正常运行'}：提示词文件已清理`, !existsSync(promptPath));
+      check(`${cancel ? '取消运行' : '正常运行'}：终态唯一且监听器清理`, terminals === 1 && getEventListeners(ac.signal, 'abort').length === 0);
+    }
+  } finally {
+    if (active && active.exitCode === null && active.signalCode === null) active.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

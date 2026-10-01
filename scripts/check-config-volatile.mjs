@@ -39,54 +39,28 @@ function section(title) {
   console.log(`\n=== ${title} ===`);
 }
 
-section('自检：确认这个坑真实存在（否则本文件在测空气）');
+section('自检：已废弃配置仍能穿过真实 schema 的 volatile 引用');
 {
-  // 这是**已知坏形态**：直接访问属性。如果它哪天变成可用的，说明 schemastery 行为
-  // 变了，本文件的前提要重新核实 —— 因此把它也断言下来。
-  //
-  // 用 `cliTimeoutSec` 作样本（它现在是 volatile 里唯一的字段；`allowCrossCli` 已随
-  // 「跨 CLI 总开关」一并移除，见 src/index.js 的说明）。
+  // 空容器不拒绝未知字段；用旧值验证引用语义，不重新定义已废弃字段。
   const resolved = Config({ volatile: { cliTimeoutSec: 30 } });
-  check(
-    '直接读 `resolved.volatile.cliTimeoutSec` 确实取不到值（这就是原 bug 的机制）',
-    resolved.volatile?.cliTimeoutSec === undefined,
-    `实际得到 ${JSON.stringify(resolved.volatile?.cliTimeoutSec)}`,
-  );
-  check(
-    '`resolved.volatile.get()` 能取到真值',
-    resolved.volatile?.get?.()?.cliTimeoutSec === 30,
-    `实际得到 ${JSON.stringify(resolved.volatile?.get?.()?.cliTimeoutSec)}`,
-  );
+  check('直接读旧 volatile 属性取不到值（原 bug 机制仍被保护）',
+    resolved.volatile?.cliTimeoutSec === undefined);
+  check('volatile.get() 能取回兼容配置的旧值', resolved.volatile.get().cliTimeoutSec === 30);
 }
 
-section('readVolatile：穿过真实 Config schema');
+section('readVolatile：兼容容器读取与无运行期限默认值');
 {
-  const cases = [
-    ['cliTimeoutSec = 30', { volatile: { cliTimeoutSec: 30 } }, 30],
-    ['cliTimeoutSec = 1', { volatile: { cliTimeoutSec: 1 } }, 1],
-    ['未提供 volatile（应回落到默认 900）', { provider: 'self' }, 900],
-    ['volatile 为空对象（应回落到默认 900）', { provider: 'self', volatile: {} }, 900],
-  ];
-  for (const [label, input, expected] of cases) {
-    const v = readVolatile(Config(input));
-    check(
-      `${label} → cliTimeoutSec === ${expected}`,
-      v.cliTimeoutSec === expected,
-      `实际 ${JSON.stringify(v.cliTimeoutSec)}`,
-    );
+  for (const [label, input, expected] of [
+    ['旧值 30', { volatile: { cliTimeoutSec: 30 } }, 30],
+    ['旧值 1', { volatile: { cliTimeoutSec: 1 } }, 1],
+    ['未提供 volatile', { provider: 'self' }, undefined],
+    ['volatile 空对象', { provider: 'self', volatile: {} }, undefined],
+  ]) {
+    check(`${label}：读取兼容值且不注入期限默认值`, readVolatile(Config(input)).cliTimeoutSec === expected);
   }
-}
-
-section('readVolatile：cliTimeoutSec 默认值与覆盖');
-{
-  const dflt = readVolatile(Config({ provider: 'self' }));
-  check(
-    '未提供时 cliTimeoutSec 为 900',
-    dflt.cliTimeoutSec === 900,
-    `实际 ${JSON.stringify(dflt.cliTimeoutSec)}`,
-  );
-  const over = readVolatile(Config({ volatile: { cliTimeoutSec: 30 } }));
-  check('可被覆盖为 30', over.cliTimeoutSec === 30, `实际 ${JSON.stringify(over.cliTimeoutSec)}`);
+  check('Config 不再生成 900 秒默认期限', !Object.hasOwn(readVolatile(Config({ provider: 'self' })), 'cliTimeoutSec'));
+  check('已废弃字段的非法旧值也不阻止加载',
+    readVolatile(Config({ volatile: { cliTimeoutSec: 'invalid-old-value' } })).cliTimeoutSec === 'invalid-old-value');
 }
 
 section('readVolatile：输入退化情形不抛错');

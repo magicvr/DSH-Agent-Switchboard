@@ -725,6 +725,45 @@ section('CLI 逐角色阻塞：未知配置不注册 provider、不解析命令�
   check('装载后旧 custom 原始配置保持不变', JSON.stringify([legacy, valid]) === before);
 }
 
+section('隔离 DSH_HOME：残留运行期限不影响配置加载或健康状态');
+{
+  const legacy = initialConfig([fixtureRole], { provider: 'self', volatile: { cliTimeoutSec: 'invalid-old-value' } });
+  const path = configPathFor(fixtureHome);
+  writeConfigFile(path, legacy);
+  const before = readFileSync(path, 'utf8');
+  const loaded = Config['~standard'].validate({ provider: 'self', volatile: { cliTimeoutSec: 'invalid-old-value' } });
+  check('Cordis standard-schema 加载路径接受旧期限字段', !loaded.issues && loaded.value !== undefined);
+  const logs = [];
+  const originalError = console.error;
+  console.error = (...args) => { logs.push(args.join(' ')); };
+  const results = [];
+  try {
+    for (const mount of [false, true]) {
+      const ctx = makeCtx();
+      let resolved;
+      try { resolved = Config({ provider: 'self', mount, volatile: { cliTimeoutSec: 'invalid-old-value' } }); }
+      catch { /* 由下面断言报告兼容性回归 */ }
+      check(`${mount ? 'preset' : '根'}：旧期限字段仍可穿过 Config`, resolved !== undefined);
+      if (resolved) {
+        apply(ctx, resolved);
+        await import('@deepseek-ai/dsh-tool-subagent');
+        await new Promise(setImmediate);
+        results.push(await ctx.tools.get('switchboard_selftest').execute({}));
+      }
+    }
+    // 单独覆盖仅文件残留的路径，不让 Cordis 原值掩盖文件诊断遗漏。
+    const ctx = makeCtx();
+    apply(ctx, Config({ provider: 'self' }));
+    results.push(await ctx.tools.get('switchboard_selftest').execute({}));
+  } finally { console.error = originalError; }
+  check('根与 preset 兼容加载成功且自检健康', results.length === 3 && results.every(r => r.ok));
+  check('各作用域自检可见弃用诊断（含仅文件残留）', results.length === 3
+    && results.every(r => r.roleConfigStatus.includes('cliTimeoutSec 已废弃并忽略')));
+  check('弃用日志只打印一次', logs.filter(line => line.includes('cliTimeoutSec 已废弃并忽略')).length === 1);
+  check('加载不改写残留旧配置文件', readFileSync(path, 'utf8') === before);
+  check('残留旧字段不造成配置错误', results.length === 3 && results.every(r => r.configErrors === '' && r.fatal === ''));
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 } finally {
   if (previousDshHome === undefined) delete process.env.DSH_HOME;

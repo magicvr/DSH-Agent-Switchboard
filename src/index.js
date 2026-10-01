@@ -68,13 +68,13 @@ export const name = 'agent-switchboard';
  * ⚠️ **这是一个踩过的真坑**：调用 `.volatile()` 后，schemastery 把该子对象变成
  * 一个**引用对象**（Volatile ref），其属性**不在对象自身上** ——
  *   - `JSON.stringify(resolved.volatile)` → `{}`
- *   - `resolved.volatile.allowCrossCli`   → `undefined`（恒为 undefined）
- *   - `resolved.volatile.get()`           → `{ allowCrossCli: true, cliTimeoutSec: 900 }`
+ *   - `resolved.volatile.someField`       → `undefined`（恒为 undefined，与配置里写没写无关）
+ *   - `resolved.volatile.get()`           → 该引用对象的当前取值（普通对象）
  *
- * 因此 `resolved.volatile?.allowCrossCli === true` 这种直接访问**永远**判定为
- * 未开启。实测后果：跨 CLI 派发开关从未真正生效过，而自检一直显示
- * 「allowCrossCli 未开启」，看起来与「默认关闭」的表现完全相同，所以长期未被发现 ——
- * 直到在 preset 里显式写入 `volatile.allowCrossCli: true` 仍不生效才暴露。
+ * 因此 `resolved.volatile?.someField === true` 这种直接访问**永远**判定为不成立。
+ * 实测后果：当时那个全局开关从未真正生效过，而自检一直显示「未开启」，看起来与
+ * 「默认关闭」的表现完全相同，所以长期未被发现 —— 直到在 preset 里显式写入该字段
+ * 仍不生效才暴露。
  *
  * 这里对两种形态都兼容：带 `.get()` 的引用对象，以及普通对象
  * （Loader 经 JSON Schema 投影后可能给出后者）。拿不到就返回 `{}`。
@@ -140,6 +140,19 @@ export function readVolatileField(resolved, key) {
  * - `subprocess`：执行本地 CLI。argv 数组直传、`shell: false`，全程无 shell。
  */
 export const inject = ['tools', 'subagents', 'agents', 'systemPrompt', 'subprocess'];
+
+/** 弃用日志每次模块加载只发一次；各激活实例仍保留自己的诊断。 */
+let warnedLegacyTimeout = false;
+
+/** 每激活实例保留诊断；弃用日志每次模块加载最多打印一次。 */
+function noteLegacyTimeout(value, diagnostics) {
+  if (!Object.hasOwn(readVolatile(value), 'cliTimeoutSec') && !Object.hasOwn(value ?? {}, 'cliTimeoutSec')) return;
+  diagnostics.deprecatedConfig = 'cliTimeoutSec 已废弃并忽略；CLI 无运行期限，可通过会话停止取消';
+  if (!warnedLegacyTimeout) {
+    warnedLegacyTimeout = true;
+    console.error(`[${name}] ${diagnostics.deprecatedConfig}`);
+  }
+}
 
 /**
  * 新建一份装载诊断记录。
@@ -245,8 +258,7 @@ export const Config = z.object({
       //    取舍说明：「会执行本机命令」这件事的可控性现在依赖两点 —— 角色的 `backend`
       //    必须被显式设为 `cli`，且该角色只在 Switchboard preset 会话里存在。这比一个
       //    看不见的全局开关更容易理解和审计。
-      /** 单次 CLI 派发的超时（秒）。 */
-      cliTimeoutSec: z.number().step(1).min(1).default(900).description('单次 CLI 派发的超时（秒）'),
+      // 保留空 volatile 容器以兼容旧配置；已废弃字段不参与运行控制。
     })
     .default({})
     .volatile(),
@@ -577,6 +589,7 @@ export function selftestTool(ctx, diagnostics) {
           `路径=${diagnostics.roleConfigPath ?? '未解析'}`,
           `读取=${diagnostics.roleConfigRead ?? '（本作用域未读取）'}`,
           `同步=${diagnostics.roleConfigSync ?? '（本作用域未同步）'}`,
+          ...(diagnostics.deprecatedConfig ? [`弃用=${diagnostics.deprecatedConfig}`] : []),
         ].join(' | '),
         configErrors: diagnostics.configErrors.join('\n'),
         fatal: diagnostics.fatal ?? '',
@@ -713,6 +726,7 @@ function applyInner(ctx, config) {
   // 每次激活一份独立记录。preset 机制下同一插件会被多次加载，共享模块级状态
   // 会让后一次激活清空前一次的记录（实测出现自相矛盾的自检输出）。
   const diagnostics = newDiagnostics();
+  noteLegacyTimeout(resolved, diagnostics);
 
   // 说明：这里刻意**不**报告「本插件处于哪个 preset 作用域」。
   // `agentPresets.composedPreset(ctx)` 是从传入的上下文向上找最近的 preset 挂载，
@@ -789,6 +803,7 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics }) {
   const cordisRoles = readVolatileField(resolved, 'roles');
   const current = readRoleConfigFile(roleConfigPath);
   diagnostics.roleConfigRead = current.detail;
+  if (current.ok) noteLegacyTimeout(current.value, diagnostics);
   // 根实例保留原始数量与校验错误，但不挂载、不查询这些角色的工具可见性。
   const rawRoles = Array.isArray(cordisRoles) && cordisRoles.length > 0
     ? cordisRoles : current.ok ? current.value.roles : [];
@@ -858,6 +873,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
   //   - 而真正挂载角色工具的是 **preset 实例**，它读的是自己那份配置。
   // 因此必须确认 preset 实例能否看到根条目的配置；两条都记进诊断，一次重启即可判明。
   const fromFile = readRoleConfigFile(roleConfigPath);
+  if (fromFile.ok) noteLegacyTimeout(fromFile.value, diagnostics);
   const fromCordis = readVolatileField(resolved, 'roles');
   const cordisRoles = Array.isArray(fromCordis) ? fromCordis : [];
   diagnostics.roleConfigRead =
@@ -913,21 +929,6 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
 
   const maxDepth = typeof resolved.maxDepth === 'number' ? resolved.maxDepth : 3;
 
-  // CLI 派发的超时。
-  //
-  // ⚠️ 必须经 `readVolatile()` 取值，不能直接读 `resolved.volatile.cliTimeoutSec`
-  //    （那恒为 undefined —— volatile 字段是**引用对象**，直接读属性拿不到真值）。
-  //
-  // 这里**没有** `allowCrossCli` 门禁了：曾经有一个全局开关挡在 CLI 角色挂载之前，
-  // 但它后来在面板上被移除、却仍在执行期拦截，于是 CLI 角色永远挂不上且界面上只看到
-  // 「工具不存在」。现在「要不要走外部 CLI」由角色自己的 `backend: 'cli'` 表达，
-  // 而角色只在声明了 `mount: true` 的 Switchboard preset 会话里挂载。
-  const volatile = readVolatile(resolved);
-  const cliTimeoutSec =
-    typeof volatile.cliTimeoutSec === 'number' && volatile.cliTimeoutSec > 0
-      ? volatile.cliTimeoutSec
-      : 900;
-  console.error(`[${name}] cliTimeoutSec=${cliTimeoutSec}`);
   const { active: activeCliRoles, blocked: blockedCliRoles } = planCliMounts(roles);
 
   // 注册 CLI 角色各自的 provider 实例。
@@ -951,7 +952,6 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
         role,
         spawn: (spec) => safeSpawn(ctx, spec),
         resolveExecutable: (command, env, signal) => ctx.subprocess.resolveExecutable(command, env, signal),
-        timeoutMs: cliTimeoutSec * 1000,
         // 与系统提示词里的路由指引同一套措辞，让主代理能对照「本该走哪条」与「实际走哪条」。
         routeSummary: routeSummaryFor(role),
       });
