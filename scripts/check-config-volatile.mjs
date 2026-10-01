@@ -106,5 +106,55 @@ section('readVolatile：输入退化情形不抛错');
   }
 }
 
+// ---------------------------------------------------------------------------
+// 可写性不变式：这是「角色设置页能不能写回配置」的**硬前提**。
+//
+// 背景（见 docs/architecture.md 3.1e）：服务端 SettingsForms.write 对路径操作做
+// isVolatilePath 校验，非 volatile 路径一律抛 `Config field "..." is not volatile`。
+// 因此 `roles` **必须**标 .volatile()，否则自建的角色设置页一个字都写不进去。
+//
+// 而 volatile 又只能标在**数组整体**：标在元素内部会被客户端
+// validateVolatileSchema 以「路径含 * 不固定」为由拒绝。
+//
+// 这三条断言把这个组合锁住 —— 一旦有人「顺手」改动 schema 结构，这里会立刻失败，
+// 而不是等到实机写配置时才发现。
+// ---------------------------------------------------------------------------
+section('可写性不变式：roles 必须整体 volatile，且数组下标路径可写');
+{
+  /**
+   * 复刻 dsh-settings 的 `isVolatilePath`。
+   *
+   * @param {object} schema - schemastery schema 节点。
+   * @param {string[]} path - 字段路径段。
+   * @returns {boolean} 该路径是否可实时编辑。
+   */
+  function isVolatilePath(schema, path) {
+    if (schema.meta.volatile) return true;
+    const [key, ...rest] = path;
+    const child = key === undefined ? undefined : schema.dict?.[key];
+    return child !== undefined && isVolatilePath(child, rest);
+  }
+
+  const schema = Config;
+  check('roles 自身可写（决定了整个设置页能否工作）', isVolatilePath(schema, ['roles']));
+
+  const arrayPaths = [
+    ['roles', '0', 'backend'],
+    ['roles', '0', 'model'],
+    ['roles', '3', 'cliArgs', '0'],
+    ['roles', '1', 'cliPromptDelivery'],
+  ];
+  for (const p of arrayPaths) {
+    check(`数组下标路径可写：${p.join('.')}`, isVolatilePath(schema, p));
+  }
+  // 删元素也走同一条路径判定，因此它同样是「可写」的前提。
+  check('删元素路径可写：roles.4（unset 会 splice 掉该元素）', isVolatilePath(schema, ['roles', '4']));
+
+  // 反向断言：非 volatile 的顶层字段**不应**变成可写 —— 否则等于把 provider/maxDepth
+  // 也交给了设置页，超出 D13 的范围。
+  check('provider 不在 volatile 子树下（不应被设置页改写）', !isVolatilePath(schema, ['provider']));
+  check('maxDepth 不在 volatile 子树下', !isVolatilePath(schema, ['maxDepth']));
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);

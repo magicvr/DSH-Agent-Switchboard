@@ -130,6 +130,19 @@ export const Config = z.object({
   /** CLI 角色的默认可执行工作目录；角色自身可用 cliCwd 覆盖。 */
   cwd: z.string().description('CLI 角色的默认工作目录'),
   /** 角色列表。 */
+  //
+  // ⚠️ `.volatile()` 是**必须**的，而且是可写面板的前提，原因有硬约束（见 3.1e）：
+  //   1. 服务端 `SettingsForms.write` 对路径操作做 `isVolatilePath` 校验，
+  //      非 volatile 路径一律抛 `Config field "roles.0.backend" is not volatile`。
+  //      而 `roles` 是顶层字段，默认不在任何 volatile 子树下 —— 不标就**根本写不进去**。
+  //   2. volatile 只能标在**数组整体**上：标在元素内部会被客户端 `validateVolatileSchema`
+  //      拒绝（`volatile fields require a fixed object path without an enclosing
+  //      volatile field @ ["roles","*","backend"]`），因为元素路径含 `*` 不固定。
+  //   3. 标在数组上还顺带修正了一个语义：角色配置原先标为「结构性配置，改动后需重新启用
+  //      插件」，而现在角色与机制本就该实时生效，标为 live 才是准确表述。
+  //
+  // 代价：自动配置面板也会把 `roles` 整棵树暴露为可编辑表单。这不理想但并不危险，
+  // 且本插件自带的设置页（Client 半边）提供的是更合适的角色编辑器。
   roles: z
     .array(
       z.object({
@@ -159,7 +172,8 @@ export const Config = z.object({
         cliMaxErrorBytes: z.number().step(1).min(1),
       }),
     )
-    .default([]),
+    .default([])
+    .volatile(),
 });
 
 /**

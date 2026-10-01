@@ -181,6 +181,28 @@
 
     **官方同构先例**：`agent-presets` 自己就是一个 `settings.section`，用 `configForms` 编辑预设配置。
     ⚠️ 但本插件的 Client 半边**禁止 import 任何 Harness Client 包**（第 3 节），因此若自建页面，表单需要自绘。
+28. **写入是否受 volatile 限制，取决于用哪个方法。** `SettingsForms.write(ns, change, expected, paths)` 的 `paths` 参数**默认为空数组**，而 volatile 校验是 `for (const path of paths) if (!isVolatilePath(...))`：
+
+    | 方法 | 传 paths？ | 受 volatile 限制？ |
+    | --- | --- | --- |
+    | `settings.mutate(ns, ops, rev)` | 是（`ops.map(op => op.path)`） | **是** |
+    | `settings.update(ns, patch, rev)` | 否 | 否 |
+    | `settings.replace(ns, section, rev)` | 否 | **否** |
+
+    - 因此编辑 `roles` 有两条路：**甲**给 `roles` 标 `.volatile()` 并用 `mutate` 下标路径；**乙**不改 schema，用 `replace` 整块写 `{roles: [...]}`。
+    - 本插件选**甲**（`roles` 已标 volatile）：它让「改角色立即生效」在 schema 层也是准确表述，且 `mutate` 能显式携带 `revision` 做并发保护。乙是保留方案。
+    - 另注：`write` 还要求 `volatileForm(schema) !== undefined`，否则抛 `Plugin entry "…" has no volatile…` —— 一个 volatile 字段都没有的插件**完全无法通过设置页写入**。
+29. **`describe()` 是同步的**，返回**数组**（其 JSDoc 写「keyed by unique profile entry ids」，与实现不一致，以实现为准）。行的关键字段：`ns` / `schema` / `value` / `revision` / `writable` / `base` / `user` / `autoGenerate` / `applies`。**没有 `patch` 字段**。
+    - 行会被**丢弃**的条件：`schema` 取不到、`entry.fiber` 不存在、`fiber.runtime === null`、`fiber.state !== 2`（ACTIVE），或 `volatileForm(schema) === undefined`。
+    - 客户端读当前值：`ctx.configForms.get(ns).getSnapshot()` → `{status, value, base, user, revision, writable, mode}`；跨命名空间用 `ctx.configForms.describe().namespace(ns)`。**首帧可能是 `status: "loading"`**，因为 `ensure()` 是异步的，所以需要 `subscribe()` 后再取。
+    - 客户端 `ConfigForms.get(entryId)` 的 `entryId` **就是** `ns`，即 Loader 条目 id（本插件为 `include:agent-switchboard`；可用 `cordis_inspect_query`（Provider `Config`，`name` 过滤）权威确认，不要靠猜）。
+30. **`.volatile()` 只能标在数组整体，不能标在数组元素内部。** 这是第 24 条的另一面：数组元素路径经 `schema.inner` → `[...path, '*']` 变成**非固定**路径，客户端 `validateVolatileSchema` 随即抛错。
+31. **⚠️ 用 PowerShell 的 `>` 重定向采集探针输出会引入编码损坏 —— 这是本机实测踩到的坑，不是归档的问题。**
+    - 实测：`node scripts/dsh-cat.mjs <path> > raw/foo.js` 产出的文件前 4 字节是 `ff fe 77 00`，即 **UTF-16LE**；而用 `execFileSync(..., {encoding:'utf8'})` 或管道（`|`）采集时同一文件是**纯 UTF-8、零 NUL**。
+    - 三个文件实测均为 UTF-8 / NUL=0：`dsh-settings/lib/index.js`、`dsh-client-ui-settings/lib/client.js`、`dsh-client-ui-permission-presets/lib/client.js`。
+    - 后果很隐蔽：`read` 工具会把被写成 UTF-16 的副本判为二进制而拒读，看起来像「这个文件是二进制」。
+    - 做法：采集归档内容时用 `execFileSync` 的 `encoding: 'utf8'` 或管道，**不要用 `>`**。若已用 `>`，检查头两字节是否为 `ff fe`，是则 `buf.toString('utf16le')` 可救回。
+    - 教训：这处曾让我把「我的采集方式有问题」误判成「归档里编码不统一」，并据此写出过错误结论。
 
 ### 3.2 一条误导性的诊断信息（重要）
 
