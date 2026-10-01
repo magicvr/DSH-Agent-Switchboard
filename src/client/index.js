@@ -31,8 +31,18 @@
  * 一个显示不出内容的设置页是可接受的，一个让 slot 崩掉的设置页不是。
  */
 
-/** Loader 条目 id —— 同时是配置命名空间（`settings.describe()` 行的 `ns`）。 */
-const SWITCHBOARD_NS = 'include:agent-switchboard';
+/**
+ * 配置命名空间的**候选**列表，按可能性排序。
+ *
+ * ⚠️ 为什么不写死一个：`ns` 是「profile entry id」这一事实来自文档，但确切取值由
+ * 运行时决定。实测踩过：设置页读不到值（显示 `empty(form:unavailable)`），而无法从
+ * 外部核对该值对不对。把已知两种形态都试一遍、并用「值里有没有 `roles`」来确认，
+ * 比猜一个然后失败得莫名其妙可靠。
+ *
+ * 首选短的：`settings.describe()` 行的 `ns` 取的是 `entry.options.id`，
+ * 而插件管理器显示的 `include:agent-switchboard` 是展示层的组合形式。
+ */
+const NS_CANDIDATES = ['agent-switchboard', 'include:agent-switchboard'];
 
 /** 后端取值，与 Host 的 `z.union(['spawn', 'fork', 'cli'])` 保持一致。 */
 const BACKENDS = ['spawn', 'fork', 'cli'];
@@ -108,43 +118,70 @@ window.__ModuleLoader__.load({
     const { useState, useEffect, useRef, useCallback } = React;
 
     /**
-     * 读出当前配置快照。
+     * 依次尝试候选命名空间，返回第一个「有值且含 roles 数组」的结果。
      *
-     * 两条读取路径互为兜底，因为首帧的可用性取决于镜像是否已 `ensure()`：
+     * ⚠️ 为什么是**候选**而不是单一常量：`ns` 是「profile entry id」这一事实来自文档，
+     * 但确切取值由运行时决定。实测踩过：设置页读不到值，而无法从外部核对该值。
+     * 与其猜一个然后失败得莫名其妙，不如把已知形态都试一遍，并用
+     * 「该命名空间的值里有没有 `roles`」来**确认**，而不是假定。
+     *
+     * 两条读取路径也互为兜底，因为首帧可用性取决于镜像是否已 `ensure()`：
      *   - `configForms.get(ns).getSnapshot().value` —— 该条目的表单值
      *   - `configForms.describe().namespace(ns).value` —— 跨命名空间描述行
      *
      * @param {object} ctx - Client 插件上下文。
-     * @returns {{ roles: object[], revision: number|undefined, source: string }} 读取结果。
+     * @returns {{ns: string, roles: object[], volatile: object, revision: number|undefined, source: string}} 读取结果。
      */
     function readState(ctx) {
-      const empty = { roles: [], revision: undefined, source: 'unavailable' };
-      try {
-        const snap = ctx.configForms.get(SWITCHBOARD_NS).getSnapshot();
-        if (snap?.value && Array.isArray(snap.value.roles)) {
-          return { roles: snap.value.roles, revision: snap.revision, source: 'form' };
+      const tried = [];
+      for (const ns of NS_CANDIDATES) {
+        try {
+          const snap = ctx.configForms.get(ns).getSnapshot();
+          tried.push(`${ns}:form:${snap?.status ?? '?'}`);
+          if (snap?.value && Array.isArray(snap.value.roles)) {
+            return {
+              ns,
+              roles: snap.value.roles,
+              volatile: snap.value.volatile ?? {},
+              revision: snap.revision,
+              source: 'form',
+            };
+          }
+        } catch (error) {
+          tried.push(`${ns}:form-threw:${error instanceof Error ? error.message : String(error)}`);
         }
-        const row = ctx.configForms.describe().namespace(SWITCHBOARD_NS);
-        if (row && Array.isArray(row.value?.roles)) {
-          return { roles: row.value.roles, revision: row.revision, source: 'mirror' };
+        try {
+          const row = ctx.configForms.describe().namespace(ns);
+          tried.push(`${ns}:mirror:${row === undefined ? 'absent' : 'present'}`);
+          if (row && Array.isArray(row.value?.roles)) {
+            return {
+              ns,
+              roles: row.value.roles,
+              volatile: row.value.volatile ?? {},
+              revision: row.revision,
+              source: 'mirror',
+            };
+          }
+        } catch (error) {
+          tried.push(`${ns}:mirror-threw:${error instanceof Error ? error.message : String(error)}`);
         }
-        return { ...empty, source: `form:${snap?.status ?? 'unknown'}` };
-      } catch (error) {
-        return { ...empty, source: `error:${error instanceof Error ? error.message : String(error)}` };
       }
+      // 全部候选都没命中：把尝试过程带出去，让界面能显示可诊断信息而不是一句「空」。
+      return { ns: NS_CANDIDATES[0], roles: [], volatile: {}, revision: undefined, source: tried.join(' ') };
     }
 
     /**
      * 把一串路径操作提交到 Host。
      *
      * @param {object} ctx - Client 插件上下文。
+     * @param {string} ns - 已确认可用的命名空间（由 `readState` 解析得出）。
      * @param {Array<object>} ops - `{op:'set', path, value}` 或 `{op:'unset', path}`。
      * @param {number|undefined} revision - 读取时拿到的 revision，用于并发保护。
      * @returns {Promise<{ok: boolean, message: string}>} 结果。
      */
-    async function submit(ctx, ops, revision) {
+    async function submit(ctx, ns, ops, revision) {
       try {
-        const response = await ctx.remote.settings.mutate(SWITCHBOARD_NS, ops, revision);
+        const response = await ctx.remote.settings.mutate(ns, ops, revision);
         // 远程方法把失败包在 envelope 里（`{ ok: false, error }`），不抛异常。
         if (response && response.ok === false) {
           const err = response.error;
@@ -411,6 +448,7 @@ window.__ModuleLoader__.load({
       const ctx = props.ctx ?? props.context;
       const [draft, setDraft] = useState(null);
       const [revision, setRevision] = useState(undefined);
+      const [ns, setNs] = useState(NS_CANDIDATES[0]);
       const [status, setStatus] = useState('loading');
       const [notice, setNotice] = useState(null);
       const [busy, setBusy] = useState(false);
@@ -426,14 +464,10 @@ window.__ModuleLoader__.load({
         const state = readState(ctx);
         setDraft(cloneRoles(state.roles));
         setRevision(state.revision);
+        setNs(state.ns);
+        setAllowCrossCli(state.volatile?.allowCrossCli === true);
         savedRef.current = JSON.stringify(state.roles);
         setStatus(state.roles.length > 0 ? 'ready' : `empty(${state.source})`);
-        try {
-          const v = readVolatileFlag(ctx);
-          setAllowCrossCli(v);
-        } catch {
-          /* 开关读取失败不影响角色编辑 */
-        }
       }, [ctx]);
 
       // 首次挂载 + 订阅镜像变化。订阅是必要的：`ensure()` 是异步的，首帧往往读不到值。
@@ -509,7 +543,7 @@ window.__ModuleLoader__.load({
         }
         setBusy(true);
         // 角色是变长数组：整块 set 语义明确，不必算易错的逐字段 diff。
-        const result = await submit(ctx, [{ op: 'set', path: ['roles'], value: roles }], revision);
+        const result = await submit(ctx, ns, [{ op: 'set', path: ['roles'], value: roles }], revision);
         setBusy(false);
         if (result.ok) {
           savedRef.current = JSON.stringify(roles);
@@ -526,6 +560,7 @@ window.__ModuleLoader__.load({
         setBusy(true);
         const result = await submit(
           ctx,
+          ns,
           [{ op: 'set', path: ['volatile', 'allowCrossCli'], value: next }],
           revision,
         );
@@ -629,9 +664,38 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { style: { color: 'var(--dsw-alias-label-secondary)' } },
-            status.startsWith('empty') ? `尚未配置任何角色（读取源：${status}）。` : '尚未配置任何角色。',
-            h('br'),
-            '点「新增角色」开始。每个角色会变成主代理可用的一个委派工具。',
+            '尚未配置任何角色。点「新增角色」开始；每个角色会变成主代理可用的一个委派工具。',
+            // ⚠️ 始终显示读取源：如果这次仍然读不到，这行就是唯一的线索。
+            //    实测踩过「页面显示空、但没有任何可诊断信息」，只能靠重启去查，
+            //    因此把诊断直接放到界面上。
+            h(
+              'div',
+              {
+                style: {
+                  marginTop: '6px',
+                  fontSize: '10px',
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                  opacity: 0.75,
+                  wordBreak: 'break-all',
+                },
+              },
+              `读取源：${status}`,
+            ),
+            // 已解析到的命名空间一并显示：若为空说明两个候选都没命中，
+            // 那就是「配置面板拿不到本插件的命名空间」这一类问题。
+            h(
+              'div',
+              {
+                style: {
+                  marginTop: '2px',
+                  fontSize: '10px',
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                  opacity: 0.75,
+                  wordBreak: 'break-all',
+                },
+              },
+              `命名空间：${ns}（候选：${NS_CANDIDATES.join(' | ')}）`,
+            ),
           ),
         );
       }
@@ -651,19 +715,6 @@ window.__ModuleLoader__.load({
           ),
         ),
       );
-    }
-
-    /**
-     * 读取跨 CLI 总开关的当前值。
-     *
-     * @param {object} ctx - Client 插件上下文。
-     * @returns {boolean} 是否已开启。
-     */
-    function readVolatileFlag(ctx) {
-      const snap = ctx.configForms.get(SWITCHBOARD_NS).getSnapshot();
-      if (snap?.value?.volatile) return snap.value.volatile.allowCrossCli === true;
-      const row = ctx.configForms.describe().namespace(SWITCHBOARD_NS);
-      return row?.value?.volatile?.allowCrossCli === true;
     }
 
     return {

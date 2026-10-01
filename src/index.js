@@ -194,6 +194,35 @@ function safeSpawn(ctx, spec) {
 }
 
 /**
+ * 报告 `settings.describe()` 实际为哪些命名空间产出了行。
+ *
+ * 为什么需要：插件的设置页用 `configForms.get(ns)` 读配置，而 `ns` 是
+ * 「profile entry id」。这个值是**运行时事实**，靠读源码推断容易出错
+ * （实测踩过：自建设置页读不到值，怀疑 ns 不对，但无法从外部核对）。
+ * 把真实列表带进自检，一次重启就能确定，而不是继续猜。
+ *
+ * 用 `ctx.get('settings')` 而非写进 `inject`：这是一个**可选**依赖，
+ * 不满足时只应让这一行诊断降级，绝不能因此让整个插件（含角色工具）不激活。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @returns {string} 一行可读的诊断文本。
+ */
+function settingsNamespacesText(ctx) {
+  const service = typeof ctx.get === 'function' ? ctx.get('settings') : undefined;
+  if (service === undefined || typeof service.describe !== 'function') {
+    return 'settings.describe 不可用';
+  }
+  try {
+    const rows = service.describe();
+    if (!Array.isArray(rows)) return `describe() 返回非数组：${typeof rows}`;
+    if (rows.length === 0) return '（describe() 返回空数组）';
+    return rows.map((r) => `${r.ns}#${r.revision}`).join(' ');
+  } catch (error) {
+    return `describe() 抛错：${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+/**
  * 读取 preset roster 与构成清单，用于诊断「我们的 preset 为什么加载失败」。
  *
  * 为什么在插件里读而不是靠外部工具：GUI 只显示「加载失败」四个字，而
@@ -293,6 +322,7 @@ function selftestTool(ctx, diagnostics) {
           blocked: { type: 'string', required: true },
           presetRoster: { type: 'string', required: true },
           presetBroken: { type: 'string', required: true },
+          settingsNamespaces: { type: 'string', required: true },
           configErrors: { type: 'string', required: true },
           fatal: { type: 'string', required: true },
         },
@@ -304,6 +334,7 @@ function selftestTool(ctx, diagnostics) {
           `明细：${value.mounted}`,
           `preset roster：${value.presetRoster}`,
           `preset 异常行：${value.presetBroken}`,
+          `settings 命名空间：${value.settingsNamespaces}`,
           `CLI provider：${value.providers}`,
           `CLI 可执行文件：${value.executables}`,
           `因开关未挂载：${value.blocked}`,
@@ -348,6 +379,7 @@ function selftestTool(ctx, diagnostics) {
             : diagnostics.blocked.map((b) => `${b.id}(${b.reason})`).join(' '),
         presetRoster,
         presetBroken,
+        settingsNamespaces: settingsNamespacesText(ctx),
         configErrors: diagnostics.configErrors.join('\n'),
         fatal: diagnostics.fatal ?? '',
       };
