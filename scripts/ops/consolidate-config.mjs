@@ -9,11 +9,11 @@
 //    字符串，使 platform 条件静默失效）。
 //
 // 用法：
-//   node scripts/consolidate-config.mjs --check
-//   node scripts/consolidate-config.mjs --apply
+//   node scripts/ops/consolidate-config.mjs --check
+//   node scripts/ops/consolidate-config.mjs --apply
 import { readFileSync, writeFileSync, copyFileSync } from 'node:fs';
 import { parse } from 'yaml';
-import { resolvePaths, printPaths } from './lib/paths.mjs';
+import { resolvePaths, printPaths } from '../lib/paths.mjs';
 
 const paths = resolvePaths({ argv: process.argv.slice(2).filter(a => !['--apply', '--check'].includes(a)) });
 printPaths(paths);

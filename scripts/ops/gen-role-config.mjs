@@ -1,10 +1,10 @@
 // 把 raw/agents/*.toml 的角色定义转换成插件 Config 所需的 YAML 片段。
 // 产物写入 raw/roles-block.yml，供人工过目后再并入 profile 的 cordis.patch.yml。
-// 用法：node scripts/gen-role-config.mjs
+// 用法：node scripts/ops/gen-role-config.mjs
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { parsePathArgs, pathValue, resolvePaths, printPaths } from './lib/paths.mjs';
+import { parsePathArgs, pathValue, resolvePaths, printPaths } from '../lib/paths.mjs';
 
 const pathFlags = ['home', 'profile', 'patch', 'roles-file'];
 const options = parsePathArgs(process.argv.slice(2).filter(a => a !== '--dry-run'), [...pathFlags, 'agents-dir', 'output', 'inject']);
@@ -202,7 +202,7 @@ for (const r of roles) {
 
 // ---------------------------------------------------------------------------
 // 可选：把配置块注入某个 profile 的 cordis.patch.yml
-// 用法：node scripts/gen-role-config.mjs --inject <patch 路径> [--dry-run]
+// 用法：node scripts/ops/gen-role-config.mjs --inject <patch 路径> [--dry-run]
 // 会先备份为 <patch>.bak-<时间戳>。只替换 agent-switchboard 条目的 config。
 // ---------------------------------------------------------------------------
 if (options.inject !== undefined) {

@@ -10,12 +10,12 @@
 //   条件静默失效（与 scripts/gen-preset.mjs 避开的是同一个坑）。
 //
 // 用法：
-//   node scripts/experiment-dormant.mjs --check    只预检（不写盘）
-//   node scripts/experiment-dormant.mjs --apply     写盘（自动备份）
-//   node scripts/experiment-dormant.mjs --restore   用存档还原
+//   node scripts/ops/experiment-dormant.mjs --check    只预检（不写盘）
+//   node scripts/ops/experiment-dormant.mjs --apply     写盘（自动备份）
+//   node scripts/ops/experiment-dormant.mjs --restore   用存档还原
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { parse } from 'yaml';
-import { resolvePaths, printPaths } from './lib/paths.mjs';
+import { resolvePaths, printPaths } from '../lib/paths.mjs';
 
 const paths = resolvePaths({ argv: process.argv.slice(2).filter(a => !['--apply', '--check', '--restore'].includes(a)) });
 printPaths(paths);
@@ -206,7 +206,7 @@ const jsBefore = (original.match(/!!js /g) ?? []).length;
 const jsAfter = (afterText.match(/!!js /g) ?? []).length;
 console.log(`  !!js 表达式：改写前 ${jsBefore} → 改写后 ${jsAfter}`);
 if (jsBefore !== jsAfter) {
-  console.error('FAIL  !!js 被破坏！立即还原：node scripts/experiment-dormant.mjs --restore');
+  console.error('FAIL  !!js 被破坏！立即还原：node scripts/ops/experiment-dormant.mjs --restore');
   process.exit(1);
 }
 
@@ -215,7 +215,7 @@ try {
   after = parse(afterText);
 } catch (error) {
   console.error(`FAIL  产物无法解析：${error.message}`);
-  console.error('      还原：node scripts/experiment-dormant.mjs --restore');
+  console.error('      还原：node scripts/ops/experiment-dormant.mjs --restore');
   process.exit(1);
 }
 const afterGlobal = after.find((o) => o && o.id === 'agent-switchboard');
@@ -234,4 +234,4 @@ if ((afterSelf?.config?.roles?.length ?? 0) !== roleCount) {
   console.error('FAIL  角色配置未正确迁移');
   process.exit(1);
 }
-console.log('\nPASS  实验配置就位。若需回滚：node scripts/experiment-dormant.mjs --restore');
+console.log('\nPASS  实验配置就位。若需回滚：node scripts/ops/experiment-dormant.mjs --restore');

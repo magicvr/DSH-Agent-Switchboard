@@ -507,3 +507,7 @@ homedir 的 `AppData/Local` 推导。后缀来自已有实现；非 Windows 要�
 **实施进度（批次 2d-1）：** 7 个环境探针已移入 `scripts/probes/`，含不在离线
 `check` 主链中的 `check-cli-live.mjs`；相对导入、npm 入口和说明引用同步更新，
 路径解析与脚本功能保持原样。8 个运维脚本仍在 `scripts/`，`ops/` 留待批次 2d-2。
+
+**实施进度（批次 2d-2）：** 8 个运维脚本已移入 `scripts/ops/`；相对导入、preset 文件引用、
+npm 入口、文档及脚本用法与运行时命令同步更新。离线 `check` 主链不变，路径解析与脚本功能
+保持原样；批次 2d-1 的 7 个探针仍在 `scripts/probes/`，目录归类完成。

@@ -10,12 +10,12 @@
 // preset 会话读文件。
 //
 // 用法：
-//   node scripts/seed-root-roles.mjs --check
-//   node scripts/seed-root-roles.mjs --apply
+//   node scripts/ops/seed-root-roles.mjs --check
+//   node scripts/ops/seed-root-roles.mjs --apply
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { parse, stringify } from 'yaml';
 import { join } from 'node:path';
-import { resolvePaths, printPaths } from './lib/paths.mjs';
+import { resolvePaths, printPaths } from '../lib/paths.mjs';
 
 const paths = resolvePaths({ argv: process.argv.slice(2).filter(a => !['--apply', '--check'].includes(a)) });
 printPaths(paths);

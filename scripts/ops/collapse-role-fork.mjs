@@ -12,11 +12,11 @@
 //    此前多次「先写盘、再断言」在失败时留下被改坏的文件，只能靠备份恢复。
 //
 // 用法：
-//   node scripts/collapse-role-fork.mjs --check [--drop <id>]
-//   node scripts/collapse-role-fork.mjs --apply [--drop <id>]
+//   node scripts/ops/collapse-role-fork.mjs --check [--drop <id>]
+//   node scripts/ops/collapse-role-fork.mjs --apply [--drop <id>]
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { parse } from 'yaml';
-import { parsePathArgs, resolvePaths, printPaths } from './lib/paths.mjs';
+import { parsePathArgs, resolvePaths, printPaths } from '../lib/paths.mjs';
 
 const pathFlags = ['home', 'profile', 'patch', 'roles-file'];
 const options = parsePathArgs(process.argv.slice(2).filter(a => !['--apply', '--check'].includes(a)), [...pathFlags, 'drop']);

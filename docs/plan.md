@@ -58,7 +58,15 @@
 │       └── index.js             __ModuleLoader__.load + composer.dock 只读指示
 ├── scripts/
 │   ├── lib/                     路径解析与本地 CLI 配置校验共享模块
-│   ├── ops/                     写入、迁移、修复脚本（批次 2d-2 待归类，尚未创建）
+│   ├── ops/                     写入、迁移、修复脚本（批次 2d-2 已归类）
+│   │   ├── migrate-roles-to-file.mjs  角色文件迁移
+│   │   ├── fix-cli-models.mjs         CLI 模型与 cwd 修复
+│   │   ├── consolidate-config.mjs     重复配置收敛
+│   │   ├── collapse-role-fork.mjs     实验角色分支收敛
+│   │   ├── experiment-dormant.mjs     preset 挂载实验与还原
+│   │   ├── seed-root-roles.mjs        根条目角色播种
+│   │   ├── probe-preset.mjs           preset 校验与注入
+│   │   └── gen-role-config.mjs        角色配置块生成
 │   ├── probes/                  环境相关取证与实机实验（批次 2d-1 已归类）
 │   │   ├── probe-claude-isolate.mjs  Claude 隔离调用探针
 │   │   ├── probe-cli-help.mjs        CLI help 候选筛选
@@ -70,14 +78,16 @@
 │   ├── check-*.mjs              可移植离线检查及显式目标预检
 │   ├── dsh-probe.mjs            只读 asar 取证（已完成）
 │   ├── dsh-cat.mjs              只读读取归档内单文件（已完成）
-│   └── inline-asar-probe.mjs    底层解析器（已完成）
+│   ├── inline-asar-probe.mjs    底层解析器（已完成）
+│   ├── gen-preset.mjs           preset 声明生成
+│   └── inspect-sessions.mjs     会话记录取证
 └── test/                        Phase 2 起
 ```
 
 脚本按副作用与环境依赖分类：`lib/` 只提供共享解析和校验，`ops/` 承载业务允许的写入，
 `probes/` 承载安装环境与外部 CLI 取证；离线检查保留在 `scripts/`。批次 1 仅新增
 `lib/`，已有脚本不移动。批次 2d-1 已将上述 7 个探针移入 `probes/`；
-`ops/` 的 8 个运维脚本留待批次 2d-2，目前仍在 `scripts/`。路径契约见 D15。
+批次 2d-2 已将上述 8 个运维脚本移入 `ops/`，目录归类完成。路径契约见 D15。
 
 ## Phase 1 · 最小可加载插件（打通装载链路）
 
@@ -137,7 +147,7 @@
 - `src/index.js`：`apply` 时用 `ctx.plugin()` 为每个角色挂载一个 `dsh-tool-subagent` 实例；并注册角色路由指引到 `ctx.systemPrompt`
 - `scripts/check-roles.mjs`：61 条离线断言
 - `scripts/check-config-schema.mjs`：Config 与依赖解析离线预检
-- `scripts/gen-role-config.mjs`：把 `raw/agents/*.toml` 转成插件 Config（含 YAML 校验与备份）
+- `scripts/ops/gen-role-config.mjs`：把 `raw/agents/*.toml` 转成插件 Config（含 YAML 校验与备份）
 
 **验收结果（全部真机通过）：**
 

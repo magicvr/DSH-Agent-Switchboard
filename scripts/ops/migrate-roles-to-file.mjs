@@ -15,18 +15,18 @@
 //    字符串，使 standard 复制来的 platform 条件静默失效）。
 //
 // 用法：
-//   node scripts/migrate-roles-to-file.mjs --check
-//   node scripts/migrate-roles-to-file.mjs --apply
-//   node scripts/migrate-roles-to-file.mjs --apply --seed-from <备份文件>
+//   node scripts/ops/migrate-roles-to-file.mjs --check
+//   node scripts/ops/migrate-roles-to-file.mjs --apply
+//   node scripts/ops/migrate-roles-to-file.mjs --apply --seed-from <备份文件>
 //
-// ⚠️ `--seed-from` 是必需的救援路径：`probe-preset.mjs --inject` 会用生成好的 preset
+// ⚠️ `--seed-from` 是必需的救援路径：`node scripts/ops/probe-preset.mjs --inject` 会用生成好的 preset
 //    文件**整块替换** profile 里的声明，因此如果先重新注入、再迁移，profile 里那份
 //    角色就已经被替换掉了。此时只能从备份里取回角色。实测踩到过这一步。
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { parse } from 'yaml';
-import { readConfigFile, writeConfigFile, initialConfig } from '../src/config-file.js';
+import { readConfigFile, writeConfigFile, initialConfig } from '../../src/config-file.js';
 import { join } from 'node:path';
-import { parsePathArgs, pathValue, resolvePaths, printPaths } from './lib/paths.mjs';
+import { parsePathArgs, pathValue, resolvePaths, printPaths } from '../lib/paths.mjs';
 
 const pathFlags = ['home', 'profile', 'patch', 'roles-file'];
 const options = parsePathArgs(process.argv.slice(2).filter(a => !['--apply', '--check'].includes(a)), [...pathFlags, 'seed-from']);

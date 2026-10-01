@@ -21,14 +21,14 @@
 // - **先断言后写盘**：任何一条断言不过就完全不写。
 //
 // 用法：
-//   node scripts/fix-cli-models.mjs --check
-//   node scripts/fix-cli-models.mjs --apply
+//   node scripts/ops/fix-cli-models.mjs --check
+//   node scripts/ops/fix-cli-models.mjs --apply
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { parse } from 'yaml';
 // 用**驱动表本身**产出参数模板，而不是在这里再写一份 ——
 // 界面「一键填好」用的也是这个函数，因此脚本改出来的值与界面一致（有漂移断言锁定）。
-import { cliFieldsFor } from '../src/cli/drivers.js';
-import { parsePathArgs, resolvePaths, printPaths } from './lib/paths.mjs';
+import { cliFieldsFor } from '../../src/cli/drivers.js';
+import { parsePathArgs, resolvePaths, printPaths } from '../lib/paths.mjs';
 
 const pathArgv = process.argv.slice(2).filter(a => !['--apply', '--check'].includes(a));
 const options = parsePathArgs(pathArgv, ['home', 'profile', 'patch', 'roles-file', 'cwd']);
@@ -285,7 +285,7 @@ check('未列出的角色未被改动', architect?.model === 'gpt-6-astra', Stri
 check('角色数量不变', (afterRoot?.config?.roles ?? []).length === roles.length, String(afterRoot?.config?.roles?.length));
 
 // 端到端判据：修正后的配置必须能通过规范化 —— 这才是「实验能不能跑」的真正条件。
-const { normalizeRoles } = await import('../src/roles.js');
+const { normalizeRoles } = await import('../../src/roles.js');
 const norm = normalizeRoles(afterRoot.config.roles, afterRoot.config.provider, afterRoot.config.cwd);
 check('修正后规范化无错', norm.errors.length === 0, norm.errors.join('; '));
 const cliCount = norm.roles.filter((r) => r.cli !== undefined).length;

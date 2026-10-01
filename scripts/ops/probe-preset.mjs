@@ -19,10 +19,10 @@
 // `dsh-web-app/presets/standard.patch.yml` 顶层直接就是 `- insert:`，可对照。
 //
 // 用法：
-//   node scripts/probe-preset.mjs --check   只校验将要注入的内容（不写盘）
-//   node scripts/probe-preset.mjs --inject  写盘（自动备份）
+//   node scripts/ops/probe-preset.mjs --check   只校验将要注入的内容（不写盘）
+//   node scripts/ops/probe-preset.mjs --inject  写盘（自动备份）
 import { readFileSync, writeFileSync } from 'node:fs';
-import { resolvePaths, printPaths } from './lib/paths.mjs';
+import { resolvePaths, printPaths } from '../lib/paths.mjs';
 
 const paths = resolvePaths({ argv: process.argv.slice(2).filter(a => !['--check', '--inject'].includes(a)) });
 printPaths(paths);
@@ -37,7 +37,7 @@ const PRESET_ID = 'preset-switchboard';
  * （脚本里一份、presets/switchboard.patch.yml 一份），必然漂移。清单由
  * scripts/gen-preset.mjs 从当前 standard 复制生成，本脚本只负责注入。
  */
-const presetBlockText = readFileSync(new URL('../presets/switchboard.patch.yml', import.meta.url), 'utf8')
+const presetBlockText = readFileSync(new URL('../../presets/switchboard.patch.yml', import.meta.url), 'utf8')
   .replace(/\r\n/g, '\n')
   .replace(/\n*$/, '\n');
 

@@ -61,12 +61,12 @@
     "check:apply": "node scripts/check-apply.mjs",
     "check:client": "node scripts/check-client.mjs",
     "check:wiring": "node scripts/check-profile-wiring.mjs",
-    "migrate:roles": "node scripts/migrate-roles-to-file.mjs",
+    "migrate:roles": "node scripts/ops/migrate-roles-to-file.mjs",
     "check:live": "node scripts/probes/check-cli-live.mjs",
     "check:preset": "node scripts/gen-preset.mjs --check",
-    "gen:roles": "node scripts/gen-role-config.mjs",
+    "gen:roles": "node scripts/ops/gen-role-config.mjs",
     "gen:preset": "node scripts/gen-preset.mjs",
-    "inject:preset": "node scripts/probe-preset.mjs --inject",
+    "inject:preset": "node scripts/ops/probe-preset.mjs --inject",
     "probe:codex": "node scripts/probes/probe-codex.mjs",
     "check:portability": "node scripts/check-script-portability.mjs"
   }
