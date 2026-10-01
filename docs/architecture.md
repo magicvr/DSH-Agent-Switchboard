@@ -85,12 +85,17 @@
     - 机制解释：Loader 按**包名**处理，同一包已在根上加载时 preset 那次不会重复执行。
     - 因此「不选这个 preset 就不生效」这一目标形态成立于：`preset 声明 + 移除全局挂载`。
     - preset 里那一条目的 `config` 会被当作插件配置传入（实测 `provider/maxDepth/cwd/roles` 均正确到达），这给了「按 preset 携带角色配置」的官方路径。
+    - **preset 层的挂载会覆盖根层同 id 条目的 `disabled: true`**（实测）：本仓库 `cordis.patch.yml` 把条目声明为 `disabled: true`（默认惰性），preset 仍能在选中它的会话里激活插件。因此「bundle 里声明 disabled + preset 里再声明一次」是可用组合，不必用空数组 `[]` 表达「无全局挂载」（`[]` 语法合法但官方零先例）。
+    - **最干净的证据是 A/B 对照**：同一次运行、同一 profile，未选该 preset 的会话在主代理工具面里**看不到** `switchboard_selftest` 与 `delegate_to_*`；选中它的会话则有 30 个工具（含 `switchboard_selftest` 与 4 个 `delegate_to_*`）。这比任何自检字段都直接。
 22. **`agentPresets.composedPreset(ctx)` 必须传入「处于该作用域内」的 ctx，否则永远返回 `undefined`。**
     - 实现是 `standingMountFor(ctx)?.presetId`，即**从传入的上下文向上找最近的 preset 挂载**。
-    - 本插件的 `apply` 运行在**根上下文**，从那里向上查找永远命中不到 preset 挂载 —— 所以自检里的 `preset 作用域：根作用域` 是**假信号**，与 preset 是否生效无关。
+    - 本插件的 `apply` 运行在**根上下文**，从那里向上查找永远命中不到 preset 挂载 —— 所以曾一度出现在自检里的 `preset 作用域：根作用域` 是**假信号**，与 preset 是否生效无关（该字段已删除）。
     - 正确用法：在**工具调用时**传 `exec.agent.ctx`（那才处于会话的作用域内）。`dsh-subagent` 里的 `composeFrom(childCtx, parent.ctx)` 同理。
     - ⚠️ **教训：问「我在哪个作用域」时，必须用在作用域内的那个 ctx。用作用域外的 ctx 去问，答案永远是「不在任何作用域」。**
-23. **同一个插件会被激活多次**（根一次、每个选中它的 preset 作用域再一次）。因此插件的诊断/状态**不能放在模块级**：实测模块级 `diagnostics` 导致后一次激活清空前一次的记录，自检出现自相矛盾的输出。每次 `apply` 必须新建一份实例状态。
+23. **插件的诊断/状态不能放在模块级**：本仓库初版把 `diagnostics` 写成模块级对象，实测出现自相矛盾的自检输出（`codex-scout=失败` 与 `因开关未挂载：（无）` 并存）。
+    - 直接原因是当时本插件被**激活两次**（根一次、preset 作用域再一次）：后一次 `apply` 重置了模块级字段，而自检读到的是产生 `mounts` 的那一次。
+    - 现已把这份状态改为每次 `apply` 用 `newDiagnostics()` 新建一份（无论将来是否又会变成多实例都正确）。
+    - 现状补充：由于 `cordis.patch.yml` 已把条目声明为 `disabled: true`，本插件在**非 preset 会话里根本不激活**，实际只激活一次；但「实例自带状态、不共享模块级可变对象」这条原则仍然保留 —— 它消除的是整类隐患，而不只是当前这个症状。
 
 ### 3.1c Phase 2 实测补充：三个会重复踩的坑
 
