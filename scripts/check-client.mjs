@@ -348,5 +348,48 @@ section('CLI 驱动表：Client 镜像必须与 Host 权威一致');
   check('客户端不含 claude 预设', !CLIENT_SRC.includes("id: 'claude'"));
 }
 
+section('多字段写入必须原子（锁死「锁死在自定义命令」这个故障）');
+{
+  // ⚠️ `set` 的实现是 `onChange(index, { ...role, [key]: value })`，其中 `role` 是本行
+  //    渲染时的**快照**。因此**连续多次 `set` 只有最后一次生效**，前面的字段被静默丢弃。
+  //
+  //    实测故障：驱动选择器的 onChange 连着调用 4 次 `set` 去填 command / prefixArgs /
+  //    args / promptDelivery，只写进了最后一项 → 字段凑不成任何驱动 → 下拉框永远反推
+  //    不中 → **无法选择 Codex/Grok，只能停在「自定义命令」**。
+  //
+  //    静态断言：`set` 只在 `setMany` 的定义里出现（即不允许多字段场景直接连调 `set`）。
+  check('存在原子提交 helper `setMany`', /const setMany = \(patch\) => onChange\(/.test(CLIENT_SRC));
+  check(
+    '单字段 `set` 的定义存在（它仍用于真正的单字段编辑）',
+    /const set = \(key, value\) => onChange\(/.test(CLIENT_SRC),
+  );
+  // 驱动选择器那一段必须用 setMany，不得用连续的 set。
+  const driverOnChange = /onChange: \(e\) => \{\s*const id = e\.target\.value;[\s\S]{0,900}?\n\s*\},/.exec(CLIENT_SRC);
+  check('能定位到驱动选择器的 onChange', driverOnChange !== null);
+  if (driverOnChange !== null) {
+    const body = driverOnChange[0];
+    check('驱动选择器使用 setMany（原子提交）', /setMany\(/.test(body), body.slice(0, 200));
+    check(
+      '驱动选择器没有连续调用 set（那会只生效最后一次）',
+      (body.match(/\bset\(/g) ?? []).length === 0,
+      `出现 ${(body.match(/\bset\(/g) ?? []).length} 次 set(`,
+    );
+  }
+  // 切到 cli 时也必须一次填好整组字段，否则新角色带着空命令进入 CLI 分支。
+  check(
+    '切换 backend 有专门的 handler（切到 cli 时补默认驱动）',
+    /const changeBackend = \(next\) =>/.test(CLIENT_SRC) && /DEFAULT_CLI_DRIVER/.test(CLIENT_SRC),
+  );
+  check(
+    '默认驱动不是 custom（custom 不带模板，会留下空命令）',
+    /const DEFAULT_CLI_DRIVER = '(?!custom)[a-z]+'/.test(CLIENT_SRC),
+    'DEFAULT_CLI_DRIVER 指向了 custom 或不合法',
+  );
+  check(
+    'backend 下拉不再复用通用 select（它只改一个字段）',
+    !/field\('派发机制', select\('backend'/.test(CLIENT_SRC),
+  );
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);

@@ -56,6 +56,14 @@ const BACKENDS = ['spawn', 'fork', 'cli'];
 /** 已知的思考强度取值（必须与 Host 的 `EFFORT_VALUES` 一致）。 */
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
+/**
+ * 切换 `backend` 到 `cli` 时默认选的驱动。
+ *
+ * 必须是表里真实存在的驱动（`custom` 不行：它不带参数模板，会让新角色带着空命令
+ * 进入 CLI 分支，界面反推不出驱动、Host 侧也会判配置错误）。
+ */
+const DEFAULT_CLI_DRIVER = 'codex';
+
 /** 后端的中文说明（仅用于展示）。 */
 const BACKEND_LABEL = {
   spawn: '内置 · spawn（独立上下文）',
@@ -461,6 +469,21 @@ window.__ModuleLoader__.load({
       /** 改本行某个字段。 */
       const set = (key, value) => onChange(index, { ...role, [key]: value });
 
+      /**
+       * 一次提交**多个**字段。
+       *
+       * ⚠️ 为什么不能用连续多次 `set`：`set` 每次都是 `onChange(index, { ...role, ... })`，
+       * 而 `role` 是本行渲染时的那份**快照**。连续调用会各自基于**同一个旧快照**展开，
+       * 因此**只有最后一次生效**，前面的字段被静默丢弃。
+       *
+       * 实测踩到：驱动选择器原本连着调用 4 次 `set` 去填 command / prefixArgs / args /
+       * promptDelivery，结果只写进了最后一项，于是下拉框永远反推不中驱动，表现为
+       * **「锁死在自定义命令」**。
+       *
+       * @param {object} patch - 要合并进本行的字段。
+       */
+      const setMany = (patch) => onChange(index, { ...role, ...patch });
+
       /** 带标签的字段容器。 */
       const field = (label, control) =>
         h(
@@ -493,6 +516,25 @@ window.__ModuleLoader__.load({
           },
           options.map((o) => h('option', { key: o, value: o }, labels ? labels[o] ?? o : o)),
         );
+
+      /**
+       * 切换派发机制。
+       *
+       * ⚠️ 切到 `cli` 时**必须同时填好一组可用的 CLI 字段**，否则新角色会带着空的
+       * `cliCommand` / `cliArgs` 进入 CLI 分支：界面上的驱动下拉框因为「反推不出任何驱动」
+       * 而显示「自定义命令」，而 Host 侧会因为 `cliCommand` 缺失直接判配置错误。
+       * 默认给第一个真实驱动（`codex`），用户再按需换。
+       *
+       * @param {string} next - 新的 backend。
+       */
+      const changeBackend = (next) => {
+        if (next !== 'cli') {
+          set('backend', next);
+          return;
+        }
+        const fields = cliFieldsFor(DEFAULT_CLI_DRIVER, role.readOnly === true);
+        setMany({ backend: next, cliDriver: DEFAULT_CLI_DRIVER, ...(fields ?? {}) });
+      };
 
       /** 一个勾选框。 */
       const checkbox = (key, label) =>
@@ -550,7 +592,19 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { style: { flex: '0 0 200px' } },
-            field('派发机制', select('backend', BACKENDS, BACKEND_LABEL)),
+            field(
+              '派发机制',
+              h(
+                'select',
+                {
+                  value: role.backend ?? 'spawn',
+                  disabled,
+                  onChange: (e) => changeBackend(e.target.value),
+                  style: selectStyle(),
+                },
+                BACKENDS.map((b) => h('option', { key: b, value: b }, BACKEND_LABEL[b] ?? b)),
+              ),
+            ),
           ),
           h('div', { style: { flex: '1 1 150px' } }, field('模型', text('model', 'gpt-6-luna'))),
           h('div', { style: { flex: '0 0 100px' } }, field('思考强度', select('effort', EFFORTS))),
@@ -595,16 +649,20 @@ window.__ModuleLoader__.load({
                       disabled,
                       onChange: (e) => {
                         const id = e.target.value;
-                        set('cliDriver', id);
                         const fields = cliFieldsFor(id, role.readOnly === true);
-                        if (fields !== undefined) {
-                          // 只填「命令形态」四件套；模型与工作目录属于用户自己的环境，
-                          // 不由驱动改写（每个 CLI 有自己的模型命名空间，插件给不出默认值）。
-                          set('cliCommand', fields.cliCommand);
-                          set('cliPrefixArgs', fields.cliPrefixArgs);
-                          set('cliArgs', fields.cliArgs);
-                          set('cliPromptDelivery', fields.cliPromptDelivery);
-                        }
+                        // 必须**一次**提交全部字段（见 `setMany` 的说明：连续 set 只有最后一次生效）。
+                        // 只填「命令形态」四件套；模型与工作目录属于用户自己的环境，不由驱动改写。
+                        setMany(
+                          fields === undefined
+                            ? { cliDriver: id }
+                            : {
+                                cliDriver: id,
+                                cliCommand: fields.cliCommand,
+                                cliPrefixArgs: fields.cliPrefixArgs,
+                                cliArgs: fields.cliArgs,
+                                cliPromptDelivery: fields.cliPromptDelivery,
+                              },
+                        );
                       },
                       style: selectStyle(),
                     },
@@ -616,6 +674,24 @@ window.__ModuleLoader__.load({
                 'span',
                 { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
                 driverHint,
+              ),
+              // 临时诊断：下拉框显示什么由「按字段反推」决定，因此必须能看到它实际依据的值。
+              // 排查「锁死在自定义命令」这类问题时，读代码是无用的 —— 要看真实数据。
+              h(
+                'span',
+                {
+                  style: {
+                    fontSize: '10px',
+                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                    opacity: 0.75,
+                    wordBreak: 'break-all',
+                  },
+                },
+                `[诊断] cliDriver=${JSON.stringify(role.cliDriver ?? null)} 反推=${currentDriver} ` +
+                  `command=${JSON.stringify(role.cliCommand ?? null)} ` +
+                  `delivery=${JSON.stringify(role.cliPromptDelivery ?? null)} ` +
+                  `prefix=${JSON.stringify(role.cliPrefixArgs ?? null)} ` +
+                  `args=${JSON.stringify(role.cliArgs ?? null)}`,
               ),
               h(
                 'span',

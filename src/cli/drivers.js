@@ -178,21 +178,53 @@ export function cliFieldsFor(id, readOnly) {
  * 若用户手工改过 `cli*` 字段导致与任何驱动都不一致，返回 `'custom'`，
  * 避免界面把用户的自定义配置**显示**成某个预设（那会误导）。
  *
+ * ⚠️ **必须同时接受「模板」与「已解析」两种形态**。
+ *
+ * 界面拿到的 `cliCommand` / `cliPrefixArgs` 可能已经被解析过（不再是字面量 `{node}` /
+ * `{npmRoot}`），取决于值经过哪一层投影。若只按模板比对，一旦拿到解析后的值就会**永远
+ * 匹配不上**，下拉框表现为「锁死在自定义命令」—— 这正是实测遇到的故障。
+ * 两种形态都试一遍，问题就不依赖「值到底经过哪一层」这个不确定前提。
+ *
  * @param {object} role - 角色（含 `cli*` 字段）。
  * @returns {string} 驱动 id。
  */
 export function inferCliDriver(role) {
   for (const d of CLI_DRIVERS) {
     if (d.id === 'custom') continue;
-    if (role?.cliCommand !== d.command) continue;
-    if (JSON.stringify(role.cliPrefixArgs ?? []) !== JSON.stringify(d.prefixArgs)) continue;
-    if ((role.cliPromptDelivery ?? 'stdin') !== d.promptDelivery) continue;
-    const args = role.cliArgs ?? [];
+    // 命令与前缀参数：模板形态与解析后形态都算匹配。
+    if (!matchesCommandText(role?.cliCommand, d.command)) continue;
+    if (!matchesList(role?.cliPrefixArgs, d.prefixArgs)) continue;
+    if ((role?.cliPromptDelivery ?? 'stdin') !== d.promptDelivery) continue;
+    const args = role?.cliArgs ?? [];
     for (const readOnly of [true, false]) {
       if (JSON.stringify(args) === JSON.stringify(d.args(readOnly))) return d.id;
     }
   }
   return 'custom';
+}
+
+/**
+ * 单个命令文本是否匹配（模板或其解析结果）。
+ *
+ * @param {unknown} actual - 角色里的值。
+ * @param {string} expected - 驱动定义里的模板。
+ * @returns {boolean} 是否匹配。
+ */
+function matchesCommandText(actual, expected) {
+  if (typeof actual !== 'string') return false;
+  return actual === expected || actual === resolveDriverPlaceholders(expected);
+}
+
+/**
+ * 字符串数组是否匹配（逐项按模板或其解析结果比对）。
+ *
+ * @param {unknown} actual - 角色里的数组。
+ * @param {string[]} expected - 驱动定义里的模板数组。
+ * @returns {boolean} 是否匹配。
+ */
+function matchesList(actual, expected) {
+  if (!Array.isArray(actual) || actual.length !== expected.length) return false;
+  return actual.every((v, i) => matchesCommandText(v, expected[i]));
 }
 
 /**

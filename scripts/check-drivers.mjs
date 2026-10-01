@@ -190,6 +190,35 @@ section('inferCliDriver：反推必须与选择一致，自定义不得被误认
   check('参数被改过 → 反推为 custom', inferCliDriver(modified) === 'custom', inferCliDriver(modified));
   const wrongCmd = { ...cliFieldsFor('codex', true), cliCommand: 'something-else' };
   check('命令被改过 → 反推为 custom', inferCliDriver(wrongCmd) === 'custom', inferCliDriver(wrongCmd));
+
+  // ⚠️ 锁死「锁死在自定义命令」这个真实故障。
+  //
+  //    起因：驱动选择器的 onChange 原本连着调用 4 次基于同一份 `role` 快照的 set，
+  //    只有最后一次生效 —— 写进去的字段凑不成任何驱动，于是下拉框永远反推不中，
+  //    表现为**无法选择 Codex/Grok，只能停在「自定义命令」**。
+  //
+  //    修法：一次原子提交（客户端 `setMany`）。这里从数据侧断言「一次填好的字段必须
+  //    能被反推回来」，与 `cliFieldsFor → inferCliDriver` 的往返一致。
+  const partiallyWritten = { ...cliFieldsFor('codex', true) };
+  delete partiallyWritten.cliArgs; // 模拟「四个字段只写进了部分」的旧 bug 产物
+  check(
+    '字段只写进一部分时反推为 custom（这正是旧 bug 的成因，反例证明断言有效）',
+    inferCliDriver(partiallyWritten) === 'custom',
+    inferCliDriver(partiallyWritten),
+  );
+
+  // 解析后形态也必须反推得中：界面拿到的值是否经过占位符解析并不确定，
+  // 反推不能依赖这个前提（否则换一层投影就会重新「锁死」）。
+  const resolvedForm = {
+    ...cliFieldsFor('codex', true),
+    cliCommand: process.execPath,
+    cliPrefixArgs: cliFieldsFor('codex', true).cliPrefixArgs.map(resolveDriverPlaceholders),
+  };
+  check(
+    '占位符已解析的形态同样反推为 codex',
+    inferCliDriver(resolvedForm) === 'codex',
+    inferCliDriver(resolvedForm),
+  );
 }
 
 section('端到端拼装：驱动产出的字段经 buildInvocation 得到正确 argv');
