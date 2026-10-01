@@ -108,7 +108,7 @@
 
 ```js
 const capabilities = {
-  agentOptions: false,   // 无法把 DSH 的 provider/model 透传给任意 CLI
+  agentOptions: false,   // 不承载 DSH 的 AgentOptions 路由，见下方澄清
   outputSchema: false,   // 无法保证从任意 CLI 文本里稳定得到结构化输出
   depthLimit: false,     // 受管进程无法强制递归上限（强制要求，见 D4）
   toolFilter: false,     // 无法控制外部 CLI 的工具集
@@ -120,6 +120,94 @@ const inheritsParentContext = false;
 **依据（已核实）：** `SubagentCapabilities` 是一组显式布尔位，`depthLimit` 有强制语义。谎报能力会让工具层按支持的方式调用而对端并不支持，因此宁可声明不支持。
 
 **注意：** `persona` 声明为 `false` 只是说「不由 provider 层的 persona 机制实现」；角色提示词由本插件在构造 prompt 时自行前置，效果等价但机制不同。
+
+### 澄清：`agentOptions: false` 不代表「不支持选模型」
+
+早期版本的 D7 把 `agentOptions: false` 的理由写成「无法把 DSH 的 provider/model 透传给任意 CLI」，并据此暗示外部 CLI 无法选模型——**这个结论是错的**，在 D12 中修正。
+
+两者是**不同的命名空间**：
+
+| | DSH 的 `AgentOptions` | 外部 CLI 的模型/强度 |
+| --- | --- | --- |
+| 形态 | `{ provider, model, reasoningEffort }` | 各自的 flag，如 `-m`、`--model`、`--effort`、`-c model_reasoning_effort=` |
+| 命名空间 | DSH 的 LLM route（如 `deepseek-official/deepseek-v4-flash`） | 该 CLI 自己的模型 id（如 `gpt-6-luna`） |
+| 本插件是否透传 | **否**，声明为不支持 | **是**，走 D12 的独立字段 |
+
+因为我们不通过 `dsh-tool-subagent` 派发（D5），`capabilities` 这组标志对实际派发路径不构成约束；它的作用是「如有人拿本 provider 配 `dsh-tool-subagent` 实例，工具层会据此正确拒绝 `agentOptions` 请求」。
+
+---
+
+## D12 · 外部 CLI 的模型与思考强度：独立字段，角色固定
+
+**背景（已核实，2026-02 本机实测）：**
+
+| CLI | 模型 | 思考强度 | 备注 |
+| --- | --- | --- | --- |
+| `codex` | `-m, --model <MODEL>` | **无专用 flag**，只能 `-c model_reasoning_effort=<值>` | `--help` 与 `codex exec --help` **完全未提及** reasoning/effort；真实配置 `~/.codex/config.toml` 含 `model_reasoning_effort = "max"` 与 `enabled-reasoning-efforts = ["low","medium","high","xhigh","ultra","persistent","max"]` |
+| `claude` | `--model <model>` | `--effort <level>` | help 明示取值 `low, medium, high, xhigh, max` |
+| `grok` | `-m, --model <MODEL>` | `--reasoning-effort <EFFORT>`（别名 `--effort`） | `grok models` 可列出可用模型 |
+
+**决策 1 · 模型与强度是结构化字段，不是塞进 `args` 的裸字符串。**
+
+理由：三者 flag 形态完全不同（尤其 codex 走 `-c key=value` 而另两个走专用 flag）。若只提供 `args` 数组，每个角色都得手写各自 flag，无法校验、无法给默认值、面板里也无法结构化配置。
+
+```jsonc
+"cli": {
+  "command": "codex",
+  // 数组元素级占位符替换，全程无 shell
+  "args": ["exec", "{prompt}"],
+  "modelFlag": ["-m"],                                  // 模型名作为独立 argv 元素
+  "effortFlag": ["-c", "model_reasoning_effort={effort}"],
+  "model": "gpt-6-luna",
+  "effort": "max",
+  "cwd": ".",
+  "timeoutSec": 900
+}
+```
+
+`{model}` / `{effort}` 的替换**始终发生在一个完整 argv 元素内部**，替换结果永不参与字符串拼接，因此 D4 的安全模型（argv 数组、无 shell）完全不受影响。
+
+**决策 2 · 模型与强度由角色配置固定，主代理无权覆盖。**
+
+理由：主代理按设计只做信息统合，不该有成本决策权。这也让工具 schema 不出现模型参数，避免主代理把「选模型」当成一种能力去试探。DSH 自身的子代理模型选择有 `subagentModelSelection` 设置与每实例的 `modelSelectionSettings` 开关，本插件对应地把这项权力收归角色配置。
+
+**决策 3 · 强度用本插件的统一枚举，并显式声明可映射性。**
+
+统一枚举（界面与配置里用同一套词）：
+
+```
+minimal | low | medium | high | xhigh | max
+```
+
+- 每个 CLI 后端声明 `effortValues`：该后端实际接受的档位。
+- 若角色配置的强度**不在该后端的 `effortValues` 内** → **装载/校验期直接报错**，绝不静默降级（静默降级会让「我设了 max 却跑在 low」变成无法察觉的事实）。
+- 若某后端某档位无对应值（例如 `codex` 的 `minimal`）→ 视为该后端不支持该档位，同样报错，由用户在角色配置里改。
+
+**诚实的限制（已核实）：** `enabled-reasoning-efforts` 是 codex 的**桌面端每模型**设置，说明**可用档位随模型变化**，并非固定集合。因此：
+
+- 本插件的 `effortValues` 是**保守声明**，取该 CLI 文档化或已实测的交集；它是「本插件保证能映射的档位」，不等于「该 CLI 在该模型上支持的全部档位」。
+- 若某 CLI 在该模型上拒绝某档位，错误会在 CLI 侧产生，本插件通过 D8 的机制保留其原始 stderr 与退出码，**不美化、不吞掉**。
+- 各 CLI 的最终档位表必须实测后写入 `docs/cli-backends.md`，不得凭推测填写。
+
+### 实测证据留档（2026-02，本机）
+
+保留原始取证，供 Phase 3 直接使用，避免重复调查：
+
+| 事实 | 证据来源 |
+| --- | --- |
+| `codex -m, --model <MODEL>` 存在 | `codex --help` 输出 |
+| `codex` 的 help（含 `codex exec --help`）**零次**出现 `reasoning` / `effort` | 对两处 help 全文检索，命中 0 |
+| codex 接受 `model_reasoning_effort` | `~/.codex/config.toml` 含 `model_reasoning_effort = "max"` |
+| codex 档位随模型变化 | 同文件 `[desktop] enabled-reasoning-efforts = ["low","medium","high","xhigh","ultra","persistent","max"]` |
+| `codex exec` 支持 `--json`、`--output-schema <FILE>`、`-o/--output-last-message <FILE>`、`-C/--cd <DIR>`、`-s/--sandbox` | `codex exec --help` |
+| `claude --model <model>`、`--effort <level>`，档位 `low, medium, high, xhigh, max` | `claude --help`（help 明示取值） |
+| `claude --fallback-model` 可用 | `claude --help` |
+| `grok -m, --model <MODEL>`、`--reasoning-effort <EFFORT>`（别名 `--effort`） | `grok --help` |
+| `grok models` 子命令可列出可用模型 | `grok --help` |
+
+> ⚠️ 上表**只证明参数存在**，不证明「指定后确实生效」。Phase 3 的验收标准第 2 条要求用真实调用验证生效，不能只看退出码为 0。
+>
+> 另注：本机 `codex` 的入口是 PowerShell 脚本 `%APPDATA%\npm\codex.ps1`（内部转发到 `@openai/codex/bin/codex.js`），不是 `.exe`。实测运行时会打印 `failed to clean up stale arg0 temp dirs` 与 `could not create PATH aliases` 的警告，但命令仍正常返回——`ctx.subprocess.resolveExecutable` 对这类脚本入口与这些 stderr 噪音的处理方式必须在 Phase 3 单独确认。
 
 ---
 

@@ -72,11 +72,15 @@
       "backend": "cli",
       "cli": {
         "provider": "codex",
-        // 参数模板占位符：{prompt} / {cwd}
-        // ⚠️ 下面这行是占位示例，参数尚未实测（Phase 3 校准）
+        // 参数模板：{prompt} / {cwd} / {model} / {effort}
+        // ⚠️ 下面 args 是占位示例，子命令尚未实测（Phase 3 校准）
         "args": ["exec", "{prompt}"],
+        "modelFlag": ["-m"],
+        "effortFlag": ["-c", "model_reasoning_effort={effort}"],
+        // 模型与思考强度是角色级固定配置，主代理无权覆盖
+        "model": "gpt-6-luna",
+        "effort": "max",
         "cwd": ".",
-        // 单次派发的超时（秒）
         "timeoutSec": 900
       }
     },
