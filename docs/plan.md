@@ -89,8 +89,15 @@
 
 **待完成（阻塞条件明确）：**
 
-- 条目的 `fiberPhase` 目前为 `null`（未激活）。原因是 **link 模式下的模块缓存**：源码改动后 `set_plugin` 开关与 `install_bundle` 都不会重新加载模块（已用落地文件探针证实新代码从未执行）。需要**重启承载本会话的 dsh** 才能装载新模块。
+- **条目的 `fiberPhase` 当前为 `failed`（未激活）。** 第一次重启后模块确实被重新加载了（`fiberPhase` 由 `null` 变为 `failed`，`Config` 状态由「无 config 说明」变为 `status: "schema"`），随即暴露出真实错误：`schema.required is not supported by the value schema DSL`。该错误已定位并修复——`output.schema` 是 value schema DSL，必需性必须写成**属性级 `required: true`**，由 DSL 自动装配成对象级数组（见 `architecture.md` 第 3.1 节第 12 条）。
+- **仍受 link 模式模块缓存限制。** 修复后再次开关条目，报错堆栈行号未变，说明运行的仍是缓存模块（`set_plugin` 开关不清模块缓存）。因此需要**再重启一次 dsh** 才能装载修复后的模块。
 - 重启后逐条跑完下列 5 条验收。
+
+### 教训：验证方法本身出过错
+
+这处 schema 我连错两次、方向相反，根因是**把两层 schema 规则混为一谈**（value schema DSL 与它编译产物的受限 JSON Schema 子集是两套规则）。
+
+但更值得记住的是**验证方法的失败**：第一轮我用「抽取子集校验器去验编译产物」的方式，得出了修复有效的结论——那只覆盖了第二层，完全没有覆盖我实际写错的第一层。**只验产物、不验输入，会给出虚假的成功信号。** 后续任何 schema 改动都必须两层都验，并用已知错误写法做回归对照。
 
 **验收（重启后逐条真实通过）：**
 1. `plugin_manager install_bundle` 能把包装进 profile。

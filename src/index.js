@@ -8,8 +8,10 @@
  * 至此已实测确认的两条装载期事实（都写进 docs/decisions.md）：
  *   1. `@deepseek-ai/*`（schemastery / dsh-tools 等）**可以被外部插件 import**——
  *      它们由 dsh 安装处以「双锚点解析」供给，尽管它们在磁盘上不存在于 profile。
- *   2. `dsh-tools` 对 schema 只接受**受限 JSON Schema 子集**：`required` 必须是
- *      **属性名字符串数组**，不能写成 `{ required: true }` 这种字段级布尔标记。
+ *   2. `defineTool` 的 `parameters` 与 `output.schema` 走**两层不同的 schema 规则**：
+ *      `output.schema` 是 value schema DSL（必需性用**属性级 `required: true`**），
+ *      编译后的产物才交给「受限 JSON Schema 子集」校验器（那里 `required` 是数组）。
+ *      手写编译产物会失败，务必只写 DSL 输入。
  *
  * @module @magicvr/dsh-agent-switchboard
  */
@@ -46,8 +48,12 @@ export const Config = z.object({
 /**
  * 自检工具：把「插件确实被装载且工具注册面可用」变成可被外部查询到的事实。
  *
- * 形状严格遵循 `dsh-tools` 的受限 JSON Schema 子集：
- * `required` 是属性名数组，而不是字段上的 `required: true`。
+ * 形状必须遵循 `dsh-tools` 的 **value schema DSL**，它不是裸 JSON Schema：
+ *   - 对象级 `required: [ ... ]` **在 DSL 里非法**，会报
+ *     `schema.required is not supported by the value schema DSL`；
+ *   - 必需性靠**属性级的 `required: true`** 表达，DSL 在编译时自动把它装配成
+ *     产物的对象级 `required` 数组（见 dsh-tools 的 `property-map` /
+ *     `property-map-tail` 处理）。
  *
  * @param {object} config - 已通过 `Config` 校验的配置。
  * @returns {object} ToolDefinition
@@ -65,13 +71,12 @@ function selftestTool(config) {
         type: 'object',
         additionalProperties: false,
         properties: {
-          ok: { type: 'boolean' },
-          plugin: { type: 'string' },
-          phase: { type: 'string' },
-          marker: { type: 'string' },
-          allowCrossCli: { type: 'boolean' },
+          ok: { type: 'boolean', required: true },
+          plugin: { type: 'string', required: true },
+          phase: { type: 'string', required: true },
+          marker: { type: 'string', required: true },
+          allowCrossCli: { type: 'boolean', required: true },
         },
-        required: ['ok', 'plugin', 'phase', 'marker', 'allowCrossCli'],
       },
       render: (_args, value) => [
         {

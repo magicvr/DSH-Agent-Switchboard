@@ -1,4 +1,4 @@
-# 架构设计
+﻿# 架构设计
 
 > **状态：草案。** 本文描述的是**目标形态**，不是已实现的形态。带「待定」标记的地方都还没有结论。
 
@@ -56,13 +56,19 @@
     - 但运行时由 dsh 安装处以「**双锚点解析**」供给（官方措辞：module resolution is two-anchor by construction — 先从 dsh 安装的 launcher 包解析，再从 profile 解析），并由 `dsh-app-boot` 把这套解析注入 Node 的 ESM/CJS 解析器。
     - **教训：不要用「磁盘上能不能找到」来判断插件能否 import 某个包。**
 
-12. **`dsh-tools` 的 `output.schema` 只接受受限 JSON Schema 子集，`required` 必须是字符串数组。**
-    - 合法关键字仅：`type` / `oneOf` / `properties` / `required` / `additionalProperties` / `items` / `enum` / `const`，外加注解 `description` / `title` / `default` / `examples`。其他任何键都被拒绝。
-    - `required` **只允许出现在 `type: "object"` 的节点上**，且必须是**属性名字符串数组**：`required: ['a','b']`。
-    - 写成字段级布尔标记 `{ a: { type: 'string', required: true } }` 会报
-      `schema.properties.a.required is not supported on type "string"`。
-    - ⚠️ **极易踩的坑**：`parameters` 用的是**另一套**更宽松的 schema 规格（那里字段级 `required: true` 是合法的），而 `output.schema` 用这一套。同一份工具定义里两套规则并存。`dsh-tool-todo` 的 `lib/index.js` 里形如 `output: { schema: { … required: true … } }` 的片段是 **JSDoc 注释里的文档示例，不是可运行代码**——照抄它就会踩这个坑（本插件第一版正是如此失败的）。
-    - 校验器实现位置：`dsh-tools/lib/index.js` 的 `checkSchemaNode` / `checkObjectSchemaTail` / `assertSupportedJsonSchema`。
+12. **工具 schema 是「两层」的：`defineTool` 的 value schema DSL，编译后才交给受限 JSON Schema 子集校验器。**
+    - **第一层（写代码时面对的那层）**：`output.schema` 是 **value schema DSL**，必需性用**属性级 `required: true`** 表达。对象级 `required: [...]` 在这层**非法**，报 `schema.required is not supported by the value schema DSL`。
+    - **第二层（编译器产出的那层）**：DSL 编译产物（普通 JSON Schema）再被 `assertSupportedJsonSchema` 校验。该层合法关键字仅 `type` / `oneOf` / `properties` / `required` / `additionalProperties` / `items` / `enum` / `const` + 注解 `description` / `title` / `default` / `examples`；`required` 只允许出现在 `type: "object"` 节点上，且必须是**属性名字符串数组**。
+    - `object` 节点的 DSL 白名单只有：注解 + `type` + `properties` + `additionalProperties`（**不含 `required`**），且 `additionalProperties` **必须显式给出 `true` 或 `false`**。
+    - 属性上的 `required` **只能是 `true`**（写 `false` 报 `must be true when present`）。
+    - **DSL 会自动把属性级 `required: true` 装配成对象级 `required` 数组**（`property-map` / `property-map-tail`）。因此手写那个数组等于手写编译产物，必然失败。
+    - ⚠️ **本插件为此连错两次，方向相反**：第一版写属性级 `required: true`，却把这一层误判成裸 JSON Schema 而去“修正”，第二版改成对象级 `required: [...]`，反而破坏 DSL。正确写法是只写 DSL 输入，**不要写对象级 `required`**：
+      ```js
+      output: { schema: { type: 'object', additionalProperties: false,
+        properties: { ok: { type: 'boolean', required: true } } } }
+      ```
+    - 校验器实现位置：`dsh-tools/lib/index.js` 的 `runSchemaCompiler` / `assertAuthorKeys` / `property-map` / `property-map-tail`（DSL 层）与 `checkSchemaNode` / `checkObjectSchemaTail` / `assertSupportedJsonSchema`（子集层）。
+    - **验证方法教训**：只对「编译产物」跑子集校验器**不够**，会漏掉 DSL 层错误。必须**两层都验**，并用已知错误写法做回归对照，确认预检本身有效。
 
 ### 3.2 一条误导性的诊断信息（重要）
 
