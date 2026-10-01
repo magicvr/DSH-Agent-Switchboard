@@ -62,7 +62,11 @@ section('toolConfigFor：模型与强度进 agentOptions');
   check('agentOptions.model', cfg.agentOptions.model === 'gpt-6.1-sol');
   check('agentOptions.reasoningEffort', cfg.agentOptions.reasoningEffort === 'high');
   check('persona = instructions', cfg.persona === 'i');
-  check('禁止嵌套 → maxDepth 0', cfg.maxDepth === 0);
+  check(
+    '禁止嵌套 → maxDepth 1（本层可派发，子代理不可再派）',
+    cfg.maxDepth === 1,
+    `实际 ${cfg.maxDepth}；注意 0 会连第一层派发都拒绝`,
+  );
   check('backgroundMode one-shot', cfg.backgroundMode === 'one-shot');
   check('非只读 → 无 toolFilter', cfg.toolFilter === undefined);
 }
@@ -81,17 +85,31 @@ section('只读角色：写入类工具被 deny');
   check('edit 被 deny', denied.has('edit'));
   check('pwsh 被 deny', denied.has('pwsh'));
   check('deny 列表即 WRITE_TOOLS', denied.size === WRITE_TOOLS.length);
+  check(
+    '只读且禁止嵌套 → maxDepth 仍为 1（只读不等于不可派发）',
+    cfg.maxDepth === 1,
+    `实际 ${cfg.maxDepth}`,
+  );
 }
 
-section('允许嵌套：maxDepth 用传入值');
+section('深度语义：绝对深度而非相对层数');
 {
-  const { role } = normalizeRole(
-    { id: 'lead', description: 'd', model: 'm', instructions: 'i', allowNestedDispatch: true },
-    0,
-    'p',
-  );
-  const cfg = toolConfigFor(role, { maxDepth: 5 });
-  check('maxDepth = 5', cfg.maxDepth === 5);
+  // 依据 dsh-subagent 的 resolveChildDepth：childDepth = parentDepth + 1，
+  // 顶层代理 parentDepth 为 0，故第一个子代理深度为 1。
+  // 这条断言锁住「maxDepth 不能为 0」这个曾被写错、且实测会拒绝派发的语义。
+  const mk = (allowNestedDispatch) =>
+    normalizeRole({ id: 'r', description: 'd', model: 'm', instructions: 'i', allowNestedDispatch }, 0, 'p')
+      .role;
+
+  const noNest = toolConfigFor(mk(false), { maxDepth: 3 });
+  check('禁止嵌套 → 1', noNest.maxDepth === 1, `实际 ${noNest.maxDepth}`);
+  check('禁止嵌套时绝不为 0（0 会拒绝第一层派发）', noNest.maxDepth !== 0);
+
+  const nest = toolConfigFor(mk(true), { maxDepth: 5 });
+  check('允许嵌套 → 1 + maxDepth = 6', nest.maxDepth === 6, `实际 ${nest.maxDepth}`);
+
+  const nestZero = toolConfigFor(mk(true), { maxDepth: 0 });
+  check('允许嵌套但 maxDepth 为 0 → 仍为 1', nestZero.maxDepth === 1, `实际 ${nestZero.maxDepth}`);
 }
 
 section('省略 effort 时不写入 reasoningEffort');

@@ -170,7 +170,7 @@ export function normalizeRoles(rawRoles, defaultProvider) {
  *
  * @param {Role} role - 规范化后的角色。
  * @param {object} options - 全局选项。
- * @param {number} options.maxDepth - 该角色的派发深度上限。
+ * @param {number} options.maxDepth - 允许嵌套时，**额外**可用的层数。
  * @returns {object} `dsh-tool-subagent` 的 Config。
  */
 export function toolConfigFor(role, { maxDepth }) {
@@ -188,11 +188,19 @@ export function toolConfigFor(role, { maxDepth }) {
     backgroundMode: 'one-shot',
   };
 
-  // 深度策略：
-  //  - 禁止嵌套 → maxDepth: 0（provider 会据此拒绝再派发）
-  //  - 允许嵌套 → 交给插件的 maxDepth 设置
-  // 注意：`dsh-tool-subagent` 要求 provider 具备 depthLimit 能力，spawn/fork 都有。
-  config.maxDepth = role.allowNestedDispatch ? maxDepth : 0;
+  // 深度上限是**绝对深度**，不是「相对嵌套层数」。
+  //
+  // 依据 dsh-subagent 的 resolveChildDepth：
+  //     const childDepth = delegationDepthOf(parent) + 1;
+  //     if (maxDepth !== void 0 && childDepth > maxDepth) throw new SubagentDepthError(childDepth, maxDepth);
+  // 顶层代理的 delegationDepthOf 为 0，因此**它派出的第一个子代理深度就是 1**。
+  // 这意味着 maxDepth: 0 会连第一层派发都拒绝（实测报错
+  // `subagent depth 1 exceeds maxDepth 0`），而不是「禁止子代理再往下派」。
+  //
+  // 因此：
+  //   - 禁止嵌套 → 1（本层可派发，但子代理不能再派）
+  //   - 允许嵌套 → 1 + maxDepth（额外给出 maxDepth 层）
+  config.maxDepth = role.allowNestedDispatch ? 1 + maxDepth : 1;
 
   if (role.readOnly) {
     config.toolFilter = { deny: [...WRITE_TOOLS] };
