@@ -84,6 +84,8 @@ export function classifyRun({ exitCode, signal, timedOut }) {
  *
  * 回传内容刻意包含：
  *   - 角色与路由事实（证明「配置真的被 CLI 接受了」，而非只是本插件以为如此）；
+ *   - **派发线路摘要**（`route`），措辞与系统提示词里的路由指引一致 ——
+ *     这样主代理能把「我派给的角色本该走哪条线路」与「实际走了哪条」对上；
  *   - 正文；
  *   - 失败时的退出码与 stderr 尾部（不截断到看不出原因的长度）。
  *
@@ -91,6 +93,7 @@ export function classifyRun({ exitCode, signal, timedOut }) {
  * @param {string} input.roleId - 角色 id。
  * @param {string} input.command - 实际执行的命令（可执行文件或 node）。
  * @param {readonly string[]} input.argv - 实际执行的 argv（用于审计，证明无 shell）。
+ * @param {string} [input.routeSummary] - 线路摘要，形如 `backend=cli(codex) model=… effort=…`。
  * @param {number | null} input.exitCode - 退出码。
  * @param {NodeJS.Signals | null} [input.signal] - 终止信号。
  * @param {boolean} [input.timedOut] - 是否超时。
@@ -105,6 +108,7 @@ export function formatRunResult(input) {
     roleId,
     command,
     argv,
+    routeSummary,
     exitCode,
     signal,
     timedOut,
@@ -119,6 +123,10 @@ export function formatRunResult(input) {
 
   const lines = [];
   lines.push(`[switchboard] role=${roleId} backend=cli command=${command}`);
+  // 线路摘要与系统提示词里的措辞一致，便于主代理对照「本该走哪条」与「实际走哪条」。
+  if (typeof routeSummary === 'string' && routeSummary.length > 0) {
+    lines.push(`[switchboard] 线路=${routeSummary}`);
+  }
   lines.push(`[switchboard] argv=${JSON.stringify(argv)}`);
   lines.push(
     `[switchboard] exit=${exitCode === null ? 'null' : exitCode}` +

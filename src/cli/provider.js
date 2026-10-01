@@ -111,6 +111,14 @@ export function createCliProvider({
   spawn,
   resolveExecutable,
   timeoutMs,
+  /**
+   * 线路摘要，形如 `backend=cli(codex) model=… effort=…`，会出现在回传日志里。
+   *
+   * ⚠️ **由调用方传入，不在本模块里算**：`routeSummaryFor` 住在 `roles.js`，
+   * 而 `roles.js` 已经 import 了本模块（它要用 `createCliProvider`）—— 在这里再
+   * import 回去就成环。交给调用方（它本来就有 role 与那个函数）是最省事且无环的做法。
+   */
+  routeSummary,
   now = () => Date.now(),
 }) {
   const cli = role.cli;
@@ -277,6 +285,9 @@ export function createCliProvider({
         roleId: role.id,
         command: invocation.argv[0],
         argv: invocation.argv,
+        // 与系统提示词里的路由指引**同一套措辞**，这样主代理能把
+        // 「本该走哪条线路」与「实际走了哪条」直接对上。由调用方传入（避免循环依赖）。
+        routeSummary,
         exitCode: outcome.exitCode,
         signal: outcome.signal,
         timedOut: timedOutByUs || request.signal?.aborted === true,

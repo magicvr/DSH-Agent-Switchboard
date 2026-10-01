@@ -410,10 +410,73 @@ export function roleGuidanceText(roles) {
     const flags = [];
     if (role.readOnly) flags.push('read-only');
     flags.push(role.allowNestedDispatch ? 'may delegate further' : 'cannot delegate further');
+    // **派发机制与模型必须在决策前可见**。
+    //
+    // 为什么放进提示词：工具描述里虽然有一句「后端：cli」，但那要调用时才进入上下文；
+    // 而主代理在**选择**派给谁的时候看不到任何线路信息，也无从知道自己该不该预期一次
+    // 外部进程调用。跨 CLI 端到端实验暴露了这个不对称。
+    //
+    // 只放线路与模型这类**路由事实**，不放 `instructions` 正文（那是 persona 的事，
+    // 放进来会显著抬高主代理的上下文成本 —— 有回归断言守住这一点）。
+    const route = routeSummaryFor(role);
+    if (route.length > 0) flags.push(route);
     lines.push(`- **${role.id}**${role.title ? ` (${role.title})` : ''} — ${role.description.trim()}`);
     lines.push(`  \`${role.toolName}\` · ${flags.join(' · ')}`);
   }
   lines.push('');
   lines.push('Report what the results establish, not the raw process.');
   return lines.join('\n');
+}
+
+/**
+ * 一句话描述某个角色的派发线路（后端 + 模型 + 强度），供路由指引使用。
+ *
+ * 措辞刻意简短：这是给主代理的**决策依据**，不是给用户看的说明文档。
+ *
+ * @param {object} role - 规范化后的角色。
+ * @returns {string} 形如 `backend=cli(codex) model=gpt-6-luna effort=medium`；信息不足时返回空串。
+ */
+export function routeSummaryFor(role) {
+  if (role === null || typeof role !== 'object') return '';
+  const parts = [];
+  if (role.backend === CLI_BACKEND) {
+    const cliName = cliLabelOf(role);
+    parts.push(`backend=cli${cliName === undefined ? '' : `(${cliName})`}`);
+  } else {
+    parts.push(`backend=${role.backend}`);
+  }
+  if (typeof role.model === 'string' && role.model.length > 0) parts.push(`model=${role.model}`);
+  if (typeof role.effort === 'string' && role.effort.length > 0) parts.push(`effort=${role.effort}`);
+  return parts.join(' ');
+}
+
+/**
+ * 从一个 CLI 角色推断它用的是哪个 CLI（**仅用于展示**，不参与执行）。
+ *
+ * 判据是 `cli.command` 的基名：预设驱动把它填成 `grok`，或 `node`（codex 的可用入口
+ * 是 `node <codex.js>`，此时从 `prefixArgs` 里认脚本名）。
+ *
+ * **宁可不说，也不要显示一个可能错的 CLI 名** —— 因此推断不出时返回 undefined，
+ * 指引里就只显示 `backend=cli`。这条原则来自本项目的既有教训：错误的诊断信息比没有
+ * 诊断信息更糟（见 architecture.md 关于「误导性报错」的记录）。
+ *
+ * @param {object} role - 规范化后的角色。
+ * @returns {string|undefined} CLI 名，推断不出时为 undefined。
+ */
+function cliLabelOf(role) {
+  const command = role?.cli?.command;
+  if (typeof command !== 'string' || command.length === 0) return undefined;
+  // ⚠️ **先取基名再判断**。`normalizeRole` 已经把 `{node}` 解析成绝对路径
+  // （实测为 `C:\Program Files\nodejs\node.EXE`），因此直接对整串做
+  // `/^node$/i` 会匹配失败，转而把 `node` 当成 CLI 名显示出来 ——
+  // 那是一条**误导性**的路由信息（worker 明明是 codex）。
+  const base = (command.split(/[\\/]/).pop() ?? '').replace(/\.(exe|cmd|bat|ps1)$/i, '');
+  if (/^node$/i.test(base)) {
+    // `node <script>` 形态：从 prefixArgs 里认脚本名（codex 的可用入口就是这样）。
+    const script = (role.cli.prefixArgs ?? []).find((a) => typeof a === 'string' && a.length > 0);
+    if (typeof script !== 'string') return undefined;
+    if (/codex/i.test(script)) return 'codex';
+    return undefined;
+  }
+  return base.length > 0 ? base : undefined;
 }

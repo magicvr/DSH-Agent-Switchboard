@@ -195,6 +195,33 @@ section('argv 与 stdio：promptFile 模式');
   check('promptFile 模式：运行结束后临时文件已清理', path !== undefined && !existsSync(path), String(path));
 }
 
+section('回传日志必须让主代理看得出「走了哪条线路」');
+{
+  // ⚠️ 主代理需要把「角色本该走哪条线路」与「实际走了哪条」对上。因此日志里要有一行
+  //    线路摘要，且措辞与系统提示词的 `routeSummaryFor` 一致（同一套措辞才能对照）。
+  const { spawn } = makeSpawn({ stdout: 'BODY' });
+  const p = createCliProvider({
+    role: codexRole(),
+    spawn,
+    routeSummary: 'backend=cli(codex) model=gpt-6-luna effort=medium',
+  });
+  const result = await (await p.start({ prompt: textPrompt('t') })).result;
+  const text = result.output[0].text;
+  check('日志含线路摘要行', text.includes('[switchboard] 线路=backend=cli(codex)'), text.slice(0, 240));
+  check('线路摘要含模型', text.includes('model=gpt-6-luna'), text.slice(0, 240));
+  check('日志仍含 role 行', text.includes('[switchboard] role='), text.slice(0, 240));
+
+  // 未提供摘要时不得出现半截的 `线路=undefined`（退化输入）。
+  const { spawn: spawn2 } = makeSpawn({ stdout: 'BODY' });
+  const p2 = createCliProvider({ role: codexRole(), spawn: spawn2 });
+  const text2 = (await (await p2.start({ prompt: textPrompt('t') })).result).output[0].text;
+  check('未提供摘要时不输出 undefined', !text2.includes('[switchboard] 线路=undefined'), text2.slice(0, 200));
+  check(
+    '未提供摘要时日志仍完整',
+    text2.includes('[switchboard] role=') && text2.includes('[switchboard] argv='),
+  );
+}
+
 section('路由事实被抽入 structured 与正文');
 {
   const stderr = [

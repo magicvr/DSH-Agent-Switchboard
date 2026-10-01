@@ -352,4 +352,45 @@
 
 ## 7. 可观测性
 
-每次派发记录：任务标识、角色、后端线路、起止时间、退出状态、结果摘要。用途是让你能回答「这件事到底是谁做的、花了多久、成功没有」。
+每次派发记录：任务标识、角色、后端线路、起止时间、退出状态、结果摘要。用途是你能回答「这件事到底是谁做的、花了多久、成功没有」。
+
+### 7.1 「调度日志进主代理可见输出」的现状（已实现，含一处固有限制）
+
+**决策前可见** —— `roleGuidanceText()` 注入系统提示词，每个角色那两行现在带**线路摘要**
+（`routeSummaryFor()`）：
+
+```text
+  `delegate_to_worker` · may delegate further · backend=cli(codex) model=gpt-6.1-sol effort=high
+  `delegate_to_architect` · read-only · cannot delegate further · backend=spawn model=gpt-6-astra effort=medium
+```
+
+⚠️ **为什么必须放进提示词**：工具描述里虽然也有一句「后端：cli」，但那要**调用时**才进入
+上下文；主代理在**选择**派给谁的时候看不到任何线路信息。这个不对称是跨 CLI 端到端实验
+暴露的。只放线路与模型这类路由事实，**不放 `instructions` 正文**（有回归断言守住，
+它是 persona 的内容，放进来会显著抬高主代理的上下文成本）。
+
+`cliLabelOf()` 只对**能确定**的 CLI 给出名字（`grok`；`node` + `codex.js` → `codex`），
+推断不出时只显示 `backend=cli` —— **宁可不说，也不要显示可能错的线路名**。
+（实测踩到：`{node}` 被解析成绝对路径后，整串匹配失败，曾把 worker 显示成 `cli(node)`。）
+
+**决策后可见** —— CLI 路径的 `[switchboard]` 日志是**回传内容的一部分**
+（`formatRunResult()` → `output[0].text`），因此主代理确实看得到，不是只进日志：
+
+```text
+[switchboard] role=worker backend=cli command=…\node.EXE
+[switchboard] 线路=backend=cli(codex) model=gpt-6.1-sol effort=high   ← 与提示词同一套措辞
+[switchboard] argv=[…]                                               ← 证明无 shell、参数可审计
+[switchboard] exit=0 duration=28.6s
+[switchboard] cli-route {"model":"gpt-6.1-sol",…}                    ← CLI **自报**的生效路由
+```
+
+`线路=` 与提示词里的摘要**同源同措辞**，主代理可直接对照「本该走哪条」与「实际走了哪条」。
+
+**固有限制：内置后端（`spawn` / `fork`）没有等价的返回日志。**
+`dsh-tool-subagent` 回传时是 `output: result.output`（原样透传子代理输出），
+本插件**没有可注入的位置**。因此内置角色只能靠「提示词里写明了它走 `backend=spawn`」
+来知情，拿不到 `model` 是否真的生效这种自报事实 —— 那是 CLI 特有的能力
+（只有 codex 会把路由打印到 stderr）。
+
+设计取舍：**不为了形式上的对称去伪造一条内置后端日志**。宁可如实说明这条不对称，
+也不输出无法验证的「看起来在汇报」的行。

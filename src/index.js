@@ -29,6 +29,7 @@ import {
   normalizeRoles,
   planCliMounts,
   roleGuidanceText,
+  routeSummaryFor,
   toolConfigFor,
 } from './roles.js';
 import { createCliProvider } from './cli/provider.js';
@@ -907,6 +908,8 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
         spawn: (spec) => safeSpawn(ctx, spec),
         resolveExecutable: (command, env, signal) => ctx.subprocess.resolveExecutable(command, env, signal),
         timeoutMs: cliTimeoutSec * 1000,
+        // 与系统提示词里的路由指引同一套措辞，让主代理能对照「本该走哪条」与「实际走哪条」。
+        routeSummary: routeSummaryFor(role),
       });
       ctx.subagents.registerProvider(provider);
       diagnostics.providers.push({ id: role.id, name: provider.name, ok: true, detail: '已注册' });

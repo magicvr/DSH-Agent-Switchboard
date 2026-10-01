@@ -7,6 +7,7 @@ import {
   normalizeRoles,
   planCliMounts,
   roleGuidanceText,
+  routeSummaryFor,
   toolConfigFor,
   toolDescriptionFor,
 } from '../src/roles.js';
@@ -230,7 +231,59 @@ section('枚举一致性');
   check('EFFORT_VALUES 与 DSH 取值一致', EFFORT_VALUES.join(',') === 'low,medium,high,xhigh,max');
 }
 
-section('roleGuidanceText：路由指引');
+section('routeSummaryFor：派发线路必须在**决策前**可见');
+{
+  // ⚠️ 背景：工具描述里有「后端：cli」，但那要调用时才进上下文；主代理在**选择**派给谁
+  //    时看不到任何线路信息。跨 CLI 端到端实验暴露了这个不对称，本组断言锁住修复。
+  const builtin = { id: 'a', backend: 'spawn', model: 'gpt-6-astra', effort: 'medium' };
+  const s1 = routeSummaryFor(builtin);
+  check('内置角色含 backend', s1.includes('backend=spawn'), s1);
+  check('内置角色含 model', s1.includes('model=gpt-6-astra'), s1);
+  check('内置角色含 effort', s1.includes('effort=medium'), s1);
+
+  // CLI 角色：CLI 名要从**解析后**的 command 基名推断（normalizeRole 会解析 {node}）。
+  const grok = { id: 'b', backend: 'cli', model: 'grok-4.7', effort: 'low', cli: { command: 'grok', prefixArgs: [] } };
+  check('CLI 角色标注 cli(grok)', routeSummaryFor(grok).includes('backend=cli(grok)'), routeSummaryFor(grok));
+
+  const codex = {
+    id: 'c',
+    backend: 'cli',
+    model: 'gpt-6-luna',
+    effort: 'high',
+    // 实测形态：{node} 被解析成绝对路径，脚本名在 prefixArgs 里。
+    cli: { command: 'C:\\Program Files\\nodejs\\node.EXE', prefixArgs: ['C:\\npm\\node_modules\\@openai\\codex\\bin\\codex.js'] },
+  };
+  const s3 = routeSummaryFor(codex);
+  check(
+    'node + codex.js 形态标注 cli(codex)，而不是 cli(node)',
+    s3.includes('backend=cli(codex)'),
+    s3,
+  );
+  check('不把 node 当成 CLI 名（误导性路由信息）', !s3.includes('cli(node)'), s3);
+
+  // 推断不出时只显示 backend=cli —— 宁可不说，也不要显示可能错的名字。
+  const unknown = { id: 'd', backend: 'cli', cli: { command: 'C:\\x\\mystery.exe', prefixArgs: [] } };
+  check('带路径的未知命令用其基名', routeSummaryFor(unknown).includes('backend=cli(mystery)'), routeSummaryFor(unknown));
+  const nodeNoScript = { id: 'e', backend: 'cli', cli: { command: 'node', prefixArgs: [] } };
+  check(
+    'node 且无脚本名时只给 backend=cli（不猜）',
+    routeSummaryFor(nodeNoScript).includes('backend=cli') && !routeSummaryFor(nodeNoScript).includes('('),
+    routeSummaryFor(nodeNoScript),
+  );
+
+  // 退化输入不得抛错。
+  for (const bad of [null, undefined, 42, 'x', {}]) {
+    let threw = false;
+    try {
+      routeSummaryFor(bad);
+    } catch {
+      threw = true;
+    }
+    check(`退化输入 ${JSON.stringify(bad) ?? 'undefined'} 不抛错`, !threw);
+  }
+}
+
+section('roleGuidanceText：每个角色必须带线路信息，且不泄漏 instructions');
 {
   check('无角色时返回空串（不注册空提示）', roleGuidanceText([]) === '');
 
