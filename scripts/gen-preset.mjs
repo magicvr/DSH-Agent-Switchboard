@@ -1,0 +1,285 @@
+// 生成 Switchboard 的 Agent preset 声明文件。
+//
+// 方案 A：复制 `standard` 的**完整**插件清单，再叠加本插件。
+//
+// 为什么用「文本行复制」而不是 YAML 序列化：
+//   `standard.patch.yml` 里有 `disabled: !!js process.platform === 'win32'` 这类表达式。
+//   `yaml` 库解析后会把 `!!js` 变成**普通字符串**，再序列化就得到
+//   `disabled: process.platform === 'win32'` —— 一个非空字符串在 YAML 里是真值，
+//   于是「Windows 上禁用 bash、非 Windows 上禁用 pwsh」这条规则会**静默反转**。
+//   为保住标签，这里逐行搬运原文并只调整缩进。
+//
+// 用法：
+//   node scripts/gen-preset.mjs            写入 presets/switchboard.patch.yml
+//   node scripts/gen-preset.mjs --check     只比对漂移，不写盘
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { execFileSync } from 'node:child_process';
+
+const ROOT = process.cwd();
+// 用裸说明符由 Node 自行解析入口（`yaml` 的入口不是 index.js）。
+const { parse } = await import('yaml');
+
+const STANDARD_ENTRY = 'dsh/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml';
+const PRESET_ID = 'preset-switchboard';
+const PRESET_KEY = 'switchboard';
+const SELF_PACKAGE = '@magicvr/dsh-agent-switchboard';
+const OUT_FILE = join(ROOT, 'presets', 'switchboard.patch.yml');
+
+/**
+ * 读取归档内某个文件的文本（复用只读探针 dsh-cat.mjs）。
+ *
+ * @param {string} asarPath - 归档内路径。
+ * @returns {string} 文件文本。
+ */
+function cat(asarPath) {
+  return execFileSync(process.execPath, [join(ROOT, 'scripts', 'dsh-cat.mjs'), asarPath], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
+/** standard preset 的原始文本。 */
+const standardText = cat(STANDARD_ENTRY);
+
+/**
+ * 从一段「plugins:」列表中抽出每个**顶层列表项**的原始文本行。
+ *
+ * 顶层项以 `- ` 起始，属于它的后续行缩进更深。这样能完整保留 `config:`、
+ * `disabled: !!js ...`、`group:` 等嵌套结构，而不经过任何序列化。
+ *
+ * @param {string} text - 含 plugins 列表的 YAML 文本。
+ * @returns {{ header: string[], entries: string[][] }} 列表前导行与各项行数组。
+ */
+function extractPluginEntries(text) {
+  const lines = text.split('\n');
+  const start = lines.findIndex((l) => /^\s*plugins:\s*$/.test(l));
+  if (start === -1) throw new Error('在 standard patch 里找不到 plugins: 列表');
+
+  // plugins: 之后、第一个 `- ` 之前的行（可能为空）
+  let first = start + 1;
+  while (first < lines.length && !/^\s*- /.test(lines[first])) first++;
+  const header = lines.slice(start + 1, first).filter((l) => l.trim().length > 0);
+
+  const baseIndent = /^(\s*)- /.exec(lines[first])[1].length;
+  const entries = [];
+  let current = null;
+  for (let i = first; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim().length === 0) {
+      if (current) current.push('');
+      continue;
+    }
+    const indent = line.length - line.trimStart().length;
+    const isNew = /^\s*- /.test(line) && indent === baseIndent;
+    if (isNew) {
+      if (current) entries.push(current);
+      current = [line];
+    } else if (current) {
+      current.push(line);
+    } else {
+      // 已是下一个顶层键（不在任何列表项内）
+      break;
+    }
+  }
+  if (current) entries.push(current);
+  return { header, entries, baseIndent };
+}
+
+/**
+ * 把一个条目的行重新缩进到目标层级。
+ *
+ * @param {string[]} entryLines - 原始行。
+ * @param {number} fromIndent - 原始顶层缩进。
+ * @param {number} toIndent - 目标顶层缩进。
+ * @returns {string[]} 重新缩进后的行。
+ */
+function reindent(entryLines, fromIndent, toIndent) {
+  const shift = toIndent - fromIndent;
+  return entryLines.map((line) => {
+    if (line.trim().length === 0) return '';
+    const indent = line.length - line.trimStart().length;
+    const next = Math.max(0, indent + shift);
+    return ' '.repeat(next) + line.trimStart();
+  });
+}
+
+const { header, entries, baseIndent } = extractPluginEntries(standardText);
+
+// 目标缩进：preset 文件里 plugins 项的 `- ` 位于第 10 列（与官方 preset 同构）。
+const TARGET_INDENT = 10;
+
+const rawEntries = entries.map((e) => e.join('\n')).join('\n');
+const parsedStandard = parse(standardText);
+const standardPlugins = parsedStandard[0].insert[0].config.plugins;
+
+if (entries.length !== standardPlugins.length) {
+  console.error(
+    `FAIL  文本抽取的条目数(${entries.length}) 与解析出的插件数(${standardPlugins.length}) 不一致`,
+  );
+  process.exit(1);
+}
+
+// 本插件自身的条目：放在最前，便于阅读。
+const selfEntry = [
+  '- id: switchboard-roles',
+  `  name: '${SELF_PACKAGE}'`,
+];
+
+/**
+ * 对复制来的标准清单行做**定点修改**。
+ *
+ * 只做必要的一处：禁用 standard 的通用委派工具 `tool-subagent` / `tool-subagent-fork`。
+ *
+ * 理由：本插件的设计意图是「主代理只通过角色工具派发」。若同时提供 standard 的
+ * 通用 `subagent` / `subagent_fork`，主代理面对多个角色工具 + 通用工具时很可能
+ * 选通用那个（它描述更笼统、看起来更灵活），角色分工就被架空了。
+ * 保留 `tool-subagent-control` 与 `list-agents`：它们提供 send_message /
+ * interrupt_agent / list_agents，对管理已派发的子代理仍然必要。
+ *
+ * ⚠️ 必须对**行**操作而不是对「顶层条目」操作：这两个插件嵌在 `delegation` 组的
+ * `config:` 内部，不属于顶层条目 —— 按顶层条目遍历会一个都匹配不到（第一版就是
+ * 这样静默失效的，`改动：（无）` 就是线索）。
+ *
+ * 其余条目一律照搬，避免在本插件里重复表述 standard 的策略。
+ *
+ * @param {string[]} lines - 已重新缩进的标准清单行。
+ * @returns {{ lines: string[], patched: string[] }} 修改后的行与被禁用的 id。
+ */
+function disableGenericDelegationTools(lines) {
+  const targetIds = new Set(['tool-subagent', 'tool-subagent-fork']);
+  const patched = [];
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    out.push(line);
+    const m = /^(\s*)- id:\s*(\S+)\s*$/.exec(line);
+    if (!m || !targetIds.has(m[2])) continue;
+    // 该条目的后续行里若已有 disabled，则不动它（可能带 !!js 条件）。
+    let hasDisabled = false;
+    for (let j = i + 1; j < lines.length; j++) {
+      const next = lines[j];
+      if (next.trim().length === 0) continue;
+      const indent = next.length - next.trimStart().length;
+      if (indent < m[1].length) break;
+      if (new RegExp(`^\\s{${m[1].length}}disabled:`).test(next)) {
+        hasDisabled = true;
+        break;
+      }
+    }
+    if (!hasDisabled) {
+      patched.push(m[2]);
+      // ⚠️ 缩进必须与同项的其它**映射键**对齐，即 `- ` 之后再加 2 列。
+      // 用 `- ` 自身的缩进会让该键落在序列标记那一列，YAML 报
+      // "All mapping items must start at the same column"。
+      out.push(`${' '.repeat(m[1].length + 2)}disabled: true`);
+    }
+  }
+  return { lines: out, patched };
+}
+
+const { lines: copiedLines, patched: patchedIds } = disableGenericDelegationTools(
+  entries.flatMap((e) => reindent(e, baseIndent, TARGET_INDENT)),
+);
+
+const pluginLines = [
+  ...reindent(selfEntry, 0, TARGET_INDENT),
+  ...copiedLines,
+];
+
+const body = [
+  '# Switchboard 的 Agent preset 声明。',
+  '#',
+  '# ⚠️ 本文件由 scripts/gen-preset.mjs **生成**，不要手工编辑：',
+  '#   插件清单整体复制自 @deepseek-ai/dsh-web-app/presets/standard.patch.yml，',
+  '#   以便随 DSH 升级保持一致；`npm run check:preset` 会比对漂移。',
+  '#',
+  '# 逐行搬运而非 YAML 序列化，是为了保住 `disabled: !!js ...` 表达式标签 ——',
+  '# 序列化会把标签降级成普通字符串，使 `disabled` 恒为真。',
+  '- insert:',
+  `    - id: ${PRESET_ID}`,
+  `      name: '@deepseek-ai/dsh-agent-preset'`,
+  '      config:',
+  `        id: ${PRESET_KEY}`,
+  '        name: Switchboard',
+  '        description: 主代理只做信息统合，把工作派给带角色的子代理（含跨 CLI）。',
+  '        order: 50',
+  '        plugins:',
+  ...pluginLines,
+  '',
+].join('\n');
+
+// 断言：原文里的 !!js 表达式必须一字不少地带过来。
+// ⚠️ 只统计**非注释行** —— 文件头注释里提到了 `!!js`，全文计数会把它算进来，
+// 造成假失败（第一版就是这样）。
+const countJsTags = (text) =>
+  text
+    .split('\n')
+    .filter((l) => !l.trimStart().startsWith('#'))
+    .join('\n')
+    .match(/!!js /g)?.length ?? 0;
+
+const jsTagsIn = countJsTags(standardText);
+const jsTagsOut = countJsTags(body);
+console.log(`standard 插件数: ${standardPlugins.length}`);
+console.log(`本插件条目: 1，合计 ${standardPlugins.length + 1}`);
+console.log(`!!js 表达式（非注释行）: 原文 ${jsTagsIn} 个 → 产物 ${jsTagsOut} 个`);
+if (jsTagsIn !== jsTagsOut) {
+  console.error('FAIL  !!js 表达式数量不一致 —— 标签可能被破坏');
+  process.exit(1);
+}
+console.log('PASS  !!js 表达式全部保留');
+
+// 产物必须仍能被解析，且插件数与预期一致。
+let produced;
+try {
+  produced = parse(body);
+} catch (error) {
+  console.error(`FAIL  产物无法解析：${error.message}`);
+  process.exit(1);
+}
+const producedPlugins = produced[0].insert[0].config.plugins;
+if (producedPlugins.length !== standardPlugins.length + 1) {
+  console.error(`FAIL  产物插件数 ${producedPlugins.length} 不符（期望 ${standardPlugins.length + 1}）`);
+  process.exit(1);
+}
+if (!producedPlugins.some((p) => p.name === SELF_PACKAGE)) {
+  console.error('FAIL  产物未引用本包');
+  process.exit(1);
+}
+console.log('PASS  产物可解析、插件数正确、含本包');
+console.log(
+  patchedIds.length > 0
+    ? `改动：禁用 standard 的通用委派工具 ${patchedIds.join(', ')}（避免架空角色分工）`
+    : '改动：（无）',
+);
+
+// 漂移检测：与已落盘的产物比对插件名序列。
+let drift = false;
+if (existsSync(OUT_FILE)) {
+  const existing = parse(readFileSync(OUT_FILE, 'utf8'));
+  const existingNames = existing[0].insert[0].config.plugins.map((p) => p.name);
+  const producedNames = producedPlugins.map((p) => p.name);
+  if (JSON.stringify(existingNames) !== JSON.stringify(producedNames)) {
+    drift = true;
+    console.warn('\n⚠️  已落盘的 presets/switchboard.patch.yml 与当前 standard 清单**不一致**：');
+    console.warn(`    落盘 ${existingNames.length} 项，当前 standard ${producedNames.length} 项`);
+    const missing = producedNames.filter((n) => !existingNames.includes(n));
+    const extra = existingNames.filter((n) => !producedNames.includes(n));
+    if (missing.length) console.warn(`    应新增：${missing.join(', ')}`);
+    if (extra.length) console.warn(`    已移除：${extra.join(', ')}`);
+  } else {
+    console.log('\nPASS  无漂移（与当前 standard 清单一致）');
+  }
+} else {
+  console.log('\n（尚无落盘文件）');
+}
+
+if (process.argv.includes('--check')) {
+  console.log(drift ? '\n--check：存在漂移，需要重新生成。' : '\n--check：一致。');
+  process.exit(drift ? 1 : 0);
+}
+
+mkdirSync(dirname(OUT_FILE), { recursive: true });
+writeFileSync(OUT_FILE, body, 'utf8');
+console.log(`\n已写入 ${OUT_FILE}`);

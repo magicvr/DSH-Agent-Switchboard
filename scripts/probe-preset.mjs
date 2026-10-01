@@ -30,125 +30,156 @@ const PKG = '@magicvr/dsh-agent-switchboard';
 const PRESET_ID = 'preset-switchboard';
 
 /**
- * 生成 preset 声明块。
+ * 读取生成好的 preset 声明文件。
  *
- * 结构照抄官方 `dsh-web-app/presets/standard.patch.yml`：
- * 顶层是一个 patch **条目**（`- id:` 是 patch 条目的 id），
- * 其 `insert` 列表里再放真正的 preset 声明。
- *
- * ⚠️ 关键设计取舍：preset 的 `plugins` 是**完整的会话构成清单**，不是增量补丁。
- * 因此一个「最小」preset 会让会话几乎没有工具可用。这里先用**较简的一组**来验证
- * 机制本身是否通 —— 一旦确认 preset 能被识别、插件能在其作用域内生效，再决定
- * 是否复制 standard 的完整清单（或改用"根挂载 + 按 preset 判定惰性"的方案）。
- *
- * @param {string} pluginName - 插件包名。
- * @returns {string} YAML 文本（顶层数组条目）。
+ * ⚠️ 这里**不再内联**一份硬编码的插件清单：那会让 preset 出现两份真相
+ * （脚本里一份、presets/switchboard.patch.yml 一份），必然漂移。清单由
+ * scripts/gen-preset.mjs 从当前 standard 复制生成，本脚本只负责注入。
  */
-function presetBlock(pluginName) {
-  return [
-    `# Switchboard 预设：只在使用该预设的会话里挂载角色工具。`,
-    `- insert:`,
-    `    - id: preset-switchboard`,
-    `      name: '@deepseek-ai/dsh-agent-preset'`,
-    `      config:`,
-    `        id: switchboard`,
-    `        name: Switchboard`,
-    `        description: 主代理只做信息统合，把工作派给带角色的子代理（含跨 CLI）。`,
-    `        order: 50`,
-    `        plugins:`,
-    `          # 本插件自身。选中该 preset 的会话才会挂载角色工具。`,
-    `          - id: switchboard-roles`,
-    `            name: '${pluginName}'`,
-    `          # 会话要能干活，至少需要基础工具集。`,
-    `          - id: agent-instructions`,
-    `            name: '@deepseek-ai/dsh-agent-instructions'`,
-    `            config:`,
-    `              maxBytes: 65536`,
-    `          - id: tool-pwsh`,
-    `            name: '@deepseek-ai/dsh-tool-pwsh'`,
-    `          - id: tool-fs`,
-    `            name: '@deepseek-ai/dsh-tool-fs'`,
-    `          - id: tool-fs-search`,
-    `            name: '@deepseek-ai/dsh-tool-fs-search'`,
-    `          - id: tool-skill`,
-    `            name: '@deepseek-ai/dsh-tool-skill'`,
-    `          - id: skill-filesystem`,
-    `            name: '@deepseek-ai/dsh-skill-filesystem'`,
-    `          - id: tool-todo`,
-    `            name: '@deepseek-ai/dsh-tool-todo'`,
-    `            config:`,
-    `              allowParallelInProgress: true`,
-    `          - id: tool-ask-user`,
-    `            name: '@deepseek-ai/dsh-tool-ask-user'`,
-    `          - id: persona`,
-    `            name: '@deepseek-ai/dsh-persona'`,
-    `            config:`,
-    `              suffix: Your working directory is {{cwd}}.`,
-    `              prefix: You are a coding agent powered by the {{model}} model.`,
-    `          - id: tool-subagent-control`,
-    `            name: '@deepseek-ai/dsh-tool-subagent-control'`,
-    `          - id: tool-subagent-list-agents`,
-    `            name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'`,
-    `          - id: tool-subagent`,
-    `            name: '@deepseek-ai/dsh-tool-subagent'`,
-    `            config:`,
-    `              provider: spawn`,
-    `              toolName: subagent`,
-    `              backgroundMode: continuable`,
-    `          - id: tool-workflow`,
-    `            name: '@deepseek-ai/dsh-tool-workflow'`,
-    `            disabled: true`,
-    `          - id: workflow-ptc`,
-    `            name: '@deepseek-ai/dsh-workflow-ptc'`,
-    `            config:`,
-    `              provider: spawn`,
-  ].join('\n');
-}
+const presetBlockText = readFileSync(new URL('../presets/switchboard.patch.yml', import.meta.url), 'utf8')
+  .replace(/\r\n/g, '\n')
+  .replace(/\n*$/, '\n');
 
 const original = readFileSync(PATCH, 'utf8').replace(/\r\n/g, '\n');
 
 /**
- * 剥离此前注入过的 Switchboard preset 块。
+ * 判断某行是否属于「我们自己注入的 preset 块」。
  *
- * 需要可重复注入：第一版的**错误结构**（多包了一层 `- id: preset-switchboard`）
- * 已经写进 profile，必须能被完整替换而不是叠加或留残。
+ * ⚠️ 这里有一个会造成**数据丢失**的陷阱，务必保持严格：
+ *   配置值里也含 "Switchboard" —— 例如 `agent-switchboard` 条目的
+ *   `cwd: "C:\Users\...\Code\DSH-Agent-Switchboard"`。若用宽泛的
+ *   `l.includes('Switchboard')`，剥离区间会从那一行一直吃到文件末尾的
+ *   preset 块，**删掉近 900 行**（含全部角色配置）。实测确实发生过，只是
+ *   被写盘前的断言拦下了。
  *
- * 实现要点：从头注释行（或那条 `- id: PRESET_ID`）开始，一直吃到下一个
- * 顶层 `- ` 为止 —— 顶层条目内部的缩进行都属于该条目。
+ * 因此只认两种情况：
+ *   1. 生成器写的**注释行**，且必须是 `#` 开头的行首形式；
+ *   2. preset 声明的 id 行（`- id: preset-switchboard`）。
  *
- * ⚠️ 踩过的坑：第一版只从注释行开始删、且没处理「注释缺失但 `- id:` 还在」的
- * 情况，结果删掉了内容却留下了 `- id: preset-switchboard` 那层，解析出来仍是一个
- * 残缺条目。因此下面加了「剥离后不应再提到 PRESET_ID」的断言。
+ * @param {string} line - 单行文本。
+ * @returns {boolean} 是否属于我们的块。
+ */
+function isOurBlockLine(line) {
+  const trimmed = line.trimStart();
+  // 注释行：必须是 `#` 开头，且形如生成器写的块头注释。
+  if (trimmed.startsWith('# Switchboard')) return true;
+  // 声明行：`- id: preset-switchboard`（可能带缩进）。
+  return /^-?\s*id:\s*preset-switchboard\s*$/.test(trimmed);
+}
+
+/**
+ * 剥离此前注入过的 Switchboard preset 块，并顺带清理**空操作**。
+ *
+ * 需要可重复注入：早期版本的错误结构已写进过 profile，必须能被完整替换而不是
+ * 叠加或留残。
+ *
+ * ⚠️ 为什么还要清理空操作：真实文件的形态是
+ *     - insert:                      ← 独立一行
+ *     # Switchboard 的 Agent preset 声明。
+ *     - insert:                      ← 我们的块
+ *         - id: preset-switchboard
+ * 剥离只删「注释 + 我们的行」，于是第一个 `- insert:` 变成**没有内容的空操作**，
+ * 解析出 `insert: null`。这不只是难看：空 insert 会让 Loader 的 patch 树多一个
+ * 无意义节点。因此把「删除空 insert 操作」并入剥离流程，任何残留形态都能自愈，
+ * 而不是逐个个案特判。
  *
  * @param {string} text - patch 文本。
- * @returns {string} 剥离后的文本。
+ * @returns {string} 剥离并清理后的文本。
  */
 function stripInjectedPreset(text) {
   const lines = text.split('\n');
   const isTopLevel = (l) => /^- /.test(l);
-  const isOurs = (l) => l.includes('Switchboard 预设') || l.includes(`id: ${PRESET_ID}`);
 
+  // 1) 删除我们自己的块。
   for (let start = 0; start < lines.length; start++) {
-    if (!isOurs(lines[start])) continue;
-    // 向前回退包含紧邻的我们自己的注释行。
+    if (!isOurBlockLine(lines[start])) continue;
     while (start > 0 && lines[start - 1].trimStart().startsWith('# Switchboard')) start--;
     let end = start + 1;
     while (end < lines.length && !isTopLevel(lines[end])) end++;
     const stripped = [...lines.slice(0, start), ...lines.slice(end)].join('\n');
     return stripInjectedPreset(stripped);
   }
+
+  // 2) 删除空操作（例如只剩一个 `- insert:` 而没有列表项）。
+  for (let start = 0; start < lines.length; start++) {
+    if (!/^- insert:\s*$/.test(lines[start])) continue;
+    let end = start + 1;
+    while (end < lines.length && !isTopLevel(lines[end])) end++;
+    const meaningful = lines
+      .slice(start + 1, end)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith('#'));
+    if (meaningful.length === 0) {
+      // 连同其前面的空白行一起删，避免留下连续空行。
+      let from = start;
+      while (from > 0 && lines[from - 1].trim() === '') from--;
+      const next = [...lines.slice(0, from), ...lines.slice(end)].join('\n');
+      return stripInjectedPreset(next);
+    }
+  }
+
   return text;
 }
 
 const cleaned = stripInjectedPreset(original).replace(/\n*$/, '\n');
-// 剥离必须干净：否则残缺条目会污染 patch。
-if (cleaned.includes(PRESET_ID)) {
-  console.error(`FAIL  剥离后仍残留 ${PRESET_ID} —— stripInjectedPreset 有误`);
-  process.exit(1);
+const { parse } = await import('yaml');
+
+/**
+ * 结构化残留检查。
+ *
+ * ⚠️ 为什么不能只做字符串检查：我第一版的「剥离干净」断言只查文本里是否还提到
+ * PRESET_ID，而残留可能是一个**孤立的 `- insert:`**（不含任何 id 文本）。
+ * 它解析出来是一个空 insert 操作 —— 字符串断言看不见，实测因此漏过一次。
+ * 结构问题必须用解析来判断。
+ *
+ * @param {string} text - 待检查的 patch 文本。
+ * @param {string} label - 报告用的标签。
+ * @returns {boolean} 是否干净。
+ */
+function assertNoStrayOperations(text, label) {
+  let doc;
+  try {
+    doc = parse(text);
+  } catch (error) {
+    console.error(`FAIL  ${label} 无法解析：${error.message}`);
+    return false;
+  }
+  const stray = [];
+  doc.forEach((op, index) => {
+    if (!op || typeof op !== 'object') {
+      stray.push(`[${index}] 非对象操作`);
+      return;
+    }
+    if (Object.prototype.hasOwnProperty.call(op, 'insert')) {
+      // ⚠️ YAML 会把**只有一项**的序列解析成单个对象而不是数组。若只处理
+      //     `Array.isArray` 分支，单项的 insert 会被静默当成「非数组」跳过 ——
+      //     那正是一次真实漏检（孤立的 `- insert:` 因此没被发现）。
+      const list = Array.isArray(op.insert) ? op.insert : [op.insert];
+      if (list.length === 0 || list[0] === null || list[0] === undefined) {
+        stray.push(`[${index}] 空 insert 操作`);
+      }
+    }
+    const keys = Object.keys(op);
+    if (keys.length === 0) stray.push(`[${index}] 空操作`);
+    if (keys.length === 1 && keys[0] === 'insert') {
+      const list = Array.isArray(op.insert) ? op.insert : [op.insert];
+      if (list.length === 1 && list[0] && typeof list[0] === 'object') {
+        // 单项且含 id 的 insert 是正常的 plugin insert；只有缺 id 才可疑。
+        if (typeof list[0].id !== 'string') stray.push(`[${index}] insert 项缺少 id`);
+      }
+    }
+  });
+  if (stray.length > 0) {
+    console.error(`FAIL  ${label} 含残留操作：${stray.join('; ')}`);
+    return false;
+  }
+  console.log(`PASS  ${label} 无空/残留操作（顶层 ${doc.length} 项）`);
+  return true;
 }
-console.log('PASS  剥离干净（无残留）');
-const already = cleaned.includes(`id: preset-switchboard`);
-const block = presetBlock(PKG);
+
+if (!assertNoStrayOperations(cleaned, '剥离后')) process.exit(1);
+const already = cleaned.includes(`id: ${PRESET_ID}`);
+const block = presetBlockText;
 const next = `${cleaned}${already ? '' : `\n${block}\n`}`;
 
 console.log(`patch: ${PATCH}`);
@@ -157,7 +188,6 @@ console.log(`插件包名: ${PKG}`);
 console.log('');
 
 // 离线校验：用真实解析器确认合并后仍是合法 YAML，且 preset 结构正确。
-const { parse } = await import('yaml');
 let doc;
 try {
   doc = parse(next);
