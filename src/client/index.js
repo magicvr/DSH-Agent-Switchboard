@@ -118,56 +118,88 @@ window.__ModuleLoader__.load({
     const { useState, useEffect, useRef, useCallback } = React;
 
     /**
-     * 依次尝试候选命名空间，返回第一个「有值且含 roles 数组」的结果。
+     * 找出「值里含 roles 数组」的命名空间。
      *
-     * ⚠️ 为什么是**候选**而不是单一常量：`ns` 是「profile entry id」这一事实来自文档，
-     * 但确切取值由运行时决定。实测踩过：设置页读不到值，而无法从外部核对该值。
-     * 与其猜一个然后失败得莫名其妙，不如把已知形态都试一遍，并用
-     * 「该命名空间的值里有没有 `roles`」来**确认**，而不是假定。
+     * ⚠️ 为什么不做成单一常量、也不只按名字匹配：
      *
-     * 两条读取路径也互为兜底，因为首帧可用性取决于镜像是否已 `ensure()`：
-     *   - `configForms.get(ns).getSnapshot().value` —— 该条目的表单值
-     *   - `configForms.describe().namespace(ns).value` —— 跨命名空间描述行
+     * 本插件会被**激活多次** —— profile 级的根条目一次（无 config），每个选中
+     * `Switchboard` preset 的会话作用域再一次（带 roles）。而设置页面对的是
+     * **根条目**那个命名空间，它的值里 `roles` 为空数组。若只认名字，读到的永远
+     * 是那份空的，于是页面显示「尚未配置任何角色」——这正是实测踩到的现象
+     * （命名空间对、表单 status 为 ready、但值里没有 roles）。
+     *
+     * 因此判据改为「**按值识别**」：遍历 `describe()` 报告的全部命名空间，挑出
+     * 值里含 `roles` 数组的那些，并优先返回非空的。这样无论最终生效的是哪一个
+     * 命名空间，都能找到真正的角色列表。
+     *
+     * 两条读取路径也互为兜底，因为首帧可用性取决于镜像是否已 `ensure()`。
      *
      * @param {object} ctx - Client 插件上下文。
-     * @returns {{ns: string, roles: object[], volatile: object, revision: number|undefined, source: string}} 读取结果。
+     * @returns {{ns: string, roles: object[], volatile: object, revision: number|undefined, source: string, seen: string}} 读取结果。
      */
     function readState(ctx) {
       const tried = [];
-      for (const ns of NS_CANDIDATES) {
+      /** 命中的候选：{ns, roles, volatile, revision, source}。按 roles 长度择优选。 */
+      const hits = [];
+
+      // 读取单个命名空间的值（两条路径）。
+      const valueOf = (ns) => {
         try {
           const snap = ctx.configForms.get(ns).getSnapshot();
           tried.push(`${ns}:form:${snap?.status ?? '?'}`);
-          if (snap?.value && Array.isArray(snap.value.roles)) {
-            return {
-              ns,
-              roles: snap.value.roles,
-              volatile: snap.value.volatile ?? {},
-              revision: snap.revision,
-              source: 'form',
-            };
-          }
+          if (snap?.value) return { value: snap.value, revision: snap.revision, source: 'form' };
         } catch (error) {
           tried.push(`${ns}:form-threw:${error instanceof Error ? error.message : String(error)}`);
         }
         try {
           const row = ctx.configForms.describe().namespace(ns);
           tried.push(`${ns}:mirror:${row === undefined ? 'absent' : 'present'}`);
-          if (row && Array.isArray(row.value?.roles)) {
-            return {
-              ns,
-              roles: row.value.roles,
-              volatile: row.value.volatile ?? {},
-              revision: row.revision,
-              source: 'mirror',
-            };
-          }
+          if (row?.value) return { value: row.value, revision: row.revision, source: 'mirror' };
         } catch (error) {
           tried.push(`${ns}:mirror-threw:${error instanceof Error ? error.message : String(error)}`);
         }
+        return undefined;
+      };
+
+      // 候选命名空间 = 已知的两个 + describe() 报告的全部（可能含作用域变体）。
+      const names = new Set(NS_CANDIDATES);
+      try {
+        const snap = ctx.configForms.describe().getSnapshot();
+        for (const row of snap?.view?.namespaces ?? []) {
+          if (typeof row?.ns === 'string') names.add(row.ns);
+        }
+      } catch (error) {
+        tried.push(`enumerate-threw:${error instanceof Error ? error.message : String(error)}`);
       }
-      // 全部候选都没命中：把尝试过程带出去，让界面能显示可诊断信息而不是一句「空」。
-      return { ns: NS_CANDIDATES[0], roles: [], volatile: {}, revision: undefined, source: tried.join(' ') };
+
+      for (const ns of names) {
+        const got = valueOf(ns);
+        if (!got) continue;
+        if (Array.isArray(got.value.roles)) {
+          hits.push({
+            ns,
+            roles: got.value.roles,
+            volatile: got.value.volatile ?? {},
+            revision: got.revision,
+            source: got.source,
+          });
+        } else if (/switchboard|agent-switchboard/.test(ns)) {
+          // 与插件相关但值里没有 roles：记下来，便于诊断（这是实测踩到的那种情况）。
+          tried.push(`${ns}:no-roles(${Object.keys(got.value).join(',') || 'empty'})`);
+        }
+      }
+
+      // 优先非空；全为空时返回空的那个（界面会显示「尚未配置」+ 诊断）。
+      const best = hits.find((hit) => hit.roles.length > 0) ?? hits[0];
+      if (best) return { ...best, seen: tried.join(' ') };
+      return {
+        ns: NS_CANDIDATES[0],
+        roles: [],
+        volatile: {},
+        revision: undefined,
+        source: tried.join(' '),
+        seen: tried.join(' '),
+      };
     }
 
     /**
@@ -450,6 +482,7 @@ window.__ModuleLoader__.load({
       const [revision, setRevision] = useState(undefined);
       const [ns, setNs] = useState(NS_CANDIDATES[0]);
       const [status, setStatus] = useState('loading');
+      const [seen, setSeen] = useState('');
       const [notice, setNotice] = useState(null);
       const [busy, setBusy] = useState(false);
       const [allowCrossCli, setAllowCrossCli] = useState(false);
@@ -465,6 +498,7 @@ window.__ModuleLoader__.load({
         setDraft(cloneRoles(state.roles));
         setRevision(state.revision);
         setNs(state.ns);
+        setSeen(state.seen ?? state.source ?? '');
         setAllowCrossCli(state.volatile?.allowCrossCli === true);
         savedRef.current = JSON.stringify(state.roles);
         setStatus(state.roles.length > 0 ? 'ready' : `empty(${state.source})`);
@@ -681,8 +715,9 @@ window.__ModuleLoader__.load({
               },
               `读取源：${status}`,
             ),
-            // 已解析到的命名空间一并显示：若为空说明两个候选都没命中，
-            // 那就是「配置面板拿不到本插件的命名空间」这一类问题。
+            // 已解析到的命名空间与「看到了什么」一并显示。
+            // 实测教训：只显示「读取源」不够 —— 有一次命名空间对、status 为 ready、
+            // 但值里没有 roles，没有这几行就只能靠重启去查。
             h(
               'div',
               {
@@ -695,6 +730,19 @@ window.__ModuleLoader__.load({
                 },
               },
               `命名空间：${ns}（候选：${NS_CANDIDATES.join(' | ')}）`,
+            ),
+            h(
+              'div',
+              {
+                style: {
+                  marginTop: '2px',
+                  fontSize: '10px',
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                  opacity: 0.6,
+                  wordBreak: 'break-all',
+                },
+              },
+              `探到的命名空间与结果：${seen || '（无）'}`,
             ),
           ),
         );
