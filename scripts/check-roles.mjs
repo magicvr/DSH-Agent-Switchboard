@@ -274,5 +274,106 @@ section('roleGuidanceText：路由指引');
   );
 }
 
+section('CLI 后端角色');
+{
+  const base = {
+    id: 'codex-worker',
+    description: 'd',
+    instructions: 'i',
+    backend: 'cli',
+    cliCommand: 'node',
+    cliArgs: ['exec', '-'],
+    cliCwd: 'C:/w',
+  };
+
+  const ok = normalizeRole(base, 0, undefined, 'C:/fallback');
+  check('合法 CLI 角色通过', ok.role !== null, ok.errors.join('; '));
+  check('CLI 角色不需要 DSH model', ok.role?.model === undefined);
+  check(
+    'cli 配置被规范化',
+    ok.role?.cli?.command === 'node' && ok.role?.cli?.promptDelivery === 'stdin',
+    JSON.stringify(ok.role?.cli),
+  );
+  check('cliArgs 被复制为独立数组', JSON.stringify(ok.role?.cli?.args) === JSON.stringify(['exec', '-']));
+  check('cwd 取自角色配置', ok.role?.cli?.cwd === 'C:/w', String(ok.role?.cli?.cwd));
+
+  const noCmd = normalizeRole({ ...base, cliCommand: undefined }, 0, undefined, 'C:/w');
+  check(
+    '缺 cliCommand 报错',
+    noCmd.role === null && noCmd.errors.some((e) => e.includes('cliCommand')),
+    noCmd.errors.join('; '),
+  );
+
+  const noArgs = normalizeRole({ ...base, cliArgs: undefined }, 0, undefined, 'C:/w');
+  check(
+    '缺 cliArgs 报错',
+    noArgs.role === null && noArgs.errors.some((e) => e.includes('cliArgs')),
+    noArgs.errors.join('; '),
+  );
+
+  const badArgs = normalizeRole({ ...base, cliArgs: 'exec -' }, 0, undefined, 'C:/w');
+  check('cliArgs 非数组报错', badArgs.role === null, badArgs.errors.join('; '));
+
+  // 模板错误必须在装载期报出，而不是等第一次派发才失败。
+  const badPlaceholder = normalizeRole({ ...base, cliArgs: ['exec', '{nope}'] }, 0, undefined, 'C:/w');
+  check(
+    '模板里的未知占位符在装载期报错',
+    badPlaceholder.role === null && badPlaceholder.errors.some((e) => e.includes('nope')),
+    badPlaceholder.errors.join('; '),
+  );
+
+  const missingCwd = normalizeRole({ ...base, cliCwd: undefined }, 0, undefined, undefined);
+  check(
+    'cliCwd 与全局都缺时报错',
+    missingCwd.role === null && missingCwd.errors.some((e) => e.includes('cliCwd')),
+    missingCwd.errors.join('; '),
+  );
+
+  // toolConfigFor：CLI 后端**不得**设置 maxDepth / toolFilter / agentOptions / persona。
+  // CLI provider 把这四项能力都声明为 false（D7），设了会让工具装载期抛错。
+  const cfg = toolConfigFor(ok.role, { maxDepth: 3 });
+  check('provider 指向该角色自己的 CLI provider', cfg.provider === 'switchboard-cli-codex-worker', cfg.provider);
+  check('不设置 maxDepth（CLI provider 无 depthLimit 能力）', !('maxDepth' in cfg));
+  check('不设置 toolFilter（CLI provider 无该能力）', !('toolFilter' in cfg));
+  check('不设置 agentOptions（CLI provider 无该能力）', !('agentOptions' in cfg));
+  check('不设置 persona（CLI provider 无该能力）', !('persona' in cfg));
+  check('仍有 toolName', cfg.toolName === 'delegate_to_codex_worker');
+
+  const ro = normalizeRole({ ...base, readOnly: true }, 0, undefined, 'C:/w').role;
+  const roCfg = toolConfigFor(ro, { maxDepth: 3 });
+  check('只读 CLI 角色仍不设置 toolFilter', !('toolFilter' in roCfg));
+
+  // builtin 后端仍应设置这些，且不受 CLI 分支影响。
+  const builtin = normalizeRole(
+    { id: 'b', description: 'd', instructions: 'i', model: 'm' },
+    0,
+    'p',
+    3,
+  ).role;
+  const bCfg = toolConfigFor(builtin, { maxDepth: 3 });
+  check('builtin 仍设置 agentOptions', 'agentOptions' in bCfg);
+  check('builtin 仍设置 persona', 'persona' in bCfg);
+  check('builtin 仍设置 maxDepth', bCfg.maxDepth === 1);
+}
+
+section('backend 取值校验');
+{
+  const bad = normalizeRole(
+    { id: 'x', description: 'd', instructions: 'i', model: 'm', backend: 'acp' },
+    0,
+    'p',
+  );
+  check(
+    '未知 backend 被拒',
+    bad.role === null && bad.errors.some((e) => e.includes('acp')),
+    bad.errors.join('; '),
+  );
+  check(
+    '错误信息列出可用后端',
+    bad.errors.some((e) => e.includes('cli') && e.includes('spawn')),
+    bad.errors.join('; '),
+  );
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);

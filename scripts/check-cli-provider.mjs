@@ -270,5 +270,60 @@ section('成功但无输出：如实标注');
   check('diagnostic 标注无输出', typeof result.diagnostic === 'string' && result.diagnostic.includes('没有输出内容'), String(result.diagnostic));
 }
 
+section('角色指令被前置进提示词');
+{
+  // CLI provider 的 persona 能力为 false，因此 provider 必须自己把角色指令
+  // 拼进提示词；否则 CLI 子代理不知道自己是什么角色。
+  const role = codexRole();
+  role.instructions = 'ROLE-INSTRUCTIONS-SENTINEL';
+  const { spawn, calls } = makeSpawn({ stdout: 'x' });
+  const p = createCliProvider({ role, spawn });
+  await (await p.start({ prompt: textPrompt('THE TASK') })).result;
+
+  const stdin = calls[0].stdio.stdin;
+  check('提示词经 stdin 传入', typeof stdin === 'object' && typeof stdin.data === 'string');
+  check('含角色指令', stdin.data.includes('ROLE-INSTRUCTIONS-SENTINEL'), stdin.data.slice(0, 120));
+  check('含任务正文', stdin.data.includes('THE TASK'));
+  check('角色指令在任务之前', stdin.data.indexOf('ROLE-INSTRUCTIONS-SENTINEL') < stdin.data.indexOf('THE TASK'));
+
+  // argv 模式：角色指令**不会**被前置（多行值不得进入 argv 元素）。
+  // 这是命令行传参的固有限制，不是疏漏 —— 断言把它固定下来，避免日后误以为
+  // 「argv 模式也能带角色指令」。
+  const role2 = codexRole({ promptDelivery: 'argv', args: ['-p', '{prompt}'] });
+  role2.instructions = 'ROLE-INSTRUCTIONS-SENTINEL';
+  const s2 = makeSpawn({ stdout: 'x' });
+  const p2 = createCliProvider({ role: role2, spawn: s2.spawn });
+  await (await p2.start({ prompt: textPrompt('THE TASK') })).result;
+  check('argv 模式确实调用了 spawn', s2.calls.length === 1);
+  const promptArg = s2.calls[0].argv.find((a) => a.includes('THE TASK'));
+  check('argv 模式的任务正文进入 argv', typeof promptArg === 'string', String(promptArg));
+  check(
+    'argv 模式不前置角色指令（多行值不得进 argv，属固有限制）',
+    typeof promptArg === 'string' && !promptArg.includes('ROLE-INSTRUCTIONS-SENTINEL'),
+    String(promptArg),
+  );
+
+  // 多行的提示词在 argv 模式下必须被明确拒绝，而不是悄悄截断或塞进去。
+  const s4 = makeSpawn({ stdout: 'x' });
+  const p4 = createCliProvider({ role: role2, spawn: s4.spawn });
+  const multi = await (
+    await p4.start({ prompt: [{ type: 'text', text: 'line1\nline2' }] })
+  ).result;
+  check('argv 模式下多行提示词被拒绝且不 spawn', s4.calls.length === 0 && multi.stopReason === 'error');
+  check(
+    '错误信息说明是换行导致',
+    multi.output[0].text.includes('换行'),
+    multi.output[0].text.slice(0, 160),
+  );
+
+  // 无角色指令时不应残留分隔线。
+  const role3 = codexRole();
+  role3.instructions = '   ';
+  const s3 = makeSpawn({ stdout: 'x' });
+  const p3 = createCliProvider({ role: role3, spawn: s3.spawn });
+  await (await p3.start({ prompt: textPrompt('ONLY TASK') })).result;
+  check('空角色指令时不加分隔线', s3.calls[0].stdio.stdin.data === 'ONLY TASK', s3.calls[0].stdio.stdin.data);
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);

@@ -8,12 +8,29 @@
  *
  * @module @magicvr/dsh-agent-switchboard/roles
  */
+import { validateTemplate } from './cli/argv.js';
 
 /** 思考强度的统一枚举。与 DSH 的 `ReasoningEffortId` 取值一致。 */
 export const EFFORT_VALUES = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']);
 
 /** 内置子代理后端名。两者都由 `dsh-base` 装载（已核实）。 */
 export const BUILTIN_PROVIDERS = Object.freeze(['spawn', 'fork']);
+
+/** CLI 后端的 backend 名。 */
+export const CLI_BACKEND = 'cli';
+
+/**
+ * 一个 CLI 角色对应的 provider 实例名。
+ *
+ * 每个 CLI 角色注册**自己的** provider 实例，因为单一 provider 无法区分是哪个
+ * 角色发起的调用，而角色级命令/模型/强度必须各不相同。
+ *
+ * @param {string} roleId - 角色 id。
+ * @returns {string} provider 名。
+ */
+export function cliProviderName(roleId) {
+  return `switchboard-cli-${roleId}`;
+}
 
 /**
  * 写入类工具名。`readOnly` 角色通过 `toolFilter.deny` 从机制上挡住它们。
@@ -60,9 +77,10 @@ const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
  * @param {unknown} raw - 来自插件配置的原始角色定义。
  * @param {number} index - 在 roles 数组中的下标，用于定位错误。
  * @param {string | undefined} defaultProvider - 全局默认 LLM provider。
+ * @param {string | undefined} defaultCwd - 全局默认可执行工作目录。
  * @returns {{ role: Role | null, errors: string[] }}
  */
-export function normalizeRole(raw, index, defaultProvider) {
+export function normalizeRole(raw, index, defaultProvider, defaultCwd) {
   const errors = [];
   const at = `roles[${index}]`;
 
@@ -86,12 +104,24 @@ export function normalizeRole(raw, index, defaultProvider) {
   const instructions = read('instructions');
   if (!instructions) errors.push(`${at}.instructions 必填（子代理的开发者指令）`);
 
-  const model = read('model');
-  if (!model) errors.push(`${at}.model 必填`);
+  // 先定 backend，因为「哪些字段必填」取决于它：
+  //   - builtin 后端需要 DSH 的 provider/model route；
+  //   - cli 后端需要可执行文件与参数模板，**不需要** DSH route。
+  const backend = read('backend') ?? 'spawn';
+  if (!BUILTIN_PROVIDERS.includes(backend) && backend !== CLI_BACKEND) {
+    errors.push(
+      `${at}.backend "${backend}" 非法：只能是 ${[...BUILTIN_PROVIDERS, CLI_BACKEND].join(' / ')}`,
+    );
+  }
+  const isCli = backend === CLI_BACKEND;
 
+  const model = read('model');
   const provider = read('provider') ?? defaultProvider;
-  if (!provider) {
-    errors.push(`${at}.provider 未设置，且插件级 provider 也未设置`);
+  if (!isCli) {
+    if (!model) errors.push(`${at}.model 必填（backend 为 ${backend} 时需要 DSH 的 LLM route）`);
+    if (!provider) {
+      errors.push(`${at}.provider 未设置，且插件级 provider 也未设置`);
+    }
   }
 
   const effort = read('effort');
@@ -101,11 +131,49 @@ export function normalizeRole(raw, index, defaultProvider) {
     );
   }
 
-  const backend = read('backend') ?? 'spawn';
-  if (!BUILTIN_PROVIDERS.includes(backend)) {
-    errors.push(
-      `${at}.backend "${backend}" 非法：Phase 2 只支持 ${BUILTIN_PROVIDERS.join(' / ')}`,
-    );
+  // CLI 后端专属配置。放在角色**顶层**而非嵌套对象里，是为了让插件面板能把它
+  // 当普通标量字段渲染；嵌套结构在设置表单里难编辑（见 decisions.md D9）。
+  let cli;
+  if (isCli) {
+    const cliCommand = read('cliCommand');
+    if (!cliCommand) {
+      errors.push(`${at}.cliCommand 必填（backend 为 cli 时必须给出可执行文件）`);
+    }
+
+    const cliArgs = raw.cliArgs;
+    if (!Array.isArray(cliArgs) || cliArgs.length === 0) {
+      errors.push(`${at}.cliArgs 必填，且必须是字符串数组（给出该 CLI 的参数模板）`);
+    }
+
+    const cliPrefixArgs = raw.cliPrefixArgs;
+    if (cliPrefixArgs !== undefined && !Array.isArray(cliPrefixArgs)) {
+      errors.push(`${at}.cliPrefixArgs 必须是字符串数组`);
+    }
+
+    const cliPromptDelivery = read('cliPromptDelivery') ?? 'stdin';
+    const cliCwd = read('cliCwd') ?? defaultCwd;
+
+    if (Array.isArray(cliArgs) && cliCommand) {
+      // 模板校验放到这里（而不是只在运行时）：配置错误应在装载期就报出来，
+      // 而不是等第一次派发才失败。
+      const templateErrors = validateTemplate(cliArgs, { promptDelivery: cliPromptDelivery });
+      for (const line of templateErrors) errors.push(`${at}.cliArgs：${line}`);
+    }
+
+    cli = {
+      command: cliCommand,
+      prefixArgs: Array.isArray(cliPrefixArgs) ? [...cliPrefixArgs] : [],
+      args: Array.isArray(cliArgs) ? [...cliArgs] : [],
+      promptDelivery: cliPromptDelivery,
+      cwd: cliCwd,
+      graceMs: Number.isSafeInteger(raw.cliGraceMs) ? raw.cliGraceMs : 3000,
+      maxOutputBytes: Number.isSafeInteger(raw.cliMaxOutputBytes) ? raw.cliMaxOutputBytes : 1_000_000,
+      maxErrorBytes: Number.isSafeInteger(raw.cliMaxErrorBytes) ? raw.cliMaxErrorBytes : 100_000,
+      timeoutMs: Number.isSafeInteger(raw.cliTimeoutMs) ? raw.cliTimeoutMs : undefined,
+    };
+
+    // CLI 后端不承载 DSH 的 provider/model route，因此上面没有强制它们。
+    if (!cliCwd) errors.push(`${at}.cliCwd 未设置，且全局 cwd 也未设置`);
   }
 
   if (errors.length > 0) return { role: null, errors };
@@ -122,6 +190,7 @@ export function normalizeRole(raw, index, defaultProvider) {
       readOnly: raw.readOnly === true,
       backend,
       allowNestedDispatch: raw.allowNestedDispatch === true,
+      ...(cli ? { cli } : {}),
       toolName: `delegate_to_${id.replace(/-/g, '_')}`,
     },
     errors,
@@ -133,9 +202,10 @@ export function normalizeRole(raw, index, defaultProvider) {
  *
  * @param {unknown} rawRoles - 配置里的 roles 数组。
  * @param {string | undefined} defaultProvider - 全局默认 LLM provider。
+ * @param {string | undefined} [defaultCwd] - 全局默认可执行工作目录。
  * @returns {{ roles: Role[], errors: string[] }}
  */
-export function normalizeRoles(rawRoles, defaultProvider) {
+export function normalizeRoles(rawRoles, defaultProvider, defaultCwd) {
   if (rawRoles === undefined || rawRoles === null) return { roles: [], errors: [] };
   if (!Array.isArray(rawRoles)) {
     return { roles: [], errors: ['roles 必须是数组'] };
@@ -144,12 +214,12 @@ export function normalizeRoles(rawRoles, defaultProvider) {
   const roles = [];
   const errors = [];
   for (let index = 0; index < rawRoles.length; index++) {
-    const { role, errors: roleErrors } = normalizeRole(rawRoles[index], index, defaultProvider);
+    const { role, errors: roleErrors } = normalizeRole(rawRoles[index], index, defaultProvider, defaultCwd);
     errors.push(...roleErrors);
     if (role) roles.push(role);
   }
 
-  // 跨角色唯一性：重复的 id 会让工具名与 preset id 相撞，必须拦下。
+  // 跨角色唯一性：重复的 id 会让工具名与 provider 名相撞，必须拦下。
   const seenIds = new Map();
   const seenTools = new Map();
   for (const role of roles) {
@@ -174,19 +244,29 @@ export function normalizeRoles(rawRoles, defaultProvider) {
  * @returns {object} `dsh-tool-subagent` 的 Config。
  */
 export function toolConfigFor(role, { maxDepth }) {
+  const isCli = role.backend === CLI_BACKEND;
+
   /** @type {Record<string, unknown>} */
   const config = {
-    provider: role.backend,
+    // cli 后端指向**该角色自己的** provider 实例：单一 provider 无法区分是哪个
+    // 角色发起的调用，而每个角色的命令/模型/强度都不同。
+    provider: isCli ? cliProviderName(role.id) : role.backend,
     toolName: role.toolName,
+    backgroundMode: 'one-shot',
+  };
+
+  if (!isCli) {
     // 角色级固定模型与强度，主代理无权覆盖（decisions.md D12）。
-    agentOptions: {
+    // CLI 后端不需要这两项：模型与强度由 argv 模板里的 {model}/{effort} 承载。
+    config.agentOptions = {
       provider: role.provider,
       model: role.model,
       ...(role.effort === undefined ? {} : { reasoningEffort: role.effort }),
-    },
-    persona: role.instructions,
-    backgroundMode: 'one-shot',
-  };
+    };
+    // persona 只有 builtin provider 支持（CLI provider 的 capabilities.persona 为 false）。
+    // CLI 后端的角色指令需要由 argv 模板或 CLI 自身配置承载。
+    config.persona = role.instructions;
+  }
 
   // 深度上限是**绝对深度**，不是「相对嵌套层数」。
   //
@@ -200,9 +280,19 @@ export function toolConfigFor(role, { maxDepth }) {
   // 因此：
   //   - 禁止嵌套 → 1（本层可派发，但子代理不能再派）
   //   - 允许嵌套 → 1 + maxDepth（额外给出 maxDepth 层）
-  config.maxDepth = role.allowNestedDispatch ? 1 + maxDepth : 1;
+  //
+  // ⚠️ **只对 builtin 后端设置**：`dsh-tool-subagent` 要求 provider 具备
+  // `depthLimit` 能力，而 CLI provider 声明为 false（D7）。对 CLI 角色设置
+  // maxDepth 会让工具装载期直接抛错 —— 我们已经实测过同类约束的报错路径。
+  if (!isCli) {
+    config.maxDepth = role.allowNestedDispatch ? 1 + maxDepth : 1;
+  }
 
-  if (role.readOnly) {
+  // ⚠️ `toolFilter` 同样只有 builtin provider 支持。
+  // CLI 角色的「只读」只能由 CLI 自身的沙箱参数实现（例如 codex 的
+  // `-s read-only`，写在 cliArgs 模板里）。角色的 readOnly 字段对 CLI 后端
+  // 因此是**声明性的**，必须如实标注而不是假装有硬约束（D7、cli-backends.md）。
+  if (role.readOnly && !isCli) {
     config.toolFilter = { deny: [...WRITE_TOOLS] };
   }
 

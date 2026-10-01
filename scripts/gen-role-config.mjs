@@ -89,11 +89,58 @@ for (const name of ORDER) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// 追加一个 CLI 后端的角色，用来验证 Phase 3 的跨 CLI 派发。
+//
+// `cliCommand` 用 PATH 里的 `node`（而非 `C:\Program Files\nodejs\node.exe`）：
+// 绝对路径在仓库配置里不可移植，而 `node` 由 `ctx.subprocess.resolveExecutable`
+// 解析。`codex.js` 的路径必须绝对，因为它是 node 的脚本参数。
+// ---------------------------------------------------------------------------
+const CODEX_JS = join(
+  process.env.APPDATA ?? '',
+  'npm',
+  'node_modules',
+  '@openai',
+  'codex',
+  'bin',
+  'codex.js',
+);
+
+roles.push({
+  id: 'codex-scout',
+  title: 'Codex 侦察员',
+  description:
+    'Read-only exploration and evidence gathering, delegated to the local Codex CLI instead of a DSH subagent. ' +
+    'Use for repository search, wide reading, symbol discovery and factual verification when you specifically want ' +
+    'the Codex agent (its own model and tooling) rather than the built-in scout. Read-only.',
+  model: 'gpt-6-astra',
+  effort: 'medium',
+  readOnly: true,
+  backend: 'cli',
+  allowNestedDispatch: false,
+  cli: {
+    command: 'node',
+    prefixArgs: [CODEX_JS],
+    // 提示词走 stdin（codex exec - 即从此读取），因此模板里没有 {prompt}。
+    // `-s read-only` 是 codex 自己的沙箱参数 —— CLI 后端的「只读」只能这样实现
+    // （toolFilter 只对 builtin provider 有效，见 D7）。
+    args: ['exec', '-s', 'read-only', '--skip-git-repo-check', '-m', '{model}', '-c', 'model_reasoning_effort={effort}', '-'],
+    promptDelivery: 'stdin',
+    cwd: ROOT,
+    graceMs: 3000,
+  },
+  instructions:
+    'You are a read-only exploration agent working through the Codex CLI. ' +
+    'Answer the delegated question directly and concisely, with file paths and line references as evidence. ' +
+    'Report facts and their evidence; do not modify any file.',
+});
+
 // 手工渲染 YAML：字符串用双引号转义，长文本用块标量。
 const q = (s) => JSON.stringify(s);
 const out = [];
 out.push('  provider: self');
 out.push('  maxDepth: 3');
+out.push(`  cwd: ${q(ROOT)}`);
 out.push('  roles:');
 for (const r of roles) {
   out.push(`    - id: ${q(r.id)}`);
@@ -102,8 +149,16 @@ for (const r of roles) {
   out.push(`      model: ${q(r.model)}`);
   out.push(`      effort: ${q(r.effort)}`);
   out.push(`      readOnly: ${r.readOnly}`);
-  out.push(`      backend: spawn`);
+  out.push(`      backend: ${r.backend ?? 'spawn'}`);
   out.push(`      allowNestedDispatch: ${r.allowNestedDispatch}`);
+  if (r.cli) {
+    out.push(`      cliCommand: ${q(r.cli.command)}`);
+    out.push(`      cliPrefixArgs: [${r.cli.prefixArgs.map(q).join(', ')}]`);
+    out.push(`      cliArgs: [${r.cli.args.map(q).join(', ')}]`);
+    out.push(`      cliPromptDelivery: ${q(r.cli.promptDelivery)}`);
+    out.push(`      cliCwd: ${q(r.cli.cwd)}`);
+    out.push(`      cliGraceMs: ${r.cli.graceMs}`);
+  }
   out.push(`      instructions: ${blockScalar(r.instructions, 8)}`);
 }
 
@@ -114,9 +169,9 @@ console.log('已生成 raw/roles-block.yml');
 console.log(`角色数：${roles.length}`);
 for (const r of roles) {
   console.log(
-    `  ${r.id.padEnd(10)} model=${r.model.padEnd(14)} effort=${String(r.effort).padEnd(7)} ` +
-      `readOnly=${String(r.readOnly).padEnd(5)} nested=${String(r.allowNestedDispatch).padEnd(5)} ` +
-      `instructions=${r.instructions.length} 字符`,
+    `  ${r.id.padEnd(12)} backend=${String(r.backend ?? 'spawn').padEnd(6)} model=${String(r.model).padEnd(14)} ` +
+      `effort=${String(r.effort).padEnd(7)} readOnly=${String(r.readOnly).padEnd(5)} ` +
+      `nested=${String(r.allowNestedDispatch).padEnd(5)} instructions=${r.instructions.length} 字符`,
   );
 }
 
@@ -205,20 +260,43 @@ if (injectIndex !== -1) {
       console.log(`disabled = ${JSON.stringify(entry.disabled)}`);
       console.log(`config.provider = ${JSON.stringify(cfg.provider)}`);
       console.log(`config.maxDepth = ${JSON.stringify(cfg.maxDepth)}`);
+      console.log(`config.cwd = ${JSON.stringify(cfg.cwd)}`);
       console.log(`config.roles 数量 = ${roleList.length}`);
       for (const r of roleList) {
         console.log(
-          `  ${String(r.id).padEnd(10)} model=${String(r.model).padEnd(14)} ` +
-            `effort=${String(r.effort).padEnd(7)} readOnly=${String(r.readOnly).padEnd(5)} ` +
+          `  ${String(r.id).padEnd(12)} backend=${String(r.backend ?? 'spawn').padEnd(6)} ` +
+            `model=${String(r.model).padEnd(14)} effort=${String(r.effort).padEnd(7)} ` +
             `instructions=${typeof r.instructions === 'string' ? r.instructions.length : 'INVALID'} 字符`,
         );
       }
-      const bad = roleList.filter((r) => typeof r.instructions !== 'string' || r.instructions.length < 100);
-      if (bad.length > 0) {
-        console.error(`校验失败：${bad.length} 个角色的 instructions 不完整`);
+
+      const problems = [];
+      for (const r of roleList) {
+        if (typeof r.instructions !== 'string' || r.instructions.length < 100) {
+          problems.push(`${r.id}: instructions 不完整`);
+        }
+        if (r.backend === 'cli') {
+          // CLI 角色的关键字段必须被解析成正确类型，否则装载期才会报错。
+          if (typeof r.cliCommand !== 'string' || r.cliCommand.length === 0) {
+            problems.push(`${r.id}: cliCommand 缺失或类型错误`);
+          }
+          if (!Array.isArray(r.cliArgs) || r.cliArgs.length === 0) {
+            problems.push(`${r.id}: cliArgs 不是非空数组`);
+          } else if (!r.cliArgs.every((a) => typeof a === 'string')) {
+            problems.push(`${r.id}: cliArgs 含非字符串元素`);
+          }
+          if (r.cliPromptDelivery === 'stdin' && r.cliArgs.some((a) => a.includes('{prompt}'))) {
+            problems.push(`${r.id}: stdin 模式下 cliArgs 含 {prompt}（提示词会被传两次）`);
+          }
+          if (typeof r.cliCwd !== 'string') problems.push(`${r.id}: cliCwd 缺失`);
+        }
+      }
+      if (problems.length > 0) {
+        console.error(`校验失败（${problems.length} 处）：`);
+        for (const p of problems) console.error(`  - ${p}`);
         process.exitCode = 1;
       } else {
-        console.log('结构校验通过：4 个角色的 instructions 均为完整字符串');
+        console.log(`结构校验通过：${roleList.length} 个角色的关键字段均为正确类型`);
       }
     }
   } catch (error) {

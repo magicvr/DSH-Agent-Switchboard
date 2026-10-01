@@ -25,6 +25,20 @@
 import { buildInvocation } from './argv.js';
 import { formatRunResult } from './output.js';
 
+/**
+ * 一个 CLI 角色对应的 provider 实例名。
+ *
+ * ⚠️ 必须与 `roles.js` 的 `cliProviderName()` 保持一致：工具实例的 `provider`
+ * 字段由那里生成，注册名由这里生成，两者不一致会导致工具装载期找不到 provider。
+ * 该一致性由 `scripts/check-cli.mjs` 的断言锁住（两处实现都引用同一条格式）。
+ *
+ * @param {string} roleId - 角色 id。
+ * @returns {string} provider 名。
+ */
+export function cliProviderNameFor(roleId) {
+  return `switchboard-cli-${roleId}`;
+}
+
 /** 本 provider 声明的能力集：全部为 false，理由见模块文档与 D7。 */
 export const CLI_CAPABILITIES = Object.freeze({
   agentOptions: false,
@@ -75,7 +89,7 @@ export function createCliProvider({ role, spawn, resolveExecutable, now = () => 
   if (!cli) throw new Error(`角色 "${role.id}" 使用 cli 后端但缺少 cli 配置`);
 
   return {
-    name: `switchboard-cli-${role.id}`,
+    name: cliProviderNameFor(role.id),
     capabilities: { ...CLI_CAPABILITIES },
     inheritsParentContext: CLI_INHERITS_PARENT_CONTEXT,
 
@@ -90,7 +104,23 @@ export function createCliProvider({ role, spawn, resolveExecutable, now = () => 
      */
     async start(request) {
       const startedAt = now();
-      const { text, ignoredBlocks } = promptText(request.prompt);
+      const { text: taskText, ignoredBlocks } = promptText(request.prompt);
+
+      // ⚠️ 角色指令必须由**本 provider 自己**前置进提示词。
+      //
+      // 原因：CLI provider 的 `capabilities.persona` 为 false（D7 —— 外部进程不由
+      // DSH 的 persona 机制驱动），所以 dsh-tool-subagent 不会替我们注入 persona。
+      // 若不在这里拼进去，CLI 子代理就完全不知道自己的角色 —— 而「带角色的子代理」
+      // 正是本插件的核心。这与 builtin 后端机制不同但效果等价。
+      //
+      // ⚠️ **只在 stdin 模式前置**：argv 模式的值不得含换行（见 cli/argv.js 的安全
+      // 约束），而角色指令几乎必然是多行的。因此在 argv 模式下，多行提示词**无法**
+      // 经命令行传递 —— 这是命令行传参的固有限制，不是可以绕过的实现细节。
+      // 需要多行角色的 CLI 必须支持从 stdin 读取提示词（codex 支持）。
+      const withRole =
+        cli.promptDelivery === 'stdin' && role.instructions && role.instructions.trim().length > 0
+          ? `${role.instructions.trim()}\n\n---\n\n${taskText}`
+          : taskText;
 
       // 可执行文件解析：优先交给调用方提供的解析器（它了解 DSH 的执行世界），
       // 失败则退回配置里的字面命令。
@@ -111,7 +141,7 @@ export function createCliProvider({ role, spawn, resolveExecutable, now = () => 
           prefixArgs: cli.prefixArgs ?? [],
           args: cli.args,
           values: {
-            prompt: cli.promptDelivery === 'argv' ? text : undefined,
+            prompt: cli.promptDelivery === 'argv' ? withRole : undefined,
             cwd: cli.cwd,
             // 模型与强度取自角色顶层，与 builtin 后端共用同一组字段（见模块文档）。
             model: role.model,
@@ -125,7 +155,7 @@ export function createCliProvider({ role, spawn, resolveExecutable, now = () => 
       // 组装 stdio：提示词走 stdin 时用 `{ data }` 形式，一次性写入后关闭；
       // 否则 ignore，避免外部 CLI 误等输入。
       const stdinMode =
-        cli.promptDelivery === 'argv' ? 'ignore' : { data: text };
+        cli.promptDelivery === 'argv' ? 'ignore' : { data: withRole };
 
       let handle;
       try {

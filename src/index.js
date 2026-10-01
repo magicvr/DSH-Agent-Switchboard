@@ -21,25 +21,45 @@
  */
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { EFFORT_VALUES, normalizeRoles, roleGuidanceText, toolConfigFor } from './roles.js';
+import {
+  CLI_BACKEND,
+  EFFORT_VALUES,
+  cliProviderName,
+  normalizeRoles,
+  roleGuidanceText,
+  toolConfigFor,
+} from './roles.js';
+import { createCliProvider } from './cli/provider.js';
 
 /** Loader 条目名，与 package.json 的 `name` 保持一致。 */
 export const name = 'agent-switchboard';
 
 /**
  * 声明式依赖。Cordis 会等到这些 Service 就绪后再调用 `apply`。
- * - `subagents`：解析内置后端（在挂载的工具实例里使用）。
+ * - `subagents`：注册 CLI provider，并解析内置后端。
  * - `agents`：取发起本次调用的父代理（在被挂载的工具内部使用）。
  * - `systemPrompt`：注册角色路由指引。**必需**——`dsh-tool-subagent` 的
- *   工具描述不可配置，四个角色工具的描述完全相同，路由规则只能靠系统提示传达。
+ *   工具描述不可配置，各角色工具的描述完全相同，路由规则只能靠系统提示传达。
+ * - `subprocess`：执行本地 CLI。argv 数组直传、`shell: false`，全程无 shell。
  */
-export const inject = ['tools', 'subagents', 'agents', 'systemPrompt'];
+export const inject = ['tools', 'subagents', 'agents', 'systemPrompt', 'subprocess'];
 
 /**
  * 装载诊断。供自检工具读取；每次 `apply` 重算。
- * @type {{ configErrors: string[], mounts: { id: string, ok: boolean, detail: string }[], fatal: string | undefined }}
+ *
+ * 诊断做得很细是有原因的：Host 半边在 link 安装下不能热加载
+ * （docs/architecture.md 3.3），每次排错都要重启 dsh，所以必须在**一次**激活里
+ * 把「哪个角色失败、为什么」全部报出来。
+ *
+ * @type {{
+ *   configErrors: string[],
+ *   mounts: { id: string, ok: boolean, detail: string }[],
+ *   providers: { id: string, name: string, ok: boolean, detail: string }[],
+ *   executables: { id: string, command: string, resolved?: string, ok: boolean, detail?: string }[],
+ *   fatal: string | undefined,
+ * }}
  */
-const diagnostics = { configErrors: [], mounts: [], fatal: undefined };
+const diagnostics = { configErrors: [], mounts: [], providers: [], executables: [], fatal: undefined };
 
 /**
  * 插件配置。
@@ -67,6 +87,8 @@ export const Config = z.object({
   provider: z.string().description('角色默认 LLM provider'),
   /** 允许嵌套派发时，子代理可用的深度上限。 */
   maxDepth: z.number().step(1).min(0).default(3).description('允许嵌套派发时的深度上限'),
+  /** CLI 角色的默认可执行工作目录；角色自身可用 cliCwd 覆盖。 */
+  cwd: z.string().description('CLI 角色的默认工作目录'),
   /** 角色列表。 */
   roles: z
     .array(
@@ -74,18 +96,48 @@ export const Config = z.object({
         id: z.string().required(),
         title: z.string(),
         description: z.string().required(),
+        // --- builtin 后端需要：DSH 的 LLM route ---
         provider: z.string(),
-        model: z.string().required(),
+        // model 对 CLI 后端是「外部 CLI 的模型 id」，对 builtin 后端是 DSH route 的
+        // model。两者共用一个字段是有意的：同一个角色只应有一个模型来源（见 D12）。
+        model: z.string(),
         // ⚠️ schemastery **没有** `z.enum`（沿 zod 的直觉会踩坑）：枚举用 `z.union`。
         effort: z.union(EFFORT_VALUES),
         instructions: z.string().required(),
         readOnly: z.boolean().default(false),
-        backend: z.union(['spawn', 'fork']).default('spawn'),
+        backend: z.union(['spawn', 'fork', 'cli']),
         allowNestedDispatch: z.boolean().default(false),
+        // --- cli 后端需要：可执行文件与参数模板 ---
+        // 放在角色**顶层**而非嵌套对象，是为了让设置面板把每一项当普通标量字段渲染。
+        cliCommand: z.string(),
+        cliPrefixArgs: z.array(z.string()),
+        cliArgs: z.array(z.string()),
+        cliPromptDelivery: z.union(['stdin', 'argv']),
+        cliCwd: z.string(),
+        cliGraceMs: z.number().step(1).min(0),
+        cliMaxOutputBytes: z.number().step(1).min(1),
+        cliMaxErrorBytes: z.number().step(1).min(1),
       }),
     )
     .default([]),
 });
+
+/**
+ * 调用 `ctx.subprocess.spawn`，把「服务本身抛错」也变成可上报的失败。
+ *
+ * `spawn` 的契约是：argv、cwd、env 或 graceMs 非法时**同步抛错**。不可用时
+ * （例如没有挂载 subprocess 实现）也在这里失败，而不是让异常穿透到工具层。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} spec - `SubprocessSpawnSpec`。
+ * @returns {object} `SubprocessHandle`
+ */
+function safeSpawn(ctx, spec) {
+  if (!ctx.subprocess || typeof ctx.subprocess.spawn !== 'function') {
+    throw new Error('ctx.subprocess.spawn 不可用：没有挂载 subprocess 服务实现');
+  }
+  return ctx.subprocess.spawn(spec);
+}
 
 /**
  * 自检工具：一次调用即可看清装载结果，避免为每个问题重启一次 dsh。
@@ -97,7 +149,7 @@ function selftestTool() {
     name: 'switchboard_selftest',
     description:
       'Report whether the DSH Agent Switchboard plugin is loaded, which role delegation tools it ' +
-      'registered, and any configuration errors. Takes no arguments and has no side effects.',
+      'registered, and any configuration or CLI-resolution errors. Takes no arguments and has no side effects.',
     parameters: {},
     output: {
       schema: {
@@ -108,6 +160,8 @@ function selftestTool() {
           phase: { type: 'string', required: true },
           roleCount: { type: 'number', required: true },
           mounted: { type: 'string', required: true },
+          providers: { type: 'string', required: true },
+          executables: { type: 'string', required: true },
           configErrors: { type: 'string', required: true },
           fatal: { type: 'string', required: true },
         },
@@ -117,6 +171,8 @@ function selftestTool() {
           `Agent Switchboard · ${value.phase}`,
           `已挂载角色工具：${value.roleCount}`,
           `明细：${value.mounted}`,
+          `CLI provider：${value.providers}`,
+          `CLI 可执行文件：${value.executables}`,
         ];
         if (value.configErrors) lines.push(`配置错误：\n${value.configErrors}`);
         if (value.fatal) lines.push(`致命错误：${value.fatal}`);
@@ -125,13 +181,28 @@ function selftestTool() {
     },
     execute() {
       return Promise.resolve({
-        ok: diagnostics.fatal === undefined && diagnostics.configErrors.length === 0,
-        phase: 'phase-2',
+        ok:
+          diagnostics.fatal === undefined &&
+          diagnostics.configErrors.length === 0 &&
+          diagnostics.mounts.every((m) => m.ok),
+        phase: 'phase-3',
         roleCount: diagnostics.mounts.filter((m) => m.ok).length,
         mounted:
           diagnostics.mounts.length === 0
             ? '（无）'
             : diagnostics.mounts.map((m) => `${m.id}=${m.ok ? 'OK' : `失败(${m.detail})`}`).join(' '),
+        providers:
+          diagnostics.providers.length === 0
+            ? '（无 CLI 角色）'
+            : diagnostics.providers
+                .map((p) => `${p.id}->${p.name}${p.ok ? '' : ` 失败(${p.detail})`}`)
+                .join(' '),
+        executables:
+          diagnostics.executables.length === 0
+            ? '（无 CLI 角色）'
+            : diagnostics.executables
+                .map((e) => `${e.id}:${e.command}=${e.ok ? (e.resolved ?? 'OK') : `无法解析(${e.detail})`}`)
+                .join(' '),
         configErrors: diagnostics.configErrors.join('\n'),
         fatal: diagnostics.fatal ?? '',
       });
@@ -174,12 +245,14 @@ export function apply(ctx, config) {
   const resolved = config ?? {};
   diagnostics.configErrors = [];
   diagnostics.mounts = [];
+  diagnostics.providers = [];
+  diagnostics.executables = [];
   diagnostics.fatal = undefined;
 
   // 自检工具总是注册：即使角色配置全错，也要能用它看到错在哪。
   ctx.tools.register(selftestTool());
 
-  const { roles, errors } = normalizeRoles(resolved.roles, resolved.provider);
+  const { roles, errors } = normalizeRoles(resolved.roles, resolved.provider, resolved.cwd);
   diagnostics.configErrors = errors;
   if (errors.length > 0) {
     // 配置有错时不挂载任何角色工具：半挂载会让主代理看到一批语义不明的工具。
@@ -207,6 +280,45 @@ export function apply(ctx, config) {
   });
 
   const maxDepth = typeof resolved.maxDepth === 'number' ? resolved.maxDepth : 3;
+
+  // 注册 CLI 角色各自的 provider 实例。
+  //
+  // 为什么**每个角色一个实例**而不是一个共享 provider：provider 的 `start()`
+  // 只能从 `request` 里看到提示词与父代理，无法知道是哪个角色发起的调用，
+  // 而角色级命令/参数模板/模型/强度各不相同。注册名必须与
+  // `toolConfigFor()` 写进工具配置的 provider 名一致（由 check-cli.mjs 的
+  // 跨模块断言锁住）。
+  const cliRoles = roles.filter((role) => role.backend === CLI_BACKEND);
+  for (const role of cliRoles) {
+    try {
+      const provider = createCliProvider({
+        role,
+        spawn: (spec) => safeSpawn(ctx, spec),
+        resolveExecutable: (command, env, signal) => ctx.subprocess.resolveExecutable(command, env, signal),
+      });
+      ctx.subagents.registerProvider(provider);
+      diagnostics.providers.push({ id: role.id, name: provider.name, ok: true, detail: '已注册' });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      diagnostics.providers.push({ id: role.id, name: cliProviderName(role.id), ok: false, detail });
+      console.error(`[${name}] CLI provider "${role.id}" 注册失败：${detail}`);
+    }
+  }
+
+  // CLI 角色的**装载期**校验：把「命令根本不存在」这类问题在启动时就报出来，
+  // 而不是等第一次派发。解析失败不阻断装载（可能依赖运行期 PATH），只作为诊断。
+  for (const role of cliRoles) {
+    Promise.resolve()
+      .then(() => ctx.subprocess.resolveExecutable(role.cli.command, role.cli.env))
+      .then((path) => {
+        diagnostics.executables.push({ id: role.id, command: role.cli.command, resolved: path, ok: true });
+      })
+      .catch((error) => {
+        const detail = error instanceof Error ? error.message : String(error);
+        diagnostics.executables.push({ id: role.id, command: role.cli.command, ok: false, detail });
+        console.error(`[${name}] CLI 角色 "${role.id}" 的可执行文件无法解析：${detail}`);
+      });
+  }
 
   // 动态 import：把「工具包取不到」变成可上报的诊断，而不是整个插件激活失败。
   import('@deepseek-ai/dsh-tool-subagent')

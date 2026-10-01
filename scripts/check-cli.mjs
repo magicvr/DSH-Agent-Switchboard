@@ -8,6 +8,8 @@ import {
   validateTemplate,
 } from '../src/cli/argv.js';
 import { classifyRun, formatRunResult, parseRouteFacts } from '../src/cli/output.js';
+import { cliProviderNameFor } from '../src/cli/provider.js';
+import { normalizeRole, toolConfigFor } from '../src/roles.js';
 
 let pass = 0;
 let fail = 0;
@@ -222,6 +224,36 @@ section('formatRunResult');
   });
   check('无路由事实时明确标注不臆造', noRoute.text.includes('未自报路由事实'));
   check('route 字段为空对象', Object.keys(noRoute.route).length === 0);
+}
+
+section('provider 命名一致性（跨模块）');
+{
+  // 工具实例的 `provider` 字段由 roles.js 的 toolConfigFor 生成，
+  // 而注册名由 provider.js 的 createCliProvider 生成。两者不一致会让工具在
+  // 装载期找不到 provider —— 这类跨模块契约必须有断言锁住，不能靠人记住。
+  const role = normalizeRole(
+    {
+      id: 'codex-scout',
+      description: 'd',
+      instructions: 'i',
+      backend: 'cli',
+      cliCommand: 'node',
+      cliArgs: ['exec', '-'],
+      cliCwd: 'C:/w',
+    },
+    0,
+    undefined,
+    'C:/w',
+  ).role;
+
+  check('cli 角色规范化成功', role !== null);
+  const cfg = toolConfigFor(role, { maxDepth: 3 });
+  check(
+    'toolConfigFor 的 provider 名 = cliProviderNameFor 的注册名',
+    cfg.provider === cliProviderNameFor(role.id),
+    `tool=${cfg.provider} provider=${cliProviderNameFor(role.id)}`,
+  );
+  check('provider 名含角色 id', cfg.provider === 'switchboard-cli-codex-scout', cfg.provider);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

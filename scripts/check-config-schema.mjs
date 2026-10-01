@@ -160,7 +160,7 @@ const rootDict = rootNode?.dict ?? {};
 const fieldNames = Object.keys(rootDict);
 console.log(`Config 顶层字段：${fieldNames.join(', ')}`);
 
-for (const want of ['provider', 'maxDepth', 'roles', 'volatile']) {
+for (const want of ['provider', 'maxDepth', 'cwd', 'roles', 'volatile']) {
   if (fieldNames.includes(want)) console.log(`PASS  顶层字段 ${want} 存在`);
   else {
     console.error(`FAIL  顶层字段 ${want} 缺失`);
@@ -214,6 +214,15 @@ const expectedRoleFields = [
   'readOnly',
   'backend',
   'allowNestedDispatch',
+  // cli 后端的字段。放在角色顶层是为了让设置面板按普通标量字段渲染它们。
+  'cliCommand',
+  'cliPrefixArgs',
+  'cliArgs',
+  'cliPromptDelivery',
+  'cliCwd',
+  'cliGraceMs',
+  'cliMaxOutputBytes',
+  'cliMaxErrorBytes',
 ];
 for (const want of expectedRoleFields) {
   if (Object.prototype.hasOwnProperty.call(roleFields, want)) {
