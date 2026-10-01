@@ -27,14 +27,14 @@ DSH 插件 `DSH Agent Switchboard`：把主代理限制为「信息流统合器�
 | --- | --- |
 | [`README.md`](./README.md) | 项目定位、核心设计、状态 |
 | [`docs/plan.md`](./docs/plan.md) | **目录结构、分阶段实施方案、验收标准、风险登记** |
-| [`docs/decisions.md`](./docs/decisions.md) | **技术决策记录 D1–D10（含依据与代价）** |
+| [`docs/decisions.md`](./docs/decisions.md) | **技术决策记录 D1–D11（含依据与代价）** |
 | [`docs/architecture.md`](./docs/architecture.md) | 已核实的 DSH 插件契约与取证 |
 | `docs/cli-backends.md` | CLI 实测参数表（Phase 3 产出，尚未创建） |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | 提交规范与自查项 |
 
 ## 取证工具
 
-`scripts/dsh-probe.mjs`、`scripts/dsh-cat.mjs`、`scripts/inline-asar-probe.mjs` 是**只读**探针，用于在不落任何临时文件的前提下检查已安装的 DSH 归档：
+探针的检查点路径可用 `DSH_ASAR` 环境变量覆盖（默认指向本机安装位置）：
 
 ```bash
 node scripts/dsh-probe.mjs list-registry        # 列出归档内所有 DSH 包
