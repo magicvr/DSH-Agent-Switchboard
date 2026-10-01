@@ -85,13 +85,15 @@
 3. 从 profile 目录可直接 import 两半边；Client 半边加载时确实调用了 `load()` 且 id 正确。
 4. 包已被 `install_bundle` 成功 link 进 profile（`link:C:/.../DSH-Agent-Switchboard`，pnpm 退出码 0）。
 5. **`@deepseek-ai/schemastery` 与 `@deepseek-ai/dsh-tools` 的 import 在运行时可用** —— 曾一度怀疑不可用（磁盘上解析必然失败），最终由报错堆栈中出现 `src/index.js` 行号证明模块加载与 `apply` 执行均成功。
-6. `output.schema` 已按受限子集改正，并用**抽取自 `dsh-tools` 的真实校验器**验证：新 schema **0 violations**，且该抽取版能逐字复现线上对旧写法的报错。
+6. `output.schema` 已改为 value schema DSL 写法（属性级 `required: true`），并用**两层预检**验证：DSL 层与编译产物子集层**均 0 violations**，且预检能对两种已知错误写法逐字复现线上报错。
+7. ✅ **Client 半边已在运行中的 GUI 生效**（不依赖 Host 半边，有自己的 HMR）。`cordis_inspect_query`（Client `Slots`，root `conversation.composer.dock`）的 `occupants` 现有两项：官方 `stats`（order 0）与我们的 `id: "agent-switchboard"`（order 5），`active: true`。**这条即验收第 4 条，已通过。**
+8. ✅ 顺带确认：`dsh.client.platform: "web"` **在桌面版下是正确的**——profile 目录名为 `desktop`，但渲染层就是这套 Web 客户端。
 
 **待完成（阻塞条件明确）：**
 
-- **条目的 `fiberPhase` 当前为 `failed`（未激活）。** 第一次重启后模块确实被重新加载了（`fiberPhase` 由 `null` 变为 `failed`，`Config` 状态由「无 config 说明」变为 `status: "schema"`），随即暴露出真实错误：`schema.required is not supported by the value schema DSL`。该错误已定位并修复——`output.schema` 是 value schema DSL，必需性必须写成**属性级 `required: true`**，由 DSL 自动装配成对象级数组（见 `architecture.md` 第 3.1 节第 12 条）。
-- **仍受 link 模式模块缓存限制。** 修复后再次开关条目，报错堆栈行号未变，说明运行的仍是缓存模块（`set_plugin` 开关不清模块缓存）。因此需要**再重启一次 dsh** 才能装载修复后的模块。
-- 重启后逐条跑完下列 5 条验收。
+- **Host 半边仍为 `failed`。** 第一次重启后模块确实被重新加载（`fiberPhase` 由 `null` 变为 `failed`，`Config` 状态变为 `status: "schema"`），并暴露出真实错误 `schema.required is not supported by the value schema DSL`。该错误已修复——`output.schema` 是 value schema DSL，必需性必须写成**属性级 `required: true`**（见 `architecture.md` 第 3.1 节第 12 条）。
+- **修复的真机生效仍需重启。** link 模式下模块被缓存，`set_plugin` 开关与 `install_bundle` 都不重新加载源码（已用落地文件探针证实新代码从未执行）。Client 半边不受此限。
+- 重启后跑完验收第 1–3、5 条。
 
 ### 教训：验证方法本身出过错
 

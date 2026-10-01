@@ -116,14 +116,14 @@
 
 **最关键的一条：** DSH 的 `ctx.subagents` 是一个**具名 provider 注册表**，`registerProvider()` 是公开扩展点，而 `SubagentRun.localAgent` 的类型是 `Agent | undefined`。这个 `undefined` 分支就是「非 DSH 子代理」的官方预留位——**跨 CLI 派发不需要绕开内置机制，它就是内置机制的一个 provider。**
 
-> 包名定为 `@magicvr/dsh-agent-switchboard`。本仓库目前还没有 `package.json`，因此现在**不可安装**。决策清单见 [`docs/decisions.md`](./docs/decisions.md)。
+> 包名为 `@magicvr/dsh-agent-switchboard`，`package.json` 已落地并已 link 进 profile。决策清单见 [`docs/decisions.md`](./docs/decisions.md)。
 
 ## 路线图
 
 分四期，每期都有必须真实通过的验收标准，见 [`docs/plan.md`](./docs/plan.md)。
 
 - [x] **Phase 0 · 设计与取证** — 仓库初始化、摸清 DSH 契约、技术决策与实施方案定型
-- [~] **Phase 1 · 最小可加载插件** — 代码已落地并已成功 link 进 profile；**真机激活待一次应用重启**（link 模式下 Host 半边改动不热加载，原因见 [architecture.md](docs/architecture.md) 第 3.3 节）
+- [~] **Phase 1 · 最小可加载插件** — 已 link 进 profile；**Client 半边已在运行中的 GUI 生效**（`composer.dock` 可见）；**Host 半边待一次重启**（link 模式下 Host 模块被缓存，改动不热加载，见 [architecture.md](docs/architecture.md) 第 3.3 节）
 - [ ] **Phase 2 · builtin 后端** — 角色模型、每个角色一个委派工具、走 DSH 内置子代理
 - [ ] **Phase 3 · CLI 后端** — 自己实现 `SubagentProvider`，走 `ctx.subprocess` 调用本机 CLI
 - [ ] **Phase 4 · 可观测性与打磨** — 调度日志、可写面板、并发预算
