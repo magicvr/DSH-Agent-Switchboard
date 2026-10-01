@@ -1,10 +1,17 @@
 // 一次性读取 asar 内指定文件的全文（不落临时文件）。
 // 用法：node scripts/dsh-cat.mjs <archive-relative-path>
 import { readFileSync } from 'node:fs';
+import { resolveAsar } from './lib/paths.mjs';
 
-const archive =
-  process.env.DSH_ASAR ||
-  'C:\\Users\\magicvr\\AppData\\Local\\Programs\\DeepSeek Harness\\resources\\app.asar';
+let archive;
+try {
+  const selected = resolveAsar();
+  archive = selected.archive;
+  console.error(`ASAR: ${archive} [${selected.source}]`);
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
 const wanted = process.argv[2];
 
 if (!wanted) {
