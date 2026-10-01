@@ -133,20 +133,25 @@
 | 4 | `persona` 生效 | ✅ | scout 按角色的「证据优先」格式作答，给出 `src/roles.js:24–32` 等精确引用 |
 | 5 | 嵌套派发默认关闭 | ✅ | 角色工具配置 `maxDepth: 1`，子代理无法再派 |
 | 6 | 路由指引传达给主代理 | ✅ | 系统提示中出现 `## Subagent roles` 段 |
-| 7 | **模型按角色切换** | ⚠️ **未能独立验证** | 见下 |
+| 7 | **模型按角色切换** | ✅ | 见下 |
 
-**未能验证的一项，以及原因（重要）：**
+**第 7 条：验证方式与决定性证据（本阶段最重要的一条）**
 
-「角色是否真的用上了各自指定的 `model` / `effort`」——配置已下发到每个工具实例的
-`agentOptions`（结构上必然被消费），但**我无法从任何模型可见的表面反查实际使用的模型**。已逐一排查并确认这些表面**都不含**该信息：
+模型名**不会**出现在子代理自己的上下文里——实测 worker 回答 `not stated in my context` 并拒绝猜测，这正是它该有的行为。因此改用**持久化会话记录**取权威答案。
 
-- 子代理自己的上下文：worker 明确回答 `not stated in my context`，拒绝猜测（这是它的正确行为）
-- `ctx.subagents` 的 catalog（`SubagentCatalogEntry`）：不含模型字段
-- 持久化会话记录 `session.v4.jsonl.zstd`：当前可读部分只有 header，无 `request/header` 事件
-- `list_subagent_models` 工具：需要 `modelSelectionSettings: true` 才注册，而本插件按 D12 设为 false
-- Client 侧源码：未发现 per-session 模型展示
+记录位置：`~/.dsh/sessions/<workspace>/<childId>/session.v4.jsonl.zstd`，每个子会话都记有 `data.header.config`：
 
-**这是一个真实的可观测性缺口，不是本插件的 bug。** 决定性的验证手段是**反证实验**：把某个角色的 `model` 改成一个不存在的 id，重新启用后派发该角色——若失败，即证明 `agentOptions.model` 确实被消费；若仍成功，则说明该字段被忽略。这需要一次重启，尚未执行。
+| 会话 | `provider` / `model` / `reasoningEffort` |
+| --- | --- |
+| 子会话（scout 角色） | `self` / **`gpt-6-luna`** / **`medium`** |
+| 子会话（worker 角色） | `self` / **`gpt-6.1-sol`** / **`high`** |
+| 主会话（主代理） | `deepseek-account` / `deepseek-flash` / high |
+
+**为什么这是决定性证明：** 子代理用的是**角色配置的模型**，而非父代理的 `deepseek-flash`；`reasoningEffort` 也逐字匹配。而 `gpt-6-luna` 与 `gpt-6.1-sol` 这两个 id **只存在于本插件的角色配置中**（`raw/agents/*.toml` → profile patch），没有其他来源，不可能凭空出现在子会话记录里。D12「模型由角色固定」至此得到实证。
+
+**⚠️ 读取方法（踩过两个坑，脚本已固化于 `scripts/inspect-sessions.mjs`）：** 会话文件由**多个 zstd frame** 顺序拼成（单个会话实测 6–1646 个 frame）。`zstdDecompressSync` 只解第一个 frame，而 `createZstdDecompress` 流式解码**同样只产出第一个 frame**。必须按 frame 边界逐个解压再拼接。
+
+截断的解压结果看起来是「成功」的，因此极易被误判为「记录里没有该信息」——**我一度正是据此得出了「模型无法验证」的错误结论**，并差点把它写进文档当作事实。这条失败模式值得记住：解压器「没报错」不等于「读全了」。
 
 ## Phase 3 · CLI 后端
 
