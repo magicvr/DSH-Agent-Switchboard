@@ -5,7 +5,7 @@
 // 远程服务读写。**不迁移就会丢配置** —— 装载期只会读到「文件不存在」。
 //
 // 本脚本做两件事：
-//   1. 若配置文件尚不存在，用 profile 里的角色播种它；
+//   1. 若配置文件缺失或角色为空，用 profile 里的角色播种它；
 //   2. 从 preset 声明里移除那一行插件的 `config`（角色不再由那里提供）。
 //
 // ⚠️ 顺序很重要：**先播种文件、再改 profile**。反过来一旦中途失败，就会既丢了
@@ -23,6 +23,7 @@
 //    文件**整块替换** profile 里的声明，因此如果先重新注入、再迁移，profile 里那份
 //    角色就已经被替换掉了。此时只能从备份里取回角色。实测踩到过这一步。
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
 import { parse } from 'yaml';
 import { readConfigFile, writeConfigFile, initialConfig } from '../../src/config-file.js';
 import { join } from 'node:path';
@@ -113,7 +114,8 @@ if (!existing.ok) {
   process.exit(1);
 }
 const hasFile = existing.missing !== true;
-console.log(`配置文件${hasFile ? `已存在（现有 ${existing.value.roles.length} 个角色，不会覆盖）` : '不存在，将播种'}`);
+const needsSeed = !hasFile || existing.value.roles.length === 0;
+console.log(`配置文件${needsSeed ? (hasFile ? '角色为空，将播种（保留现有字段）' : '不存在，将播种') : `已存在（现有 ${existing.value.roles.length} 个角色，不会覆盖）`}`);
 
 // --- 3) 读取当前 profile，检查 mount ------------------------------------------
 const profileText = readFileSync(PROFILE, 'utf8').replace(/\r\n/g, '\n');
@@ -140,7 +142,7 @@ const hasRolesInProfile = Array.isArray(selfRow.config?.roles) && selfRow.config
 console.log(`profile 里是否还有 roles：${hasRolesInProfile}`);
 
 console.log('\n将要做的改动：');
-if (!hasFile && seedRoles.length > 0) console.log(`  1. 播种配置文件（${seedRoles.length} 个角色）→ ${configPath}`);
+if (needsSeed && seedRoles.length > 0) console.log(`  1. 播种配置文件（${seedRoles.length} 个角色）→ ${configPath}`);
 else console.log('  1. 不改动配置文件');
 console.log(
   hasRolesInProfile
@@ -154,8 +156,8 @@ if (mode === 'check') {
 }
 
 // --- 4) 先播种文件（顺序关键：先文件、后 profile）-------------------------------
-if (!hasFile && seedRoles.length > 0) {
-  const written = writeConfigFile(configPath, initialConfig(seedRoles, seedExtra));
+if (needsSeed && seedRoles.length > 0) {
+  const written = writeConfigFile(configPath, initialConfig(seedRoles, { ...seedExtra, ...existing.value, roles: seedRoles }));
   if (!written.ok) {
     console.error(`FAIL  播种配置文件失败：${written.error}`);
     console.error('      未改动 profile —— 保持原状，不制造「两边都没有」的状态。');
@@ -166,6 +168,13 @@ if (!hasFile && seedRoles.length > 0) {
 
 // --- 5) 再收窄 profile 里的 config --------------------------------------------
 if (hasRolesInProfile) {
+  const verified = readConfigFile(configPath);
+  if (!verified.ok || verified.missing || verified.value.roles.length === 0
+    || (needsSeed && !isDeepStrictEqual(verified.value.roles, seedRoles))) {
+    console.error('FAIL  删除 profile 角色前复读配置失败、角色为空或与播种 roles 不一致');
+    console.error('      未改动 profile —— 保持原状，不制造「两边都没有」的状态。');
+    process.exit(1);
+  }
   const lines = profileText.split('\n');
   const selfIdLine = lines.findIndex((l) => /^\s*- id:\s*switchboard-roles\s*$/.test(l));
   if (selfIdLine === -1) {
@@ -225,8 +234,8 @@ if (jsBefore !== jsAfter) {
   process.exit(1);
 }
 const finalRead = readConfigFile(configPath);
-console.log(`  配置文件读取：${finalRead.ok ? `OK（${finalRead.value.roles.length} 个角色：${finalRead.value.roles.map((r) => r.id).join(', ')}）` : `失败：${finalRead.error}`}`);
-if (!finalRead.ok || finalRead.value.roles.length === 0) {
+console.log(`  配置文件读取：${finalRead.ok && !finalRead.missing ? `OK（${finalRead.value.roles.length} 个角色：${finalRead.value.roles.map((r) => r.id).join(', ')}）` : `失败：${finalRead.error ?? '文件缺失'}`}`);
+if (!finalRead.ok || finalRead.missing || finalRead.value.roles.length === 0) {
   console.error('FAIL  迁移后配置文件不可用或为空');
   process.exit(1);
 }

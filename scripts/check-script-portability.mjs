@@ -1,5 +1,8 @@
 // 离线：仅写临时 fixture，不运行外部 CLI、不改变真实 USERPROFILE。
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
+import { pathToFileURL } from 'node:url';
+import { parse } from 'yaml';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { captureSync } from './lib/capture.mjs';
@@ -72,7 +75,7 @@ try {
   });
 
   console.log('\n=== 显式目标与 wiring 进程退出 ===');
-  const env = { ...process.env }; delete env.DSH_HOME;
+  const env = { ...process.env, DSH_HOME: join(temp, 'isolated-home') };
   const runWiring = (argv, extraEnv = {}) => captureSync(process.execPath,
     [join(REPO_ROOT, 'scripts', 'check-profile-wiring.mjs'), ...argv], { cwd: temp, env: { ...env, ...extraEnv } });
   for (const [label, argv, extraEnv] of [
@@ -89,6 +92,97 @@ try {
   test('显式目标缺 roles 文件失败', () => { const r = runWiring(['--home', home]); return r.status === 1 && /缺少 roles 文件/.test(r.stderr); });
   mkdirSync(join(home, 'agent-switchboard')); writeFileSync(configPathFor(home), JSON.stringify({ roles: [] }));
   test('非仓库 cwd 的完整 wiring fixture 跑满九条', () => { const r = runWiring(['--home', home]); return r.status === 0 && /结果：9 通过 \/ 0 失败/.test(r.stdout); });
+
+  console.log('\n=== 角色文件迁移与删源前复读 ===');
+  const migration = join(REPO_ROOT, 'scripts', 'ops', 'migrate-roles-to-file.mjs');
+  const seedRoles = [{ id: 'migration-fixture', title: 'Fixture', prompt: 'offline fixture', backend: 'spawn' }];
+  const migrationText = `- insert:\n  - id: preset-switchboard\n    config:\n      plugins:\n      - id: switchboard-roles\n        name: "${self}"\n        config:\n          mount: true\n          provider: seed-provider\n          cwd: seed-cwd\n          maxDepth: 2\n          roles: ${JSON.stringify(seedRoles)}\n`;
+  const fixture = (name, value) => {
+    const home = join(temp, name);
+    const profile = join(home, 'profiles', 'desktop');
+    const patch = join(profile, 'cordis.patch.yml');
+    const roles = configPathFor(home);
+    mkdirSync(profile, { recursive: true });
+    writeFileSync(patch, migrationText);
+    if (value !== undefined) {
+      mkdirSync(join(home, 'agent-switchboard'));
+      writeFileSync(roles, JSON.stringify(value));
+    }
+    return { home, patch, roles };
+  };
+  const runMigration = (f, fault) => {
+    const argv = [migration, '--apply', '--home', f.home];
+    if (fault) {
+      // Patch built-in exports only in this child; production imports still execute unchanged.
+      const shim = `
+        import fs from 'node:fs';
+        import { syncBuiltinESMExports } from 'node:module';
+        const target = ${JSON.stringify(f.roles)};
+        const fault = ${JSON.stringify(fault)};
+        const originalRead = fs.readFileSync;
+        const originalWrite = fs.writeFileSync;
+        const originalRename = fs.renameSync;
+        let written = false;
+        fs.renameSync = (...args) => {
+          const result = originalRename(...args);
+          if (args[1] === target) written = true;
+          return result;
+        };
+        fs.readFileSync = (...args) => {
+          if (written && args[0] === target && fault !== 'write-failure') {
+            return JSON.stringify({ roles: fault === 'empty-reread' ? [] : [{ id: 'wrong-role' }] });
+          }
+          return originalRead(...args);
+        };
+        fs.writeFileSync = (...args) => {
+          if (fault === 'write-failure' && String(args[0]).startsWith(target + '.')) {
+            throw new Error('fixture seed write failure');
+          }
+          return originalWrite(...args);
+        };
+        syncBuiltinESMExports();
+        process.argv = ${JSON.stringify([process.execPath, ...argv])};
+        await import(${JSON.stringify(pathToFileURL(migration).href)});
+      `;
+      return captureSync(process.execPath, ['--input-type=module', '--eval', shim],
+        { cwd: temp, env: { ...env, DSH_HOME: f.home } });
+    }
+    return captureSync(process.execPath, argv, { cwd: temp, env: { ...env, DSH_HOME: f.home } });
+  };
+  const profileConfig = f => parse(readFileSync(f.patch, 'utf8'))[0].insert[0].config.plugins[0].config;
+  const readRoles = f => existsSync(f.roles) ? JSON.parse(readFileSync(f.roles, 'utf8')) : undefined;
+  const wrapperOnly = {
+    formatVersion: 7, roles: [], provider: 'existing-provider', cwd: 'existing-cwd', maxDepth: 4,
+    volatile: { wrapperProvider: 'wrapper-route', wrapperModel: 'wrapper-model', wrapperEffort: 'high', cliTimeoutSec: 45 },
+    custom: { retained: true },
+  };
+  for (const [label, value] of [['缺文件', undefined], ['空 roles 文件', { roles: [] }], ['wrapper-only 文件', wrapperOnly]]) {
+    const f = fixture(`migration-success-${label}`, value);
+    const result = runMigration(f);
+    const after = readRoles(f);
+    check(`${label}迁移成功`, result.status === 0 && /PASS  迁移完成/.test(result.stdout));
+    check(`${label}播种 roles 与来源一致`, isDeepStrictEqual(after?.roles, seedRoles));
+    check(`${label}源 config 只剩 mount:true`, isDeepStrictEqual(profileConfig(f), { mount: true }));
+    check(`${label}保留已有字段并补齐默认值`, isDeepStrictEqual(after,
+      { formatVersion: 1, provider: 'seed-provider', cwd: 'seed-cwd', maxDepth: 2, ...value, roles: seedRoles }));
+  }
+  const existingRoles = [{ id: 'existing-role', custom: true }];
+  const populated = fixture('migration-existing-roles', { ...wrapperOnly, roles: existingRoles });
+  const populatedResult = runMigration(populated);
+  check('非空 roles 文件不覆盖且可完成迁移', populatedResult.status === 0
+    && isDeepStrictEqual(readRoles(populated), { ...wrapperOnly, roles: existingRoles })
+    && isDeepStrictEqual(profileConfig(populated), { mount: true }));
+  for (const fault of ['empty-reread', 'mismatch-reread', 'write-failure']) {
+    const f = fixture(`migration-${fault}`, wrapperOnly);
+    const result = runMigration(f, fault);
+    const output = result.stdout + result.stderr;
+    check(`${fault}迁移必须失败`, result.status === 1 && /FAIL/.test(output));
+    check(`${fault}失败必须原样保留 profile`, readFileSync(f.patch, 'utf8') === migrationText);
+    check(`${fault}命中指定故障路径`, fault === 'write-failure'
+      ? /fixture seed write failure/.test(output) && isDeepStrictEqual(readRoles(f), wrapperOnly)
+      : /PASS  已播种配置文件/.test(output) && /删除 profile 角色前复读/.test(output)
+        && isDeepStrictEqual(readRoles(f)?.roles, seedRoles));
+  }
 
   console.log('\n=== ASAR 定位 ===');
   const asar = extra => resolveAsar({ env: {}, cwd: temp, homedir: base.homedir, platform: 'win32', isFile: () => true, ...extra });

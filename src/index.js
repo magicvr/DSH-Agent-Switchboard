@@ -181,21 +181,37 @@ function wrapperRouteFrom(value) {
 
 /** 用既有文件桥接根配置与 preset；显式空值确保清除后不回落 preset 的旧值。 */
 function syncWrapperRouteToFile(resolved, roleConfigPath, diagnostics) {
+  // 独立维护当前同步失败；恢复后不锁存旧错误。
+  const previous = diagnostics.wrapperSyncError;
+  diagnostics.configErrors = diagnostics.configErrors.filter((error) => error !== previous);
+  diagnostics.wrapperSyncError = undefined;
+  diagnostics.wrapperSyncPending = false;
+  const fail = (detail) => {
+    const message = `包裹路由同步失败：${detail}`;
+    diagnostics.wrapperSyncError = message;
+    if (!diagnostics.configErrors.includes(message)) diagnostics.configErrors.push(message);
+    if (message !== previous) console.error(`[${name}] ${message}`);
+  };
   const current = readRoleConfigFile(roleConfigPath);
   const fields = ['wrapperProvider', 'wrapperModel', 'wrapperEffort'];
   const root = readVolatile(resolved);
   const existing = current.ok ? current.value : {};
   if (!fields.some((key) => Object.hasOwn(root, key) || Object.hasOwn(existing.volatile ?? {}, key))) return;
   if (!current.ok) {
-    diagnostics.configErrors.push(current.detail);
+    fail(current.detail);
     return;
   }
+  // 仅路由不能冒充已播种角色；根配置仍保留设置，下次有角色写入时一并同步。
+  if (current.missing) {
+    diagnostics.wrapperSyncPending = true;
+    return;
+  }
+  diagnostics.wrapperSyncPending = false;
   const volatile = { ...existing.volatile };
   for (const key of fields) volatile[key] = typeof root[key] === 'string' ? root[key].trim() : '';
   if (JSON.stringify(volatile) === JSON.stringify(existing.volatile)) return;
-  const written = writeConfigFile(roleConfigPath, current.missing
-    ? initialConfig([], { volatile }) : { ...existing, volatile });
-  if (!written.ok) diagnostics.configErrors.push(`包裹路由同步失败：${written.error}`);
+  const written = writeConfigFile(roleConfigPath, { ...existing, volatile });
+  if (!written.ok) fail(written.error);
 }
 
 /** 每激活实例保留诊断；弃用日志每次模块加载最多打印一次。 */
@@ -650,6 +666,7 @@ export function selftestTool(ctx, diagnostics) {
           `路径=${diagnostics.roleConfigPath ?? '未解析'}`,
           `读取=${diagnostics.roleConfigRead ?? '（本作用域未读取）'}`,
           `同步=${diagnostics.roleConfigSync ?? '（本作用域未同步）'}`,
+          ...(diagnostics.wrapperSyncPending ? ['包裹路由=等待角色写入后同步（未创建空角色文件）'] : []),
           ...(diagnostics.deprecatedConfig ? [`弃用=${diagnostics.deprecatedConfig}`] : []),
         ].join(' | '),
         configErrors: diagnostics.configErrors.join('\n'),
@@ -819,12 +836,6 @@ function applyInner(ctx, config) {
 
   // 自检工具总是注册：即使角色配置全错，也要能用它看到错在哪。
   ctx.tools.register(selftestTool(ctx, diagnostics));
-  const wrapper = wrapperRouteFrom(resolved);
-  if (wrapper.errors.length > 0) {
-    diagnostics.configErrors = wrapper.errors;
-    for (const error of wrapper.errors) console.error(`[${name}] ${error}`);
-    return;
-  }
 
   // --- 角色配置的来源：插件自己的文件（见 src/config-file.js 顶部的架构说明）------
   //
@@ -869,21 +880,24 @@ function applyInner(ctx, config) {
   //    （客户端只装载构建期生成的静态贡献清单，且没有 Proxy），那个服务客户端根本
   //    调不到；留着它只会平添「注册失败拖垮启动」的风险。现在客户端走 `settings`。
   if (!mountHere) {
-    syncRolesToFile({ resolved, roleConfigPath, diagnostics });
-    syncWrapperRouteToFile(resolved, roleConfigPath, diagnostics);
-    // volatile 更新可能被 Loader 就地处理，不触发重新 apply；在更新瀑布中先同步根路由。
-    // 继续调用 next，不改变既有更新/重挂载决策；监听随根实例销毁而释放。
-    ctx.on?.('internal/update', (updated, _noSave, next) => {
+    // volatile 更新可能被 Loader 就地处理，不触发重新 apply；先注册保证非法初值可恢复。
+    const sync = (updated) => {
       const wrapper = wrapperRouteFrom(updated);
       diagnostics.configErrors = diagnostics.configErrors.filter((error) => !error.startsWith('volatile.wrapper'));
       if (wrapper.errors.length > 0) {
         diagnostics.configErrors.push(...wrapper.errors);
         for (const error of wrapper.errors) console.error(`[${name}] ${error}`);
       } else {
+        syncRolesToFile({ resolved: updated, roleConfigPath, diagnostics });
         syncWrapperRouteToFile(updated, roleConfigPath, diagnostics);
       }
+    };
+    // internal/update 的特殊注册不自动进入 effect；显式归属本次激活的释放范围。
+    if (ctx.on) ctx.effect(() => ctx.on('internal/update', (updated, _noSave, next) => {
+      sync(updated);
       return next();
-    });
+    }));
+    sync(resolved);
     return;
   }
 
@@ -980,7 +994,8 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
   const fromFile = readRoleConfigFile(roleConfigPath);
   if (fromFile.ok) noteLegacyTimeout(fromFile.value, diagnostics);
   if (fromFile.ok) noteLegacyWrapper(fromFile.value, diagnostics);
-  // 根实例经文件同步的包裹路由优先，包括空值；角色仍保持本作用域优先。
+  // 只校验有效来源：文件有任一包裹字段即整个路由对象优先（含空值），不逐字段合并。
+  // 被覆盖的 preset 路由不校验；角色仍保持本作用域优先。
   const hasRootRoute = fromFile.ok && ['wrapperProvider', 'wrapperModel', 'wrapperEffort']
     .some((key) => Object.hasOwn(fromFile.value.volatile ?? {}, key));
   const wrapper = wrapperRouteFrom(hasRootRoute ? fromFile.value : resolved);

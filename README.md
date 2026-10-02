@@ -60,6 +60,11 @@ Jobs 不可用时 CLI 照常执行，结果标注回流不可用。CLI 没有运
 角色配置文件为 **`$DSH_HOME/agent-switchboard/roles.json`**，供选中 Switchboard preset 的会话读取。
 设置面板读 `configForms` 镜像、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，
 Host 根实例将配置同步到文件。根条目保持启用，但只在 `mount: true` 的作用域挂载角色工具；
+文件含任一 wrapper 字段即整个包裹路由对象优先（包含空值），不逐字段补入 preset；只校验有效来源，被覆盖的非法 preset 路由忽略。
+包裹同步以 `{ ...existing, volatile }` 写回，保留现有角色、顶层其它字段与 volatile 其它字段。
+仅保存包裹设置且文件缺失时只记等待角色写入，不创建 `roles: []` 文件；后续角色写入时一并同步。
+特殊 `internal/update` 监听的 disposer 由显式 `ctx.effect` 管理；初始非法也先注册监听，后续就地修正可恢复同步。
+包裹同步错误与失败日志去重，恢复后清除旧错误。迁移脚本也会播种空 roles 文件，并在删除源角色前复读验证（详见 D22）。
 **preset 不再携带 `config.roles`**。保存的角色供新会话使用。文件形状如下（**示意**）：
 
 ```jsonc

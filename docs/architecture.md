@@ -354,11 +354,17 @@ provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliT
 
 包裹路由取插件级 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`（D22）。
 根实例通过既有 `$DSH_HOME/agent-switchboard/roles.json` 的 `volatile` 同步三字段；不新增服务或文件。
-根实例在 apply 和 Cordis 的 `internal/update` 瀑布中同步路由，更新钩子继续 next，不改变重挂载决策；
+根实例在 apply 和 Cordis 的 `internal/update` 瀑布中同步路由，更新钩子继续 next，不改变重挂载决策。
+特殊 `internal/update` 返回的 disposer 不会自动纳入 effect；生产代码显式使用 `ctx.effect(() => ctx.on(...))`，
+使监听随本次激活释放，重启后不残留旧闭包。先注册监听再验证初始配置，初始非法也可经就地更新修正并恢复同步。
 因此 volatile 就地更新时也能让新 preset 实例读到新设置；已挂载的子代理配置仍以挂载时值为准。
-挂载实例优先取文件中已同步的根设置，包含显式空值；文件尚无这三字段时才回落当前实例配置。
+挂载实例只校验有效路由来源：文件含任一 wrapper 字段即整个路由对象优先（包含显式空值），不逐字段补入 preset；
+被覆盖的非法 preset 路由忽略。文件没有任何 wrapper 字段时才回落当前实例配置。
 这与角色列表「本作用域非空 roles 优先，否则读文件」的优先级不同：preset 可独立选择角色，不能覆盖已经同步的统一包裹路由。
-根字段留空或移除会把已保存的统一设置清为空字符串，避免回落到 preset 的旧值；同步失败进入配置错误诊断。
+根字段留空或移除会把已保存的统一设置清为空字符串，避免回落到 preset 的旧值。
+包裹同步以 `{ ...existing, volatile }` 写回，并保留 volatile 中其它字段；roles 与顶层其它字段均保留，不是整份配置替换。
+文件缺失且仅有包裹设置时只记等待角色写入，不新建 `roles: []` 文件；后续角色写入时一并同步根包裹设置。
+包裹同步失败进入当前配置错误诊断并去重，相同失败不重复打印日志，失败内容变化时打印；恢复同步即清除旧错误。
 仅 CLI 角色把非空 provider / model / effort 映射为 agentOptions.provider / model / reasoningEffort；
 三者全空完全不设 `agentOptions`，继承父代理。强度必须属于 `EFFORT_VALUES`，非法值阻止挂载；文件读取路径同样校验。
 内置 spawn / fork 保持角色自身 provider / model / effort，角色级 Provider 控件仍只对内置后端显示。

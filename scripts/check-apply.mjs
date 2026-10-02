@@ -5,6 +5,8 @@
 // 覆盖边界：派发使用真实 Config / 工具插件，start 是含真实 resolveChildDepth 的桩。
 // 另用真实 Cordis + ToolRuntime + applyChildComposition 验证 child 工具过滤执行；
 // 不是真实 spawn 集成，未验证 preset 继承与完整上下文隔离，见 D21。
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -1052,13 +1054,20 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   const role = { id: 'cli-route', description: 'd', instructions: 'i', backend: 'cli',
     model: 'external', effort: 'low', cliCwd: 'C:/w', cliDriver: 'codex', ...cliFieldsFor('codex', false) };
   const path = configPathFor(fixtureHome);
-  writeConfigFile(path, initialConfig([role], { provider: 'self', volatile: { cliTimeoutSec: 'legacy' } }));
+  const originalFile = initialConfig([role], { provider: 'self', cwd: 'C:/preserved', maxDepth: 7,
+    volatile: { cliTimeoutSec: 'legacy' } });
+  originalFile.formatVersion = 9;
+  originalFile.custom = { keep: true };
+  writeConfigFile(path, originalFile);
   const rootRoute = { wrapperProvider: ' root-route ', wrapperModel: 'root-model', wrapperEffort: 'high' };
   apply(makeCtx(), Config({ volatile: rootRoute }));
   let file = JSON.parse(readFileSync(path, 'utf8'));
   check('根实例无 roles 也同步统一三字段，并保留现有角色与兼容字段',
     file.roles[0].id === role.id && file.volatile.wrapperProvider === 'root-route' &&
     file.volatile.wrapperModel === 'root-model' && file.volatile.wrapperEffort === 'high' && file.volatile.cliTimeoutSec === 'legacy');
+  check('包裹同步完整保留 roles/provider/cwd/maxDepth/formatVersion 与其它顶层字段',
+    ['roles', 'provider', 'cwd', 'maxDepth', 'formatVersion', 'custom'].every(key =>
+      JSON.stringify(file[key]) === JSON.stringify(originalFile[key])));
   const mount = async (config) => {
     const ctx = makeCtx();
     const configs = [];
@@ -1080,6 +1089,17 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
     ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile[key] === ''));
   outcome = await mount({ volatile: { wrapperProvider: 'preset-route' } });
   check('根三个空值优先：CLI 不设置 agentOptions', outcome.configs.length === 1 && !('agentOptions' in outcome.configs[0]));
+  outcome = await mount({ volatile: { wrapperEffort: 'invalid' } });
+  check('有效根空路由覆盖非法 preset，仍健康挂载', outcome.configs.length === 1 && outcome.result.ok &&
+    !('agentOptions' in outcome.configs[0]));
+  writeConfigFile(path, initialConfig([role], { provider: 'self', volatile: { wrapperModel: 'partial-root' } }));
+  outcome = await mount({ volatile: { wrapperProvider: 'preset-route', wrapperEffort: 'invalid' } });
+  check('部分文件路由仍对象级优先，不补入 preset provider/非法 effort', outcome.configs.length === 1 && outcome.result.ok &&
+    JSON.stringify(outcome.configs[0].agentOptions) === JSON.stringify({ model: 'partial-root' }));
+  writeFileSync(path, '{broken');
+  outcome = await mount({ roles: [role], volatile: { wrapperModel: 'local-fallback' } });
+  check('坏文件但本地角色非空：回落本地角色与路由并正常挂载', outcome.configs.length === 1 && outcome.result.ok &&
+    JSON.stringify(outcome.configs[0].agentOptions) === JSON.stringify({ model: 'local-fallback' }));
   writeConfigFile(path, initialConfig([role], { provider: 'self' }));
   outcome = await mount({ volatile: { wrapperModel: 'fallback-model' } });
   check('文件尚无统一路由时回落当前实例，仅设置非空模型',
@@ -1104,10 +1124,20 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   check('桥接文件非字符串 wrapperEffort 明确报错并阻止挂载',
     outcome.configs.length === 0 && outcome.result.configErrors.includes('wrapperEffort 必须是字符串'));
   rmSync(path);
-  apply(makeCtx(), Config({ volatile: { wrapperProvider: 'only-route' } }));
+  const pendingCtx = makeCtx();
+  let pendingUpdate;
+  pendingCtx.on = (_event, listener) => { pendingUpdate = listener; return () => {}; };
+  pendingCtx.effect = execute => execute();
+  apply(pendingCtx, Config({ volatile: { wrapperProvider: 'only-route' } }));
+  check('首次仅保存包裹设置不创建空角色文件', !existsSync(path));
+  check('缺文件路由同步在自检明确显示等待角色写入',
+    (await pendingCtx.tools.get('switchboard_selftest').execute({})).roleConfigStatus.includes('等待角色写入后同步'));
+  pendingUpdate(Config({ volatile: {} }), false, () => {});
+  check('缺文件就地清空包裹设置后清除等待同步状态且仍不建文件', !existsSync(path) &&
+    !(await pendingCtx.tools.get('switchboard_selftest').execute({})).roleConfigStatus.includes('等待角色写入后同步'));
+  apply(makeCtx(), Config({ provider: 'self', roles: [role], volatile: { wrapperProvider: 'only-route' } }));
   file = JSON.parse(readFileSync(path, 'utf8'));
-  check('首次仅保存包裹设置也创建合法配置文件，空角色可保留设置',
-    Array.isArray(file.roles) && file.roles.length === 0 && typeof file.formatVersion === 'number' &&
+  check('后续写入角色一并同步此前保留的根包裹设置', file.roles[0].id === role.id &&
     file.volatile.wrapperProvider === 'only-route');
 }
 
@@ -1119,29 +1149,38 @@ section('真实 Cordis 更新瀑布：volatile 不重挂载时仍同步根包裹
   let applies = 0;
   let continued = 0;
   let ctx;
+  let currentHome = fixtureHome;
+  const restartHome = mkdtempSync(join(tmpdir(), 'switchboard-restart-'));
   const fiber = root.plugin({
     Config,
     apply(actual, config) {
       applies++;
       ctx = makeCtx();
+      ctx.get = key => key === 'profileContext' ? { home: currentHome } : undefined;
       ctx.on = actual.on.bind(actual);
+      ctx.effect = actual.effect.bind(actual);
       apply(ctx, config);
       // 模拟 Loader 的 volatile 就地更新：下游不调用 next，不重新 apply。
-      actual.on('internal/update', () => { continued++; });
+      actual.effect(() => actual.on('internal/update', () => { continued++; }));
     },
-  }, { provider: 'self', volatile: { wrapperModel: 'initial' } });
+  }, { provider: 'self', volatile: { wrapperEffort: 'invalid' } });
   try {
     await fiber.await();
+    const initialHealth = await ctx.tools.get('switchboard_selftest').execute({});
+    check('初始非法路由仍注册一个插件更新钩子并可诊断', !initialHealth.ok &&
+      /wrapperEffort.*非法/.test(initialHealth.configErrors) && fiber._hooks['internal/update'].length === 2);
     fiber.update({ provider: 'self', volatile: { wrapperModel: 'live-model', wrapperEffort: 'high' } });
     await new Promise(setImmediate);
     let file = JSON.parse(readFileSync(path, 'utf8'));
     check('真实 update 钩子同步新模型/强度并继续瀑布，不依赖重挂载', applies === 1 && continued === 1 &&
-      file.volatile.wrapperModel === 'live-model' && file.volatile.wrapperEffort === 'high');
+      file.volatile?.wrapperModel === 'live-model' && file.volatile?.wrapperEffort === 'high');
+    check('初始非法改合法后不重挂载也同步且清除错误', applies === 1 &&
+      (await ctx.tools.get('switchboard_selftest').execute({})).ok);
     fiber.update({ provider: 'self', volatile: {} });
     await new Promise(setImmediate);
     file = JSON.parse(readFileSync(path, 'utf8'));
     check('真实 update 清空统一路由，仍不重挂载', applies === 1 && continued === 2 &&
-      ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile[key] === ''));
+      ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile?.[key] === ''));
     const before = readFileSync(path, 'utf8');
     fiber.update({ provider: 'self', volatile: { wrapperEffort: 'invalid' } });
     await new Promise(setImmediate);
@@ -1153,7 +1192,97 @@ section('真实 Cordis 更新瀑布：volatile 不重挂载时仍同步根包裹
     const recovered = await ctx.tools.get('switchboard_selftest').execute({});
     check('就地修正强度后清除本次路由错误并恢复同步', recovered.ok &&
       JSON.parse(readFileSync(path, 'utf8')).volatile.wrapperEffort === 'low');
-  } finally { await fiber.dispose(); }
+    const oldCtx = ctx;
+    const oldBytes = readFileSync(path, 'utf8');
+    currentHome = restartHome;
+    writeConfigFile(configPathFor(restartHome), initialConfig([fixtureRole], { provider: 'self' }));
+    await fiber.restart();
+    await fiber.restart();
+    check('两次 restart 仅保留一个插件钩子和一个 Loader 钩子', applies === 3 &&
+      fiber._hooks['internal/update'].length === 2);
+    fiber.update({ provider: 'self', volatile: { wrapperModel: 'new-path', wrapperEffort: 'high' } });
+    await new Promise(setImmediate);
+    check('restart 后只写新路径，旧闭包不再写原路径', readFileSync(path, 'utf8') === oldBytes &&
+      JSON.parse(readFileSync(configPathFor(restartHome), 'utf8')).volatile?.wrapperModel === 'new-path');
+    fiber.update({ provider: 'self', volatile: { wrapperEffort: 'invalid' } });
+    await new Promise(setImmediate);
+    check('restart 后旧诊断闭包不再受更新影响', (await oldCtx.tools.get('switchboard_selftest').execute({})).ok &&
+      !(await ctx.tools.get('switchboard_selftest').execute({})).ok);
+  } finally {
+    await fiber.dispose();
+    rmSync(restartHome, { recursive: true, force: true });
+  }
+  check('卸载后 internal/update 钩子全部释放', fiber._hooks['internal/update'].length === 0);
+}
+
+section('包裹路由同步失败：当前错误去重、日志与修复恢复');
+{
+  const path = configPathFor(fixtureHome);
+  writeConfigFile(path, initialConfig([fixtureRole], { provider: 'self' }));
+  const root = new Context();
+  let ctx;
+  const fiber = root.plugin({
+    Config,
+    apply(actual, config) {
+      ctx = makeCtx();
+      ctx.on = actual.on.bind(actual);
+      ctx.effect = actual.effect.bind(actual);
+      apply(ctx, config);
+      actual.effect(() => actual.on('internal/update', () => {}));
+    },
+  }, { provider: 'self', volatile: { wrapperModel: 'before-failure' } });
+  const logs = [];
+  const originalError = console.error;
+  try {
+    await fiber.await();
+    console.error = (...args) => logs.push(args.join(' '));
+    // 用目录占据目标文件，稳定触发真实读写错误，避免平台权限差异。
+    rmSync(path);
+    mkdirSync(path);
+    const update = async () => {
+      fiber.update({ provider: 'self', volatile: { wrapperModel: 'after-repair' } });
+      await new Promise(setImmediate);
+      return ctx.tools.get('switchboard_selftest').execute({});
+    };
+    const failed = await update();
+    const repeated = await update();
+    check('同步失败进入健康诊断，重复失败仅一个当前同步错误', !failed.ok && !repeated.ok &&
+      repeated.configErrors.split('\n').filter(line => line.startsWith('包裹路由同步失败')).length === 1);
+    check('相同同步失败主动记日志但不重复追加', logs.filter(line => line.includes('包裹路由同步失败')).length === 1);
+    rmSync(path, { recursive: true });
+    writeConfigFile(path, initialConfig([fixtureRole], { provider: 'self' }));
+    const recovered = await update();
+    check('同步失败修复后当前错误清除且健康恢复', recovered.ok && recovered.configErrors === '' &&
+      JSON.parse(readFileSync(path, 'utf8')).volatile.wrapperModel === 'after-repair');
+    const rename = fs.renameSync;
+    try {
+      fs.renameSync = (source, target) => {
+        if (target === path) throw Object.assign(new Error('fixture-wrapper-write'), { code: 'EIO' });
+        return rename(source, target);
+      };
+      syncBuiltinESMExports();
+      for (let i = 0; i < 2; i++) {
+        fiber.update({ provider: 'self', volatile: { wrapperModel: 'write-recovered' } });
+        await new Promise(setImmediate);
+      }
+      const failedWrite = await ctx.tools.get('switchboard_selftest').execute({});
+      check('原子写失败重复发生仍仅一个当前同步错误并主动日志', !failedWrite.ok &&
+        failedWrite.configErrors.split('\n').filter(line => line.startsWith('包裹路由同步失败')).length === 1 &&
+        logs.filter(line => line.includes('包裹路由同步失败：fixture-wrapper-write')).length === 1 &&
+        JSON.parse(readFileSync(path, 'utf8')).volatile.wrapperModel === 'after-repair');
+    } finally {
+      fs.renameSync = rename;
+      syncBuiltinESMExports();
+    }
+    fiber.update({ provider: 'self', volatile: { wrapperModel: 'write-recovered' } });
+    await new Promise(setImmediate);
+    const writeRecovered = await ctx.tools.get('switchboard_selftest').execute({});
+    check('原子写失败解除后同步成功清除旧错误', writeRecovered.ok && writeRecovered.configErrors === '' &&
+      JSON.parse(readFileSync(path, 'utf8')).volatile.wrapperModel === 'write-recovered');
+  } finally {
+    console.error = originalError;
+    await fiber.dispose();
+  }
 }
 
 section('残留角色包裹路由：兼容加载与模块级一次性诊断');
