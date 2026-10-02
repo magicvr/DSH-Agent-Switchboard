@@ -970,7 +970,7 @@ window.__ModuleLoader__.load({
           savedRef.current = JSON.stringify({ roles, wrapper });
           setNotice({
             kind: 'ok',
-            text: `已保存 ${roles.length} 个角色。选中 Switchboard preset 的新会话会使用它们。`,
+            text: `已保存 ${roles.length} 个角色。Switchboard 正在应用配置，无需重启；后续派发使用新配置，应用失败请查看自检。`,
           });
           refresh();
         } else {

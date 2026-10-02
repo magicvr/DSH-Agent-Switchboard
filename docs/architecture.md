@@ -82,7 +82,7 @@
 
 21. **当前组合是「根条目启用 + preset 显式 `mount: true`」。** 根实例提供配置同步与自检；角色工具和路由指引只在声明了 `mount: true` 的作用域挂载。
     - **历史实测（以下禁用根条目的方案已被后续 D13 / D14 取代）：** 早期先只「加上 preset 声明」，插件仍报告挂在根上；再把 profile 全局条目设为 `disabled: true`，角色工具才只在选中该 preset 的会话里生效，其他会话连 `switchboard_selftest` 都看不到。当时以 Loader 按包名处理解释该现象，采用了「preset 声明 + 移除全局挂载」。这不是当前的挂载门禁。
-    - preset 条目的 `config` 会作为插件配置传入（历史实测 `provider/maxDepth/cwd/roles` 均正确到达）。**当前 preset 不再携带 `roles`**，只声明挂载等作用域配置；常驻 preset 在启动时从 `$DSH_HOME/agent-switchboard/roles.json` 读取，修改后须重启 DSH 才重新读取（见第 36 条）。
+    - preset 条目的 `config` 会作为插件配置传入（历史实测 `provider/maxDepth/cwd/roles` 均正确到达）。**当前 preset 不再携带 `roles`**，只声明挂载等作用域配置；常驻 preset 在启动时从 `$DSH_HOME/agent-switchboard/roles.json` 读取，运行期由根实例写盘后的专用广播驱动重新读取与代际重挂（见第 36 条及 D24）。
     - 历史上「bundle 声明 `disabled: true` + preset 再声明一次」确实能激活 preset 插件，`[]` 也曾被确认语法合法；**该方案已被后续决策取代，不能据此禁用当前根条目**。客户端模块扫描跳过 disabled 条目，禁用根条目会让「角色与派发」设置页**静默消失，没有报错**（`cordis.patch.yml` 第 5–15 行）。
     - 历史 A/B 对照曾是：未选 preset 看不到自检和委派工具，选中后有 30 个工具（含自检与 4 个委派工具）。**当前自检在 `mount` 判断之前注册，根作用域及继承它的会话都可看到 `switchboard_selftest`；`delegate_to_*` 仍只在挂载角色的作用域可见。** 不应把旧工具数量或自检不可见作为当前验收条件。
 22. **`agentPresets.composedPreset(ctx)` 必须传入「处于该作用域内」的 ctx，否则永远返回 `undefined`。**
@@ -194,7 +194,7 @@
     | `settings.replace(ns, section, rev)` | 否 | **否** |
 
     - 因此编辑 `roles` 有两条路：**甲**给 `roles` 标 `.volatile()` 并用 `mutate` 下标路径；**乙**不改 schema，用 `replace` 整块写 `{roles: [...]}`。
-    - 本插件选**甲**（`roles` 已标 volatile），设置页整体提交 `set(['roles'], value)` 并携带 `revision` 做并发保护；Host 根实例将角色立即同步到文件。Switchboard preset 是启动时加载的常驻单例，新会话只继承它，不会重新执行 `apply` 或重读文件；因此角色配置保存后必须重启 DSH 才会生效。**保存成功不等于当前进程已应用配置。** 乙是保留方案。
+    - 本插件选**甲**（`roles` 已标 volatile），设置页整体提交 `set(['roles'], value)` 并携带 `revision` 做并发保护；Host 根实例将角色立即同步到文件。Switchboard preset 是启动时加载的常驻单例，新会话只继承它，不会重新执行 `apply` 或重读文件；根实例写盘后广播 `agent-switchboard/config-changed`，常驻实例准备新一代工具并同步替换公开入口，后续委派与下次系统提示组装使用有效新快照。**保存成功不等于挂载成功；失败保留上一代并由自检报告。** 乙是保留方案。
     - 另注：`write` 还要求 `volatileForm(schema) !== undefined`，否则抛 `Plugin entry "…" has no volatile…` —— 一个 volatile 字段都没有的插件**完全无法通过设置页写入**。
 29. **`describe()` 是同步的**，返回**数组**（其 JSDoc 写「keyed by unique profile entry ids」，与实现不一致，以实现为准）。行的关键字段：`ns` / `schema` / `value` / `revision` / `writable` / `base` / `user` / `autoGenerate` / `applies`。**没有 `patch` 字段**。
     - 行会被**丢弃**的条件：`schema` 取不到、`entry.fiber` 不存在、`fiber.runtime === null`、`fiber.state !== 2`（ACTIVE），或 `volatileForm(schema) === undefined`。
@@ -270,7 +270,7 @@
     - `dsh.profile.bundles` **必须含本包**（`dependencies` 里有**不够**）：Loader 只加载
       `bundles` 列出的包。缺失后果是**应用正常启动、但插件完全不存在**，且**没有任何报错**
       （实测踩到：Loader 条目数 187 而非 188，`include:agent-switchboard` 从未创建）。
-    - 根条目**必须启用**，bundle 声明不必携带 `config.roles`；设置页读 `configForms`、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，Host 根实例将角色同步到 `$DSH_HOME/agent-switchboard/roles.json`。preset 中本包只需 `mount: true`，**不得再携带 `roles`**；常驻挂载实例启动时在本作用域 Cordis 角色非空时优先使用它，否则读取文件。新会话继承现有实例，不触发再次读取；修改角色配置后必须重启 DSH。
+    - 根条目**必须启用**，bundle 声明不必携带 `config.roles`；设置页读 `configForms`、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，Host 根实例将角色同步到 `$DSH_HOME/agent-switchboard/roles.json`。preset 中本包只需 `mount: true`，**不得再携带 `roles`**；常驻挂载实例启动时在本作用域 Cordis 角色非空时优先使用它，否则读取文件。新会话继承现有实例，不重新执行 `apply`；根实例写盘广播驱动已有 preset 重新读取、准备和替换角色工具。
     - `scripts/check-profile-wiring.mjs` 显式断言根条目未禁用、preset 的 `mount: true` 及 `selfRow?.config?.roles === undefined`（找不到默认 profile 时跳过；显式目标缺失则失败）。
 37. **禁用/启用插件这个操作本身会重写 profile，且只保留它认识的条目。** 实测两次：一次
     web boot 失败后，profile 的 `cordis.patch.yml` 从 41,802 字节被削到 670 字节，
@@ -356,8 +356,11 @@ provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliT
 根实例通过既有 `$DSH_HOME/agent-switchboard/roles.json` 的 `volatile` 同步三字段；不新增服务、文件类型或路径。
 根实例在 apply 和 Cordis 的 `internal/update` 瀑布中同步路由，更新钩子继续 next，不改变重挂载决策。
 特殊 `internal/update` 返回的 disposer 不会自动纳入 effect；生产代码显式使用 `ctx.effect(() => ctx.on(...))`，
-使监听随本次激活释放，重启后不残留旧闭包。先注册监听再验证初始配置，初始非法也可经就地更新修正并恢复根实例到文件的同步；这不会刷新常驻 preset。
-因此 volatile 就地更新只会让根实例把新设置写入文件，不会让常驻 preset 重新读取；新会话也只继承既有实例。角色配置以及包裹路由变更均需重启 DSH 才生效。当前无文件监听、定时重读或 settings 订阅；角色工具也没有运行期重挂能力（CLI 工具注册 disposer 未保留，委派子 Fiber 未追踪）。
+使监听随本次激活释放，重启后不残留旧闭包。先注册监听再验证初始配置，初始非法也可经就地更新修正并恢复根实例到文件的同步；写盘成功后向全局同名 hook 表广播 `agent-switchboard/config-changed`，payload 为 `{ roleConfigPath }`，不带 receiver。真实 Cordis 离线集成已验证跨 scope 可达；`internal/update` 本身仍仅为根 Fiber 私有 hook。
+常驻 preset 的监听按路径匹配，串行处理并合并快速保存，以版本检查丢弃过时准备代；不依赖再次 `apply`、文件监听、定时器或 `tools/change`。每代在私有 scope 准备 CLI 配置快照与委派子 Fiber，等待 Fiber 激活并核实本代注册定义，不能把父层旧工具当成新代挂载成功。短同步提交段注销旧委派入口并注册新入口；注册失败撤销新入口、恢复旧定义，旧 Fiber 无需重启。
+实例级自检与动态 text guidance 仅注册一次；guidance 在提示组装时读取当前有效角色与工具清单。配置代持有私有 scope、子 Fiber、私有工具与公开入口 disposer；委派 execute 从预检开始持有租约，subagents.start 从启动至结果持有租约，后台 Job 从入队至 hooks.done 持有租约。旧代仅在退休且活跃归零后释放 scope/Fiber；热重挂不 abort signal、不主动销毁子会话或 CLI 进程。
+CLI 公开工具名保持稳定，入口通过 WeakMap 中的真实 `run.localAgent` 身份选择代际私有工具快照；未由对应角色派发的 Agent 拒绝执行，防止旧内置子代理的 deny 快照漏掉新 CLI 名。退休代的 CLI 入口保留至租约归零，已启动包裹仍使用原角色/命令/参数。不存在租约之外的额外运行期限。
+有效文件 `maxDepth` 优先，缺失或无效时回落 preset，最后默认 3；根就地更新会同步已有文件的 maxDepth。角色配置、CLI 预设/参数和包裹路由用于后续派发；历史模型上下文、正在执行的子代理/CLI/后台 Job 不被改写。
 挂载实例只校验有效路由来源：文件含任一 wrapper 字段即整个路由对象优先（包含显式空值），不逐字段补入 preset；
 被覆盖的非法 preset 路由忽略。文件没有任何 wrapper 字段时才回落当前实例配置。
 这与角色列表的优先级不同——角色列表是「本作用域**未提供** roles 时才回落读文件；显式空数组表示清空，不得复活文件里的旧角色」，而包裹路由是文件优先：preset 可独立选择角色，不能覆盖已经同步的统一包裹路由。
@@ -377,7 +380,7 @@ provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliT
 内置 spawn / fork 保持角色自身 provider / model / effort，角色级 Provider 控件仍只对内置后端显示。
 面板顶部统一小节始终显示并说明仅 CLI 生效；保存时按角色列表与各包裹字段各自的 dirty 状态，以同一 revision 原子提交对应操作。仅改包裹字段不提交 `['roles']`，角色删空仍提交 `[]`；未改包裹字段不提交对应 `['volatile', 'wrapper…']` 操作。
 旧角色 agentProvider / agentModel 接受残留但不再使用；每激活实例记录弃用诊断，每次模块加载只打印一次告警。
-以上作用域桥接与「保存即由根实例同步到 roles.json」已通过离线夹具及真机核验；preset 的常驻单例生命周期与重启要求已确认。离线测试曾手动再次调用 `apply` 验证其能读到文件，这只能证明重新挂载时可读盘，不能证明运行中配置会自动刷新；此前把该测试假设写成运行时事实，已在 D22 后续修正中更正。
+以上作用域桥接与「保存即由根实例同步到 roles.json」已通过离线夹具及真机核验；preset 的常驻单例生命周期已确认。D24 热重载机制通过真实 Cordis、ToolRuntime、真实 Config/角色文件/工具插件及假 subagents.start 的离线集成验证，真实设置保存往返和在途 CLI 真机验收尚未执行。历史离线测试曾手动再次调用 `apply` 验证其能读到文件，这只能证明重新挂载时可读盘，不能证明运行中配置会自动刷新；此前把该测试假设写成运行时事实，已在 D22 后续修正中更正。
 CLI 出站使用 allow：`allowNestedDispatch: false` 时仍包含本角色专属 CLI 工具，并非空 allow；为 true 时另允许已挂载的受控委派工具。
 CLI allow 不开放其他角色的底层 CLI 执行工具。内置角色不设置 allow，使用 deny 保留派发采集时可见的普通工具与后注册普通工具的动态可见性。
 deny 合成当前可用的非受控派发入口、全部当前可用的底层 CLI 工具、关闭嵌套时已挂载的受控委派工具、只读时当前可用的写工具；

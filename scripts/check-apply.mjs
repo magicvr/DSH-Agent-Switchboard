@@ -10,7 +10,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { createScope, scopeOf } from '@deepseek-ai/dsh-scope';
+import { createScope, scopeChainOf, scopeOf } from '@deepseek-ai/dsh-scope';
 import { Context } from '@deepseek-ai/cordis';
 import { ToolRuntime } from '@deepseek-ai/dsh-tools';
 import { applyChildComposition, delegationDepthOf, resolveChildDepth } from '@deepseek-ai/dsh-subagent';
@@ -91,29 +91,38 @@ function makeCtx({ provideProfileContext = true, provideReflect = true, scope } 
         }
       : undefined,
     tools: {
+      get ctx() { return ctx; },
       register(def) {
-        const key = scopeOf(ctx);
-        const layer = key === undefined ? globalTools : scopedTools;
+        const key = scopeOf(this.ctx);
+        if (key !== undefined && !scopedTools.has(key)) scopedTools.set(key, new Map());
+        const layer = key === undefined ? globalTools : scopedTools.get(key);
         if (layer.has(def.name)) throw new Error(`重复工具：${def.name}`);
         layer.set(def.name, def);
         registered.push(def?.name);
         return () => layer.delete(def.name);
       },
       get(name, viewingScope) {
-        return (viewingScope !== undefined && viewingScope === scopeOf(ctx) ? scopedTools.get(name) : undefined)
-          ?? globalTools.get(name);
+        for (const key of scopeChainOf(viewingScope)) {
+          const found = scopedTools.get(key)?.get(name);
+          if (found) return found;
+        }
+        return globalTools.get(name);
       },
       schemas(viewingScope) {
         const visible = new Map(globalTools);
-        if (viewingScope !== undefined && viewingScope === scopeOf(ctx)) {
-          for (const [name, tool] of scopedTools) visible.set(name, tool);
+        for (const key of scopeChainOf(viewingScope).reverse()) {
+          for (const [name, tool] of scopedTools.get(key) ?? []) visible.set(name, tool);
         }
         return [...visible.values()];
       },
     },
     // createScope 借助 extend 写入真实的私有 scope 标签；角色插件只模拟注册副作用。
     extend(properties) {
-      return Object.assign(Object.create(this), properties);
+      const child = Object.assign(Object.create(this), properties);
+      if (!Object.hasOwn(properties, 'tools')) Object.defineProperty(child, 'tools', {
+        value: Object.create(this.tools, { ctx: { value: child } }), configurable: true, writable: true,
+      });
+      return child;
     },
     plugin(_module, config) {
       if (config?.toolName) this.tools.register({ name: config.toolName });
@@ -448,10 +457,13 @@ section('首次核验失败后 provider 延迟就绪：当前健康覆盖失败�
     const get = ctx.get.bind(ctx);
     ctx.get = (key) => key === 'profileContext' ? { home, dir: home } : get(key);
     let providerReady;
-    ctx.plugin = (_module, config) => {
+    const scopePlugin = ctx.plugin;
+    ctx.plugin = function (_module, config) {
+      if (!config) return scopePlugin.call(this, _module, config);
       // 模拟真实插件等待 provider-added 后才注册工具；首次微任务核验必定看不到它。
-      providerReady = () => ctx.tools.register({ name: config.toolName });
-      return { ctx, dispose() {} };
+      const tools = this.tools;
+      providerReady = () => tools.register({ name: config.toolName });
+      return { ctx: this, dispose() {} };
     };
     apply(ctx, { provider: 'self', mount: true });
     await import('@deepseek-ai/dsh-tool-subagent');
@@ -490,7 +502,7 @@ section('工具始终未注册：不抛错的 fiber 不能被当作可用工具'
     const ctx = makeCtx({ scope });
     const get = ctx.get.bind(ctx);
     ctx.get = (key) => key === 'profileContext' ? { home, dir: home } : get(key);
-    ctx.plugin = () => ({ ctx, dispose() {} });
+    ctx.plugin = function () { return { ctx: this, dispose() {} }; };
     apply(ctx, { provider: 'self', mount: true });
     await import('@deepseek-ai/dsh-tool-subagent');
     await new Promise(setImmediate);
@@ -738,7 +750,7 @@ section('CLI 逐角色阻塞：未知配置不注册工具、不解析命令、�
     !ctx.registered.includes('delegate_to_legacy') && ctx.registered.includes('delegate_to_valid') && ctx.registered.includes('delegate_to_builtin'));
   const result = await ctx.tools.get('switchboard_selftest').execute({});
   check('自检与主代理指引都显示旧配置待迁移',
-    result.blocked.includes('legacy') && result.blocked.includes('待迁移') && guidance.includes('不得派发'));
+    result.blocked.includes('legacy') && result.blocked.includes('待迁移') && guidance().includes('不得派发'));
   check('装载后旧 custom 原始配置保持不变', JSON.stringify([legacy, valid]) === before);
 }
 
@@ -750,22 +762,25 @@ section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失
   for (const mode of ['success', 'throw', 'missing', 'delegate-missing']) {
     const scope = {};
     const ctx = makeCtx({ scope });
-    const originalRegister = ctx.tools.register.bind(ctx.tools);
+    const originalRegister = ctx.tools.register;
     const originalGet = ctx.tools.get.bind(ctx.tools);
     const configs = [];
+    let boundCliTool;
     let registeredBeforeDelegate = false;
-    ctx.tools.register = def => {
+    ctx.tools.register = function (def) {
       if (def.name === 'switchboard_cli_run_cli_worker') {
+        boundCliTool ??= def;
         if (mode === 'throw') throw new Error('fixture-cli-register-failed');
         if (mode === 'missing') return () => {};
       }
-      return originalRegister(def);
+      return originalRegister.call(this, def);
     };
-    const originalPlugin = ctx.plugin.bind(ctx);
-    ctx.plugin = (module, config) => {
+    const originalPlugin = ctx.plugin;
+    ctx.plugin = function (module, config) {
+      if (!config) return originalPlugin.call(this, module, config);
       configs.push(config);
       registeredBeforeDelegate = originalGet('switchboard_cli_run_cli_worker', scope) != null;
-      return mode === 'delegate-missing' ? { dispose() {} } : originalPlugin(module, config);
+      return mode === 'delegate-missing' ? { ctx: this, dispose() {} } : originalPlugin.call(this, module, config);
     };
     apply(ctx, { mount: true, roles: [role, { ...fixtureRole, id: 'independent' }], provider: 'self' });
     await import('@deepseek-ai/dsh-tool-subagent');
@@ -800,7 +815,8 @@ section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失
       ctx.get = key => key === 'jobs' ? (jobsAvailable ? jobs : undefined) : contextGet(key);
       ctx.subprocess.spawn = () => ({ done: Promise.resolve({ exitCode: 0 }), collected: {}, waitForExit: async () => true });
       const exec = { agent: { id: 'fixture-child', session: { header: { origin: 'subagent' } } } };
-      const cliTool = ctx.tools.get('switchboard_cli_run_cli_worker', scope);
+      // Jobs/owner 断言执行私有配置快照；公开入口的包裹身份由热重载集成段验证。
+      const cliTool = boundCliTool;
       const cliResult = await cliTool.execute({ prompt: 'T' }, exec);
       check('apply 将 ctx 传给专属工具，运行时读取 Jobs 与正确 owner', starts.length === 1
         && starts[0].kind === 'cli' && starts[0].owner === 'fixture-child' && cliResult.outputFeedback === 'jobs');
@@ -857,11 +873,13 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
     return () => {};
   };
   // 真实 Config 的 standard-schema 校验先物化输入；再执行真实工具插件的 apply。
-  ctx.plugin = (module, config) => {
+  const scopePlugin = ctx.plugin;
+  ctx.plugin = function (module, config) {
+    if (!config) return scopePlugin.call(this, module, config);
     const validated = module.Config['~standard'].validate(config);
     if (validated.issues) throw new Error(JSON.stringify(validated.issues));
     validatedConfigs.push(validated.value);
-    module.apply(ctx, validated.value);
+    module.apply(this, validated.value);
     return { dispose() {} };
   };
   ctx.tools.register({ name: 'read' });
@@ -898,8 +916,8 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
       && !first.toolFilter.allow.includes('switchboard_cli_run_leaf'));
   check('真实插件 persona 使用同一有效清单，保留预算提示', first.persona.includes('delegate_to_leaf')
     && first.persona.includes('剩余深度预算') && !first.persona.includes('不要调用其他角色的工具'));
-  check('guidance 用实际挂载清单生成有效出站提示', guidance.includes('may delegate further')
-    && guidance.includes('cannot delegate further'));
+  check('guidance 用实际挂载清单生成有效出站提示', guidance().includes('may delegate further')
+    && guidance().includes('cannot delegate further'));
   const beforeLeaf = requests.length;
   let leafResult, leafError;
   try { leafResult = await ctx.tools.get('delegate_to_leaf', scope).execute({ prompt: 'T', description: 'fixture' }, exec); }
@@ -1006,7 +1024,7 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
   await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
   for (const refresh of events.get('tools/change') ?? []) refresh();
   check('全部 delegate 卸载后 persona、guidance 不再宣称可继续派发',
-    requests.at(-1).persona.includes('不可继续派发') && !guidance.includes('may delegate further'));
+    requests.at(-1).persona.includes('不可继续派发') && !guidance().includes('may delegate further'));
 }
 
 section('隔离 DSH_HOME：残留运行期限不影响配置加载或健康状态');
@@ -1063,7 +1081,7 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
     const ctx = makeCtx();
     const configs = [];
     const plugin = ctx.plugin;
-    ctx.plugin = function (module, cfg) { configs.push(cfg); return plugin.call(this, module, cfg); };
+    ctx.plugin = function (module, cfg) { if (cfg) configs.push(cfg); return plugin.call(this, module, cfg); };
     apply(ctx, Config({ mount: true, provider: 'self', ...config }));
     await import('@deepseek-ai/dsh-tool-subagent');
     await new Promise(setImmediate);
@@ -1437,6 +1455,279 @@ section('残留角色包裹路由：兼容加载与模块级一次性诊断');
   const combined = await ctx.tools.get('switchboard_selftest').execute({});
   check('两种旧配置同时残留时弃用诊断互不覆盖', combined.roleConfigStatus.includes('cliTimeoutSec 已废弃并忽略') &&
     combined.roleConfigStatus.includes('角色 agentProvider / agentModel 已废弃并忽略'));
+}
+
+section('热重载：真实 Cordis 跨 scope 广播、代际回滚与在途保护（preset 只 apply 一次）');
+{
+  const { cliFieldsFor } = await import('../src/cli/drivers.js');
+  const home = mkdtempSync(join(tmpdir(), 'switchboard-hot-reload-'));
+  const path = configPathFor(home);
+  const root = new Context();
+  const sections = new Map();
+  const generations = new Set();
+  const requests = [], runs = [], pendingJobs = [];
+  const rapidGuidance = [];
+  let recordRapid = false;
+  let preflight;
+  let holdRun = false;
+  let missingProvider = false;
+  let rootApplies = 0, presetApplies = 0, broadcasts = 0, guidanceRegisters = 0;
+  root.provide('profileContext', { home, dir: home });
+  root.provide('systemPrompt', {
+    tools() {}, context() {}, getContextOrder() { return 0; }, getSectionOrder() { return 0; },
+    section(section) {
+      if (section.name === 'agent-switchboard:roles') guidanceRegisters++;
+      sections.set(section.name, section);
+      return () => { if (sections.get(section.name) === section) sections.delete(section.name); };
+    },
+  });
+  new ToolRuntime(root);
+  root.tools.register({ name: 'write', parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'string' }, render: () => [] }, execute: async () => 'fixture' });
+  root.provide('agents', { list: () => [] });
+  root.provide('sessionProjections', { register() { return () => {}; } });
+  root.provide('llm', { async resolveCallConfig(config) { if (preflight) await preflight.promise; return config; } });
+  root.provide('subprocess', {
+    resolveExecutable: async () => 'fixture-executable',
+    spawn: () => ({ done: Promise.resolve({ exitCode: 0 }), collected: {}, waitForExit: async () => true }),
+  });
+  const providers = new Map(['spawn', 'fork'].map(name => [name, { name, inheritsParentContext: false,
+    capabilities: { depthLimit: true, agentOptions: true, persona: true, toolFilter: true } }]));
+  root.provide('subagents', {
+    resolveMaxDepth: depth => depth,
+    getProvider: name => missingProvider ? undefined : providers.get(name),
+    async start(provider, request) {
+      resolveChildDepth(request.parent, request.maxDepth);
+      requests.push({ provider, request });
+      const completion = Promise.withResolvers();
+      const localAgent = { id: `hot-child-${runs.length}`, session: { header: { origin: 'subagent' } } };
+      const run = { id: localAgent.id, localAgent, result: completion.promise, disposed: 0,
+        dispose() { this.disposed++; }, finish: () => completion.resolve({ stopReason: 'completed', output: [] }) };
+      runs.push(run);
+      if (!holdRun) run.finish();
+      return run;
+    },
+  });
+  root.provide('jobs', { start(spec) { pendingJobs.push(spec); return `hot-job-${pendingJobs.length}`; } });
+  root.on('agent-switchboard/config-changed', payload => { if (payload.roleConfigPath === path) broadcasts++; });
+  root.on('tools/change', () => {
+    if (recordRapid) rapidGuidance.push(sections.get('agent-switchboard:roles')?.text({}) ?? '');
+  });
+  root.on('internal/status', fiber => {
+    const generation = fiber.ctx[Symbol.for('agent-switchboard.generation')];
+    if (generation) generations.add(generation);
+  });
+  const role = { ...fixtureRole, id: 'hot', model: 'first-model', allowNestedDispatch: true };
+  writeConfigFile(path, initialConfig([role], { provider: 'self', maxDepth: 2 }));
+  const rootFiber = root.plugin({ Config, apply(actual, config) {
+    rootApplies++;
+    apply(actual, config);
+    actual.effect(() => actual.on('internal/update', () => {}));
+  } }, { provider: 'self' });
+  const presetScope = createScope(root, {});
+  const presetFiber = presetScope.ctx.plugin({ Config, apply(actual, config) {
+    presetApplies++;
+    apply(actual, config);
+  } }, { mount: true, provider: 'self', maxDepth: 7 });
+  const scope = scopeOf(presetScope.ctx);
+  const getTool = name => root.tools.get(name, scope);
+  const tick = async () => { for (let i = 0; i < 6; i++) await new Promise(setImmediate); };
+  const save = (roles, options = {}) => rootFiber.update({ provider: 'self', roles, maxDepth: 2, ...options });
+  const parent = { id: 'hot-parent', ctx: presetScope.ctx, options: { provider: 'self', model: 'parent-model' },
+    session: { header: { origin: 'user' }, requestHeader: () => undefined } };
+  const controller = new AbortController();
+  const exec = { agent: parent, signal: controller.signal };
+  const call = name => getTool(name).execute({ prompt: 'T', description: '热重载测试' }, exec);
+  const guidance = () => sections.get('agent-switchboard:roles')?.text({ scope }) ?? '';
+  try {
+    await rootFiber.await();
+    await presetFiber.await();
+    await tick();
+    check('H01：真实 preset 首次挂载工具且只有一次 apply', !!getTool('delegate_to_hot') && presetApplies === 1);
+    await call('delegate_to_hot');
+    check('H02：真实 Config/文件/工具插件的首派发 maxDepth 文件 2 优先于 preset 7',
+      requests.at(-1).request.maxDepth === 3 && requests.at(-1).request.agentOptions.model === 'first-model');
+
+    const firstGeneration = [...generations].find(g => g.roles.some(r => r.model === 'first-model'));
+    preflight = Promise.withResolvers();
+    const inFlight = call('delegate_to_hot');
+    await tick();
+    save([{ ...role, model: 'second-model', description: '更新后的热角色', instructions: '新规则',
+      backend: 'fork', provider: 'new-provider', effort: 'high', readOnly: true, allowNestedDispatch: false },
+      { ...fixtureRole, id: 'added' }], { maxDepth: 4 });
+    await tick();
+    check('H03：根更新跨 scope 广播驱动替换，不重新 apply preset 或根',
+      broadcasts >= 1 && rootApplies === 1 && presetApplies === 1 && !!getTool('delegate_to_added'));
+    check('H04：预检租约保留旧 scope/Fiber，原 signal 不 abort 且会话未销毁',
+      firstGeneration?.active > 0 && !firstGeneration?.released && !controller.signal.aborted && runs.every(run => run.disposed === 1));
+    check('H05：guidance 只注册一次且不发 tools/change 就读取新角色说明',
+      guidanceRegisters === 1 && guidance().includes('更新后的热角色') && guidance().includes('delegate_to_added'));
+    preflight.resolve();
+    preflight = undefined;
+    await inFlight;
+    await tick();
+    check('H06：跨重挂预检任务用旧模型正常完成，活跃归零后释放旧 scope',
+      requests.at(-1).request.agentOptions.model === 'first-model' && firstGeneration?.released === true
+      && firstGeneration.scope.ctx.fiber.uid === null && !controller.signal.aborted);
+    await call('delegate_to_hot');
+    check('H07：改 backend/model/effort/provider/instructions/maxDepth 后新派发全部取新快照',
+      requests.at(-1).provider === 'fork' && requests.at(-1).request.agentOptions.model === 'second-model'
+      && requests.at(-1).request.agentOptions.provider === 'new-provider'
+      && requests.at(-1).request.agentOptions.reasoningEffort === 'high'
+      && requests.at(-1).request.persona === '新规则' && requests.at(-1).request.maxDepth === 5
+      && requests.at(-1).request.toolFilter.deny.includes('write')
+      && requests.at(-1).request.toolFilter.deny.includes('delegate_to_added'));
+
+    recordRapid = true;
+    save([{ ...role, model: 'third-model' }]);
+    save([{ ...role, model: 'fourth-model' }, { ...fixtureRole, id: 'rapid' }]);
+    save([{ ...role, model: 'latest-model' }]);
+    await tick();
+    recordRapid = false;
+    await call('delegate_to_hot');
+    check('H08：连续快速保存只公开最新一代，无旧角色/重名/准备代残留',
+      requests.at(-1).request.agentOptions.model === 'latest-model' && !getTool('delegate_to_added') && !getTool('delegate_to_rapid')
+      && root.tools.schemas(scope).filter(tool => tool.name === 'delegate_to_hot').length === 1
+      && [...generations].filter(g => !g.released).length === 1
+      && !rapidGuidance.some(text => text.includes('third-model') || text.includes('fourth-model')));
+
+    const oldTool = getTool('delegate_to_hot');
+    save([{ ...role, model: '' }]);
+    await tick();
+    const health = await getTool('switchboard_selftest').execute({});
+    await call('delegate_to_hot');
+    check('H09：非法文件回滚保留旧入口可派发且自检诊断可见',
+      getTool('delegate_to_hot') === oldTool && requests.at(-1).request.agentOptions.model === 'latest-model'
+      && !health.ok && health.configErrors.includes('热重载失败') && health.configErrors.includes('model'));
+    save([role]);
+    await tick();
+    check('H10：修正配置后诊断恢复健康', (await getTool('switchboard_selftest').execute({})).ok);
+    const beforeMissingProvider = getTool('delegate_to_hot');
+    missingProvider = true;
+    save([{ ...role, model: 'provider-not-ready' }]); await tick();
+    missingProvider = false;
+    if (getTool('delegate_to_hot')) await call('delegate_to_hot');
+    check('H22：准备代无自己的工具时不能借祖先旧定义假成功，保留旧入口及诊断',
+      getTool('delegate_to_hot') === beforeMissingProvider && requests.at(-1).request.agentOptions.model === 'first-model'
+      && (await getTool('switchboard_selftest').execute({})).configErrors.includes('工具尚未出现在工具注册表'));
+
+    // 公开注册失败发生在旧入口注销之后；旧私有 Fiber 必须保持可用以恢复入口。
+    const layers = root.tools.layers;
+    const originalEffect = layers.effect;
+    let rejectPublic = true;
+    layers.effect = function (actual, callback, options) {
+      if (rejectPublic && scopeOf(actual) === scope && options?.label === 'tools.register()') {
+        rejectPublic = false;
+        throw new Error('hot-public-commit-failed');
+      }
+      return originalEffect.call(this, actual, callback, options);
+    };
+    try { save([{ ...role, model: 'commit-rejected' }]); await tick(); }
+    finally { layers.effect = originalEffect; }
+    if (getTool('delegate_to_hot')) await call('delegate_to_hot');
+    check('H11：同步公开替换失败恢复旧工具及旧 Fiber，无需重启它',
+      !!getTool('delegate_to_hot') && requests.at(-1).request.agentOptions.model === 'first-model'
+      && (await getTool('switchboard_selftest').execute({})).configErrors.includes('hot-public-commit-failed'));
+
+    save([role]); await tick();
+    const backgroundGeneration = [...generations].find(g => !g.released);
+    const background = await getTool('delegate_to_hot').execute({ prompt: 'BG', description: '延迟后台', run_in_background: true }, exec);
+    save([{ ...fixtureRole, id: 'replacement' }]); await tick();
+    check('H12：后台 Job 入队即持租约，重挂后尚未启动也不会销毁旧 scope',
+      background.kind === 'background' && backgroundGeneration?.active === 1 && !backgroundGeneration?.released
+      && !getTool('delegate_to_hot') && !!getTool('delegate_to_replacement'));
+    holdRun = true;
+    const jobHooks = pendingJobs.shift().run({ append() {} });
+    await tick();
+    const backgroundRun = runs.at(-1);
+    check('H13：重挂之后旧后台启动链正常，独立 signal 未 abort、run 未 dispose',
+      requests.at(-1).request.agentOptions.model === 'first-model' && backgroundRun.disposed === 0
+      && !requests.at(-1).request.signal.aborted);
+    backgroundRun.finish(); await jobHooks.done; await tick(); holdRun = false;
+    check('H14：后台自然结算后旧代归零并释放，无提前销毁', backgroundGeneration?.released && backgroundRun.disposed === 1);
+
+    const cliRole = { id: 'hot-cli', description: 'CLI', instructions: 'CLI 规则', backend: 'cli', model: 'external-old',
+      cliDriver: 'grok', cliCwd: 'C:/fixture', ...cliFieldsFor('grok', false) };
+    save([cliRole], { volatile: { wrapperModel: 'wrapper-old', wrapperEffort: 'low' } }); await tick();
+    holdRun = true;
+    const cliCall = call('delegate_to_hot_cli'); await tick();
+    const wrapper = runs.at(-1);
+    const cliGeneration = [...generations].find(g => !g.released);
+    save([{ ...cliRole, model: 'external-new', description: '新 CLI' }],
+      { volatile: { wrapperProvider: 'route-new', wrapperModel: 'wrapper-new', wrapperEffort: 'high' } }); await tick();
+    check('H15：CLI 包裹在途不被重挂误杀，旧快照、signal 与 run 保持有效',
+      !cliGeneration?.released && wrapper.disposed === 0 && !requests.at(-1).request.signal.aborted
+      && requests.at(-1).request.agentOptions.model === 'wrapper-old');
+    let wrongIdentity;
+    try { await getTool('switchboard_cli_run_hot_cli').execute({ prompt: 'T' },
+      { agent: { id: 'old-builtin', session: { header: { origin: 'subagent' } } }, signal: controller.signal }); }
+    catch (error) { wrongIdentity = error; }
+    check('H16：旧 builtin deny 快照漏掉新增 CLI 名也被包裹身份校验拒绝', /包裹身份/.test(wrongIdentity?.message ?? ''));
+    // 移除 Jobs 桩，CLI 执行用假进程；没有调用外部 CLI。
+    // 真实工具读取的是构造时 buildCtx：通过临时释放可选 Jobs 服务测执行器降级路径。
+    const removeJobs = root.get('jobs');
+    removeJobs.start = () => { throw new Error('offline CLI jobs disabled'); };
+    const cliResult = await getTool('switchboard_cli_run_hot_cli').execute({ prompt: 'T' },
+      { agent: wrapper.localAgent, signal: controller.signal });
+    check('H17：旧包裹经当前公开 CLI 入口仍使用旧外部模型快照',
+      cliResult.status === 'completed' && cliResult.routeSummary.includes('external-old') && !cliResult.routeSummary.includes('external-new')
+      && cliGeneration.definitions.has('switchboard_cli_run_hot_cli'));
+    wrapper.finish(); await cliCall; await tick(); holdRun = false;
+    await call('delegate_to_hot_cli');
+    check('H18：新 CLI 派发采用新包裹路由，旧代际自然释放',
+      requests.at(-1).request.agentOptions.provider === 'route-new'
+      && requests.at(-1).request.agentOptions.model === 'wrapper-new'
+      && requests.at(-1).request.agentOptions.reasoningEffort === 'high' && cliGeneration?.released);
+    let invocation;
+    root.get('subprocess').spawn = spec => {
+      invocation = spec;
+      return { done: Promise.resolve({ exitCode: 0 }), collected: {}, waitForExit: async () => true };
+    };
+    save([{ ...cliRole, cliDriver: 'codex', ...cliFieldsFor('codex', false), model: 'external-codex', effort: 'high' }]);
+    await tick(); await call('delegate_to_hot_cli');
+    const newCliResult = await getTool('switchboard_cli_run_hot_cli').execute({ prompt: '新预设' },
+      { agent: runs.at(-1).localAgent, signal: controller.signal });
+    check('H24：后续 CLI 执行采用新预设/参数模板/模型/强度，无真实进程调用',
+      newCliResult.status === 'completed' && invocation.argv.includes('external-codex')
+      && invocation.argv.includes('model_reasoning_effort=high') && invocation.argv.includes('exec'));
+    holdRun = true;
+    const executingWrapper = call('delegate_to_hot_cli'); await tick();
+    const executingRun = runs.at(-1);
+    const executingGeneration = [...generations].find(g => !g.released);
+    const processDone = Promise.withResolvers();
+    let processSignal, killed = 0;
+    const subprocess = root.get('subprocess');
+    subprocess.spawn = spec => {
+      processSignal = spec.signal;
+      return { done: processDone.promise, collected: {}, waitForExit: async () => true, terminate() { killed++; } };
+    };
+    const executingCli = getTool('switchboard_cli_run_hot_cli').execute({ prompt: '正在运行' },
+      { agent: executingRun.localAgent, signal: controller.signal });
+    await tick();
+    save([]); await tick();
+    check('H20：删角色时正在执行的 CLI 进程、包裹和调用 signal 均未误杀',
+      executingGeneration?.active > 0 && !executingGeneration?.released && executingRun.disposed === 0
+      && !controller.signal.aborted && processSignal instanceof AbortSignal && !processSignal.aborted && killed === 0);
+    processDone.resolve({ exitCode: 0 });
+    const executingResult = await executingCli;
+    executingRun.finish(); await executingWrapper; await tick(); holdRun = false;
+    check('H21：跨重挂 CLI 正常完成后释放旧 scope/Fiber，旧专属入口消失',
+      executingResult.status === 'completed' && executingGeneration?.released && executingGeneration.scope.ctx.fiber.uid === null
+      && executingGeneration.fibers.every(fiber => fiber.uid === null) && killed === 0 && !getTool('switchboard_cli_run_hot_cli'));
+    check('H19：删光角色注销所有入口，guidance 不再列旧角色，自检仍仅一个',
+      !getTool('delegate_to_hot_cli') && !getTool('switchboard_cli_run_hot_cli') && !guidance().includes('delegate_to_hot_cli')
+      && root.tools.schemas(scope).filter(tool => tool.name === 'switchboard_selftest').length === 1);
+  } finally {
+    await presetFiber.dispose();
+    await presetScope.dispose();
+    await rootFiber.dispose();
+    const generationCount = generations.size;
+    root.emit('agent-switchboard/config-changed', { roleConfigPath: path }); await tick();
+    check('H23：实例释放后监听和 guidance 注销，不残留重载或私有 scope/Fiber',
+      generations.size === generationCount && !sections.has('agent-switchboard:roles')
+      && [...generations].every(g => g.released && g.scope.ctx.fiber.uid === null) && root.tools.layers.scoped.size === 0);
+    rmSync(home, { recursive: true, force: true });
+  }
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
