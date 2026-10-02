@@ -428,10 +428,14 @@ export const Config = z.object({
  * @returns {object} `SubprocessHandle`
  */
 function safeSpawn(ctx, spec) {
-  if (!ctx.subprocess || typeof ctx.subprocess.spawn !== 'function') {
-    throw new Error('ctx.subprocess.spawn 不可用：没有挂载 subprocess 服务实现');
+  // ⚠️ 服务一律走 `get()`：generation / private / extended ctx **没有声明 inject**，
+  //    在它们上面做 `ctx.subprocess` 直接属性访问会抛
+  //    `cannot get property "subprocess" without inject`（本族缺陷的真机表现）。
+  const subprocess = typeof ctx.get === 'function' ? ctx.get('subprocess') : ctx.subprocess;
+  if (!subprocess || typeof subprocess.spawn !== 'function') {
+    throw new Error('subprocess.spawn 不可用：没有挂载 subprocess 服务实现');
   }
-  return ctx.subprocess.spawn(spec);
+  return subprocess.spawn(spec);
 }
 
 /**
@@ -1013,6 +1017,7 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
  */
 function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, disposeSelftest }) {
   let current;
+  let committed = false;
   let revision = 0;
   let running = false;
   let closed = false;
@@ -1022,7 +1027,10 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
   const cliEntries = new Map();
   const dispose = value => typeof value === 'function' ? value() : value?.dispose();
   const report = error => {
-    diagnostics.configErrors = [`热重载失败，保留上一代：${error instanceof Error ? error.message : String(error)}`];
+    const detail = error instanceof Error ? error.message : String(error);
+    const initial = !committed;
+    diagnostics.configErrors = [`${initial ? '初始挂载失败' : '热重载失败，保留上一代'}：${detail}`];
+    if (initial) diagnostics.fatal = diagnostics.configErrors[0];
     console.error(`[${name}] ${diagnostics.configErrors[0]}`);
   };
   const release = generation => {
@@ -1081,68 +1089,78 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     generation.scope = createScope(ownerCtx, {}, { parent: scopeOf(ctx) });
     generations.add(generation);
     const privateCtx = generation.scope.ctx;
-    const privateTools = privateCtx.tools;
-    const tools = Object.create(privateTools);
-    tools.register = definition => {
-      const undo = privateTools.register(definition);
-      generation.definitions.set(definition.name, definition);
-      // 首次装载仍允许 provider 延迟就绪；替换代必须全部准备成功后才公开。
-      if (generation === current && !generation.retired) registerPublic(generation, definition);
-      const unregister = () => {
-        dispose(undo);
-        if (generation.definitions.get(definition.name) !== definition) return;
-        generation.definitions.delete(definition.name);
-        generation.privateDisposers.delete(definition.name);
-        dispose(generation.publicDisposers.get(definition.name));
-        generation.publicDisposers.delete(definition.name);
+    // ⚠️ 新建 scope 的 ctx **没有声明 inject**：在它上面做服务属性访问会抛
+    //    `cannot get property "tools" without inject`（本项目在 jobs 上踩过同类坑）。
+    //    服务会沿作用域向下继承，所以这里用免声明的 `get()` 解析。
+    try {
+      const privateTools = privateCtx.get('tools');
+      if (!privateTools) throw new Error('私有 scope 解析不到 tools 服务；本代角色工具无法挂载');
+      const tools = Object.create(privateTools);
+      tools.register = definition => {
+        const undo = privateTools.register(definition);
+        generation.definitions.set(definition.name, definition);
+        // 首次装载仍允许 provider 延迟就绪；替换代必须全部准备成功后才公开。
+        if (generation === current && !generation.retired) registerPublic(generation, definition);
+        const unregister = () => {
+          dispose(undo);
+          if (generation.definitions.get(definition.name) !== definition) return;
+          generation.definitions.delete(definition.name);
+          generation.privateDisposers.delete(definition.name);
+          dispose(generation.publicDisposers.get(definition.name));
+          generation.publicDisposers.delete(definition.name);
+        };
+        generation.privateDisposers.set(definition.name, unregister);
+        return unregister;
       };
-      generation.privateDisposers.set(definition.name, unregister);
-      return unregister;
-    };
-    generation.runtime = (toolCtx, role) => {
-      const subagents = Object.create(toolCtx.subagents);
-      subagents.start = async (provider, request) => {
-        const done = lease(generation);
-        try {
-          const run = await toolCtx.subagents.start(provider, request);
-          if (role.backend === CLI_BACKEND && run.localAgent) {
-            wrappers.set(run.localAgent, { generation, tool: generation.definitions.get(cliToolName(role.id)) });
-          }
-          // 保留启动及结果租约，不调用 run.dispose、不触碰 signal。
-          Promise.resolve(run.result).then(done, done);
-          return run;
-        } catch (error) { done(); throw error; }
-      };
-      return toolCtx.extend({ tools, subagents, get(key) {
-        if (key === 'tools') return tools;
-        const service = toolCtx.get(key);
-        if (key !== 'jobs' || !service) return service;
-        const jobs = Object.create(service);
-        jobs.start = spec => {
-          // 从 Job 入队开始持有，覆盖延迟 run；不改变 owner/cancel/结算策略。
+      generation.runtime = (toolCtx, role) => {
+        // 影子对象只用于替换 `start` 这一个方法；**内层必须打到真实服务**，否则自我递归。
+        // 沿用 :1084 的教训：在新建/扩展 ctx 上避免直接属性访问。
+        const realSubagents = toolCtx.get('subagents');
+        const subagents = Object.create(realSubagents);
+        subagents.start = async (provider, request) => {
           const done = lease(generation);
           try {
-            return service.start({ ...spec, run(job) {
-              try {
-                const hooks = spec.run(job);
-                Promise.resolve(hooks.done).then(done, done);
-                return hooks;
-              } catch (error) { done(); throw error; }
-            } });
+            const run = await realSubagents.start(provider, request);
+            if (role.backend === CLI_BACKEND && run.localAgent) {
+              wrappers.set(run.localAgent, { generation, tool: generation.definitions.get(cliToolName(role.id)) });
+            }
+            // 保留启动及结果租约，不调用 run.dispose、不触碰 signal。
+            Promise.resolve(run.result).then(done, done);
+            return run;
           } catch (error) { done(); throw error; }
         };
-        return jobs;
-      } });
-    };
-    const buildCtx = privateCtx.extend({ tools, [publicContextKey]: ctx, [generationKey]: generation,
-      get(key) { return key === 'tools' ? tools : privateCtx.get(key); } });
-    const nextDiagnostics = newDiagnostics();
-    nextDiagnostics.mountHere = true;
-    nextDiagnostics.roleConfigPath = roleConfigPath;
-    if (initial) current = generation;
-    try {
+        return toolCtx.extend({ tools, subagents, get(key) {
+          if (key === 'tools') return tools;
+          const service = toolCtx.get(key);
+          if (key !== 'jobs' || !service) return service;
+          const jobs = Object.create(service);
+          jobs.start = spec => {
+            // 从 Job 入队开始持有，覆盖延迟 run；不改变 owner/cancel/结算策略。
+            const done = lease(generation);
+            try {
+              return service.start({ ...spec, run(job) {
+                try {
+                  const hooks = spec.run(job);
+                  Promise.resolve(hooks.done).then(done, done);
+                  return hooks;
+                } catch (error) { done(); throw error; }
+              } });
+            } catch (error) { done(); throw error; }
+          };
+          return jobs;
+        } });
+      };
+      const buildCtx = privateCtx.extend({ tools, [publicContextKey]: ctx, [generationKey]: generation,
+        get(key) { return key === 'tools' ? tools : privateCtx.get(key); } });
+      const nextDiagnostics = newDiagnostics();
+      nextDiagnostics.mountHere = true;
+      nextDiagnostics.roleConfigPath = roleConfigPath;
+      if (initial) current = generation;
       await buildRoleGeneration(buildCtx, { roleConfigPath, resolved: { ...resolved },
         diagnostics: nextDiagnostics, generation });
+      if (initial && nextDiagnostics.configErrors.length) {
+        nextDiagnostics.fatal = `初始挂载失败：${nextDiagnostics.configErrors.join('；')}`;
+      }
       if (!initial && (nextDiagnostics.configErrors.length || nextDiagnostics.blocked.length || nextDiagnostics.fatal ||
         nextDiagnostics.mounts.some(mount => !mount.ok))) {
         throw new Error([...nextDiagnostics.configErrors, ...nextDiagnostics.blocked.map(item => item.reason),
@@ -1175,6 +1193,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     }
     current = generation;
     Object.assign(diagnostics, generation.diagnostics);
+    committed = true;
     if (previous && previous !== generation) { previous.retired = true; release(previous); }
   };
   const reload = async () => {
@@ -1315,9 +1334,29 @@ function buildRoleGeneration(ctx, { roleConfigPath, resolved, diagnostics, gener
         role,
         ctx,
         spawn: (spec) => safeSpawn(ctx, spec),
-        resolveExecutable: (command, env, signal) => ctx.subprocess.resolveExecutable(command, env, signal),
+        resolveExecutable: async (command, env, signal) => {
+          // 同 safeSpawn：generation ctx 未声明 inject，必须走 get()。
+          try {
+            const subprocess = ctx.get('subprocess');
+            if (!subprocess || typeof subprocess.resolveExecutable !== 'function') {
+              throw new Error('subprocess.resolveExecutable 不可用：没有挂载 subprocess 服务实现');
+            }
+            const path = await subprocess.resolveExecutable(command, env, signal);
+            diagnostics.executables.splice(0, diagnostics.executables.length,
+              ...diagnostics.executables.filter(item => item.id !== role.id));
+            diagnostics.executables.push({ id: role.id, command, resolved: path, ok: true });
+            return path;
+          } catch (error) {
+            const detail = `本次未解析可执行文件，执行器将尝试配置命令：${error instanceof Error ? error.message : String(error)}`;
+            diagnostics.executables.splice(0, diagnostics.executables.length,
+              ...diagnostics.executables.filter(item => item.id !== role.id));
+            diagnostics.executables.push({ id: role.id, command, ok: false, detail });
+            console.error(`[${name}] CLI 角色 "${role.id}"：${detail}`);
+            throw error;
+          }
+        },
       });
-      ctx.tools.register(tool);
+      ctx.get('tools').register(tool);
       if (ctx.get('tools')?.get(tool.name, scopeOf(ctx)) == null || !generation.definitions.has(tool.name)) {
         throw new Error(`专属 CLI 工具未注册：${tool.name}`);
       }
@@ -1335,7 +1374,14 @@ function buildRoleGeneration(ctx, { roleConfigPath, resolved, diagnostics, gener
   // 而不是等第一次派发。解析失败不阻断装载（可能依赖运行期 PATH），只作为诊断。
   for (const role of activeCliRoles) {
     Promise.resolve()
-      .then(() => ctx.subprocess.resolveExecutable(role.cli.command, role.cli.env))
+      .then(() => {
+        // 同 safeSpawn：generation ctx 未声明 inject，必须走 get()。
+        const subprocess = ctx.get('subprocess');
+        if (!subprocess || typeof subprocess.resolveExecutable !== 'function') {
+          throw new Error('subprocess.resolveExecutable 不可用：没有挂载 subprocess 服务实现');
+        }
+        return subprocess.resolveExecutable(role.cli.command, role.cli.env);
+      })
       .then((path) => {
         diagnostics.executables.push({ id: role.id, command: role.cli.command, resolved: path, ok: true });
       })

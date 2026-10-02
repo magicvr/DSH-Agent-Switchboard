@@ -63,6 +63,8 @@ function makeCtx({ provideProfileContext = true, provideReflect = true, scope } 
   const provided = [];
   const globalTools = new Map();
   const scopedTools = new Map();
+  const services = new Map();
+  const toolFaces = new WeakMap();
   let ctx = {
     registered,
     provided,
@@ -72,11 +74,14 @@ function makeCtx({ provideProfileContext = true, provideReflect = true, scope } 
       return () => {};
     },
     get(key) {
-      if (key === 'tools') return this.tools;
+      if (key === 'tools') {
+        if (!toolFaces.has(this)) toolFaces.set(this, Object.create(services.get('tools'), { ctx: { value: this } }));
+        return toolFaces.get(this);
+      }
       if (key === 'profileContext') {
         return provideProfileContext ? { home: fixtureHome, dir: join(fixtureHome, 'profiles', 'desktop') } : undefined;
       }
-      return undefined;
+      return services.get(key);
     },
     // ⚠️ 必须存在：`RoleConfigService extends TypertRemoteService`，其构造会经由
     //    `Service` 同步调用 `ctx.reflect.provide()`。缺了它就会走「注册失败」的降级路径
@@ -118,14 +123,27 @@ function makeCtx({ provideProfileContext = true, provideReflect = true, scope } 
     },
     // createScope 借助 extend 写入真实的私有 scope 标签；角色插件只模拟注册副作用。
     extend(properties) {
-      const child = Object.assign(Object.create(this), properties);
-      if (!Object.hasOwn(properties, 'tools')) Object.defineProperty(child, 'tools', {
-        value: Object.create(this.tools, { ctx: { value: child } }), configurable: true, writable: true,
-      });
+      const child = Object.defineProperties(Object.create(this), Object.getOwnPropertyDescriptors(properties));
+      if (!Object.hasOwn(properties, 'get')) {
+        const parent = this;
+        let tools;
+        Object.defineProperty(child, 'get', { configurable: true, writable: true, value(key) {
+          const service = parent.get(key);
+          if (key !== 'tools' || !service) return service;
+          tools ??= Object.create(service, { ctx: { value: child } });
+          return tools;
+        } });
+      }
+      for (const key of ['tools', 'subagents', 'agents', 'systemPrompt', 'subprocess', 'jobs', 'profileContext']) {
+        if (Object.hasOwn(properties, key)) continue;
+        Object.defineProperty(child, key, { configurable: true, get() {
+          throw new Error(`cannot get property "${key}" without inject`);
+        } });
+      }
       return child;
     },
     plugin(_module, config) {
-      if (config?.toolName) this.tools.register({ name: config.toolName });
+      if (config?.toolName) this.get('tools').register({ name: config.toolName });
       return { ctx: this, dispose() {} };
     },
     subagents: {
@@ -147,7 +165,12 @@ function makeCtx({ provideProfileContext = true, provideReflect = true, scope } 
       },
     },
   };
+  for (const key of ['tools', 'subagents', 'systemPrompt', 'subprocess']) services.set(key, ctx[key]);
   if (scope !== undefined) ctx = createScope(ctx, scope).ctx;
+  // makeCtx 返回插件实例；扩展/私有 scope 没有声明 inject，实例声明依赖可直接读取。
+  for (const key of services.keys()) Object.defineProperty(ctx, key, {
+    configurable: true, value: ctx.get(key), writable: true,
+  });
   return ctx;
 }
 
@@ -155,6 +178,46 @@ try {
 const writtenFixture = writeConfigFile(configPathFor(fixtureHome), initialConfig([fixtureRole], { provider: 'self' }));
 if (!writtenFixture.ok) throw new Error(writtenFixture.error);
 process.env.DSH_HOME = fixtureHome; // headless 路径也只读临时 home，不改 USERPROFILE。
+
+section('夹具保真：未 inject 抛错、服务按私有 scope 绑定、初始失败响亮');
+{
+  const ctx = makeCtx();
+  const privateScope = createScope(ctx, {});
+  for (const key of ['tools', 'subagents', 'agents', 'systemPrompt', 'subprocess', 'jobs', 'profileContext']) {
+    let error;
+    try { void privateScope.ctx[key]; } catch (caught) { error = caught; }
+    check(`未 inject 的私有 ctx 直接访问 ${key} 抛错`, error?.message === `cannot get property "${key}" without inject`);
+  }
+  const privateTools = privateScope.ctx.get('tools');
+  const undo = privateTools.register({ name: 'private-fixture' });
+  check('私有 tools face 与实例分层绑定，私有注册不污染实例', privateTools !== ctx.get('tools')
+    && privateTools.get('private-fixture', scopeOf(privateScope.ctx)) != null
+    && ctx.get('tools').get('private-fixture', scopeOf(ctx)) === undefined);
+  undo();
+  await privateScope.dispose();
+  apply(ctx, { mount: true, roles: [fixtureRole], provider: 'self' });
+  await import('@deepseek-ai/dsh-tool-subagent');
+  await new Promise(setImmediate);
+  const healthy = await ctx.tools.get('switchboard_selftest').execute({});
+  check('inject 强制下初始私有构建确实挂出角色工具', healthy.ok && healthy.roleCount === 1
+    && healthy.mounted === 'fixture=OK', JSON.stringify(healthy));
+
+  const broken = makeCtx();
+  const originalExtend = broken.extend;
+  broken.extend = function (properties) {
+    const child = originalExtend.call(this, properties);
+    if (scopeOf(child) !== scopeOf(this)) child.get = key => {
+      if (key === 'tools') throw new Error('fixture-private-tools-unavailable');
+      return this.get(key);
+    };
+    return child;
+  };
+  apply(broken, { mount: true, roles: [fixtureRole], provider: 'self' });
+  await new Promise(setImmediate);
+  const failed = await broken.tools.get('switchboard_selftest').execute({});
+  check('初始私有构建异常使健康门禁失败且显式记录 configErrors/fatal', !failed.ok && failed.roleCount === 0
+    && failed.configErrors.includes('初始挂载失败') && failed.fatal.includes('fixture-private-tools-unavailable'), JSON.stringify(failed));
+}
 
 section('Config：mount 字段与内置 roles 字段是否冲突');
 {
@@ -461,7 +524,7 @@ section('首次核验失败后 provider 延迟就绪：当前健康覆盖失败�
     ctx.plugin = function (_module, config) {
       if (!config) return scopePlugin.call(this, _module, config);
       // 模拟真实插件等待 provider-added 后才注册工具；首次微任务核验必定看不到它。
-      const tools = this.tools;
+      const tools = this.get('tools');
       providerReady = () => tools.register({ name: config.toolName });
       return { ctx: this, dispose() {} };
     };
@@ -826,6 +889,14 @@ section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失
       const degraded = await cliTool.execute({ prompt: 'T' }, exec);
       check('apply 路径 Jobs 卸载后照常执行并报告降级', degraded.status === 'completed'
         && degraded.outputFeedback === 'unavailable' && starts.length === 1);
+      check('generation ctx 的 safeSpawn 与 resolveExecutable 均可用', degraded.status === 'completed'
+        && (await selftest.execute({})).executables.includes('C:/fake/node.exe'));
+      ctx.subprocess.resolveExecutable = () => { throw new Error('fixture-runtime-resolution-failed'); };
+      const fallback = await cliTool.execute({ prompt: 'T' }, exec);
+      const fallbackHealth = await selftest.execute({});
+      check('运行期解析失败即使裸命令启动成功，自检仍记录本次未解析', fallback.status === 'completed'
+        && fallbackHealth.executables.includes('本次未解析可执行文件')
+        && fallbackHealth.executables.includes('fixture-runtime-resolution-failed'));
       ctx.tools.get = (name, viewingScope) => name === 'switchboard_cli_run_cli_worker' ? undefined : originalGet(name, viewingScope);
       const absent = await selftest.execute({});
       check('CLI 工具后来缺失时自检失败且不计入角色数量', !absent.ok && absent.roleCount === 1);
