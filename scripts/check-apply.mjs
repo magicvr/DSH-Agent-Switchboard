@@ -558,7 +558,7 @@ section('根实例配置桥：缺文件、读取失败、同步失败与恢复')
     check('J1：缺文件是合法初始状态且不写入文件',
       missing.ok === true && missing.configErrors === '' && !existsSync(configPathFor(missingHome)), JSON.stringify(missing));
     check('J2：missing 透传后同步文案明确尚未创建而非已有或损坏',
-      missing.roleConfigStatus?.includes('同步=根条目无角色，文件尚未创建')
+      missing.roleConfigStatus?.includes('同步=根条目无角色（未提供 roles），文件尚未创建')
         && !missing.roleConfigStatus.includes('文件已有') && !missing.roleConfigStatus.includes('失败'), JSON.stringify(missing));
 
     const jsonHome = join(home, 'json');
@@ -570,7 +570,7 @@ section('根实例配置桥：缺文件、读取失败、同步失败与恢复')
     check('J3：根实例依赖坏 JSON 时配置错误阻止健康',
       bad.ok === false && bad.configErrors?.includes('JSON 解析失败'), JSON.stringify(bad));
     check('J4：坏 JSON 的同步文案说明读取失败且原文件保持不变',
-      bad.roleConfigStatus?.includes('同步=根条目无角色；文件读取失败，未同步：')
+      bad.roleConfigStatus?.includes('同步=根条目无角色（未提供 roles）；文件读取失败，未同步：')
         && !bad.roleConfigStatus.includes('文件也没有') && !bad.roleConfigStatus.includes('文件尚未创建')
         && readFileSync(jsonPath, 'utf8') === brokenJson, JSON.stringify(bad));
 
@@ -578,9 +578,9 @@ section('根实例配置桥：缺文件、读取失败、同步失败与恢复')
     const ioHome = join(home, 'io');
     mkdirSync(configPathFor(ioHome), { recursive: true });
     const unreadable = (await activate(ioHome, { roles: [] })).result;
-    check('J5：空 Cordis 角色依赖不可读文件时不健康并明确读取失败',
-      unreadable.ok === false && unreadable.configErrors?.includes('读取失败：')
-        && unreadable.roleConfigStatus?.includes('同步=根条目无角色；文件读取失败，未同步：')
+    check('J5：显式空 Cordis 角色依赖不可写文件时不健康并明确同步失败',
+      unreadable.ok === false && unreadable.configErrors?.includes('同步失败：')
+        && unreadable.roleConfigStatus?.includes('同步=同步失败：')
         && !unreadable.roleConfigStatus.includes('文件尚未创建'), JSON.stringify(unreadable));
 
     // 私有目录的位置放一个普通文件，真实 mkdir/write 必须失败；apply 仍返回。
@@ -1059,15 +1059,6 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   originalFile.formatVersion = 9;
   originalFile.custom = { keep: true };
   writeConfigFile(path, originalFile);
-  const rootRoute = { wrapperProvider: ' root-route ', wrapperModel: 'root-model', wrapperEffort: 'high' };
-  apply(makeCtx(), Config({ volatile: rootRoute }));
-  let file = JSON.parse(readFileSync(path, 'utf8'));
-  check('根实例无 roles 也同步统一三字段，并保留现有角色与兼容字段',
-    file.roles[0].id === role.id && file.volatile.wrapperProvider === 'root-route' &&
-    file.volatile.wrapperModel === 'root-model' && file.volatile.wrapperEffort === 'high' && file.volatile.cliTimeoutSec === 'legacy');
-  check('包裹同步完整保留 roles/provider/cwd/maxDepth/formatVersion 与其它顶层字段',
-    ['roles', 'provider', 'cwd', 'maxDepth', 'formatVersion', 'custom'].every(key =>
-      JSON.stringify(file[key]) === JSON.stringify(originalFile[key])));
   const mount = async (config) => {
     const ctx = makeCtx();
     const configs = [];
@@ -1078,6 +1069,39 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
     await new Promise(setImmediate);
     return { configs, result: await ctx.tools.get('switchboard_selftest').execute({}), ctx };
   };
+  const rootRoute = { wrapperProvider: ' root-route ', wrapperModel: 'root-model', wrapperEffort: 'high' };
+  apply(makeCtx(), Config({ volatile: rootRoute }));
+  let file = JSON.parse(readFileSync(path, 'utf8'));
+  check('根实例无 roles 也同步统一三字段，并保留现有角色与兼容字段',
+    file.roles[0].id === role.id && file.volatile.wrapperProvider === 'root-route' &&
+    file.volatile.wrapperModel === 'root-model' && file.volatile.wrapperEffort === 'high' && file.volatile.cliTimeoutSec === 'legacy');
+  check('包裹同步完整保留 roles/provider/cwd/maxDepth/formatVersion 与其它顶层字段',
+    ['roles', 'provider', 'cwd', 'maxDepth', 'formatVersion', 'custom'].every(key =>
+      JSON.stringify(file[key]) === JSON.stringify(originalFile[key])));
+  const beforeOmittedRoles = JSON.parse(readFileSync(path, 'utf8'));
+  apply(makeCtx(), Config({ provider: 'self' }));
+  const afterOmittedRoles = JSON.parse(readFileSync(path, 'utf8'));
+  check('未提供 roles 不改动文件中的角色与顶层字段',
+    JSON.stringify(afterOmittedRoles.roles) === JSON.stringify(beforeOmittedRoles.roles) &&
+      afterOmittedRoles.formatVersion === beforeOmittedRoles.formatVersion &&
+      JSON.stringify(afterOmittedRoles.custom) === JSON.stringify(beforeOmittedRoles.custom));
+  apply(makeCtx(), Config({ provider: 'self', roles: [] }));
+  file = JSON.parse(readFileSync(path, 'utf8'));
+  check('显式清空 roles 真正清空文件角色', file.roles.length === 0);
+  const cleared = await mount({});
+  check('显式清空后新 preset 不再挂载旧角色', cleared.configs.length === 0 && cleared.result.roleCount === 0,
+    JSON.stringify(cleared.result));
+  apply(makeCtx(), Config({ provider: 'self', roles: [role] }));
+  file = JSON.parse(readFileSync(path, 'utf8'));
+  const beforeContinuous = JSON.stringify(file);
+  apply(makeCtx(), Config({ volatile: { wrapperModel: 'continuous-model', wrapperEffort: 'medium' } }));
+  file = JSON.parse(readFileSync(path, 'utf8'));
+  check('角色同步与包裹路由连续执行互不破坏',
+    file.roles[0].id === role.id && file.custom.keep === true && file.formatVersion === 9 &&
+      file.volatile.wrapperModel === 'continuous-model' && file.volatile.wrapperEffort === 'medium' &&
+      JSON.parse(beforeContinuous).roles[0].id === file.roles[0].id);
+  apply(makeCtx(), Config({ provider: 'self', roles: [role], volatile: rootRoute }));
+  file = JSON.parse(readFileSync(path, 'utf8'));
   const scoped = { ...role, id: 'preset-role', model: 'preset-external' };
   let outcome = await mount({ roles: [scoped], volatile: { wrapperProvider: 'preset-route', wrapperModel: 'preset-model', wrapperEffort: 'low' } });
   check('preset 角色优先，但统一包裹路由取根文件而非 preset', outcome.configs.length === 1 &&

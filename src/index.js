@@ -408,7 +408,7 @@ export const Config = z.object({
         cliMaxErrorBytes: z.number().step(1).min(1),
       }),
     )
-    .default([])
+    .default(undefined)
     .volatile(),
 });
 
@@ -921,9 +921,12 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics }) {
   diagnostics.roleConfigRead = current.detail;
   if (current.ok) noteLegacyTimeout(current.value, diagnostics);
   if (current.ok) noteLegacyWrapper(current.value, diagnostics);
-  // 根实例保留原始数量与校验错误，但不挂载、不查询这些角色的工具可见性。
-  const rawRoles = Array.isArray(cordisRoles) && cordisRoles.length > 0
-    ? cordisRoles : current.ok ? current.value.roles : [];
+  // `undefined` 表示配置对象没有提供 roles，必须保留文件；数组（包括 []）表示
+  // 显式提交，空数组也必须写回，不能把「未提供」误当成「清空」。
+  const providedRoles = cordisRoles !== undefined;
+  const rawRoles = providedRoles
+    ? (Array.isArray(cordisRoles) ? cordisRoles : [])
+    : current.ok ? current.value.roles : [];
   diagnostics.configuredRoleCount = rawRoles.length;
   const { roles, errors } = normalizeRoles(rawRoles,
     (current.ok && current.value.provider) || resolved.provider,
@@ -931,15 +934,15 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics }) {
   diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName,
     ...(r.backend === CLI_BACKEND ? { cliToolName: cliToolName(r.id) } : {}) }));
   diagnostics.configErrors = errors;
-  if (!Array.isArray(cordisRoles) || cordisRoles.length === 0) {
-    // 根条目没有角色时实际依赖文件；读取失败不能被空数组的校验结果覆盖。
+  if (!providedRoles) {
+    // 未提供 roles 不改动文件；读取失败不能被缺省值覆盖。
     if (!current.ok) diagnostics.configErrors.push(current.detail);
     diagnostics.roleConfigSync =
       !current.ok
-        ? `根条目无角色；文件读取失败，未同步：${current.detail}`
+        ? `根条目无角色（未提供 roles）；文件读取失败，未同步：${current.detail}`
         : current.missing === true
-          ? '根条目无角色，文件尚未创建 —— 等待 UI 写入'
-          : `根条目无角色；文件已有 ${current.value.roles.length} 个，保持不变`;
+          ? '根条目无角色（未提供 roles），文件尚未创建 —— 等待 UI 写入'
+          : `根条目无角色（未提供 roles）；文件已有 ${current.value.roles.length} 个，保持不变`;
     console.error(`[${name}] ${diagnostics.roleConfigSync}`);
     return;
   }
@@ -954,15 +957,16 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics }) {
   }
 
   const existing = current.ok && current.missing !== true ? current.value : {};
-  const written = writeConfigFile(
-    roleConfigPath,
-    initialConfig(cordisRoles, {
-      provider: existing.provider ?? resolved.provider,
-      cwd: existing.cwd ?? resolved.cwd,
-      maxDepth: existing.maxDepth ?? resolved.maxDepth,
-      ...(existing.volatile ? { volatile: existing.volatile } : {}),
-    }),
-  );
+  // 以现有文件为基底只替换 roles：未知顶层字段与 formatVersion 都必须原样保留；
+  // volatile 也整体保留，继续沿用既有的包裹路由/兼容字段语义。
+  const writtenValue = current.ok && current.missing !== true
+    ? { ...existing, roles: cordisRoles }
+    : initialConfig(cordisRoles, {
+      provider: resolved.provider,
+      cwd: resolved.cwd,
+      maxDepth: resolved.maxDepth,
+    });
+  const written = writeConfigFile(roleConfigPath, writtenValue);
   diagnostics.roleConfigSync = written.ok
     ? `已把 ${cordisRoles.length} 个角色从配置同步到文件`
     : `同步失败：${written.error}`;
@@ -1005,13 +1009,14 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
     return;
   }
   const fromCordis = readVolatileField(resolved, 'roles');
-  const cordisRoles = Array.isArray(fromCordis) ? fromCordis : [];
+  const cordisRoles = fromCordis;
   diagnostics.roleConfigRead =
-    `${fromFile.detail}；本作用域 Cordis 配置里 roles=${cordisRoles.length} 个`;
+    `${fromFile.detail}；本作用域 Cordis 配置里 roles=${Array.isArray(cordisRoles) ? cordisRoles.length : '未提供'} 个`;
 
-  // 优先用 Cordis 配置（那是 UI 能写的地方）；为空时回落到文件。
-  // 这样「UI 改了但文件还没同步」与「文件是权威」两种时序都不会丢角色。
-  let rawRoles = cordisRoles.length > 0 ? cordisRoles : fromFile.ok ? fromFile.value.roles : [];
+  // `undefined` 表示本作用域未提供 roles，才允许回落文件；显式 [] 表示清空，不能复活旧角色。
+  let rawRoles = cordisRoles === undefined
+    ? fromFile.ok ? fromFile.value.roles : []
+    : Array.isArray(cordisRoles) ? cordisRoles : [];
   diagnostics.configuredRoleCount = rawRoles.length;
   const defaults = {
     provider: (fromFile.ok && fromFile.value.provider) || resolved.provider,
