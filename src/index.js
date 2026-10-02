@@ -1075,7 +1075,10 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
   const prepare = async initial => {
     const generation = { active: 0, retired: false, released: false, initial,
       definitions: new Map(), privateDisposers: new Map(), publicDisposers: new Map(), fibers: [], roles: [], maxDepth: 3 };
-    generation.scope = createScope(ctx, {}, { parent: scopeOf(ctx) });
+    // 保留本作用域服务隔离与拦截，但私有 Fiber 归根所有，避免实例卸载隐式拆毁在途环境。
+    // 实例 teardown 退休全部代际，release 在租约归零后显式释放；应用根卸载仍会整体拆毁。
+    const ownerCtx = ctx.root?.fiber ? ctx.extend({ fiber: ctx.root.fiber }) : ctx;
+    generation.scope = createScope(ownerCtx, {}, { parent: scopeOf(ctx) });
     generations.add(generation);
     const privateCtx = generation.scope.ctx;
     const privateTools = privateCtx.tools;
@@ -1138,7 +1141,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     nextDiagnostics.roleConfigPath = roleConfigPath;
     if (initial) current = generation;
     try {
-      await buildRoleGeneration(buildCtx, { roleConfigPath, resolved: initial ? resolved : { ...resolved, roles: undefined },
+      await buildRoleGeneration(buildCtx, { roleConfigPath, resolved: { ...resolved },
         diagnostics: nextDiagnostics, generation });
       if (!initial && (nextDiagnostics.configErrors.length || nextDiagnostics.blocked.length || nextDiagnostics.fatal ||
         nextDiagnostics.mounts.some(mount => !mount.ok))) {

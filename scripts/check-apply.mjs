@@ -1559,7 +1559,8 @@ section('热重载：真实 Cordis 跨 scope 广播、代际回滚与在途保�
     check('H03：根更新跨 scope 广播驱动替换，不重新 apply preset 或根',
       broadcasts >= 1 && rootApplies === 1 && presetApplies === 1 && !!getTool('delegate_to_added'));
     check('H04：预检租约保留旧 scope/Fiber，原 signal 不 abort 且会话未销毁',
-      firstGeneration?.active > 0 && !firstGeneration?.released && !controller.signal.aborted && runs.every(run => run.disposed === 1));
+      firstGeneration?.active > 0 && !firstGeneration?.released && firstGeneration.scope.ctx.fiber.uid !== null
+      && firstGeneration.fibers.length > 0 && firstGeneration.fibers.every(fiber => fiber.uid !== null) && !controller.signal.aborted && runs.every(run => run.disposed === 1));
     check('H05：guidance 只注册一次且不发 tools/change 就读取新角色说明',
       guidanceRegisters === 1 && guidance().includes('更新后的热角色') && guidance().includes('delegate_to_added'));
     preflight.resolve();
@@ -1635,6 +1636,7 @@ section('热重载：真实 Cordis 跨 scope 广播、代际回滚与在途保�
     save([{ ...fixtureRole, id: 'replacement' }]); await tick();
     check('H12：后台 Job 入队即持租约，重挂后尚未启动也不会销毁旧 scope',
       background.kind === 'background' && backgroundGeneration?.active === 1 && !backgroundGeneration?.released
+      && backgroundGeneration.scope.ctx.fiber.uid !== null && backgroundGeneration.fibers.every(fiber => fiber.uid !== null)
       && !getTool('delegate_to_hot') && !!getTool('delegate_to_replacement'));
     holdRun = true;
     const jobHooks = pendingJobs.shift().run({ append() {} });
@@ -1717,6 +1719,63 @@ section('热重载：真实 Cordis 跨 scope 广播、代际回滚与在途保�
     check('H19：删光角色注销所有入口，guidance 不再列旧角色，自检仍仅一个',
       !getTool('delegate_to_hot_cli') && !getTool('switchboard_cli_run_hot_cli') && !guidance().includes('delegate_to_hot_cli')
       && root.tools.schemas(scope).filter(tool => tool.name === 'switchboard_selftest').length === 1);
+
+    // 显式数组与 undefined 必须跨同一广播保留各自来源，包括显式清空。
+    for (const localRoles of [[{ ...fixtureRole, id: 'local', model: 'local-model' }], []]) {
+      const localScope = createScope(root, {});
+      const known = new Set(generations);
+      const localKey = scopeOf(localScope.ctx);
+      const privateFibers = [];
+      const unwatch = root.on('internal/plugin', fiber => {
+        if (fiber.uid !== null && fiber.parent.fiber === root.fiber && scopeOf(fiber.parent) === localKey) privateFibers.push(fiber);
+      });
+      const localFiber = localScope.ctx.plugin({ Config, apply }, { mount: true, provider: 'self', roles: localRoles });
+      const localTool = name => root.tools.get(name, localKey);
+      try {
+        await localFiber.await(); await tick();
+        const initialLocal = [...generations].find(g => !known.has(g));
+        const empty = localRoles.length === 0;
+        check(empty ? 'H26：preset 显式空 roles 初始清空' : 'H25：preset 显式 local roles 初始优先',
+          empty ? !localTool('delegate_to_local') : !!localTool('delegate_to_local'));
+        save([{ ...fixtureRole, id: 'file-only' }]); await tick();
+        const nextLocal = [...generations].find(g => !known.has(g) && g !== initialLocal && !g.released
+          && scopeOf(g.scope.ctx.fiber.parent) === localKey);
+        check(empty ? 'H28：preset 显式空 roles 跨广播仍清空，不被文件覆盖' : 'H27：preset local roles 跨广播仍优先，不消失',
+          privateFibers.length === 2 && privateFibers[0].uid === null && privateFibers[1].uid !== null
+          && !localTool('delegate_to_file_only')
+          && (empty ? !localTool('delegate_to_local')
+            : initialLocal?.released && nextLocal?.roles.length === 1 && nextLocal.roles[0].model === 'local-model' && !!localTool('delegate_to_local')));
+      } finally {
+        await localFiber.dispose(); await localScope.dispose(); unwatch(); await tick();
+        check(localRoles.length ? 'H33：显式角色实例卸载无私有 Fiber 泄漏' : 'H34：空角色实例卸载无私有 Fiber 泄漏',
+          privateFibers.length === 2 && privateFibers.every(fiber => fiber.uid === null));
+      }
+    }
+
+    save([role]); await tick();
+    holdRun = true;
+    const unloadingCall = call('delegate_to_hot'); await tick();
+    const unloadingRun = runs.at(-1);
+    const unloadingGeneration = [...generations].find(g => !g.released);
+    const privateKey = scopeOf(unloadingGeneration.scope.ctx);
+    check('H29：父卸载夹具确实持有在途租约及私有注册', unloadingGeneration.active > 0
+      && root.tools.get('delegate_to_hot', privateKey) !== undefined);
+    await presetFiber.dispose(); await presetScope.dispose(); await tick();
+    check('H30：父实例卸载触发 teardown，但在途私有 scope/Fiber 与工具仍在',
+      presetFiber.uid === null && unloadingGeneration.retired && unloadingGeneration.active > 0
+      && !unloadingGeneration.released && unloadingGeneration.scope.ctx.fiber.uid !== null
+      && unloadingGeneration.fibers.length > 0 && unloadingGeneration.fibers.every(fiber => fiber.uid !== null)
+      && unloadingGeneration.definitions.has('delegate_to_hot') && root.tools.get('delegate_to_hot', privateKey) !== undefined
+      && !getTool('delegate_to_hot') && getTool('switchboard_selftest') === root.tools.get('switchboard_selftest')
+      && !sections.has('agent-switchboard:roles') && unloadingRun.disposed === 0 && !controller.signal.aborted);
+    const countAfterUnload = generations.size;
+    root.emit('agent-switchboard/config-changed', { roleConfigPath: path }); await tick();
+    check('H31：父卸载注销更新监听，后续广播不新建代际', generations.size === countAfterUnload);
+    unloadingRun.finish(); await unloadingCall; await tick(); holdRun = false;
+    check('H32：父卸载后自然结束仍显式释放所有代际，无私有 scope/Fiber 或工具泄漏',
+      unloadingGeneration.active === 0 && unloadingGeneration.released
+      && [...generations].every(g => g.released && g.scope.ctx.fiber.uid === null && g.fibers.every(fiber => fiber.uid === null))
+      && !root.tools.layers.scoped.has(privateKey) && unloadingRun.disposed === 1);
   } finally {
     await presetFiber.dispose();
     await presetScope.dispose();

@@ -270,7 +270,7 @@
     - `dsh.profile.bundles` **必须含本包**（`dependencies` 里有**不够**）：Loader 只加载
       `bundles` 列出的包。缺失后果是**应用正常启动、但插件完全不存在**，且**没有任何报错**
       （实测踩到：Loader 条目数 187 而非 188，`include:agent-switchboard` 从未创建）。
-    - 根条目**必须启用**，bundle 声明不必携带 `config.roles`；设置页读 `configForms`、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，Host 根实例将角色同步到 `$DSH_HOME/agent-switchboard/roles.json`。preset 中本包只需 `mount: true`，**不得再携带 `roles`**；常驻挂载实例启动时在本作用域 Cordis 角色非空时优先使用它，否则读取文件。新会话继承现有实例，不重新执行 `apply`；根实例写盘广播驱动已有 preset 重新读取、准备和替换角色工具。
+    - 根条目**必须启用**，bundle 声明不必携带 `config.roles`；设置页读 `configForms`、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，Host 根实例将角色同步到 `$DSH_HOME/agent-switchboard/roles.json`。标准 preset 中本包只需 `mount: true`，**不得再携带 `roles`**；兼容自定义 preset 的本作用域显式角色数组（含 `[]` 清空），启动和热重载均优先于文件，仅 `undefined` 回落文件。新会话继承现有实例，不重新执行 `apply`；根实例写盘广播驱动已有 preset 重新读取、准备和替换角色工具。
     - `scripts/check-profile-wiring.mjs` 显式断言根条目未禁用、preset 的 `mount: true` 及 `selfRow?.config?.roles === undefined`（找不到默认 profile 时跳过；显式目标缺失则失败）。
 37. **禁用/启用插件这个操作本身会重写 profile，且只保留它认识的条目。** 实测两次：一次
     web boot 失败后，profile 的 `cordis.patch.yml` 从 41,802 字节被削到 670 字节，
@@ -358,7 +358,7 @@ provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliT
 特殊 `internal/update` 返回的 disposer 不会自动纳入 effect；生产代码显式使用 `ctx.effect(() => ctx.on(...))`，
 使监听随本次激活释放，重启后不残留旧闭包。先注册监听再验证初始配置，初始非法也可经就地更新修正并恢复根实例到文件的同步；写盘成功后向全局同名 hook 表广播 `agent-switchboard/config-changed`，payload 为 `{ roleConfigPath }`，不带 receiver。真实 Cordis 离线集成已验证跨 scope 可达；`internal/update` 本身仍仅为根 Fiber 私有 hook。
 常驻 preset 的监听按路径匹配，串行处理并合并快速保存，以版本检查丢弃过时准备代；不依赖再次 `apply`、文件监听、定时器或 `tools/change`。每代在私有 scope 准备 CLI 配置快照与委派子 Fiber，等待 Fiber 激活并核实本代注册定义，不能把父层旧工具当成新代挂载成功。短同步提交段注销旧委派入口并注册新入口；注册失败撤销新入口、恢复旧定义，旧 Fiber 无需重启。
-实例级自检与动态 text guidance 仅注册一次；guidance 在提示组装时读取当前有效角色与工具清单。配置代持有私有 scope、子 Fiber、私有工具与公开入口 disposer；委派 execute 从预检开始持有租约，subagents.start 从启动至结果持有租约，后台 Job 从入队至 hooks.done 持有租约。旧代仅在退休且活跃归零后释放 scope/Fiber；热重挂不 abort signal、不主动销毁子会话或 CLI 进程。
+实例级自检与动态 text guidance 仅注册一次；guidance 在提示组装时读取当前有效角色与工具清单。配置代持有私有 scope、子 Fiber、私有工具与公开入口 disposer；委派 execute 从预检开始持有租约，subagents.start 从启动至结果持有租约，后台 Job 从入队至 hooks.done 持有租约。私有 scope 通过保留本作用域隔离/拦截的扩展 ctx 创建，Fiber 归应用根所有；配置重载仅退休旧代，活跃归零后显式释放 scope/Fiber，不 abort signal、不主动销毁子会话或 CLI 进程。实例卸载（含 preset scope 卸载）执行 teardown，撤销公开入口、自检、guidance 与监听并退休全部代际；在途私有环境保留到租约归零后显式释放，不再接受新派发或更新。应用根卸载/关闭 DSH 仍整体拆毁，租约不保证应用服务继续存活。
 CLI 公开工具名保持稳定，入口通过 WeakMap 中的真实 `run.localAgent` 身份选择代际私有工具快照；未由对应角色派发的 Agent 拒绝执行，防止旧内置子代理的 deny 快照漏掉新 CLI 名。退休代的 CLI 入口保留至租约归零，已启动包裹仍使用原角色/命令/参数。不存在租约之外的额外运行期限。
 有效文件 `maxDepth` 优先，缺失或无效时回落 preset，最后默认 3；根就地更新会同步已有文件的 maxDepth。角色配置、CLI 预设/参数和包裹路由用于后续派发；历史模型上下文、正在执行的子代理/CLI/后台 Job 不被改写。
 挂载实例只校验有效路由来源：文件含任一 wrapper 字段即整个路由对象优先（包含显式空值），不逐字段补入 preset；

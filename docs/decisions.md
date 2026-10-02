@@ -371,7 +371,7 @@ if (rest.length === 0 && op.op === "unset") result.splice(index, 1); // 删除�
 >
 > - 当前角色文件为 `$DSH_HOME/agent-switchboard/roles.json`（`src/config-file.js:63`）。bundle 根条目启用且不携带 config；preset 中本插件只带 `mount: true`（`presets/switchboard.patch.yml:18`），不得带 `roles`（`scripts/check-profile-wiring.mjs:115`）。
 > - **设置页并未直接读写文件。** 它仍读 `configForms` 的根命名空间 `roles`，写 `settings.mutate`（`src/client/index.js:294`、`:432`）；Host 根实例对非空 Cordis 角色做校验、比对并同步文件，根配置为空时保留已有文件（`src/index.js:788`）。
-> - 挂载实例仍兼容非空的本作用域 Cordis 角色，并优先于文件；标准 preset 不携带角色，因此走文件（`src/index.js:849`）。保存不等于已挂载会话立即更新角色工具。
+> - 挂载实例兼容本作用域显式 Cordis 角色数组（含 `[]` 清空），启动与热重载均优先于文件；标准 preset 不携带角色，因此走文件。历史上保存不刷新已挂载工具的限制已由 D24 代际热重载取代。
 > - 第 6 条所引 profile 检查的当前断言是 bundles / dependencies、bundle 条目启用、preset `mount:true` 且无 `roles`，以及角色文件可解析；不再断言 profile 根条目必须带 `config.roles`（`scripts/check-profile-wiring.mjs:58`、`:79`、`:96`、`:121`）。
 
 **为什么要有这一条：** D13 把「自建 Client 设置页 + `configForms` 写回」定为方案，但落地时连续踩到三类失败，最终**推翻了 D13 中关于存储位置与通道的具体判断**。D13 的**目标**不变（机制是角色的属性、要有 UI 配置入口），改的是**做法**。以下是已核实的事实，替代 D13 中相应的推断。
@@ -740,7 +740,7 @@ CLI 自身工具与受控委派白名单、只读 deny、`allow: []` 拒绝继�
 面板列表前始终展示统一小节，注明仅 CLI 生效；角色与三字段草稿在一次 mutate 中用同一 revision 保存。
 根配置沿现有 roles.json 桥接到 preset：文件含任一 wrapper 字段即整个包裹路由对象优先（包含空值），
 不逐字段补入 preset；文件没有任何 wrapper 字段时才回落当前实例配置。只校验最终有效来源，被文件覆盖的非法 preset 路由忽略（F6）。
-角色列表仍采用本作用域非空 roles 优先、否则读文件，两个来源不能混为一谈。
+角色列表来源与包裹路由独立：本作用域显式 roles 数组（含 `[]`）优先，仅 `undefined` 读文件；这是下文 R2 修正后的当前契约。
 根字段移除或留空会清除已保存的统一路由。同步先保留现有 volatile 其它字段，再以 `{ ...existing, volatile }`
 写回，保留 roles、provider、cwd、maxDepth、formatVersion 与顶层其它字段，不是整份配置替换。
 旧角色字段兼容加载但忽略，逐实例记录诊断，模块只告警一次。
@@ -822,8 +822,10 @@ volatile 就地更新可供新 preset 读取，已挂载的子代理保持挂载
 
 **代际与回滚：** 每代追踪私有隔离 scope、真实 dsh-tool-subagent 子 Fiber、规范化角色快照、私有工具 disposer 及公开委派入口 disposer。串行准备，快速保存用版本检查丢弃过时准备代；核实本代自己的工具定义，不能把祖先的旧工具当成准备成功。新 Fiber 激活后，在无 await 的同步段内注销旧委派入口并发布新入口；注册失败撤销新入口并恢复旧定义。旧 Fiber 保持存活，回滚无需重新启动它。自检、事件监听和动态 text guidance 属于实例，只注册一次；提示组装读取当前有效快照。
 
-**在途保护：** 委派 execute 从路由预检开始持有租约；subagents.start 从启动至结果持有租约；后台 Job 从入队至 hooks.done 持有租约，覆盖重挂后才启动的后台链。仅在旧代退休且活跃归零后释放私有 scope/Fiber。公开注销仅撤销注册定义，不 abort signal、不主动销毁子会话/CLI 进程或改 Jobs 的 owner、结算与清理策略。CLI 公开名保持稳定，通过 WeakMap 绑定真实 run.localAgent 身份和代际私有工具；当前入口可服务旧包裹快照，退休代 CLI 入口待租约归零才注销。非对应角色包裹不能执行，避免旧内置子代理的 deny 快照漏掉新增 CLI 工具名。
+**在途保护与卸载边界：** 委派 execute 从路由预检开始持有租约；subagents.start 从启动至结果持有租约；后台 Job 从入队至 hooks.done 持有租约，覆盖重挂后才启动的后台链。私有 scope 使用保留本作用域服务隔离与拦截的扩展 ctx，Fiber 归应用根所有，避免 Cordis 随 preset 实例隐式销毁子 Fiber。配置重载退休旧代，仅在活跃归零后由 release 显式释放私有 scope/Fiber。实例卸载（含 preset scope 卸载）仍执行 teardown：撤销公开入口、自检、guidance 与监听，退休全部代际；在途私有环境保持至租约归零后显式清理，不再接受新派发/更新。关闭 DSH 或应用根卸载仍整体拆毁，租约不保证应用服务继续存活。公开注销仅撤销注册定义，不 abort signal、不主动销毁子会话/CLI 进程或改 Jobs 的 owner、结算与清理策略。CLI 公开名保持稳定，通过 WeakMap 绑定真实 run.localAgent 身份和代际私有工具；配置重载时当前入口可服务旧包裹快照，退休代 CLI 入口待租约归零才注销；实例卸载时公开入口随实例撤销。非对应角色包裹不能执行，避免旧内置子代理的 deny 快照漏掉新增 CLI 工具名。
 
-**取值与边界：** 有效文件 maxDepth 优先，缺失或无效时回落 preset，最后默认 3；根就地更新同步已有文件的 maxDepth，首次启动保留既有文件。文件含任一 wrapper 字段即整套优先（含空值），不逐字段混合。角色增删、backend/model/effort/provider、instructions/description、allowNestedDispatch/readOnly、CLI 预设与参数、maxDepth 和包裹路由用于后续派发，下次系统提示组装体现新指引。已经发给模型的历史上下文、运行中的子代理/CLI/后台 Job、已启动包裹的参数保持原快照。Host 源码改动仍需重启一次加载，然后配置保存全程无需再重启。
+**取值与边界：** 本作用域 roles 显式数组（含 `[]`）启动和热重载均优先，仅 `undefined` 回落共享文件；广播不清空 preset 的显式配置。有效文件 maxDepth 优先，缺失或无效时回落 preset，最后默认 3；根就地更新同步已有文件的 maxDepth，首次启动保留既有文件。文件含任一 wrapper 字段即整套优先（含空值），不逐字段混合。角色增删、backend/model/effort/provider、instructions/description、allowNestedDispatch/readOnly、CLI 预设与参数、maxDepth 和包裹路由用于后续派发，下次系统提示组装体现新指引。已经发给模型的历史上下文、运行中的子代理/CLI/后台 Job、已启动包裹的参数保持原快照。Host 源码改动仍需重启一次加载，然后配置保存全程无需再重启。
 
 **验证：** check-apply 的 H01–H24 使用真实 Cordis、ToolRuntime、Config、角色文件、工具插件和假 subagents.start/进程覆盖单次 apply、跨 scope 事件、增删改、连续保存、非法配置与公开注册失败回滚、预检/后台/CLI 在途租约、动态 guidance、文件深度优先、身份拒绝、CLI 预设/参数更新与旧 scope/Fiber 自然释放；10 个关键生产分支通过变异实验确认失败，并恢复备份后校验 SHA-256 字节一致。不调用真实 CLI，不以此冒充真实 spawn、LLM 或设置页往返验收。
+
+**审查修正验证：** H04/H12 增加真实 scope/子 Fiber 存活判据，H25–H34 补显式角色与空数组跨广播保留、父实例及 preset scope 卸载时 teardown/在途私有环境、结束后显式清理及泄漏检查。父 Fiber 归属、清空 roles、忽略租约、漏退休及漏私有释放五组生产变异分别触发失败；每组恢复 raw 备份并校验 SHA-256 字节一致。仍不涉及真机配置或外部 CLI 调用。
