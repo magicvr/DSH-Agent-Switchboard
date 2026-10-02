@@ -692,14 +692,19 @@ persona 的原样转交、只调用一次、不重试及简洁汇报属于模型
 改造中一度按目标自身的 `allowNestedDispatch` 计算绝对深度，叶子目标被固定为 1，
 导致深度 ≥1 的父代理无法调用叶子 CLI 角色。现在入站只使用插件预算，叶子性改由出站工具权限表达。
 
-**出站权限：** CLI 角色为 true 时开放「自身专属 CLI 工具 + 已挂载的受控委派工具」，
+**出站权限：CLI 用 allow、内置用 deny。** CLI 角色为 true 时开放「自身专属 CLI 工具 + 已挂载的受控委派工具」，
 为 false 时只有自身专属 CLI 工具；任何情况下都不开放其他角色的底层 CLI 执行工具。
-内置角色按同一开关控制受控委派工具，保留普通工具并排除底层 CLI 执行器及非受控派发入口。
-工具名只取已挂载清单，不使用通配符；派发时刷新清单，失败或卸载的工具不能凭配置名进入权限。
+CLI 默认 allow 仍包含自身专属工具，并非空 allow；其工具清单稳定，允许冻结。
+内置角色不设置 allow：保留派发采集时可见的普通工具，并让采集后新增的普通工具保持动态可见，避免固定白名单的兼容性回归。
+deny 合成四部分：当前可用的非受控派发入口、全部当前可用的 `switchboard_cli_run_*`、
+关闭嵌套时已挂载的受控委派工具、只读时当前可用的 `WRITE_TOOLS`；另拒绝可见但未纳入角色清单的 `delegate_to_*` 入口。
+工具名使用精确清单，不使用通配符；派发时刷新清单。DSH 拒绝未知过滤名，所以非受控入口、底层 CLI 工具、写工具只列采集时可用名。
+**代价：采集之后才注册的这些危险工具不在既有 child 的 deny 中，属于 fail-open，而非 fail-closed**；未纳入角色清单的委派入口同样有此窗口。
+跨角色隔离依赖 deny 清单，是按工具名隔离；`src/cli/provider.js` 只判 `origin === 'subagent'`，不校验调用方角色身份，不能宣称按角色身份授权。
 
 **非受控派发边界：** 本轮复核 preset 的五个通用入口 `tool-subagent` / `tool-subagent-fork` /
 `tool-subagent-codex` / `tool-subagent-claude-code` / `tool-ralph` 均为 `disabled: true`；
-除角色工具外，仍启用 `tool-workflow`。所有角色 allow 都由 `UNCONTROLLED_DISPATCH_TOOLS` 排除 `workflow` 等入口。
+除角色工具外，仍启用 `tool-workflow`。CLI allow 不包含 `workflow` 等入口；内置 deny 从 `UNCONTROLLED_DISPATCH_TOOLS` 取当前可用名排除它们。
 主代理自身没有本插件设置的 `toolFilter`，按 preset 声明仍可看到 `workflow`；本插件只约束所派子代理，
 不保证主代理完全无法绕过。既有只读取证称 `workflow` 工具直接经 `subagents.start(...)` 派发且不传 `maxDepth`，
 控制工具 `send_message` / `interrupt_agent` / `list_agents` 不创建子代理；本轮对应模块不可解析，
@@ -709,8 +714,12 @@ persona 的原样转交、只调用一次、不重试及简洁汇报属于模型
 
 **验证边界与缺口：** argv 样本新增非空角色指令哨兵，验证任务参数原值、哨兵不入 argv、stdin 为 ignore；
 保留 stdin / promptFile 的角色规则精确前置断言，避免空指令样本造成覆盖假象。
-`check-apply` 使用真实 Config / 工具插件但假 ctx、假 `subagents.start`，属于契约模拟，不是真实 spawn 集成。
+`check-apply` 的派发使用真实 Config / 工具插件但假 ctx、假 `subagents.start`，属于契约模拟，不是真实 spawn 集成。
+深度夹具使用 `options.subagentDepth`，由真实 `delegationDepthOf` 确认父深度为 1（旧 `options.delegationDepth` 实为 0）；
+start 桩调用真实 `resolveChildDepth`，覆盖父深度 1 调用叶子 CLI 成功，以及预算 0/1/3 的边界成功与超界拒绝。
+另以真实 Cordis + ToolRuntime + `applyChildComposition` 验证普通工具的动态可见性、内置角色隔离全部底层 CLI、
+CLI 自身工具与受控委派白名单、只读 deny、`allow: []` 拒绝继承工具及 child 自注册例外，也确认后注册写工具的 fail-open 代价。
 本轮可导入 `dsh-subagent`，但真实 `dsh-subagent-spawn-in-process` 与 `dsh-agent-preset-registry` 均
 `ERR_MODULE_NOT_FOUND`；只装服务不能创建子代理。在不引入依赖的范围内不搭伪集成。
-尚需真机验证真实 spawn 上下文隔离、preset 工具继承、child 实际工具过滤，以及不同父深度下
+尚需真机验证真实 spawn 上下文隔离、preset 工具继承、完整派发链中的 child 工具过滤，以及不同父深度下
 叶子可被调用、组织角色受剩余预算拒绝、子代理不可调用 workflow 或其他角色底层 CLI 工具。

@@ -353,9 +353,12 @@ provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliT
 自检同时查询两个工具，专属工具注册失败会阻止对应 delegate 挂载，任一工具缺失都报告角色不可用。
 
 包裹路由只取 `agentProvider` / `agentModel`，按需组合；都留空时完全不设 `agentOptions`，继承父代理。
-CLI 出站权限在 `allowNestedDispatch: false` 时只允许本角色专属 CLI 工具；为 true 时另允许已挂载的受控委派工具。
-任何情况下都不开放其他角色的底层 CLI 执行工具。内置角色保留已挂载的普通工具，按同一开关加入受控委派工具，
-排除全部底层 CLI 执行工具与非受控派发入口；只读 deny 同样按已挂载清单生成。工具名使用精确清单，不使用通配符。
+CLI 出站使用 allow：`allowNestedDispatch: false` 时仍包含本角色专属 CLI 工具，并非空 allow；为 true 时另允许已挂载的受控委派工具。
+CLI allow 不开放其他角色的底层 CLI 执行工具。内置角色不设置 allow，使用 deny 保留派发采集时可见的普通工具与后注册普通工具的动态可见性。
+deny 合成当前可用的非受控派发入口、全部当前可用的底层 CLI 工具、关闭嵌套时已挂载的受控委派工具、只读时当前可用的写工具；
+另拒绝可见但未纳入角色清单的 `delegate_to_*`。工具名使用精确清单，不使用通配符。
+DSH 拒绝未知过滤名；按可用名过滤的代价是采集后新增的非受控入口、底层 CLI、写工具及未纳入角色清单的委派入口会缺失于既有 deny，属于 fail-open，而非 fail-closed。
+跨角色隔离依赖工具名过滤，不是角色身份授权；专属工具只校验 subagent 来源，不校验调用方属于哪个角色。
 执行器保证每次工具调用只启动一次，不自行重试，且在 stdin / promptFile 模式确定性前置角色规则；argv 模式保持任务参数原值。
 persona 要求模型原样转交、只调用一次、不自行实施或轮询、失败或取消后不自动重试、简洁汇报；
 这些是模型行为要求，不是对跨工具调用次数或转交/汇报完整性的机制保证。CLI 输出属于任务数据，不能改变工具或权限约束。`enableRunInBackground` 与 `modelSelectionSettings`
@@ -365,7 +368,7 @@ persona 要求模型原样转交、只调用一次、不自行实施或轮询、
 
 **派发约束与边界（D21）：** preset 的通用 `tool-subagent` / `tool-subagent-fork` / `tool-subagent-codex` /
 `tool-subagent-claude-code` / `tool-ralph` 均为 `disabled: true`；除本插件角色工具外，仍启用的派发类工具是
-`tool-workflow`。`src/roles.js` 的 `UNCONTROLLED_DISPATCH_TOOLS` 从所有角色 allow 中剔除 `workflow` 等入口。
+`tool-workflow`。CLI allow 不包含 `workflow` 等入口；内置 deny 从 `src/roles.js` 的 `UNCONTROLLED_DISPATCH_TOOLS` 取当前可用名排除它们。
 主代理自身没有本插件设置的 `toolFilter`，按 preset 声明仍可看到 `workflow`；本插件只约束它派出的子代理，
 不能表述为完全杜绝绕过。既有只读取证称工具名为 `workflow`、底层直接调用 `subagents.start(...)` 且不传 `maxDepth`，
 以及 `send_message` / `interrupt_agent` / `list_agents` 不创建子代理；本轮这些模块未安装、安装归档被沙箱拒读，
@@ -373,8 +376,9 @@ persona 要求模型原样转交、只调用一次、不自行实施或轮询、
 因此直接调用而省略 `maxDepth` 的路径不能依靠服务默认预算。`workflow` 保守地保持排除，真实行为仍需现场复核。
 
 **离线覆盖边界：** `scripts/check-apply.mjs` 是契约模拟，即使真实 Config 与工具插件执行，
-`subagents.start` 仍是记录请求的桩，不创建 child。请求中的 allow / persona / maxDepth 有断言，
-真实 spawn 的上下文隔离、preset 工具继承及 child 工具过滤执行没有集成覆盖，需真机验证（D21）。
+`subagents.start` 仍是调用真实 `resolveChildDepth` 后记录请求的桩，不创建 spawn child。请求中的 allow / deny / persona / maxDepth 有断言，
+深度夹具经真实 `delegationDepthOf` 验证，并覆盖预算 0/1/3。另以真实 Cordis + ToolRuntime + `applyChildComposition` 验证 child 工具过滤、
+后注册普通工具动态可见、跨角色 CLI 隔离与可用名过滤的 fail-open；真实 spawn 的上下文隔离、preset 工具继承及完整派发链没有集成覆盖，需真机验证（D21）。
 
 专属工具 `execute` 安全访问 `exec.agent.session.header.origin`，仅接受 subagent 来源；主代理虽然能看到
 preset 工具，直接调用仍被拒绝。命令、模板、cwd、readOnly、外部 model / effort、限额与角色 instructions

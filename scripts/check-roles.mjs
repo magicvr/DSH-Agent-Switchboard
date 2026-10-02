@@ -77,7 +77,7 @@ section('toolConfigFor：模型与强度进 agentOptions');
     `实际 ${cfg.maxDepth}；注意 0 会连第一层派发都拒绝`,
   );
   check('backgroundMode one-shot', cfg.backgroundMode === 'one-shot');
-  check('非只读也过滤出站工具，空清单不假定权限', cfg.toolFilter.allow.length === 0);
+  check('非只读内置使用 deny，空清单不冻结普通工具', !('allow' in cfg.toolFilter) && cfg.toolFilter.deny.length === 0);
 }
 
 section('只读角色：写入类工具被 deny');
@@ -480,7 +480,8 @@ section('出站权限与三种提示使用同一有效结果');
       const options = { maxDepth: 3, delegateToolNames, availableToolNames };
       const permissions = dispatchPermissionsFor(role, options);
       const config = toolConfigFor(role, options);
-      const allowed = new Set(config.toolFilter.allow);
+      const allowed = new Set(availableToolNames.filter(name => config.toolFilter.allow !== undefined
+        ? config.toolFilter.allow.includes(name) : !config.toolFilter.deny.includes(name)));
       const tag = `${backend} ${allowNestedDispatch}`;
       check(`${tag}：受控 delegate 权限精确符合开关`,
         delegateToolNames.every((name) => allowed.has(name) === allowNestedDispatch));
@@ -489,7 +490,8 @@ section('出站权限与三种提示使用同一有效结果');
       check(`${tag}：全部非受控派发入口与未知 delegate 被排除`,
         [...UNCONTROLLED_DISPATCH_TOOLS, 'delegate_to_unmanaged'].every((name) => !allowed.has(name)));
       check(`${tag}：普通工具保留在内置角色，保留传输不写入过滤`,
-        allowed.has('read') === (backend !== 'cli') && !allowed.has('run_code'));
+        allowed.has('read') === (backend !== 'cli')
+          && ![...(config.toolFilter.allow ?? []), ...(config.toolFilter.deny ?? [])].includes('run_code'));
       check(`${tag}：配置使用同一权限过滤结果`, JSON.stringify(config.toolFilter) === JSON.stringify(permissions.toolFilter));
       const description = toolDescriptionFor(role, permissions);
       const guidance = roleGuidanceText([role], options);
@@ -509,7 +511,7 @@ section('出站权限与三种提示使用同一有效结果');
       check(`${tag}：只读过滤保留且不否定受控委派`, backend === 'cli'
         ? JSON.stringify(readOnly.toolFilter) === JSON.stringify(config.toolFilter)
         : WRITE_TOOLS.every((name) => readOnly.toolFilter.deny.includes(name))
-          && delegateToolNames.every((name) => readOnly.toolFilter.allow.includes(name) === allowNestedDispatch));
+          && delegateToolNames.every((name) => !readOnly.toolFilter.deny.includes(name) === allowNestedDispatch));
       const empty = { ...options, delegateToolNames: [], availableToolNames: ['read'] };
       const unavailable = dispatchPermissionsFor(role, empty);
       check(`${tag}：无已挂载 delegate 时三种提示都不许宣称可继续派发`,
@@ -518,6 +520,15 @@ section('出站权限与三种提示使用同一有效结果');
           && !cliPersonaFor(role, unavailable).includes('可按任务需要'));
     }
   }
+  const sparse = dispatchPermissionsFor({ backend: 'spawn', readOnly: true, allowNestedDispatch: false }, {
+    delegateToolNames: ['delegate_to_self'],
+    availableToolNames: ['read', 'write', 'workflow', 'switchboard_cli_run_other', 'delegate_to_self'],
+  }).toolFilter;
+  check('内置 deny 只列可用名，不加入未注册的写工具与非受控入口',
+    !sparse.deny.includes('pwsh') && !sparse.deny.includes('subagent')
+      && sparse.deny.every(name => ['write', 'workflow', 'switchboard_cli_run_other', 'delegate_to_self'].includes(name)));
+  check('内置 deny 四部分合成且 workflow 重叠去重', sparse.deny.length === 4
+    && ['write', 'workflow', 'switchboard_cli_run_other', 'delegate_to_self'].every(name => sparse.deny.includes(name)));
 }
 
 section('backend 取值校验');

@@ -59,26 +59,28 @@ export function canStartAtDepth(parentDepth, absoluteLimit) {
 
 /**
  * 当前作用域的有效出站权限。工具名必须来自已挂载清单，不使用通配符。
- * CLI 只保留自身执行器；内置角色保留普通工具，但排除外部执行器和非受控派发。
+ * CLI 用 allow 只保留自身执行器与受控委派；内置用 deny 保持普通工具动态可见。
+ * deny 只列采集时可用名以避免 DSH 报未知名；采集后新增的危险工具会缺失于 deny，
+ * 因而是 fail-open，而非 fail-closed。跨角色隔离依赖工具名，不是调用方身份授权。
  * run_code 是 DSH 的保留传输，不能写入 toolFilter；其 SDK 同样受工具过滤约束。
  */
 export function dispatchPermissionsFor(role, { delegateToolNames = [], availableToolNames = [] } = {}) {
   const delegates = role.allowNestedDispatch ? [...new Set(delegateToolNames)] : [];
-  const ordinary = availableToolNames.filter((name) => name !== 'run_code'
-    && !name.startsWith('switchboard_cli_run_') && !name.startsWith('delegate_to_')
-    && !delegateToolNames.includes(name) && !UNCONTROLLED_DISPATCH_TOOLS.includes(name));
-  const allow = role.backend === CLI_BACKEND
-    ? [cliToolName(role.id), ...delegates]
-    : [...ordinary, ...delegates];
+  // 四部分：非受控入口、全部底层 CLI 工具、关闭嵌套时的受控委派、只读写工具。
+  // 另保留对可见但未纳入角色清单的 delegate_to_* 入口的拒绝，避免白名单改 deny 后放行。
+  const deny = [
+    ...UNCONTROLLED_DISPATCH_TOOLS.filter((name) => availableToolNames.includes(name)),
+    ...availableToolNames.filter((name) => name.startsWith('switchboard_cli_run_')),
+    ...(role.allowNestedDispatch ? [] : delegateToolNames),
+    ...(role.readOnly ? WRITE_TOOLS.filter((name) => availableToolNames.includes(name)) : []),
+    ...availableToolNames.filter((name) => name.startsWith('delegate_to_') && !delegateToolNames.includes(name)),
+  ];
   return {
     delegateToolNames: delegates,
     canDelegate: delegates.length > 0,
-    toolFilter: {
-      allow: [...new Set(allow)],
-      // DSH 同样拒绝 deny 中的未知名（例如非 Windows 没有 pwsh）。
-      ...(role.backend !== CLI_BACKEND && role.readOnly
-        ? { deny: WRITE_TOOLS.filter((name) => availableToolNames.includes(name)) } : {}),
-    },
+    toolFilter: role.backend === CLI_BACKEND
+      ? { allow: [...new Set([cliToolName(role.id), ...delegates])] }
+      : { deny: [...new Set(deny)] },
   };
 }
 

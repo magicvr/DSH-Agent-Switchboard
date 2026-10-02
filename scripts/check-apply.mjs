@@ -2,14 +2,18 @@
 //
 // 为什么必须做：本插件曾让应用无法启动。必须在不重启的前提下，用假 ctx 把
 // 根路径与 preset 路径都真跑一遍 —— 重启一次的成本太高，而且失败会让用户进不去。
-// 覆盖边界：这是契约模拟，不是真实 spawn 集成；假 ctx 不创建 child 上下文。
-// 即使执行真实 Config / 工具插件，subagents.start 仍是记录请求的桩；未验证上下文隔离、
-// preset 工具继承或 child 工具过滤执行。离线缺少 spawn-in-process 与 preset registry，见 D21。
+// 覆盖边界：派发使用真实 Config / 工具插件，start 是含真实 resolveChildDepth 的桩。
+// 另用真实 Cordis + ToolRuntime + applyChildComposition 验证 child 工具过滤执行；
+// 不是真实 spawn 集成，未验证 preset 继承与完整上下文隔离，见 D21。
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createScope, scopeOf } from '@deepseek-ai/dsh-scope';
+import { Context } from '@deepseek-ai/cordis';
+import { ToolRuntime } from '@deepseek-ai/dsh-tools';
+import { applyChildComposition, delegationDepthOf, resolveChildDepth } from '@deepseek-ai/dsh-subagent';
 import { apply, Config, liveRoleTools, selftestTool } from '../src/index.js';
+import { toolConfigFor } from '../src/roles.js';
 import { configPathFor, initialConfig, writeConfigFile } from '../src/config-file.js';
 
 const fixtureHome = mkdtempSync(join(tmpdir(), 'switchboard-check-apply-'));
@@ -826,6 +830,9 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
   const { cliFieldsFor } = await import('../src/cli/drivers.js');
   const ctx = makeCtx({ scope: {} });
   const requests = [], validatedConfigs = [], events = new Map();
+  const fixtureGet = ctx.get.bind(ctx);
+  // 仅通过内置角色的路由预检，不调用模型；本节验证权限而非 LLM 线路。
+  ctx.get = key => key === 'llm' ? { async resolveCallConfig(config) { return config; } } : fixtureGet(key);
   let guidance = '';
   ctx.on = (name, handler) => {
     if (!events.has(name)) events.set(name, []);
@@ -837,8 +844,9 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
   const providers = new Map(['spawn', 'fork'].map(name => [name, { name, inheritsParentContext: false,
     capabilities: { depthLimit: true, agentOptions: true, persona: true, toolFilter: true } }]));
   ctx.subagents.getProvider = name => providers.get(name);
-  // 只记录派发请求，不创建真实 child；下面的断言只验证配置与请求契约。
+  // 不创建 spawn child；入站边界由真实 DSH 函数执行，不能让记录桩放过超界请求。
   ctx.subagents.start = async (_provider, request) => {
+    resolveChildDepth(request.parent, request.maxDepth);
     requests.push(request);
     return { id: 'fixture-run', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose() {} };
   };
@@ -868,8 +876,15 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
   await import('@deepseek-ai/dsh-tool-subagent');
   await new Promise(setImmediate);
   const scope = scopeOf(ctx);
-  const parent = { id: 'fixture-parent', options: { provider: 'self', model: 'm', delegationDepth: 1 },
+  const parent = { id: 'fixture-parent', options: { provider: 'self', model: 'm', subagentDepth: 1 },
     session: { requestHeader: () => undefined, header: { origin: 'subagent' } } };
+  check('真实 delegationDepthOf：旧 options.delegationDepth 夹具为 0', delegationDepthOf({
+    options: { delegationDepth: 1 }, session: { header: { origin: 'subagent' } },
+  }) === 0);
+  check('真实 delegationDepthOf：修正的父代理夹具深度确为 1', delegationDepthOf(parent) === 1);
+  check('真实 delegationDepthOf：session.header.delegationDepth 也读取为 1', delegationDepthOf({
+    options: {}, session: { header: { delegationDepth: 1 } },
+  }) === 1);
   const exec = { agent: parent, signal: new AbortController().signal };
   const organizer = ctx.tools.get('delegate_to_organizer', scope);
   await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
@@ -883,12 +898,98 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
     && first.persona.includes('剩余深度预算') && !first.persona.includes('不要调用其他角色的工具'));
   check('guidance 用实际挂载清单生成有效出站提示', guidance.includes('may delegate further')
     && guidance.includes('cannot delegate further'));
-  await ctx.tools.get('delegate_to_leaf', scope).execute({ prompt: 'T', description: 'fixture' }, exec);
+  const beforeLeaf = requests.length;
+  let leafResult, leafError;
+  try { leafResult = await ctx.tools.get('delegate_to_leaf', scope).execute({ prompt: 'T', description: 'fixture' }, exec); }
+  catch (caught) { leafError = caught; }
   const leafRequest = requests.at(-1);
   check('真实插件叶子 CLI 入站使用插件上限 2，出站只有专属 CLI 工具', leafRequest.maxDepth === 2
     && JSON.stringify(leafRequest.toolFilter.allow) === '["switchboard_cli_run_leaf"]');
+  check('真实插件父深度 1 调用叶子 CLI 成功，真实 DSH 解析 child 深度为 2',
+    !leafError && requests.length === beforeLeaf + 1 && leafResult?.kind === 'foreground'
+      && resolveChildDepth(parent, leafRequest.maxDepth) === 2, leafError?.message);
   check('真实 Config 中所有目标角色都使用插件上限 2', validatedConfigs.length === 4
     && validatedConfigs.every(config => config.maxDepth === 2));
+  const toolModule = await import('@deepseek-ai/dsh-tool-subagent');
+  for (const maxDepth of [0, 1, 3]) {
+    const config = toolConfigFor({ id: `budget-${maxDepth}`, backend: 'cli', instructions: 'i',
+      toolName: `delegate_to_budget_${maxDepth}`, allowNestedDispatch: false }, { maxDepth });
+    const validated = toolModule.Config['~standard'].validate(config);
+    if (validated.issues) throw new Error(JSON.stringify(validated.issues));
+    toolModule.apply(ctx, validated.value);
+    for (let parentDepth = 0; parentDepth <= 1 + maxDepth; parentDepth++) {
+      const depthParent = { ...parent, options: { ...parent.options, subagentDepth: parentDepth } };
+      const before = requests.length;
+      let result, error;
+      try { result = await ctx.tools.get(config.toolName, scope).execute({ prompt: 'T', description: 'boundary' }, { ...exec, agent: depthParent }); }
+      catch (caught) { error = caught; }
+      const allowed = parentDepth <= maxDepth;
+      check(`真实插件预算 ${maxDepth}：父深度 ${parentDepth} → child ${parentDepth + 1} ${allowed ? '成功' : '超界拒绝'}`,
+        delegationDepthOf(depthParent) === parentDepth && (allowed
+          ? !error && result?.kind === 'foreground' && requests.length === before + 1 && requests.at(-1).maxDepth === 1 + maxDepth
+          : error?.name === 'SubagentDepthError' && error.attemptedDepth === parentDepth + 1
+            && error.maxDepth === 1 + maxDepth && requests.length === before));
+    }
+  }
+
+  // 把真实工具插件生成的请求交给真实 child composition；不使用假 tools.restrict。
+  section('真实 Cordis + ToolRuntime + applyChildComposition：动态可见性与隔离');
+  const runtimeCtx = new Context();
+  runtimeCtx.provide('systemPrompt', { tools() {}, context() {}, section() {},
+    getContextOrder() { return 0; }, getSectionOrder() { return 0; } });
+  new ToolRuntime(runtimeCtx);
+  const register = (name, target = runtimeCtx) => target.tools.register({ name,
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'string' }, render: () => [] }, execute: async () => name });
+  for (const name of ctx.tools.schemas(scope).map(tool => tool.name)) register(name);
+  register('write');
+  register('delegate_to_unmanaged');
+  const compose = (toolFilter) => {
+    const child = {};
+    const childCtx = createScope(runtimeCtx, child).ctx;
+    applyChildComposition(childCtx, { ctx: runtimeCtx }, { toolFilter });
+    return { child, childCtx, names: () => runtimeCtx.tools.schemas(child).map(tool => tool.name) };
+  };
+  for (const id of ['builtin-leaf', 'builtin-organizer']) {
+    await ctx.tools.get(`delegate_to_${id.replace(/-/g, '_')}`, scope).execute({ prompt: 'T', description: 'runtime' }, exec);
+    const request = requests.at(-1);
+    const child = compose(request.toolFilter);
+    check(`${id} 真实运行时：普通 read 工具仍可见`, child.names().includes('read'));
+    check(`${id} 真实运行时：看不到其他角色的全部底层 CLI 工具`,
+      !child.names().some(name => name.startsWith('switchboard_cli_run_')));
+    check(`${id} 真实运行时：workflow 与通用 subagent 被拒绝`,
+      !child.names().includes('workflow') && !child.names().includes('subagent'));
+    check(`${id} 真实运行时：受控委派符合开关`,
+      ['delegate_to_leaf', 'delegate_to_organizer'].every(name => child.names().includes(name) === (id === 'builtin-organizer')));
+    const late = `ordinary_late_${id.replace(/-/g, '_')}`;
+    register(late); // 采集与 child 创建之后注册，判别固定 allow 回归。
+    check(`${id} 真实运行时：既有 child 的后注册普通工具不因白名单冻结而丢失`, child.names().includes(late));
+    ctx.tools.register({ name: late });
+    await ctx.tools.get(`delegate_to_${id.replace(/-/g, '_')}`, scope).execute({ prompt: 'T', description: 'fresh' }, exec);
+    check(`${id} 真实运行时：后注册普通工具对新派发 child 可见`, compose(requests.at(-1).toolFilter).names().includes(late));
+  }
+  const names = runtimeCtx.tools.schemas().map(tool => tool.name);
+  const readOnly = compose(toolConfigFor({ backend: 'spawn', readOnly: true, allowNestedDispatch: true }, {
+    maxDepth: 1, availableToolNames: names, delegateToolNames: names.filter(name => name.startsWith('delegate_to_') && name !== 'delegate_to_unmanaged'),
+  }).toolFilter);
+  check('真实运行时：只读 deny 拒绝 write，保留 read 与受控 delegate',
+    !readOnly.names().includes('write') && readOnly.names().includes('read') && readOnly.names().includes('delegate_to_leaf'));
+  check('真实运行时：未纳入角色清单的 delegate_to_* 也被拒绝', !readOnly.names().includes('delegate_to_unmanaged'));
+  for (const [tag, request] of [['leaf', leafRequest], ['organizer', first]]) {
+    const child = compose(request.toolFilter);
+    const expected = [`switchboard_cli_run_${tag}`, ...(tag === 'organizer'
+      ? ['delegate_to_organizer', 'delegate_to_leaf', 'delegate_to_builtin_leaf', 'delegate_to_builtin_organizer'] : [])];
+    check(`CLI ${tag} 真实运行时：仅自身 CLI 工具与允许的 delegates`,
+      JSON.stringify(child.names().sort()) === JSON.stringify([...expected].sort()));
+    check(`CLI ${tag} 真实运行时：拿不到其他角色 CLI 工具`,
+      !child.names().includes(`switchboard_cli_run_${tag === 'leaf' ? 'organizer' : 'leaf'}`));
+  }
+  const empty = compose({ allow: [] });
+  check('真实运行时：allow: [] 拒绝全部继承工具', empty.names().length === 0);
+  register('child_owned', empty.childCtx);
+  check('真实运行时：allow: [] 不屏蔽 child 自注册工具', empty.names().join(',') === 'child_owned');
+  register('edit'); // 采集后新增危险名：记录 deny 可用名过滤的 fail-open 代价。
+  check('真实运行时：采集后新增写工具缺失于只读 deny，确为 fail-open', readOnly.names().includes('edit'));
   const originalGet = ctx.tools.get.bind(ctx.tools);
   const originalSchemas = ctx.tools.schemas.bind(ctx.tools);
   ctx.tools.get = (name, viewingScope) => name.startsWith('delegate_to_') && name !== 'delegate_to_organizer'
