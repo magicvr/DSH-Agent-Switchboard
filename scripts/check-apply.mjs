@@ -1365,6 +1365,7 @@ section('真实 Cordis 更新瀑布：volatile 不重挂载时仍同步根包裹
       applies++;
       ctx = makeCtx();
       ctx.get = key => key === 'profileContext' ? { home: currentHome } : undefined;
+      ctx.fiber = actual.fiber;
       ctx.on = actual.on.bind(actual);
       ctx.effect = actual.effect.bind(actual);
       apply(ctx, config);
@@ -1376,7 +1377,7 @@ section('真实 Cordis 更新瀑布：volatile 不重挂载时仍同步根包裹
     await fiber.await();
     const initialHealth = await ctx.tools.get('switchboard_selftest').execute({});
     check('初始非法路由仍注册一个插件更新钩子并可诊断', !initialHealth.ok &&
-      /wrapperEffort.*非法/.test(initialHealth.configErrors) && fiber._hooks['internal/update'].length === 2);
+      /wrapperEffort.*非法/.test(initialHealth.configErrors) && fiber._hooks['internal/update'].length === 1 && root.events._hooks['internal/update'].length === 2);
     fiber.update({ provider: 'self', volatile: { wrapperModel: 'live-model', wrapperEffort: 'high' } });
     await new Promise(setImmediate);
     let file = JSON.parse(readFileSync(path, 'utf8'));
@@ -1407,7 +1408,7 @@ section('真实 Cordis 更新瀑布：volatile 不重挂载时仍同步根包裹
     await fiber.restart();
     await fiber.restart();
     check('两次 restart 仅保留一个插件钩子和一个 Loader 钩子', applies === 3 &&
-      fiber._hooks['internal/update'].length === 2);
+      fiber._hooks['internal/update'].length === 1 && root.events._hooks['internal/update'].length === 2);
     fiber.update({ provider: 'self', volatile: { wrapperModel: 'new-path', wrapperEffort: 'high' } });
     await new Promise(setImmediate);
     check('restart 后只写新路径，旧闭包不再写原路径', readFileSync(path, 'utf8') === oldBytes &&
@@ -1420,7 +1421,7 @@ section('真实 Cordis 更新瀑布：volatile 不重挂载时仍同步根包裹
     await fiber.dispose();
     rmSync(restartHome, { recursive: true, force: true });
   }
-  check('卸载后 internal/update 钩子全部释放', fiber._hooks['internal/update'].length === 0);
+  check('卸载后 internal/update 钩子全部释放', fiber._hooks['internal/update'].length === 0 && root.events._hooks['internal/update'].length === 1);
 }
 
 section('包裹路由同步失败：当前错误去重、日志与修复恢复');
@@ -1433,6 +1434,7 @@ section('包裹路由同步失败：当前错误去重、日志与修复恢复')
     Config,
     apply(actual, config) {
       ctx = makeCtx();
+      ctx.fiber = actual.fiber;
       ctx.on = actual.on.bind(actual);
       ctx.effect = actual.effect.bind(actual);
       apply(ctx, config);
@@ -1528,6 +1530,85 @@ section('残留角色包裹路由：兼容加载与模块级一次性诊断');
     combined.roleConfigStatus.includes('角色 agentProvider / agentModel 已废弃并忽略'));
 }
 
+section('根同步：先注册的就地更新钩子消费瀑布');
+{
+  const root = new Context();
+  const path = configPathFor(fixtureHome);
+  const role = { ...fixtureRole, model: 'root-old' };
+  writeConfigFile(path, initialConfig([role], { provider: 'self' }));
+  let ctx, consumed = 0, applies = 0, writes = 0, notices = 0;
+  const rename = fs.renameSync;
+  const fiber = root.plugin({ Config, apply(actual, config) {
+    applies++;
+    // 模拟 Loader 先注册，消费 volatile 更新而不调用 next。
+    actual.effect(() => actual.on('internal/update', () => { consumed++; }));
+    ctx = makeCtx();
+    ctx.fiber = actual.fiber;
+    ctx.on = actual.on.bind(actual);
+    ctx.effect = actual.effect.bind(actual);
+    ctx.emit = actual.emit.bind(actual);
+    apply(ctx, config);
+  } }, { provider: 'self', roles: [role] });
+  root.on('agent-switchboard/config-changed', () => { notices++; });
+  try {
+    await fiber.await();
+    fs.renameSync = (source, target) => {
+      if (target === path) writes++;
+      return rename(source, target);
+    };
+    syncBuiltinESMExports();
+    const save = model => fiber.update({ provider: 'self', roles: [{ ...role, model }] });
+    check('B01：事件前仍为旧模型且未写入', JSON.parse(readFileSync(path)).roles[0].model === 'root-old' && writes === 0);
+    save('root-new');
+    check('B02：根保存事件返回前文件立即写入新模型', JSON.parse(readFileSync(path)).roles[0].model === 'root-new' && writes === 1);
+    check('B03：同步先于消费钩子且继续瀑布，无重新 apply', consumed === 1 && applies === 1 && notices === 2);
+    save('root-new');
+    check('B04：相同值保存不原子重写', writes === 1);
+    save('root-latest');
+    check('B05：连续保存用当次配置而非闭包旧值', JSON.parse(readFileSync(path)).roles[0].model === 'root-latest' && writes === 2);
+    fs.renameSync = (source, target) => {
+      if (target === path) throw new Error('fixture-root-sync-failure');
+      return rename(source, target);
+    };
+    syncBuiltinESMExports();
+    save('root-failed');
+    const health = await ctx.tools.get('switchboard_selftest').execute({});
+    check('B06：角色同步失败自检不健康并显示错误', !health.ok && health.configErrors.includes('fixture-root-sync-failure') && health.roleConfigStatus.includes('同步失败'));
+    check('B07：失败保留旧文件且不广播成功', JSON.parse(readFileSync(path)).roles[0].model === 'root-latest' && notices === 4);
+    fs.renameSync = rename;
+    syncBuiltinESMExports();
+    save('root-recovered');
+    check('B08：再次保存修复同步错误恢复健康', JSON.parse(readFileSync(path)).roles[0].model === 'root-recovered' && (await ctx.tools.get('switchboard_selftest').execute({})).ok);
+    await fiber.restart();
+    check('B09：重挂不积累更新钩子', fiber._hooks['internal/update'].length === 1 && root.events._hooks['internal/update'].length === 2);
+    const beforeRestartSave = notices;
+    save('root-after-restart');
+    check('B11：重挂后的全局监听仅广播一次', notices === beforeRestartSave + 1 && JSON.parse(readFileSync(path)).roles[0].model === 'root-after-restart');
+    const foreign = root.plugin({ Config, apply(actual) {
+      actual.effect(() => actual.on('internal/update', () => {}));
+    } }, {});
+    await foreign.await();
+    const ownBytes = readFileSync(path);
+    foreign.update({ roles: [{ ...role, model: 'foreign-model' }] });
+    check('B12：全局前置监听拒绝其它 Fiber 的配置事件', readFileSync(path).equals(ownBytes) && notices === beforeRestartSave + 1);
+    await foreign.dispose();
+    const emit = ctx.emit;
+    const beforeEventConsumed = consumed;
+    ctx.emit = () => { throw new Error('fixture-root-event-failure'); };
+    save('root-event-failed');
+    const eventHealth = await ctx.tools.get('switchboard_selftest').execute({});
+    check('B17：同步链意外异常进入可见诊断且继续更新瀑布', !eventHealth.ok && eventHealth.configErrors.includes('根配置同步异常：fixture-root-event-failure') && consumed === beforeEventConsumed + 1);
+    ctx.emit = emit;
+    save('root-event-recovered');
+    check('B18：同步链异常恢复后清除当前错误', (await ctx.tools.get('switchboard_selftest').execute({})).ok);
+  } finally {
+    fs.renameSync = rename;
+    syncBuiltinESMExports();
+    await fiber.dispose();
+  }
+  check('B10：卸载释放全部根更新钩子', fiber._hooks['internal/update'].length === 0 && root.events._hooks['internal/update'].length === 1);
+}
+
 section('热重载：真实 Cordis 跨 scope 广播、代际回滚与在途保护（preset 只 apply 一次）');
 {
   const { cliFieldsFor } = await import('../src/cli/drivers.js');
@@ -1592,8 +1673,8 @@ section('热重载：真实 Cordis 跨 scope 广播、代际回滚与在途保�
   writeConfigFile(path, initialConfig([role], { provider: 'self', maxDepth: 2 }));
   const rootFiber = root.plugin({ Config, apply(actual, config) {
     rootApplies++;
-    apply(actual, config);
     actual.effect(() => actual.on('internal/update', () => {}));
+    apply(actual, config);
   } }, { provider: 'self' });
   const presetScope = createScope(root, {});
   const presetFiber = presetScope.ctx.plugin({ Config, apply(actual, config) {
@@ -1629,6 +1710,7 @@ section('热重载：真实 Cordis 跨 scope 广播、代际回滚与在途保�
     await tick();
     check('H03：根更新跨 scope 广播驱动替换，不重新 apply preset 或根',
       broadcasts >= 1 && rootApplies === 1 && presetApplies === 1 && !!getTool('delegate_to_added'));
+    check('B13：热重挂前根事件已把新模型写到真实文件', JSON.parse(readFileSync(path)).roles[0].model === 'second-model');
     check('H04：预检租约保留旧 scope/Fiber，原 signal 不 abort 且会话未销毁',
       firstGeneration?.active > 0 && !firstGeneration?.released && firstGeneration.scope.ctx.fiber.uid !== null
       && firstGeneration.fibers.length > 0 && firstGeneration.fibers.every(fiber => fiber.uid !== null) && !controller.signal.aborted && runs.every(run => run.disposed === 1));
@@ -1642,6 +1724,9 @@ section('热重载：真实 Cordis 跨 scope 广播、代际回滚与在途保�
       requests.at(-1).request.agentOptions.model === 'first-model' && firstGeneration?.released === true
       && firstGeneration.scope.ctx.fiber.uid === null && !controller.signal.aborted);
     await call('delegate_to_hot');
+    const routed = await getTool('switchboard_selftest').execute({});
+    check('B14：自检报告已提交角色 provider/model/effort', routed.roleRoutes.includes('provider=new-provider model=second-model effort=high'));
+    check('B15：自检文本渲染路由对主代理可见', getTool('switchboard_selftest').output.render({}, routed).some(block => block.text.includes(routed.roleRoutes)));
     check('H07：改 backend/model/effort/provider/instructions/maxDepth 后新派发全部取新快照',
       requests.at(-1).provider === 'fork' && requests.at(-1).request.agentOptions.model === 'second-model'
       && requests.at(-1).request.agentOptions.provider === 'new-provider'
@@ -1671,6 +1756,7 @@ section('热重载：真实 Cordis 跨 scope 广播、代际回滚与在途保�
     check('H09：非法文件回滚保留旧入口可派发且自检诊断可见',
       getTool('delegate_to_hot') === oldTool && requests.at(-1).request.agentOptions.model === 'latest-model'
       && !health.ok && health.configErrors.includes('热重载失败') && health.configErrors.includes('model'));
+    check('B16：重载失败路由报告上一有效代而非磁盘坏值', health.roleRoutes.includes('model=latest-model'));
     save([role]);
     await tick();
     check('H10：修正配置后诊断恢复健康', (await getTool('switchboard_selftest').execute({})).ok);

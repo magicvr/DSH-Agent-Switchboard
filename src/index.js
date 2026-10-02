@@ -563,6 +563,7 @@ export function selftestTool(ctx, diagnostics) {
           roleCount: { type: 'number', required: true },
           mounted: { type: 'string', required: true },
           liveTools: { type: 'string', required: true },
+          roleRoutes: { type: 'string', required: true },
           providers: { type: 'string', required: true },
           executables: { type: 'string', required: true },
           blocked: { type: 'string', required: true },
@@ -581,6 +582,7 @@ export function selftestTool(ctx, diagnostics) {
           `明细（当前挂载状态）：${value.mounted}`,
           // 明细保留首次核验失败的信息；实时恢复后标注「曾延迟注册」，不再判为失败。
           `实时工具查询：${value.liveTools}`,
+          `当前生效路由：${value.roleRoutes}`,
           `preset roster：${value.presetRoster}`,
           `preset 异常行：${value.presetBroken}`,
           `settings 命名空间：${value.settingsNamespaces}`,
@@ -628,6 +630,9 @@ export function selftestTool(ctx, diagnostics) {
           // 不可查询也逐角色返回失败；零角色不要求工具服务可查询。
           !mounted.some((m) => m.ok === false),
         phase: 'phase-3',
+        roleRoutes: diagnostics.mountHere
+          ? (diagnostics.roleRoutes ?? []).map(route => `${route.id} (${live.find(item => item.id === route.id)?.ok ? '已挂载' : '未挂载'}): ${route.summary}`).join('\n') || '（无生效角色）'
+          : '（根实例只同步配置；请在 Switchboard preset 中查看生效路由）',
         roleCount: okCount,
         mounted:
           !diagnostics.mountHere
@@ -914,11 +919,22 @@ function applyInner(ctx, config) {
         }
       }
     };
-    // internal/update 的特殊注册不自动进入 effect；显式归属本次激活的释放范围。
-    if (ctx.on) ctx.effect(() => ctx.on('internal/update', (updated, _noSave, next) => {
-      sync(updated, true);
+    // Loader 的就地更新钩子可能消费瀑布、不调用 next；同步须先于它执行。
+    // Cordis 私有 hook 的 DisposableList 没有 unshift，不能在私有钩子上 prepend。
+    // 使用全局瀑布前置监听，但按 receiver Fiber 严格过滤；effect 保持激活期归属。
+    if (ctx.on) ctx.effect(() => ctx.on('internal/update', function (updated, _noSave, next) {
+      // ctx.fiber 可能是 Cordis 的服务视图代理，身份比较使用 Fiber 的稳定 uid。
+      if (ctx.fiber && this?.uid !== ctx.fiber.uid) return next();
+      try {
+        sync(updated, true);
+      } catch (error) {
+        const detail = `根配置同步异常：${error instanceof Error ? error.message : String(error)}`;
+        diagnostics.roleConfigSync = detail;
+        diagnostics.configErrors = [detail];
+        console.error(`[${name}] ${detail}`);
+      }
       return next();
-    }));
+    }, { global: true, prepend: true }));
     sync(resolved);
     return;
   }
@@ -1299,6 +1315,12 @@ function buildRoleGeneration(ctx, { roleConfigPath, resolved, diagnostics, gener
 
   const { roles, errors } = normalizeRoles(rawRoles, defaults.provider, defaults.cwd);
   generation.roles = roles;
+  // 随已提交代的诊断一起替换；重载失败继续展示上一代，不能把磁盘新值称为生效值。
+  diagnostics.roleRoutes = roles.map(role => {
+    const options = toolConfigFor(role, { maxDepth, wrapperRoute: wrapper.route }).agentOptions ?? {};
+    const summary = `backend=${role.backend} provider=${options.provider || '继承父代理'} model=${options.model || '继承父代理'} effort=${options.reasoningEffort || '未指定（按实际路由继承/默认）'}`;
+    return { id: role.id, summary: role.backend === CLI_BACKEND ? `${summary}; 外部 CLI ${routeSummaryFor(role)}` : summary };
+  });
   diagnostics.configErrors = errors;
   // 记录「本作用域配置了哪些角色」——自检在解析不出工具时据此说明原因，
   // 而不是含糊地报「工具未出现在工具注册表中」。

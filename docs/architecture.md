@@ -355,12 +355,19 @@ provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliT
 包裹路由取插件级 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`（D22）。
 根实例通过既有 `$DSH_HOME/agent-switchboard/roles.json` 的 `volatile` 同步三字段；不新增服务、文件类型或路径。
 根实例在 apply 和 Cordis 的 `internal/update` 瀑布中同步路由，更新钩子继续 next，不改变重挂载决策。
-特殊 `internal/update` 返回的 disposer 不会自动纳入 effect；生产代码显式使用 `ctx.effect(() => ctx.on(...))`，
-使监听随本次激活释放，重启后不残留旧闭包。先注册监听再验证初始配置，初始非法也可经就地更新修正并恢复根实例到文件的同步；写盘成功后向全局同名 hook 表广播 `agent-switchboard/config-changed`，payload 为 `{ roleConfigPath }`，不带 receiver。真实 Cordis 离线集成已验证跨 scope 可达；`internal/update` 本身仍仅为根 Fiber 私有 hook。
+根同步使用 `internal/update` 全局瀑布的前置监听，并按 receiver 的 Fiber uid 严格过滤，只处理自身根实例。
+原因：先注册的私有就地更新钩子可以消费瀑布而不调用 next，后注册的私有同步钩子因而收不到更新；真实 Cordis 离线夹具已复现。
+当前 Cordis 私有 hook 的 DisposableList 没有 unshift，不能直接对私有钩子使用 prepend。
+生产代码仍显式使用 `ctx.effect(() => ctx.on(...))`，使监听随本次激活释放，重启后不残留旧闭包。
+监听继续 next，不改变 Loader 的重挂载决策；同步异常进入根自检健康门禁并记录日志。
+先注册监听再验证初始配置，初始非法也可经就地更新修正并恢复根实例到文件的同步；写盘成功后向全局同名 hook 表广播 `agent-switchboard/config-changed`，payload 为 `{ roleConfigPath }`，不带 receiver。真实 Cordis 离线集成已验证跨 scope 可达。
+本次环境没有运行时 inspect 与可用 DSH asar，因此尚未核实真机 Loader 的钩子注册顺序，不能将离线复现直接当作本次真机症状的已确认根因，也不能据此确定回归由哪次提交引入。
 常驻 preset 的监听按路径匹配，串行处理并合并快速保存，以版本检查丢弃过时准备代；不依赖再次 `apply`、文件监听、定时器或 `tools/change`。每代在私有 scope 准备 CLI 配置快照与委派子 Fiber，等待 Fiber 激活并核实本代注册定义，不能把父层旧工具当成新代挂载成功。短同步提交段注销旧委派入口并注册新入口；注册失败撤销新入口、恢复旧定义，旧 Fiber 无需重启。
 实例级自检与动态 text guidance 仅注册一次；guidance 在提示组装时读取当前有效角色与工具清单。配置代持有私有 scope、子 Fiber、私有工具与公开入口 disposer；委派 execute 从预检开始持有租约，subagents.start 从启动至结果持有租约，后台 Job 从入队至 hooks.done 持有租约。私有 scope 通过保留本作用域隔离/拦截的扩展 ctx 创建，Fiber 归应用根所有；配置重载仅退休旧代，活跃归零后显式释放 scope/Fiber，不 abort signal、不主动销毁子会话或 CLI 进程。实例卸载（含 preset scope 卸载）执行 teardown，撤销公开入口、自检、guidance 与监听并退休全部代际；在途私有环境保留到租约归零后显式释放，不再接受新派发或更新。应用根卸载/关闭 DSH 仍整体拆毁，租约不保证应用服务继续存活。
 CLI 公开工具名保持稳定，入口通过 WeakMap 中的真实 `run.localAgent` 身份选择代际私有工具快照；未由对应角色派发的 Agent 拒绝执行，防止旧内置子代理的 deny 快照漏掉新 CLI 名。退休代的 CLI 入口保留至租约归零，已启动包裹仍使用原角色/命令/参数。不存在租约之外的额外运行期限。
 有效文件 `maxDepth` 优先，缺失或无效时回落 preset，最后默认 3；根就地更新会同步已有文件的 maxDepth。角色配置、CLI 预设/参数和包裹路由用于后续派发；历史模型上下文、正在执行的子代理/CLI/后台 Job 不被改写。
+`switchboard_selftest` 的 `roleRoutes` 及渲染文本报告当前已提交代每个角色的后端、provider、model、effort；CLI 另列外部 CLI 模型/强度，与包裹 LLM 路由区分。
+重载失败继续报告上一有效代，工具不可用时标注未挂载。继承项明确标为继承/未指定，不冒充已解析的父会话或模型默认值；根实例提示在 Switchboard preset 内查看生效路由。
 挂载实例只校验有效路由来源：文件含任一 wrapper 字段即整个路由对象优先（包含显式空值），不逐字段补入 preset；
 被覆盖的非法 preset 路由忽略。文件没有任何 wrapper 字段时才回落当前实例配置。
 这与角色列表的优先级不同——角色列表是「本作用域**未提供** roles 时才回落读文件；显式空数组表示清空，不得复活文件里的旧角色」，而包裹路由是文件优先：preset 可独立选择角色，不能覆盖已经同步的统一包裹路由。

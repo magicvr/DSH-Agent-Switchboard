@@ -818,7 +818,9 @@ volatile 就地更新可供新 preset 读取，已挂载的子代理保持挂载
 
 **状态：实现与离线集成已落地；真实 DSH 设置保存往返和在途 CLI 热重挂待验收。** preset 启动 eager load、常驻单例、新会话只 composeFrom 而不重新 apply 的事实保持不变。保留 D22 的测试教训：手动再 apply 可读盘不等于运行时自动更新。
 
-**信号与来源：** 根实例在角色、maxDepth 与包裹路由同步成功后，无 receiver 地广播 `agent-switchboard/config-changed`，payload 为 `{ roleConfigPath }`。普通广播遍历全局同名 hook 表，与 scopeTarget carrier 的向上路由不同；真实 Cordis 离线跨 scope 已验证。文件仍是唯一配置桥梁，事件只通知重读；internal/update 仍为根 Fiber 私有 hook，不把 tools/change 当重读来源。直接手改文件没有广播，须经设置保存或重新装载。
+**信号与来源：** 根实例在角色、maxDepth 与包裹路由同步成功后，无 receiver 地广播 `agent-switchboard/config-changed`，payload 为 `{ roleConfigPath }`。普通广播遍历全局同名 hook 表，与 scopeTarget carrier 的向上路由不同；真实 Cordis 离线跨 scope 已验证。文件仍是唯一配置桥梁，事件只通知重读；internal/update 同步监听只处理自身根 Fiber，不把 tools/change 当重读来源。直接手改文件没有广播，须经设置保存或重新装载。
+
+**根同步监听后续修正：** 私有更新钩子可消费瀑布，后注册监听因此不能保证收到事件。当前改为全局瀑布前置监听，并以 receiver Fiber uid 严格过滤；仍随激活释放、继续 next，不同步其它实例配置。Cordis 私有 DisposableList 不支持 unshift，不能直接对私有 hook 使用 prepend。离线已证明根事件到文件再到 preset 重挂与后续派发的因果链；真机 Loader 顺序与设置保存往返尚待核实，不能把该缺口归因于特定历史提交。
 
 **代际与回滚：** 每代追踪私有隔离 scope、真实 dsh-tool-subagent 子 Fiber、规范化角色快照、私有工具 disposer 及公开委派入口 disposer。串行准备，快速保存用版本检查丢弃过时准备代；核实本代自己的工具定义，不能把祖先的旧工具当成准备成功。新 Fiber 激活后，在无 await 的同步段内注销旧委派入口并发布新入口；注册失败撤销新入口并恢复旧定义。旧 Fiber 保持存活，回滚无需重新启动它。自检、事件监听和动态 text guidance 属于实例，只注册一次；提示组装读取当前有效快照。
 
