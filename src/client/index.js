@@ -1,7 +1,7 @@
 /**
  * Agent Switchboard 的 Client 半边。
  *
- * 提供一个 `settings.section` 页面：**角色与派发机制编辑器**（见 `docs/decisions.md` D13）。
+ * 提供 `settings.section` 角色与派发编辑器（D13），以及一次性子会话的只读 CLI 观察席位（D23）。
  *
  * 用户诉求是「让用户配置**角色**使用内置代理还是外部 CLI」，即机制是角色的一个可切换
  * 属性，而不是「内置角色」与「CLI 角色」两套并列的东西。Host 半边本来就支持
@@ -1096,6 +1096,240 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // 与官方选择器一致，仅明确的一次性子会话；未知/continuable 不接管。
+    function selectCliComposer(owner) {
+      return owner.session?.subagent?.address?.mode === 'one-shot' ? { reason: 'one-shot' } : null;
+    }
+
+    const CLI_JOB_LIMIT = 8;
+    const CLI_TEXT_LIMIT = 32 * 1024;
+    const CLI_CHUNK_LIMIT = 256;
+    const cliLive = (job) => job.status === 'running' || job.status === 'stopping';
+    const cliError = (error) => String(error?.message ?? error).slice(0, 500);
+
+    /** 纯观察操作：每次 watch 独立持有会话与订阅，绝不调用 kill 或模型工具。 */
+    function makeCliStore() {
+      let binding = null;
+      let closed = false;
+      const watchers = new Set();
+      const refresh = (watcher) => {
+        watcher.stop?.();
+        watcher.stop = null;
+        if (closed || !watchers.has(watcher)) return;
+        if (binding?.face) {
+          watcher.notify({ sessionId: watcher.sessionId, jobs: [], error: null });
+          watcher.stop = startWatch(binding.face, watcher.sessionId, watcher.notify);
+        } else watcher.notify({ sessionId: watcher.sessionId, jobs: [], error: null, unavailable: true });
+      };
+      function startWatch(remote, sessionId, notify) {
+          let stopped = false;
+          let rows = [];
+          let error = null;
+          let omitted = 0;
+          const observations = new Map();
+          const subscriptions = new Set();
+          const publish = () => {
+            if (!stopped) notify({ sessionId, error, omitted, jobs: rows.map((row) => ({
+              ...row, ...observations.get(row.id)?.view,
+            })) });
+          };
+          const dispose = (entry) => {
+            if (entry.stopped) return;
+            entry.stopped = true;
+            subscriptions.delete(entry);
+            // dispose 仅释放远程观察流；观察窗口关闭不能终止 CLI。
+            try { Promise.resolve(entry.stream?.dispose()).catch(() => {}); } catch { /* 降级 */ }
+          };
+          try {
+            if (typeof remote?.$stream !== 'function' || typeof remote?.job?.list !== 'function'
+              || typeof remote?.job?.follow !== 'function') throw new Error('任务观察服务不可用');
+          } catch (cause) {
+            error = cliError(cause);
+            publish();
+            return () => { stopped = true; };
+          }
+          const consume = (name, open, receive, failed) => {
+            const entry = { stopped: false, stream: null };
+            subscriptions.add(entry);
+            try {
+              entry.stream = remote.$stream({ name, open,
+                ended: (accepted) => {
+                  // 已接受锚点后的 EOF 是可重订阅的 carrier 结束。使用公开 restart，
+                  // 不额外导入 Harness Client 包来构造其 instanceof 错误类型。
+                  if (accepted && typeof entry.stream?.restart === 'function') {
+                    failed(new Error(`${name} 连接中断，正在重新订阅`));
+                    entry.stream.restart();
+                  }
+                  return new Error(`${name} 订阅意外结束`);
+                },
+                carrierFailed: failed,
+              });
+              (async () => {
+                try {
+                  for await (const item of entry.stream) {
+                    if (stopped || entry.stopped) break;
+                    const terminal = receive(item.value);
+                    // 与官方客户端相同：确认 rows / opened 锚点，由 $stream 管理重连。
+                    if (item.value.type === 'rows' || item.value.type === 'opened') item.accept();
+                    if (terminal) break;
+                  }
+                  if (!stopped && !entry.stopped && !entry.terminal) failed(new Error(`${name} 订阅意外结束`));
+                } catch (cause) {
+                  if (!stopped && !entry.stopped) failed(cause);
+                } finally { dispose(entry); }
+              })();
+            } catch (cause) { failed(cause); dispose(entry); }
+            return entry;
+          };
+          const follow = (row) => {
+            const state = { view: { chunks: [], gap: false, error: null }, cursor: undefined, entry: null };
+            observations.set(row.id, state);
+            state.entry = consume(`CLI 输出 ${row.id}`,
+              (signal) => remote.job.follow({ sessionId, jobId: row.id,
+                // 只存 Host frame.next/from 原值，不计算字节偏移、不调用客户端 readAt。
+                ...(state.cursor === undefined ? {} : { from: state.cursor }),
+              }, signal),
+              (frame) => {
+                if (frame.type === 'opened') {
+                  state.view = { ...state.view, error: null,
+                    gap: state.view.gap || frame.from < frame.job.output.earliest
+                      || (state.view.chunks.length === 0 && frame.from > 0) };
+                  state.cursor = frame.from;
+                } else if (frame.type === 'output') {
+                  let chunks = [...state.view.chunks, ...frame.chunks.map((chunk) => ({
+                    text: chunk.text, channel: chunk.channel ?? 'stdout',
+                  }))];
+                  let size = chunks.reduce((sum, chunk) => sum + chunk.text.length, 0);
+                  let gap = state.view.gap || frame.lossy === true || frame.chunks.some((chunk) => chunk.gapBefore === true);
+                  while (chunks.length > CLI_CHUNK_LIMIT || size > CLI_TEXT_LIMIT) {
+                    const first = chunks[0];
+                    if (chunks.length > CLI_CHUNK_LIMIT || size - first.text.length >= CLI_TEXT_LIMIT) {
+                      size -= first.text.length;
+                      chunks.shift();
+                    } else {
+                      let cut = size - CLI_TEXT_LIMIT;
+                      const unit = first.text.charCodeAt(cut);
+                      if (unit >= 0xdc00 && unit <= 0xdfff) cut++;
+                      chunks[0] = { ...first, text: first.text.slice(cut) };
+                      size -= cut;
+                    }
+                    gap = true;
+                  }
+                  state.view = { ...state.view, chunks, gap };
+                  state.cursor = frame.next;
+                } else if (frame.type === 'status') {
+                  state.view = { ...state.view, status: frame.job.status };
+                  if (state.entry) state.entry.terminal = true;
+                  publish();
+                  return true;
+                }
+                publish();
+                return false;
+              }, (cause) => { state.view = { ...state.view, error: cliError(cause) }; publish(); });
+          };
+          consume(`CLI 任务 ${sessionId}`, (signal) => remote.job.list({ sessionId }, signal), (frame) => {
+            const cliRows = frame.jobs.filter((row) => row.kind === 'cli' && row.owner === sessionId);
+            // 限制观察数量与总 DOM；优先运行中，再保留最新的已结算任务。
+            cliRows.sort((a, b) => Number(cliLive(b)) - Number(cliLive(a)) || b.startedAt - a.startedAt);
+            rows = cliRows.slice(0, CLI_JOB_LIMIT);
+            omitted = Math.max(0, cliRows.length - rows.length);
+            error = null;
+            const ids = new Set(rows.map((row) => row.id));
+            for (const [id, state] of observations) {
+              if (!ids.has(id)) { if (state.entry) dispose(state.entry); observations.delete(id); }
+            }
+            for (const row of rows) if (!observations.has(row.id)) follow(row);
+            publish();
+            return false;
+          }, (cause) => { error = cliError(cause); publish(); });
+          return () => {
+            stopped = true;
+            for (const entry of [...subscriptions]) dispose(entry);
+            observations.clear();
+            rows = [];
+          };
+      }
+      return {
+        watch(sessionId, notify) {
+          const watcher = { sessionId, notify, stop: null };
+          if (closed) return () => {};
+          watchers.add(watcher);
+          refresh(watcher);
+          return () => { watchers.delete(watcher); watcher.stop?.(); watcher.stop = null; };
+        },
+        bind(face) {
+          if (closed) return () => {};
+          const token = { face };
+          binding = token;
+          for (const watcher of watchers) refresh(watcher);
+          return () => {
+            if (closed || binding !== token) return;
+            binding = null;
+            for (const watcher of watchers) refresh(watcher);
+          };
+        },
+        dispose() {
+          if (closed) return;
+          closed = true;
+          binding = null;
+          for (const watcher of watchers) { watcher.stop?.(); watcher.stop = null; }
+          watchers.clear();
+        },
+      };
+    }
+
+    function CliJobOutput({ job }) {
+      const [expanded, setExpanded] = useState(() => cliLive(job));
+      const status = { running: '运行中', stopping: '终止中', completed: '已结算', killed: '被终止', failed: '失败' }[job.status] ?? job.status;
+      return h('details', { open: expanded, onToggle: (event) => setExpanded(event.currentTarget.open) },
+        h('summary', { style: { cursor: 'pointer' } }, `${String(job.label).slice(0, 200)} · ${status}`),
+        job.error ? h('div', { role: 'alert' }, `CLI 输出订阅失败：${job.error}`) : null,
+        job.gap ? h('div', { role: 'status' }, '输出已截断或存在 gap（丢失片段）；仅显示有界尾部。') : null,
+        h('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 240, overflow: 'auto', margin: '8px 0' } },
+          (job.chunks ?? []).map((chunk, index) => h('span', { key: index, 'data-channel': chunk.channel,
+            style: chunk.channel === 'stderr' ? { color: 'var(--dsw-alias-label-error)' } : undefined,
+          }, `[${chunk.channel}] ${chunk.text}`))),
+      );
+    }
+
+    function CliOutputPanel({ snapshot }) {
+      if (snapshot.unavailable) return h('div', { role: 'status' }, 'CLI 实时输出暂不可用。');
+      if (snapshot.error) return h('div', { role: 'alert' }, `CLI 任务订阅失败：${snapshot.error}`);
+      if (snapshot.jobs.length === 0) return null;
+      return h('section', { 'aria-label': 'CLI 实时输出', style: {
+        margin: '0 24px 8px', padding: '10px 16px', border: '0.5px solid var(--dsw-alias-border-l4)',
+        borderRadius: 'var(--dsw-radius-lg)', background: 'var(--dsw-alias-bg-layer-1)',
+        color: 'var(--dsw-alias-label-primary)', fontSize: 13, maxHeight: 360, overflow: 'auto',
+      } },
+      snapshot.omitted ? h('div', { role: 'status' }, `仅观察 ${CLI_JOB_LIMIT} 个任务，另 ${snapshot.omitted} 个未显示。`) : null,
+      snapshot.jobs.map((job) => h(CliJobOutput, { key: job.id, job })));
+    }
+
+    function CliReadOnlyComposer({ sessionId, cliStore, t }) {
+      const [snapshot, setSnapshot] = useState(() => ({ sessionId, jobs: [], error: null }));
+      useEffect(() => cliStore.watch(sessionId, setSnapshot), [sessionId, cliStore]);
+      // 会话切换的首帧也不能显示旧数据（effect 清理/新订阅在 commit 后执行）。
+      const current = snapshot.sessionId === sessionId ? snapshot : { sessionId, jobs: [], error: null };
+      const text = (key, fallback) => {
+        try {
+          const translated = typeof t === 'function' ? t(key) : null;
+          return typeof translated === 'string' && translated !== key ? translated : fallback;
+        } catch { return fallback; }
+      };
+      return h('div', null,
+        h(CliOutputPanel, { snapshot: current }),
+        // 忠实复现官方占位的文案、status 语义和布局；没有输入/发送/continuation。
+        h('div', { role: 'status', style: { border: '0.5px solid var(--dsw-alias-border-l4)',
+          borderRadius: 'var(--dsw-radius-lg)', background: 'var(--dsw-alias-bg-layer-1)',
+          minHeight: 54, color: 'var(--dsw-alias-label-tertiary)', justifyContent: 'center',
+          alignItems: 'center', gap: 8, margin: '0 24px 20px', padding: '10px 16px',
+          fontSize: 13, lineHeight: '20px', display: 'flex',
+        } }, h('strong', { style: { color: 'var(--dsw-alias-label-primary)', fontWeight: 510 } },
+          text('readonly.oneShot.title', '一次性子智能体记录')),
+        h('span', null, text('readonly.oneShot.body', '一次性任务不支持后续消息，可在这里查看完整执行记录。'))),
+      );
+    }
+
     return {
       // **读**走 `configForms` 镜像，**写**走 `remote.settings` —— 这是官方「模型」设置页
       // （`dsh-client-ui-settings-models`）的分工，其 inject 里两者都在：
@@ -1116,6 +1350,24 @@ window.__ModuleLoader__.load({
         //    （`createModelsOperations(ctx)`）一致。不要把 `ctx` 本身注入给组件：
         //    slot 的组件侧上下文与插件上下文不是同一个，实测表现为「读得到、写不到」。
         const store = makeRoleStore(ctx);
+        const cliStore = makeCliStore();
+        // Cordis 的 inject 均是必需依赖：独立子作用域缺失时不阻断设置/只读席位。
+        // 必须在该作用域 current 时提前解析 gateway 与 job，异步 (re)open 不再查 ctx。
+        if (typeof ctx.inject === 'function') ctx.inject(['remote', 'remote.job'], (scope) => {
+          try {
+            const remote = scope.remote;
+            const job = remote.job;
+            return cliStore.bind({ $stream: (options) => remote.$stream(options), job });
+          } catch { return cliStore.bind(null); }
+        });
+        ctx.slots.inject('conversation.composer', () => ctx.slots.register({
+          name: 'conversation.composer',
+          id: 'agent-switchboard-cli-observer',
+          priority: -20,
+          locale: 'subagent',
+          select: selectCliComposer,
+          inject: () => ({ cliStore }),
+        }, CliReadOnlyComposer));
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(
             {
@@ -1129,6 +1381,7 @@ window.__ModuleLoader__.load({
             SwitchboardSettings,
           ),
         );
+        return () => cliStore.dispose();
       },
     };
   },

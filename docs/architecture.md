@@ -444,6 +444,30 @@ jobId 由 Jobs 管理，schema、返回值与 render 均不暴露它；客户端
 平台可能在结束/报错时另发有界完成通知，该行为与任务面板的子会话可见性仍需真机核验。
 离线验证使用假 Jobs 与 Node 假 CLI 真进程；未调用真实 codex / grok。
 
+### 6.2 CLI 实时输出在一次性子会话输入区的呈现（用户要求）
+
+**状态：客户端与离线断言已实现，待真机验收。** 用户要求在一次性子代理侧边栏输入区上方，持续观察本子会话的 CLI 输出，不等 `turn/end`，也不把实时日志写入模型上下文或历史记录。
+
+**接入方向：** 在 `conversation.composer` 注册独立 `id: 'agent-switchboard-cli-observer'`、`priority: -20` 的只读观察者，仅选择一次性子会话；选择条件为宿主投影 `session.subagent.address.mode === 'one-shot'`（与官方选择器一致）；投影没有稳定的 Switchboard CLI 角色标签，故所有其它一次性子会话也必须忠实复现官方文案、布局与 `role="status"`，无 CLI 任务时面板返回 null。通过 `remote.$stream` 消费 `remote.job.list` / `remote.job.follow` 读取本子会话、`kind: 'cli'` 的任务，呈现有界实时文本面板，并始终忠实保留官方一次性子智能体记录文案。没有 CLI 任务或回流不可用时也保留文案，不提供输入能力或取消任务入口。
+
+**不采用的入口与原因：**
+
+| 入口 | 否定结论 |
+| --- | --- |
+| 顶部任务列表 | 子代理侧边栏没有 header，不能靠顶部列表呈现本子会话任务。 |
+| `turnTail` | 只能在 `turn/end` 后出现，不能满足运行中观察；历史 turn 会重复呈现 footer。 |
+| `conversation.composer.dock` | 被一次性子会话的只读 composer chain 隐藏，注入 dock 不会显示。 |
+| `conversation.content` / `sidebar.chat.conversation` | 前者是 Component Factory 不是 list；后者是 single，替换整个侧边栏内容区过于侵入。 |
+| transcript 外追加 / 工具进度 | `Session.append` 强制校验且只允许五类标准事件；没有 `tool/progress`，`ToolRunContext` 仅有 `deferContext` / `concludeTurn`，不伪造历史记录或逐块工具结果。 |
+
+**chain 的取舍：** `conversation.composer` 不能并列追加观察者，只能由更低 priority 的贡献取代官方静态占位。因此使用独立 id，不复用官方 id；替代视图必须保留官方文案与只读语义，不恢复输入能力。代价是需要维护占位文案及宿主 chain 兼容性，不能将离线检查通过等同于真实侧边栏视觉验收。
+
+**隔离与生命周期：** 只观察 owner 为当前子会话的 CLI 任务，不合并父会话或兄弟子会话日志，不改任务 owner。切换子会话或卸载时释放观察订阅、监听与本地缓冲，丢失或截断明确标记；观察者清理不取消、删除任务，也不等待客户端读完来结算执行器。既有调用方停止、Jobs 取消、owner 销毁及执行器资源清理保持不变（D20）。不把 owner 改为根会话（会改变访问围栏、取消与保留语义），也不省略 owner（会开放给全部 caller，并延迟清理至服务销毁）。元数据和流协议已源码核实；运行中呈现、切换隔离及卸载仍须真机核验，不能以离线桩代替验收。
+
+**订阅与降级：** 设置页与只读席位保持父插件原有依赖；`ctx.inject(['remote', 'remote.job'], ...)` 在独立子作用域提前捕获 gateway/job face，避免异步重连在 React 调用栈重新解析命名空间。服务缺失只显示「CLI 实时输出暂不可用」，不阻断父插件；服务恢复/撤销驱动观察重启/释放。list/follow 采用 `$stream`，接受 rows/opened 锚点，游标仅原样保存 Host 的 from/next；carrier 中断显式提示，已接受锚点后的意外 EOF 使用公开 restart 立即重订阅，不导入 Harness Client 包；此 EOF 分支不含退避，真实 carrier 异常仍由 `$stream` 原有重试机制处理。订阅终端错误必须显式呈现，不能当成无任务。
+
+**有界呈现：** 最多观察 8 个任务（运行中优先，其次最新结算），每个任务保留 32 Ki UTF-16 字符、256 个通道片段；正文使用文本节点，不解析 HTML/ANSI。运行中默认展开，结算后仍可展开尾部。Host lossy、chunk gapBefore、已有历史缺口与客户端裁切均明确提示；超出任务数也有提示。没有刷新定时器或 CLI 运行时长限制，也没有取消按钮。
+
 调用外部 CLI 至少要考虑：
 
 1. **调用形态**：多数 CLI 支持一次性（print/exec）与非交互会话两种模式，需要确认各自的实际参数。

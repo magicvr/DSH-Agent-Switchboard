@@ -784,3 +784,23 @@ volatile 就地更新可供新 preset 读取，已挂载的子代理保持挂载
 - M2：根同步与 preset 挂载边界明确区分未提供、数组、非法值。非数组（含 `null`）不写盘、不静默当空，
   进入 configErrors 并使自检不健康；普通对象和 Config volatile 引用解引用采用一致行为。
   不新增文件类型、路径或依赖，不改变权限模型与 CLI 生命周期。
+
+---
+
+## D23 · 一次性子会话输入区的实时 CLI 观察面板
+
+**状态：客户端实现与离线断言已落地，待真机验收。** 修订 D19 的「只用顶部任务面板、不新增客户端 UI」；Jobs 回流、子会话 owner 与 D20 的执行、结算、读取分离保持不变。
+
+**决策：** 在 `conversation.composer` 注册独立 `id: 'agent-switchboard-cli-observer'`、`priority: -20` 的只读贡献，仅选择一次性子会话，选择已核实的 `session.subagent.address.mode === 'one-shot'`；没有稳定的 CLI 角色标记，故其它一次性子会话也忠实保留官方说明与只读语义。通过 `remote.$stream` 消费 `remote.job.list` / `remote.job.follow` 观察本子会话、`kind: 'cli'` 的任务，在子代理侧边栏输入区上方呈现有界实时文本，不依赖 `turn/end`。始终忠实保留官方一次性子智能体记录文案；无任务或回流不可用时也保留，不提供输入或取消任务能力。
+
+**否定结论与理由：** 顶部任务列表依赖 header，而子代理侧边栏没有 header；`turnTail` 只能在 `turn/end` 后呈现且会重复历史 footer；`conversation.composer.dock` 被一次性只读 chain 隐藏。`conversation.content` 是 Component Factory 而非 list，`sidebar.chat.conversation` 是 single，替换整个内容区过于侵入。`Session.append` 强制校验且仅允许五类标准事件；不存在 `tool/progress`，`ToolRunContext` 只有 `deferContext` / `concludeTurn`，不以伪造记录或逐块工具结果绕过这些限制。
+
+**代价：** composer chain 无法并列追加，只能以更低 priority 取代官方静态占位；独立 id 不等于并列显示。替代视图必须维护官方文案与只读语义，并承担宿主 chain 兼容性风险；输出有界，不能承诺完整无限日志。
+
+**隔离与生命周期：** 仅观察当前子会话 owner 的 CLI 任务，不改 owner、不混入父或兄弟会话输出。切换或卸载释放订阅、监听与本地缓冲，明确标记丢失和截断；观察者清理不取消或删除任务，不把客户端读取作为执行结算前提。既有调用方停止、Jobs 取消、owner 销毁与执行器清理链路不变。
+
+**依赖与降级：** Cordis 顶层 inject 均为必需依赖，不能把观察 namespace 缺失变成设置页停用。故在子作用域声明 `inject(['remote', 'remote.job'], ...)`、提前捕获 face，父作用域始终注册只读席位与设置页；服务缺失、恢复、撤销都由实例内 store 管理，解绑只释放观察。订阅失败显式报错，丢失/截断明确标记；不导入 Client 包、没有取消按钮或运行期限。
+
+**否定 owner 改写：** 根会话 owner 会改变访问、取消、保留语义；省略 owner 会开放给全部 caller 并拖延清理至服务销毁。观察功能不应改变这些安全边界。
+
+**验证边界：** 会话字段、readonly 文案/样式、流帧与重连/依赖机制已源码核实，离线桩与变异实验负责行为判据；真实侧边栏视觉、真实 Remote 往返与 turn/end 前显示仍待用户验收。本次不改 Host/CLI 行为，不调用外部 CLI，也不修改用户配置。
