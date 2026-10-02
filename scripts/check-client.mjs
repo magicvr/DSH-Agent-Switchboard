@@ -44,7 +44,7 @@ function section(title) {
 const CLIENT_SRC = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
 // 执行真实客户端源码，仅在测试副本中暴露内部函数；生产模块不增加测试导出。
 const clientWindow = { __ModuleLoader__: { load: (spec) => { clientWindow.spec = spec; } } };
-new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleRow, WrapperSettings, makeRoleStore, SwitchboardSettings, selectCliComposer, makeCliStore, CliReadOnlyComposer, CliOutputPanel, CliJobOutput, // **读**走'))(clientWindow);
+new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleRow, WrapperSettings, makeRoleStore, SwitchboardSettings, selectCliComposer, makeCliStore, CliReadOnlyComposer, CliOutputPanel, CliJobOutput, isAtScrollBottom, // **读**走'))(clientWindow);
 const clientData = new Function(`${CLIENT_SRC.slice(0, CLIENT_SRC.indexOf('\nwindow.__ModuleLoader__.load'))}\nreturn { CLI_DRIVER_OPTIONS, DEFAULT_CLI_DRIVER, cliFieldsFor, inferCliDriver };`)();
 const rowReact = { createElement: (type, props, ...children) => ({ type, props, children }) };
 const { RoleRow, WrapperSettings, makeRoleStore } = clientWindow.spec.factory(() => rowReact);
@@ -730,7 +730,7 @@ section('统一包裹草稿：组件编辑、保存、清空与非法值的真�
 }
 
 // 可控远程流：不启动 CLI，不访问安装目录；保留迟到帧以验证清理后的隔离。
-const cliReact = { ...rowReact, useState: init => [typeof init === 'function' ? init() : init, () => {}], useEffect: () => {} };
+const cliReact = { ...rowReact, useState: init => [typeof init === 'function' ? init() : init, () => {}], useRef: init => ({ current: init }), useEffect: () => {} };
 const cliApi = clientWindow.spec.factory(() => cliReact);
 const settleCli = () => new Promise(setImmediate);
 function makeBoundCliStore(remote) {
@@ -808,6 +808,13 @@ const outputCli = (chunks, next, patch = {}) => ({ type: 'output', chunks, next,
 section('CLI composer：one-shot 选择、官方只读占位与无 turn 输出');
 {
   const { selectCliComposer, CliReadOnlyComposer, CliOutputPanel, CliJobOutput } = cliApi;
+  check('粘底判定：底部及 8px 容差边界为 true', cliApi.isAtScrollBottom(100, 300, 200) && cliApi.isAtScrollBottom(92, 300, 200));
+  check('粘底判定：超过容差为 false', !cliApi.isAtScrollBottom(90, 300, 200));
+  check('CLI 面板不含定时器', !/setInterval|setTimeout/.test(CLIENT_SRC.slice(CLIENT_SRC.indexOf('function CliJobOutput'), CLIENT_SRC.indexOf('function CliOutputPanel'))));
+  const scrollPropsTree = CliJobOutput({ job: cliRow('running', 's', { chunks: [{ channel: 'stdout', text: 'x' }] }) });
+  const scrollNodes = cliNodes(scrollPropsTree);
+  check('滚动容器携带 ref 与滚动状态回调', scrollNodes.some(node => node.type === 'pre' && node.props.ref && typeof node.props.onScroll === 'function'));
+  check('回底按钮中文标签清晰', CLIENT_SRC.includes("'aria-label': '滚动到最下'"));
   check('CLI select：仅 session.subagent.address.mode one-shot 被选中',
     selectCliComposer({ session: { subagent: { address: { mode: 'one-shot' } } } })?.reason === 'one-shot');
   for (const [name, owner] of Object.entries({ main: { session: {} }, continuable: { session: { subagent: { address: { mode: 'continuable' } } } },

@@ -234,6 +234,11 @@ function validateRoles(roles) {
   return null;
 }
 
+/** 滚动位置在底部容差内时视为粘底。 */
+function isAtScrollBottom(scrollTop, scrollHeight, clientHeight, tolerance = 8) {
+  return scrollHeight - clientHeight - scrollTop <= tolerance;
+}
+
 window.__ModuleLoader__.load({
   id: '@magicvr/dsh-agent-switchboard',
   factory(require) {
@@ -1280,12 +1285,28 @@ window.__ModuleLoader__.load({
 
     function CliJobOutput({ job }) {
       const [expanded, setExpanded] = useState(() => cliLive(job));
+      const [pinned, setPinned] = useState(true);
+      const outputRef = useRef(null);
+      useEffect(() => {
+        if (!pinned || !expanded) return;
+        const node = outputRef.current;
+        if (node) node.scrollTop = node.scrollHeight;
+      }, [job.chunks, expanded, pinned]);
+      const onScroll = (event) => setPinned(isAtScrollBottom(
+        event.currentTarget.scrollTop, event.currentTarget.scrollHeight, event.currentTarget.clientHeight,
+      ));
+      const scrollToBottom = () => {
+        setPinned(true);
+        const node = outputRef.current;
+        if (node) node.scrollTop = node.scrollHeight;
+      };
       const status = { running: '运行中', stopping: '终止中', completed: '已结算', killed: '被终止', failed: '失败' }[job.status] ?? job.status;
       return h('details', { open: expanded, onToggle: (event) => setExpanded(event.currentTarget.open) },
         h('summary', { style: { cursor: 'pointer' } }, `${String(job.label).slice(0, 200)} · ${status}`),
         job.error ? h('div', { role: 'alert' }, `CLI 输出订阅失败：${job.error}`) : null,
         job.gap ? h('div', { role: 'status' }, '输出已截断或存在 gap（丢失片段）；仅显示有界尾部。') : null,
-        h('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 240, overflow: 'auto', margin: '8px 0' } },
+        !pinned ? h('button', { type: 'button', onClick: scrollToBottom, 'aria-label': '滚动到最下' }, '滚动到最下') : null,
+        h('pre', { ref: outputRef, onScroll, style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 240, overflow: 'auto', margin: '8px 0' } },
           (job.chunks ?? []).map((chunk, index) => h('span', { key: index, 'data-channel': chunk.channel,
             style: chunk.channel === 'stderr' ? { color: 'var(--dsw-alias-label-error)' } : undefined,
           }, `[${chunk.channel}] ${chunk.text}`))),
