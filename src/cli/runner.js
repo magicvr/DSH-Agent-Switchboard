@@ -131,6 +131,10 @@ export async function runCli({ role, prompt, spawn, resolveExecutable, signal, r
       try { await handle.terminate(); await handle.waitForExit(); }
       catch { /* 保留原始失败诊断 */ }
     }
+    clearInterval(monitor);
+    // 进程失败也排空最后一段输出，不重复已经交给 sink 的字节。
+    try { emitOutput(); } catch { /* 原始失败优先 */ }
+    await pendingOutput;
     return failed(`${stage}：${error.message ?? error}`);
   } finally {
     settled = true;

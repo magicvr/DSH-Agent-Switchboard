@@ -25,6 +25,64 @@ function section(title) {
 }
 
 const childExec = (signal) => ({ agent: { id: 'child-1', session: { header: { origin: 'subagent' } } }, signal });
+
+// Jobs 桩保留真实契约：同步 starter/cancel、资源释放后 done、异步结算后才能 remove。
+function fakeJobs({ rejected = false, released = () => true } = {}) {
+  const specs = [], chunks = [], removals = [], outcomes = [], releaseChecks = [];
+  const listeners = new Set();
+  let hooks;
+  let settled = false;
+  const id = 'cli-test-private-1';
+  const service = {
+    events: { subscribe(filter, listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    } },
+    start(spec) {
+      specs.push(spec);
+      if (rejected) throw new Error('no controller');
+      hooks = spec.run({ id, append(text, options) { chunks.push({ text, ...options }); } });
+      hooks.done.then(outcome => {
+        outcomes.push(outcome);
+        releaseChecks.push(released());
+        // 不把「生产者 done」等同于「注册表已结算」，验证前台 remove 的竞态。
+        setImmediate(() => {
+          settled = true;
+          for (const listener of listeners) listener({ type: 'settled', job: { id }, awaited: false });
+        });
+      }, () => {
+        outcomes.push({ status: 'REJECTED' });
+        setImmediate(() => {
+          settled = true;
+          for (const listener of listeners) listener({ type: 'settled', job: { id }, awaited: false });
+        });
+      });
+      return id;
+    },
+    remove(jobId, owner) {
+      if (!settled) throw new Error('still live');
+      removals.push({ id: jobId, owner });
+    },
+    wait() { throw new Error('禁止有期限的 wait'); },
+    read() { throw new Error('禁止模型读取实时日志'); },
+    kill(jobId, owner, reason) {
+      if (jobId !== id || owner !== specs[0].owner) throw new Error('foreign');
+      return hooks.cancel(reason);
+    },
+    async destroyOwner(owner) {
+      if (owner !== specs[0].owner) throw new Error('foreign owner');
+      hooks.cancel('owner destroyed');
+      await hooks.done;
+    },
+  };
+  const requested = [];
+  const ctx = {
+    get(key) { requested.push(key); return key === 'jobs' ? service : undefined; },
+    get jobs() { throw new Error('必须用 ctx.get'); },
+  };
+  return { service, ctx, specs, chunks, removals, outcomes, releaseChecks, requested,
+    hooks: () => hooks, listeners: () => listeners.size, id };
+}
 /**
  * 造一个可控的 fake spawn。返回句柄与「被调用记录」。
  *
@@ -301,6 +359,11 @@ section('无运行期限：源码不含期限参数或计时终止');
   check('执行器和 provider 无 timeoutMs / setTimeout / timedOutByUs',
     !/timeoutMs|setTimeout|timedOutByUs/.test(runner + provider));
   check('Host 不读取或注入运行期限', !/const cliTimeoutSec|timeoutMs:|cliTimeoutSec:\s*z\./.test(host));
+  check('CLI 不调用有期限的 jobs.wait', !/jobs\.wait\s*\(/.test(provider));
+  check('Jobs 是可选 get 服务，未加入 inject', provider.includes("ctx.get('jobs')")
+    && !/export const inject\s*=\s*\[[^\]]*['"]jobs['"]/.test(host));
+  check('回流只 append 输出，不调用 AI 或会话上下文 API', provider.includes('job.append(text,')
+    && !/session\.append|additionalContexts|ctx\.(llm|ai)|jobs\.read\s*\(/.test(provider));
 }
 
 section('取消：信号直通、终止、分类、审计与资源清理');
@@ -312,8 +375,10 @@ section('取消：信号直通、终止、分类、审计与资源清理');
   const started = p.execute({ prompt: 'CANCEL ME' }, childExec(ac.signal));
   const path = h.calls[0].argv.at(-1);
   check('运行中提示词文件存在', existsSync(path));
-  check('request.signal 原样传入 spawn', h.calls[0].signal === ac.signal);
+  check('调用方信号汇入独立 controller 后传入 spawn', h.calls[0].signal instanceof AbortSignal
+    && h.calls[0].signal !== ac.signal && !h.calls[0].signal.aborted);
   ac.abort();
+  if (!h.aborted()) h.finish(); // 取消变异时仍释放测桩，下面断言负责报告失败。
   const result = await started;
   check('调用方取消 → 子进程被中止', h.aborted());
   check('取消 → status cancelled', result.status === 'cancelled' && result.signal === 'SIGTERM');
@@ -322,6 +387,119 @@ section('取消：信号直通、终止、分类、审计与资源清理');
   check('取消仍有路由摘要', result.routeSummary.includes('backend=cli'));
   check('取消后临时提示词文件已清理', !existsSync(path));
   check('取消后全部 abort 监听器已移除', getEventListeners(ac.signal, 'abort').length === 0);
+}
+
+section('Jobs 回流：可选降级、前台有界结果、结算与清理');
+{
+  const h = makeSpawn({ stdout: 'ANSWER' });
+  const reads = [];
+  const ctx = { get(key) { reads.push(key); return undefined; }, get jobs() { throw new Error('inject'); } };
+  const result = await createCliTool({ role: codexRole(), spawn: h.spawn, ctx }).execute({ prompt: 'T' }, childExec());
+  check('Jobs 不可用仍执行并返回实际结果', h.calls.length === 1 && result.stdout === 'ANSWER' && result.status === 'completed');
+  check('Jobs 缺失结果如实标注', result.outputFeedback === 'unavailable' && result.diagnostic.includes('Jobs 服务未加载'));
+  check('Jobs 缺失仍安全 get 查询', JSON.stringify(reads) === '["jobs"]');
+  const rejected = fakeJobs({ rejected: true });
+  const fallback = makeSpawn({ stdout: 'FALLBACK' });
+  const r = await createCliTool({ role: codexRole(), spawn: fallback.spawn, ctx: rejected.ctx })
+    .execute({ prompt: 'T' }, childExec());
+  check('Jobs 预检拒绝只降级，不重复启动', fallback.calls.length === 1 && r.stdout === 'FALLBACK'
+    && r.outputFeedback === 'unavailable' && r.diagnostic.includes('Jobs 注册失败'));
+  check('Jobs 预检拒绝不 remove 且退订', rejected.removals.length === 0 && rejected.listeners() === 0);
+  const jobs = fakeJobs();
+  const role = { ...codexRole({ maxOutputBytes: 4, maxErrorBytes: 4 }), title: '侦察角色' };
+  const streamed = makeSpawn({ stdout: '0123456789', stderr: 'ERROR-TAIL' });
+  const p = createCliTool({ role, spawn: streamed.spawn, ctx: jobs.ctx });
+  const value = await p.execute({ prompt: 'T' }, childExec());
+  check('Jobs start 一次且 kind/label/owner 正确', jobs.specs.length === 1 && jobs.specs[0].kind === 'cli'
+    && jobs.specs[0].label === '侦察角色' && jobs.specs[0].owner === 'child-1');
+  check('Jobs 输出读限额仅作用模型侧，未混用 pull-source', jobs.specs[0].outputLimitBytes === 4096 && jobs.specs[0].output === undefined);
+  check('Jobs stdout/stderr 各 append 一次且内容真实', jobs.chunks.length === 2
+    && jobs.chunks[0].channel === 'stdout' && jobs.chunks[0].text === '0123456789'
+    && jobs.chunks[1].channel === 'stderr' && jobs.chunks[1].text === 'ERROR-TAIL');
+  check('Jobs 回流不扩大模型结果限额', value.stdout === '0123' && value.stderr === 'TAIL'
+    && value.stdoutTruncated && value.stderrTruncated && value.outputFeedback === 'jobs');
+  check('结算后 remove 携带同一个 owner', jobs.removals.length === 1
+    && jobs.removals[0].id === jobs.id && jobs.removals[0].owner === 'child-1');
+  check('jobId 不进入返回值、render 或 schema', !JSON.stringify(value).includes(jobs.id)
+    && !JSON.stringify(p.output.render({}, value)).includes(jobs.id) && !('jobId' in p.output.schema.properties));
+  check('Jobs done completed 不携带日志 result 且退订', jobs.outcomes[0].status === 'completed'
+    && !('result' in jobs.outcomes[0]) && jobs.listeners() === 0);
+  const lossyJobs = fakeJobs();
+  const lossy = await createCliTool({ role: codexRole(), ctx: lossyJobs.ctx, spawn: () => ({
+    done: Promise.resolve({ exitCode: 0 }), collected: { stdout: {
+      readFrom: from => ({ text: from === 0 ? 'tail' : '', nextOffset: 4, lossy: from === 0 }),
+    } },
+  }) }).execute({ prompt: 'T' }, childExec());
+  check('丢失字节向 Jobs 观察者标记 gapBefore，避免静默拼接', lossyJobs.chunks.length === 1
+    && lossyJobs.chunks[0].gapBefore === true && lossy.stdoutTruncated);
+  const failedJobs = fakeJobs();
+  const failedSpawn = makeSpawn({ stdout: 'LAST-OUT', stderr: 'LAST-ERR' });
+  const failedResult = await createCliTool({ role: codexRole(), ctx: failedJobs.ctx, spawn: spec => ({
+    ...failedSpawn.spawn(spec), done: Promise.reject(new Error('stream failed')),
+  }) }).execute({ prompt: 'T' }, childExec());
+  check('done 拒绝仍排空两路错误尾部且不重复', failedResult.status === 'process-failed'
+    && failedJobs.chunks.length === 2 && failedJobs.chunks[0].text === 'LAST-OUT' && failedJobs.chunks[1].text === 'LAST-ERR');
+}
+
+section('Jobs 取消：同步幂等、三来源合流、done 释放资源后结算');
+{
+  for (const source of ['caller', 'panel', 'owner', 'failure', 'pre-abort']) {
+    const ac = new AbortController();
+    if (source === 'pre-abort') ac.abort('already stopped');
+    const h = controlledSpawn();
+    let path;
+    const jobs = fakeJobs({ released: () => (!path || !existsSync(path))
+      && (h.calls.length === 0 || h.cleanups() === 1)
+      && getEventListeners(ac.signal, 'abort').length === 0 });
+    const role = codexRole({ promptDelivery: 'promptFile', args: ['--prompt-file', '{prompt}'] });
+    const task = createCliTool({ role, spawn: h.spawn, ctx: jobs.ctx }).execute({ prompt: 'T' }, childExec(ac.signal));
+    path = h.calls[0]?.argv.at(-1);
+    if (source === 'caller') ac.abort('caller stopped');
+    else if (source === 'panel') {
+      const first = jobs.service.kill(jobs.id, 'child-1', 'panel stopped');
+      const second = jobs.service.kill(jobs.id, 'child-1', 'second reason');
+      check('Jobs cancel 同步返回且幂等保留第一原因', first === undefined && second === undefined
+        && h.calls[0].signal.aborted && h.calls[0].signal.reason === 'panel stopped');
+    } else if (source === 'owner') {
+      const teardown = jobs.service.destroyOwner('child-1');
+      // 变异破坏取消时仍收尾测桩，不能让检验本身永远挂起。
+      if (!h.aborted()) h.finish();
+      await teardown;
+    }
+    else if (source === 'failure') h.reject();
+    if (h.calls.length && !h.aborted()) h.finish();
+    const r = await task;
+    check(`${source}：done 不拒绝且 JobOutcome 分类正确`, jobs.outcomes.length === 1
+      && jobs.outcomes[0].status === (source === 'failure' ? 'failed' : 'killed'));
+    check(`${source}：done resolve 前已清理资源和调用方监听器`, jobs.releaseChecks[0] === true);
+    check(`${source}：结算后 remove 并退订`, jobs.removals.length === 1 && jobs.listeners() === 0);
+    check(`${source}：不暴露 jobId 且唯一终态`, !JSON.stringify(r).includes(jobs.id)
+      && r.status === (source === 'failure' ? 'process-failed' : 'cancelled'));
+    if (source !== 'failure' && source !== 'pre-abort') check(`${source}：同一 spawn 信号终止进程`, h.aborted());
+    if (source === 'pre-abort') check('Jobs 预取消不启动进程', h.calls.length === 0);
+  }
+  const jobs = fakeJobs();
+  const h = makeSpawn();
+  let refused = false;
+  try { await createCliTool({ role: codexRole(), spawn: h.spawn, ctx: jobs.ctx })
+    .execute({ prompt: 'T' }, { agent: { id: 'parent', session: { header: { origin: 'user' } } } }); }
+  catch { refused = true; }
+  check('主代理调用在读取 Jobs 和启动进程前拒绝', refused && jobs.requested.length === 0 && h.calls.length === 0);
+  const brokenJobs = fakeJobs();
+  const originalNow = Date.now;
+  let task;
+  try {
+    // 在 runner 的 try 外模拟意外拒绝，不能只测已经被 runner 归类的进程失败。
+    Date.now = () => { throw new Error('clock unavailable'); };
+    task = createCliTool({ role: codexRole(), spawn: makeSpawn().spawn, ctx: brokenJobs.ctx })
+      .execute({ prompt: 'T' }, childExec());
+  } finally { Date.now = originalNow; }
+  let error;
+  try { await task; } catch (e) { error = e; }
+  check('runner 意外拒绝仍将 Jobs done 转为 failed 而不 reject', brokenJobs.outcomes[0]?.status === 'failed'
+    && brokenJobs.outcomes[0]?.detail === 'CLI 执行器失败');
+  check('runner 意外拒绝保留工具错误且结算 remove/退订', error?.message === 'clock unavailable'
+    && brokenJobs.removals.length === 1 && brokenJobs.listeners() === 0);
 }
 
 section('已取消信号与解析期间取消：不得启动新进程');
@@ -430,6 +608,7 @@ console.error('model: fake-model');
 const timer = setInterval(() => { if (existsSync(process.argv[3])) { clearInterval(timer); console.log('FINISHED'); } }, 10);
 `);
   let active;
+  let activeSignal;
   const spawn = spec => {
     const out = join(dir, 'stdout');
     const err = join(dir, 'stderr');
@@ -437,6 +616,7 @@ const timer = setInterval(() => { if (existsSync(process.argv[3])) { clearInterv
     const child = nodeSpawn(spec.argv[0], spec.argv.slice(1), { cwd: dir, shell: false, windowsHide: true,
       stdio: ['ignore', ...fds] });
     active = child;
+    activeSignal = spec.signal;
     const onAbort = () => child.kill();
     spec.signal?.addEventListener('abort', onAbort, { once: true });
     const reader = path => ({ readFrom: from => {
@@ -481,28 +661,45 @@ const timer = setInterval(() => { if (existsSync(process.argv[3])) { clearInterv
       check(`${cancel ? '取消运行' : '正常运行'}：提示词文件已清理`, !existsSync(promptPath));
       check(`${cancel ? '取消运行' : '正常运行'}：终态唯一且监听器清理`, terminals === 1 && getEventListeners(ac.signal, 'abort').length === 0);
     }
-    for (const cancel of [false, true]) {
-      const flag = join(dir, cancel ? 'tool-cancel' : 'tool-exit');
+    for (const source of ['complete', 'caller', 'panel', 'owner']) {
+      const cancel = source !== 'complete';
+      const flag = join(dir, `tool-${source}`);
       const ac = new AbortController();
       const role = codexRole({ command: process.execPath, prefixArgs: [script], promptDelivery: 'promptFile',
         args: ['{prompt}', flag], cwd: dir, maxOutputBytes: 12, maxErrorBytes: 20 });
       role.instructions = 'TOOL-RULES';
-      const tool = createCliTool({ role, spawn });
+      const jobs = fakeJobs({ released: () => !existsSync(active.spawnargs[2])
+        && (active.exitCode !== null || active.signalCode !== null) });
+      const tool = createCliTool({ role, spawn, ctx: jobs.ctx });
       let terminals = 0;
       const task = tool.execute({ prompt: 'TOOL-TASK' }, childExec(ac.signal));
       task.then(() => { terminals++; });
       for (let guard = 0; guard < 100; guard++) {
-        if (existsSync(join(dir, 'stdout')) && readFileSync(join(dir, 'stdout'), 'utf8').includes('TOOL-TASK')) break;
+        if (jobs.chunks.some(chunk => chunk.channel === 'stdout' && chunk.text.includes('TOOL-TASK'))
+          && jobs.chunks.some(chunk => chunk.channel === 'stderr' && chunk.text.includes('fake-model'))) break;
         await delay(20);
       }
-      const label = cancel ? '专属工具取消' : '专属工具完成';
+      const label = `专属工具 ${source}`;
       const promptPath = active.spawnargs[2];
       check(`${label}：工具拉起真实 Node 假 CLI 且 argv 正确`, active.spawnargs[0] === process.execPath
         && active.spawnargs[1] === script && active.spawnargs[3] === flag && active.spawnargs.length === 4);
       check(`${label}：假 CLI 读取确定性前置的规则与正文`,
         readFileSync(join(dir, 'stdout'), 'utf8').includes('TOOL-RULES\n\n---\n\nTOOL-TASK'));
       check(`${label}：工具等待完成，不提前返回`, terminals === 0 && existsSync(promptPath));
-      if (cancel) ac.abort(); else writeFileSync(flag, 'exit');
+      check(`${label}：客户端终态前收到 stdout 和 stderr`, jobs.chunks.some(chunk => chunk.channel === 'stdout'
+        && chunk.text.includes('READY')) && jobs.chunks.some(chunk => chunk.channel === 'stderr' && chunk.text.includes('fake-model')));
+      if (source === 'caller') ac.abort();
+      else if (source === 'panel') {
+        const first = jobs.service.kill(jobs.id, 'child-1', 'panel stopped');
+        const second = jobs.service.kill(jobs.id, 'child-1', 'again');
+        check('假 CLI 真进程：Jobs cancel 同步幂等', first === undefined && second === undefined);
+      } else if (source === 'owner') {
+        const teardown = jobs.service.destroyOwner('child-1');
+        if (!activeSignal?.aborted) active.kill();
+        await teardown;
+      }
+      else writeFileSync(flag, 'exit');
+      if (cancel && !activeSignal?.aborted) active.kill();
       const result = await task;
       check(`${label}：有界正文与截断标记`, Buffer.byteLength(result.stdout) <= 12 && result.stdoutTruncated);
       check(`${label}：有界 stderr 与实际路由证据`, Buffer.byteLength(result.stderr) <= 20
@@ -511,6 +708,12 @@ const timer = setInterval(() => { if (existsSync(process.argv[3])) { clearInterv
         && result.cancelled === cancel && (cancel ? result.signal !== null : result.exitCode === 0));
       check(`${label}：退出后文件与信号监听器清理`, !existsSync(promptPath)
         && getEventListeners(ac.signal, 'abort').length === 0 && terminals === 1);
+      check(`${label}：done 在真进程退出与文件清理后 resolve`, jobs.releaseChecks[0] === true);
+      check(`${label}：结算后 remove 且不泄露 jobId`, jobs.removals.length === 1
+        && jobs.removals[0].owner === 'child-1' && !JSON.stringify(result).includes(jobs.id) && jobs.listeners() === 0);
+      const stdout = jobs.chunks.filter(chunk => chunk.channel === 'stdout').map(chunk => chunk.text).join('');
+      check(`${label}：增量输出无重复且正常退出尾部已排空`, stdout === readFileSync(join(dir, 'stdout'), 'utf8')
+        && (cancel || stdout.endsWith('FINISHED\n')));
     }
   } finally {
     if (active && active.exitCode === null && active.signalCode === null) active.kill();

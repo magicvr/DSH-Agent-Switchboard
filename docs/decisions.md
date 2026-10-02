@@ -610,3 +610,26 @@ AGENTS.md 规则 4 继续由注册时配置快照与仅 prompt 参数落实：�
 实际工具 schema 和隔离 DSH_HOME 验证配置绑定、来源拒绝、路由事实、容量、取消和注册故障。
 关键断言用生产代码变异验证判别力，并以 SHA-256 校验恢复。真实 DSH spawn / 工具继承、
 包裹路由、最终汇报和 GUI 停止仍需真机验收；本批次不调用真实 codex / grok。
+
+---
+
+## D19 · CLI 输出使用内置 Jobs 面板回流（批次 3b）
+
+**决策：** 使用会话顶部的内置任务面板，不新增客户端 UI。工具执行时通过 `ctx.get('jobs')`
+读取可选服务，注册 kind=cli、label=角色标题或 id、owner=调用方子会话 `exec.agent.id`。
+runner 增量 sink 向 job.append 推送 stdout / stderr，丢失字节显式标记；只使用推送一种路径。
+调用方停止、任务取消与 owner 销毁汇入同一 AbortController。done 在资源清理后 resolve，且不 reject。
+
+**等待与模型边界：** 工具前台等待 runner 自己的终态 Promise，finally 等 Jobs settled 后 remove。
+不向模型交出 jobId，不把实时输出作为逐块工具结果或 AI 请求；最终正文/错误仍按配置限额返回。
+Jobs 的模型侧读取与终态通知另限 4096 字节，客户端输出环沿用平台容量，不代表无限日志存储。
+本地 wait 类型文档强制正数且有限的等待界限，因此不调用 jobs.wait，不引入运行期限。
+平台对 unawaited 结算可能发送终态通知，这一路不用于运行中的逐块回流，仍需真机核验。
+
+**降级与代价：** jobs 不进 inject；服务缺失或注册预检拒绝时继续执行 CLI，并报告回流不可用。
+输出保留窗口溢出会标记丢失，结算后移除任务卡片；owner=子会话的面板可见性待真机验证。
+直接等待生产者不使用 Jobs waiter，其 awaited 语义与平台完成通知行为需要现场观察。
+
+**验证边界：** 假 Jobs 服务、Node 假 CLI 真进程与 apply 集成验证实时回流、取消、释放顺序、
+前台删除、降级、有界结果与来源防御；关键断言以生产代码变异及 SHA-256 字节校验验证判别力。
+不调用真实 codex / grok，不读写用户 DSH_HOME；真实任务面板和 CLI 进程树仍待验收。

@@ -764,6 +764,36 @@ section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失
       check('apply 的 CLI 配置使用 spawn 和自身 allow', configs[0].provider === 'spawn'
         && JSON.stringify(configs[0].toolFilter.allow) === '["switchboard_cli_run_cli_worker"]');
       check('CLI 两个工具齐全时自检健康', result.ok && result.roleCount === 2);
+      // 在 apply 后才出现的可选 Jobs 服务也应被工具读取，而非注册时固定快照。
+      const listeners = new Set();
+      const starts = [], removed = [];
+      let jobsAvailable = true;
+      const jobs = {
+        events: { subscribe(_filter, listener) { listeners.add(listener); return () => listeners.delete(listener); } },
+        start(spec) {
+          starts.push(spec);
+          const hooks = spec.run({ append() {} });
+          hooks.done.then(() => {
+            for (const listener of listeners) listener({ type: 'settled', job: { id: 'cli-private-apply' } });
+          });
+          return 'cli-private-apply';
+        },
+        remove(id, owner) { removed.push({ id, owner }); },
+      };
+      const contextGet = ctx.get.bind(ctx);
+      ctx.get = key => key === 'jobs' ? (jobsAvailable ? jobs : undefined) : contextGet(key);
+      ctx.subprocess.spawn = () => ({ done: Promise.resolve({ exitCode: 0 }), collected: {} });
+      const exec = { agent: { id: 'fixture-child', session: { header: { origin: 'subagent' } } } };
+      const cliTool = ctx.tools.get('switchboard_cli_run_cli_worker', scope);
+      const cliResult = await cliTool.execute({ prompt: 'T' }, exec);
+      check('apply 将 ctx 传给专属工具，运行时读取 Jobs 与正确 owner', starts.length === 1
+        && starts[0].kind === 'cli' && starts[0].owner === 'fixture-child' && cliResult.outputFeedback === 'jobs');
+      check('apply 路径结算后 remove，jobId 不进结果且退订', removed.length === 1
+        && removed[0].owner === 'fixture-child' && listeners.size === 0 && !JSON.stringify(cliResult).includes('cli-private-apply'));
+      jobsAvailable = false;
+      const degraded = await cliTool.execute({ prompt: 'T' }, exec);
+      check('apply 路径 Jobs 卸载后照常执行并报告降级', degraded.status === 'completed'
+        && degraded.outputFeedback === 'unavailable' && starts.length === 1);
       ctx.tools.get = (name, viewingScope) => name === 'switchboard_cli_run_cli_worker' ? undefined : originalGet(name, viewingScope);
       const absent = await selftest.execute({});
       check('CLI 工具后来缺失时自检失败且不计入角色数量', !absent.ok && absent.roleCount === 1);

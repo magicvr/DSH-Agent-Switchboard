@@ -337,12 +337,14 @@
 
 ## 6. CLI 派发后端（已实现，保留设计约束）
 
-当前 CLI 数据流（批次 3a，D18）：
+当前 CLI 数据流（批次 3b，D18 / D19）：
 
 ```text
 主代理 → delegate_to_<角色> → 内置 spawn 子代理
                               → switchboard_cli_run_<角色>（仅 prompt）
                               → runCli → ctx.subprocess.spawn → 外部 codex / grok
+                                           ↓ stdout / stderr 增量 sink
+                                    ctx.get('jobs') → job.append → 输出环 → 客户端任务面板
 主代理 ← 简洁汇报（交付物、证据、错误、未完成项）← 子代理 ← 有界 CLI 结果
 ```
 
@@ -361,7 +363,34 @@ preset 工具，直接调用仍被拒绝。命令、模板、cwd、readOnly、�
 
 工具只等待 CLI 结束并返回 status、exitCode / signal、cancelled、routeSummary（配置线路与 CLI 自报事实）、
 stdout、stderr 尾部、diagnostic 及各自截断标记。正文与错误按配置字节限额，摘要与诊断各最多 4096 字节；
-不回传 argv 或完整实时日志。此批次不接 `ctx.jobs`；输出 sink 保留供 3b 接入。
+不回传 argv 或完整实时日志；新增 `outputFeedback` 为 `jobs` 或 `unavailable`。
+
+### 6.1 CLI 实时输出回流（批次 3b）
+
+专属工具在执行时读取 `ctx.get('jobs')`，不把可选服务加入 inject。以 `kind: 'cli'`、
+`label: role.title || role.id`、`owner: exec.agent.id` 注册任务，使用 runner 的增量 sink
+向 `job.append(text, { channel, gapBefore? })` 推送，未注册 pull-source，避免双重输出。
+runner 每 50ms 读取非消费型收集器，成功和失败都排空尾部；丢失字节标记 gapBefore。
+收集器仍受 CLI 输出限额，Jobs 输出环仍受其自身保留容量限制，不能保证无限保留所有日志。
+`outputLimitBytes: 4096` 只约束 Jobs 模型侧读取/终态通知，不限制客户端观察者。
+
+调用方 `exec.signal`、面板 cancel 及 owner 销毁均进入同步幂等的 cancel，汇入同一个
+AbortController 后传给 spawn。JobHooks.done 映射 completed / killed / failed，不携带日志 result，
+不拒绝，且在 runner 的进程等待、sink、监听器与临时提示词文件清理之后 resolve。
+工具直接 await runner Promise；另外订阅 settled 事件，在 finally 等注册表结算后 remove，随后退订。
+这也支持注册表异步结算，不依赖微任务顺序。owner 销毁时若记录已移除，清理异常记诊断。
+
+本地 `dsh-jobs/lib/types/index.d.ts` 的 wait 签名为
+`wait(id, timeoutMs: number, caller?, signal?)`，文档要求正数且有限的等待界限；插件不调用它，
+没有 CLI 运行期限。缺少 Jobs 或注册预检失败时照常执行，结果如实标注不可用，不重复启动。
+
+模型上下文边界：JobHandle.append 契约仅写输出环、发布输出事件，观察者通过绝对偏移读取；
+本插件不调用 Jobs 的模型读取 API，不调用 AI、session.append 或附加上下文 API。
+专属工具 execute 持续等待，DSH tools 的 dispatchToolBody 在 await tool.execute 后才构造工具结果。
+jobId 只在工具内部用于结算和删除，schema、返回值与 render 均不暴露它。
+平台终态通知属于 Jobs controller 的职责；无 jobs.wait 时 settled 的 awaited 为 false，
+平台可能在结束/报错时另发有界完成通知，该行为与任务面板的子会话可见性仍需真机核验。
+离线验证使用假 Jobs 与 Node 假 CLI 真进程；未调用真实 codex / grok。
 
 调用外部 CLI 至少要考虑：
 
@@ -426,10 +455,11 @@ stdout、stderr 尾部、diagnostic 及各自截断标记。正文与错误按�
 `src/cli/runner.js` 的 `runCli({ role, prompt, spawn, resolveExecutable?, signal?, routeSummary?, onOutput?, now? })`
 负责模板、提示词传递、进程等待、输出与路由解析，以及所有终态的清理。
 批次 2a 时 `provider.js` 转换 ContentBlock 与包装 SubagentRun；批次 3a 已改为专属工具定义。`onOutput({ stream, text, lossy })`
-可接异步 sink，通过非消费型收集器增量读取；批次 3a 不依赖 Jobs，3b 可接输出回流。
+可接异步 sink，通过非消费型收集器增量读取；批次 3b 的专属工具将其接入 Jobs 输出环。
 输出 sink 失败记诊断；采集容量仍由 subprocess 与执行器限制，截断显式标记。
 
-旧 provider 的 `request.signal`、当前专属工具的 `exec.signal` 原样传入 spawn；已取消信号不启动进程，解析期间取消也在启动前拦截。
+旧 provider 曾将 `request.signal` 原样传入 spawn；当前专属工具合并 `exec.signal` 与 Jobs cancel 后传入 spawn。
+已取消信号不启动进程，解析期间取消也在启动前拦截。
 `done` 被观察到时固定终态；此前取消优先，之后取消不能改写完成结果。
 执行器只返回一个 Promise 终态，并在 finally 清理监听器、回流轮询及提示词文件；
 `done` 拒绝时也执行终止与等待。分类区分 `start-failed` / `process-failed` / `cancelled`，

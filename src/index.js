@@ -951,6 +951,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
     try {
       const tool = createCliTool({
         role,
+        ctx,
         spawn: (spec) => safeSpawn(ctx, spec),
         resolveExecutable: (command, env, signal) => ctx.subprocess.resolveExecutable(command, env, signal),
       });
