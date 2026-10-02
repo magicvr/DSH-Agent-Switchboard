@@ -245,9 +245,14 @@ section('argv 与 stdio：绑定配置，不接受模型覆盖');
 section('argv 与 stdio：argv 模式');
 {
   const { spawn, calls } = makeSpawn({ stdout: 'OK' });
-  const p = createCliTool({ role: codexRole({ promptDelivery: 'argv', args: ['-p', '{prompt}'] }), spawn });
+  const instructions = 'ARGV-ROLE-INSTRUCTIONS-SENTINEL';
+  const role = codexRole({ promptDelivery: 'argv', args: ['-p', '{prompt}'] });
+  role.instructions = instructions;
+  const p = createCliTool({ role, spawn });
   await p.execute({ prompt: 'task text' }, childExec());
   check('argv 模式：提示词进入 argv', calls[0].argv.includes('task text'));
+  check('argv 模式：任务参数保持原值', calls[0].argv.at(-2) === '-p' && calls[0].argv.at(-1) === 'task text');
+  check('argv 模式：角色规则不进入 argv', !calls[0].argv.some(arg => arg.includes(instructions)));
   check('argv 模式：stdin 为 ignore', calls[0].stdio.stdin === 'ignore');
 }
 

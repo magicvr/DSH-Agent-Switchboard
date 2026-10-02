@@ -2,6 +2,9 @@
 //
 // 为什么必须做：本插件曾让应用无法启动。必须在不重启的前提下，用假 ctx 把
 // 根路径与 preset 路径都真跑一遍 —— 重启一次的成本太高，而且失败会让用户进不去。
+// 覆盖边界：这是契约模拟，不是真实 spawn 集成；假 ctx 不创建 child 上下文。
+// 即使执行真实 Config / 工具插件，subagents.start 仍是记录请求的桩；未验证上下文隔离、
+// preset 工具继承或 child 工具过滤执行。离线缺少 spawn-in-process 与 preset registry，见 D21。
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -818,7 +821,7 @@ section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失
   }
 }
 
-section('实际工具插件：配置校验后仍按已挂载清单生成出站权限');
+section('契约模拟（真实 Config / 工具插件，start 为桩）：按已挂载清单生成出站权限');
 {
   const { cliFieldsFor } = await import('../src/cli/drivers.js');
   const ctx = makeCtx({ scope: {} });
@@ -834,6 +837,7 @@ section('实际工具插件：配置校验后仍按已挂载清单生成出站�
   const providers = new Map(['spawn', 'fork'].map(name => [name, { name, inheritsParentContext: false,
     capabilities: { depthLimit: true, agentOptions: true, persona: true, toolFilter: true } }]));
   ctx.subagents.getProvider = name => providers.get(name);
+  // 只记录派发请求，不创建真实 child；下面的断言只验证配置与请求契约。
   ctx.subagents.start = async (_provider, request) => {
     requests.push(request);
     return { id: 'fixture-run', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose() {} };

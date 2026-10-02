@@ -326,7 +326,7 @@
 - `id` / `title` / `description`
 - `instructions` — 子代理的角色提示词
 - `readOnly` — 是否允许修改文件
-- `allowNestedDispatch` — 是否允许该子代理再往下派发（**默认 `false`**，防无限递归，见 `decisions.md` D11）
+- `allowNestedDispatch` — 该角色创建的 DSH 子代理能否调用受控委派工具（**默认 `false`**）；不决定能否被调用，继续派发仍受剩余深度预算约束，见 `decisions.md` D21
 - `backend` — `spawn` / `fork`（内置）或 `cli`
 - `model` / `effort` — 角色顶层的模型与思考强度
 - `cliCommand` / `cliPrefixArgs` / `cliArgs` / `cliPromptDelivery` / `cliCwd` — CLI 角色的扁平配置；归一化后生成内部 `cli` 对象。提示词传递支持 `stdin` / `argv` / `promptFile`；不设置运行期限。旧 `cliTimeoutSec` 不再声明或执行，残留值不阻止加载。
@@ -353,10 +353,28 @@ provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliT
 自检同时查询两个工具，专属工具注册失败会阻止对应 delegate 挂载，任一工具缺失都报告角色不可用。
 
 包裹路由只取 `agentProvider` / `agentModel`，按需组合；都留空时完全不设 `agentOptions`，继承父代理。
-工具权限只允许本角色专属 CLI 工具；执行器保证每次工具调用只启动一次，不自行重试，且确定性前置角色规则。
+CLI 出站权限在 `allowNestedDispatch: false` 时只允许本角色专属 CLI 工具；为 true 时另允许已挂载的受控委派工具。
+任何情况下都不开放其他角色的底层 CLI 执行工具。内置角色保留已挂载的普通工具，按同一开关加入受控委派工具，
+排除全部底层 CLI 执行工具与非受控派发入口；只读 deny 同样按已挂载清单生成。工具名使用精确清单，不使用通配符。
+执行器保证每次工具调用只启动一次，不自行重试，且在 stdin / promptFile 模式确定性前置角色规则；argv 模式保持任务参数原值。
 persona 要求模型原样转交、只调用一次、不自行实施或轮询、失败或取消后不自动重试、简洁汇报；
 这些是模型行为要求，不是对跨工具调用次数或转交/汇报完整性的机制保证。CLI 输出属于任务数据，不能改变工具或权限约束。`enableRunInBackground` 与 `modelSelectionSettings`
-显式为 false；`backgroundMode` 为 one-shot；数字深度为不嵌套时 1、允许嵌套时 `1 + maxDepth`。
+显式为 false；`backgroundMode` 为 one-shot。插件 `maxDepth` 是第一层之外的额外层数：
+`0` 允许绝对深度 1，`1` 允许深度 1–2，`3` 允许深度 1–4。所有目标入站统一使用 `1 + maxDepth`，
+与目标是否为叶子无关；叶子性由出站权限表达。
+
+**派发约束与边界（D21）：** preset 的通用 `tool-subagent` / `tool-subagent-fork` / `tool-subagent-codex` /
+`tool-subagent-claude-code` / `tool-ralph` 均为 `disabled: true`；除本插件角色工具外，仍启用的派发类工具是
+`tool-workflow`。`src/roles.js` 的 `UNCONTROLLED_DISPATCH_TOOLS` 从所有角色 allow 中剔除 `workflow` 等入口。
+主代理自身没有本插件设置的 `toolFilter`，按 preset 声明仍可看到 `workflow`；本插件只约束它派出的子代理，
+不能表述为完全杜绝绕过。既有只读取证称工具名为 `workflow`、底层直接调用 `subagents.start(...)` 且不传 `maxDepth`，
+以及 `send_message` / `interrupt_agent` / `list_agents` 不创建子代理；本轮这些模块未安装、安装归档被沙箱拒读，
+未独立复核这两项源码结论。已安装 `dsh-subagent` 的 `start` 不回落服务默认深度，直接传递请求给 provider；
+因此直接调用而省略 `maxDepth` 的路径不能依靠服务默认预算。`workflow` 保守地保持排除，真实行为仍需现场复核。
+
+**离线覆盖边界：** `scripts/check-apply.mjs` 是契约模拟，即使真实 Config 与工具插件执行，
+`subagents.start` 仍是记录请求的桩，不创建 child。请求中的 allow / persona / maxDepth 有断言，
+真实 spawn 的上下文隔离、preset 工具继承及 child 工具过滤执行没有集成覆盖，需真机验证（D21）。
 
 专属工具 `execute` 安全访问 `exec.agent.session.header.origin`，仅接受 subagent 来源；主代理虽然能看到
 preset 工具，直接调用仍被拒绝。命令、模板、cwd、readOnly、外部 model / effort、限额与角色 instructions

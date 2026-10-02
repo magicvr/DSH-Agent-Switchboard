@@ -280,6 +280,8 @@ minimal | low | medium | high | xhigh | max
 
 ## D11 · 嵌套派发默认关闭，逐角色放开
 
+> **后续修正：** 本节历史深度落地方式及主代理总深度结论以 [D21](#d21--入站深度预算与出站委派权限分离) 为准；默认关闭的角色开关保留。主代理的非受控入口不由本插件过滤。
+
 > **被取代范围：** CLI provider 的 provider-managed / 提示词派发限制已随 D18 的 spawn 包裹取代；当前数字深度与工具过滤见 architecture.md 第 6 节。本轮 D20 不改深度或权限语义，外部 CLI 自身递归行为仍不由 DSH 机制保证。
 
 **决策：** 新增角色字段 `allowNestedDispatch`，**默认 `false`**。默认情况下角色子代理不得再往下派发子代理，需按角色显式开启。
@@ -594,6 +596,8 @@ subagent 与 subprocess 不强制默认期限。用户用现有会话停止取�
 
 ## D18 · CLI 改为内置 spawn 包裹与角色专属工具（批次 3a）
 
+> **后续修正：** 本节「allow 仅本角色专属工具」已由 [D21](#d21--入站深度预算与出站委派权限分离) 的出站开关规则扩展；角色指令确定性前置限于 stdin / promptFile 模式，argv 保持任务参数原值。
+
 **决策：** CLI 角色的 delegate 改用内置 spawn；子代理调用 `switchboard_cli_run_<角色后缀>`，
 工具等待外部 CLI 结束并返回有界结果，子代理简洁汇报交付物、验证证据、错误与未完成项。
 移除旧 `switchboard-cli-*` provider 实现与注册；保留历史文件名 `provider.js` 承载专属工具定义。
@@ -669,3 +673,44 @@ persona 的原样转交、只调用一次、不重试及简洁汇报属于模型
 模拟丢弃 settled、作用域释放、取消、退出确认失败、终止抛错及提示词删除失败。
 测试 watchdog 仅发现测试挂起，不是产品运行期限；关键断言以生产代码变异与 SHA-256 恢复校验验证。
 不调用真实 codex / grok、不触碰用户 DSH_HOME；面板可见性、延后读取、平台保留策略及受管进程树仍需真机核验。
+
+---
+
+## D21 · 入站深度预算与出站委派权限分离
+
+**决策：** `allowNestedDispatch` 只表达该角色创建的 DSH 子代理能否继续调用受控委派工具，
+不表达该角色能否被调用，也不保证总能继续派发；仍受剩余深度预算及实际挂载清单约束。
+插件级 `maxDepth` 是第一层之外的额外层数，所有目标的入站上限统一为 `1 + maxDepth`，与叶子性无关。
+
+| 插件 maxDepth | 允许的绝对深度 |
+| --- | --- |
+| 0 | 仅 1 |
+| 1 | 1–2 |
+| 3 | 1–4 |
+
+**修正的回归：** 改造前 CLI 角色走 `provider-managed`，不受 DSH 数字入站深度限制。
+改造中一度按目标自身的 `allowNestedDispatch` 计算绝对深度，叶子目标被固定为 1，
+导致深度 ≥1 的父代理无法调用叶子 CLI 角色。现在入站只使用插件预算，叶子性改由出站工具权限表达。
+
+**出站权限：** CLI 角色为 true 时开放「自身专属 CLI 工具 + 已挂载的受控委派工具」，
+为 false 时只有自身专属 CLI 工具；任何情况下都不开放其他角色的底层 CLI 执行工具。
+内置角色按同一开关控制受控委派工具，保留普通工具并排除底层 CLI 执行器及非受控派发入口。
+工具名只取已挂载清单，不使用通配符；派发时刷新清单，失败或卸载的工具不能凭配置名进入权限。
+
+**非受控派发边界：** 本轮复核 preset 的五个通用入口 `tool-subagent` / `tool-subagent-fork` /
+`tool-subagent-codex` / `tool-subagent-claude-code` / `tool-ralph` 均为 `disabled: true`；
+除角色工具外，仍启用 `tool-workflow`。所有角色 allow 都由 `UNCONTROLLED_DISPATCH_TOOLS` 排除 `workflow` 等入口。
+主代理自身没有本插件设置的 `toolFilter`，按 preset 声明仍可看到 `workflow`；本插件只约束所派子代理，
+不保证主代理完全无法绕过。既有只读取证称 `workflow` 工具直接经 `subagents.start(...)` 派发且不传 `maxDepth`，
+控制工具 `send_message` / `interrupt_agent` / `list_agents` 不创建子代理；本轮对应模块不可解析，
+安装归档被沙箱拒读，以上源码结论未独立复核，不作为新增实测事实。
+已安装的 `dsh-subagent/lib/index.js` 中 `start` 只验证并转交请求的 `maxDepth`，不调用 `resolveMaxDepth` 回落默认预算；
+故省略该值的直接调用路径不能依靠服务默认深度约束。保留 workflow 排除，并列入真机复核。
+
+**验证边界与缺口：** argv 样本新增非空角色指令哨兵，验证任务参数原值、哨兵不入 argv、stdin 为 ignore；
+保留 stdin / promptFile 的角色规则精确前置断言，避免空指令样本造成覆盖假象。
+`check-apply` 使用真实 Config / 工具插件但假 ctx、假 `subagents.start`，属于契约模拟，不是真实 spawn 集成。
+本轮可导入 `dsh-subagent`，但真实 `dsh-subagent-spawn-in-process` 与 `dsh-agent-preset-registry` 均
+`ERR_MODULE_NOT_FOUND`；只装服务不能创建子代理。在不引入依赖的范围内不搭伪集成。
+尚需真机验证真实 spawn 上下文隔离、preset 工具继承、child 实际工具过滤，以及不同父深度下
+叶子可被调用、组织角色受剩余预算拒绝、子代理不可调用 workflow 或其他角色底层 CLI 工具。
