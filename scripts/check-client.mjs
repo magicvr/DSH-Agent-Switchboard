@@ -586,8 +586,11 @@ section('统一包裹小节：真实控件、读取与原子写入');
   }
   const select = all.find(n => n.type === 'select');
   const { EFFORT_VALUES } = await import('../src/roles.js');
-  check('统一思考强度下拉含空继承项与全部 EFFORT_VALUES', select?.props.value === 'high' &&
-    JSON.stringify(select.children.flat().map(n => n.props.value)) === JSON.stringify(['', ...EFFORT_VALUES]));
+  check('统一思考强度下拉含空不指定项与全部 EFFORT_VALUES', select?.props.value === 'high' &&
+    JSON.stringify(select.children.flat().map(n => n.props.value)) === JSON.stringify(['', ...EFFORT_VALUES]) &&
+    select.children.flat()[0]?.children.includes('留空：不指定强度'));
+  check('强度帮助说明限定最终同路由与父未指定时的默认处理',
+    all.some(n => n.type === 'span' && n.children.includes('留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。')));
   select?.props.onChange({ target: { value: '' } });
   check('强度可清空且不修改其他字段', JSON.stringify(writes.at(-1)) === JSON.stringify({ ...wrapper, wrapperEffort: '' }));
   const calls = [];

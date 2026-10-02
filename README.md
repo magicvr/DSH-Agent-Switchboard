@@ -55,7 +55,7 @@ Jobs 不可用时 CLI 照常执行，结果标注回流不可用。CLI 没有运
 
 ### 3. 配置（Plugin Panel）
 
-内置 `spawn` / `fork` 显示角色级 **Provider** 文本输入，留空使用插件默认 provider；CLI 模式仍隐藏该角色输入。角色列表前始终显示「包裹子代理」小节，插件级统一配置 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`，仅用于外部 CLI 角色的内置 spawn 转交代理，分别留空继承父代理路由、模型、强度。包裹模型与外部 CLI 的角色 `model` 分开标注；内置角色仍使用自身的 provider / model / effort。根设置经既有角色文件同步给 preset，文件已保存的统一设置优先于 preset 自身设置（包含空值）；旧角色 `agentProvider` / `agentModel` 可加载但已忽略，并给弃用诊断。所有后端都有必填的多行「角色指令」输入，描述不会代填指令。本轮已通过离线检查，仍待重启 DSH 后真机验收。
+内置 `spawn` / `fork` 显示角色级 **Provider** 文本输入，留空使用插件默认 provider；CLI 模式仍隐藏该角色输入。角色列表前始终显示「包裹子代理」小节，插件级统一配置 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`，仅用于外部 CLI 角色的内置 spawn 转交代理。Provider / 模型留空遵循宿主的路由继承规则；思考强度的空选项为「留空：不指定强度」。留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。「父代理当前强度」指最近一次请求配置；尚无请求时取创建配置。包裹模型与外部 CLI 的角色 `model` 分开标注；内置角色仍使用自身的 provider / model / effort。根设置经既有角色文件同步给 preset，文件已保存的统一设置优先于 preset 自身设置（包含空值）；旧角色 `agentProvider` / `agentModel` 可加载但已忽略，并给弃用诊断。所有后端都有必填的多行「角色指令」输入，描述不会代填指令。本轮已通过离线检查，仍待重启 DSH 后真机验收。
 
 角色配置文件为 **`$DSH_HOME/agent-switchboard/roles.json`**，供选中 Switchboard preset 的会话读取。
 设置面板读 `configForms` 镜像、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，

@@ -249,8 +249,11 @@ function check(label, condition) {
 }
 for (const key of ['wrapperProvider', 'wrapperModel', 'wrapperEffort']) {
   const node = deref(volDict[key]);
-  check(`volatile.${key} 为可选字符串并说明继承语义`,
-    node?.type === 'string' && !node.meta?.required && /留空继承父代理/.test(node.meta?.description ?? ''));
+  check(`volatile.${key} 为可选字符串并说明空值语义`,
+    node?.type === 'string' && !node.meta?.required && (key === 'wrapperEffort'
+      ? node.meta?.description.includes('留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。') &&
+        node.meta.description.includes('仅对 CLI 角色生效') && !node.meta.description.includes('留空继承父代理强度')
+      : /留空继承父代理/.test(node.meta?.description ?? '')));
   const resolved = mod.Config({ volatile: { [key]: '' } });
   check(`${key} 接受空字符串且不生成路由默认值`, mod.readVolatile(resolved)[key] === '' &&
     mod.readVolatile(mod.Config({}))[key] === undefined);

@@ -337,7 +337,7 @@ export const Config = z.object({
       //    看不见的全局开关更容易理解和审计。
       wrapperProvider: z.string().description('统一包裹外部 CLI 角色的 LLM route；留空继承父代理路由，仅对 CLI 角色生效'),
       wrapperModel: z.string().description('统一包裹外部 CLI 角色的模型（非外部 CLI 模型）；留空继承父代理模型，仅对 CLI 角色生效'),
-      wrapperEffort: z.string().description(`统一包裹外部 CLI 角色的思考强度；留空继承父代理强度，可选 ${EFFORT_VALUES.join(' / ')}，仅对 CLI 角色生效`),
+      wrapperEffort: z.string().description(`统一包裹外部 CLI 角色的思考强度；留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。可选 ${EFFORT_VALUES.join(' / ')}，仅对 CLI 角色生效`),
     })
     .default({})
     .volatile(),

@@ -182,7 +182,7 @@ reasoning effort: ...
 完整形态，并独立核对 `readOnly` 与沙箱参数。切换只读会原子更新预设参数。
 旧 `custom` 是历史配置：仅完整匹配模板或本机解析后形态时无损识别；否则保留原数据，
 在自检「未挂载的角色」及主代理指引中显示待迁移、禁止派发，其他有效角色仍可挂载。
-CLI 包裹路由统一使用插件级 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`（D22），仅应用到外部 CLI 角色的内置 spawn 转交代理，不改变外部 CLI 的角色 `model` / `effort`。旧角色 `agentProvider` / `agentModel` 兼容加载但已忽略，并给弃用诊断。
+CLI 包裹路由当前见 [D22](./decisions.md#d22--cli-包裹路由改为插件级统一设置)：统一使用插件级 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`，仅应用到外部 CLI 角色的内置 spawn 转交代理，不改变外部 CLI 的角色 `model` / `effort`。每角色 `agentProvider` / `agentModel` 属于历史方案，兼容加载但已忽略，并给弃用诊断；不能再作为现行包裹路由配置指引。
 命令控件已隐藏，完整配置仍参与挂载前一致性校验。
 
 > ⚠️ **曾经**还需要第二步「打开总开关 `volatile.allowCrossCli: true`」，**该开关已移除**。

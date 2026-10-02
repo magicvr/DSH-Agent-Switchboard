@@ -366,7 +366,13 @@ provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliT
 文件缺失且仅有包裹设置时只记等待角色写入，不新建 `roles: []` 文件；后续角色写入时一并同步根包裹设置。
 包裹同步失败进入当前配置错误诊断并去重，相同失败不重复打印日志，失败内容变化时打印；恢复同步即清除旧错误。
 仅 CLI 角色把非空 provider / model / effort 映射为 agentOptions.provider / model / reasoningEffort；
-三者全空完全不设 `agentOptions`，继承父代理。强度必须属于 `EFFORT_VALUES`，非法值阻止挂载；文件读取路径同样校验。
+三者全空完全不设 `agentOptions`，空白字段直接省略，遵循宿主的路由继承规则，不保证无条件继承父强度。
+留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。
+「父代理当前强度」指最近一次请求配置；尚无请求时取创建配置。已有请求配置但无 effort 时，不恢复创建时的 effort。
+`resolveChildAgentOptions` 精确比较 provider / model 标识；显式填写与父相同的两项不算切换，仅改其中一项也算切换，别名不会按指向的模型等价处理。
+`dsh-tool-subagent` 预检采用同一原则，但在有 `subagentProvider.agentRouteDefaults` 时合入该默认路由并关闭预检的父强度继承；本机内置 spawn 是否声明该属性未核实。
+模型默认设置是默认处理，不保证非空强度：LLM 层用 `requested ?? reasoning.defaultEffort`，模型没有默认强度时可继续不指定；显式指定目标不支持的强度会报错。
+强度必须属于 `EFFORT_VALUES`，非法值阻止挂载；文件读取路径同样校验。
 内置 spawn / fork 保持角色自身 provider / model / effort，角色级 Provider 控件仍只对内置后端显示。
 面板顶部统一小节始终显示并说明仅 CLI 生效；保存时以同一 revision 原子提交 `['roles']` 与三条 `['volatile', 'wrapper…']` 操作。
 旧角色 agentProvider / agentModel 接受残留但不再使用；每激活实例记录弃用诊断，每次模块加载只打印一次告警。

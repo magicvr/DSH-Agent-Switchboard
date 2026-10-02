@@ -323,7 +323,7 @@ export function toolConfigFor(role, options) {
   };
 
   if (isCli) {
-    // 统一包裹路由与外部 CLI 的角色模型/强度无关；空白继承父代理。
+    // 统一包裹路由与外部 CLI 的角色模型/强度无关；空白字段省略，遵循宿主路由继承规则。
     const route = options.wrapperRoute ?? {};
     const agentOptions = {};
     for (const [key, target] of [['provider', 'provider'], ['model', 'model'], ['effort', 'reasoningEffort']]) {

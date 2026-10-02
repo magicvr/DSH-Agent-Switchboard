@@ -18,6 +18,8 @@ import {
   toolDescriptionFor,
 } from '../src/roles.js';
 import { cliFieldsFor } from '../src/cli/drivers.js';
+import { isDeepStrictEqual } from 'node:util';
+import { resolveChildAgentOptions } from '@deepseek-ai/dsh-subagent';
 
 let pass = 0;
 let fail = 0;
@@ -451,6 +453,48 @@ section('CLI 后端角色');
     check(`${backend} 的 agentOptions 不受统一包裹路由影响`,
       JSON.stringify(toolConfigFor(role, { maxDepth: 3, wrapperRoute: { provider: 'other', model: 'other', effort: 'high' } }).agentOptions)
       === JSON.stringify({ provider: 'p', model: 'm', reasoningEffort: 'medium' }));
+  }
+}
+
+section('包裹强度：生产 toolConfigFor → 真实 resolveChildAgentOptions');
+{
+  const { role } = normalizeRole({
+    id: 'wrapper-effort', backend: 'cli', description: 'd', instructions: 'i',
+    model: 'cli-model', effort: 'xhigh', readOnly: true,
+    cliDriver: 'grok', ...cliFieldsFor('grok', true), cliCwd: 'C:/w',
+  }, 0);
+  // 仅构造解析器所读的父 options / requestHeader；不创建会话、不调用 CLI 或 LLM。
+  const parent = {
+    options: { provider: 'created', model: 'created-model', reasoningEffort: 'low' },
+    session: { requestHeader: () => ({ config: { provider: 'p', model: 'm1', reasoningEffort: 'high' } }) },
+  };
+  const empty = { provider: '', model: '', effort: '' };
+  const cases = [
+    ['三项全空沿用父最新 p/m1/high', parent, empty,
+      { provider: 'p', model: 'm1', reasoningEffort: 'high' }],
+    ['显式相同 p/m1 且 effort 空保留 high', parent, { ...empty, provider: 'p', model: 'm1' },
+      { provider: 'p', model: 'm1', reasoningEffort: 'high' }],
+    ['仅改 model=m2 删除父 reasoningEffort', parent, { ...empty, model: 'm2' },
+      { provider: 'p', model: 'm2' }],
+    ['仅改 provider=q 删除父 reasoningEffort', parent, { ...empty, provider: 'q' },
+      { provider: 'q', model: 'm1' }],
+    ['显式 p/m2/low 使用 low', parent, { provider: 'p', model: 'm2', effort: 'low' },
+      { provider: 'p', model: 'm2', reasoningEffort: 'low' }],
+    ['父最新请求无 effort 不恢复创建 high', {
+      options: { provider: 'p', model: 'm1', reasoningEffort: 'high' },
+      session: { requestHeader: () => ({ config: { provider: 'p', model: 'm1' } }) },
+    }, empty, { provider: 'p', model: 'm1' }],
+    ['尚无请求时回落创建 p/m1/high', {
+      options: { provider: 'p', model: 'm1', reasoningEffort: 'high' },
+      session: { requestHeader: () => undefined },
+    }, empty, { provider: 'p', model: 'm1', reasoningEffort: 'high' }],
+    ['不同模型标识不按别名等价处理', parent, { ...empty, model: 'm1-alias' },
+      { provider: 'p', model: 'm1-alias' }],
+  ];
+  for (const [label, callingParent, wrapperRoute, expected] of cases) {
+    const config = toolConfigFor(role, { maxDepth: 3, wrapperRoute });
+    const resolved = resolveChildAgentOptions(callingParent, config.agentOptions, 1);
+    check(label, isDeepStrictEqual(resolved, { ...expected, subagentDepth: 1 }), JSON.stringify(resolved));
   }
 }
 

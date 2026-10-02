@@ -834,8 +834,9 @@ window.__ModuleLoader__.load({
         field('思考强度', h('select', {
           value: wrapper.wrapperEffort ?? '', disabled, style: selectStyle(),
           onChange: (e) => onChange({ ...wrapper, wrapperEffort: e.target.value }),
-        }, h('option', { value: '' }, '留空继承父代理强度'),
+        }, h('option', { value: '' }, '留空：不指定强度'),
         EFFORTS.map((effort) => h('option', { key: effort, value: effort }, effort)))),
+        h('span', null, '留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。'),
       );
     }
 
