@@ -264,14 +264,14 @@ section('Host 预设一致性与旧配置逐角色阻塞');
       inferCliDriver({ ...raw, cliArgs: ['--different'] }) === undefined);
     const plain = normalizeRoles([raw]).roles[0];
     const wrapper = normalizeRoles([{ ...raw, agentProvider: 'wrapper-route', agentModel: 'wrapper-model' }]).roles[0];
-    check(`${driver}：包裹路由可选，留空不设置`,
-      plain.agentProvider === undefined && plain.agentModel === undefined);
-    check(`${driver}：包裹路由保存但不影响 CLI 执行字段`,
-      wrapper.agentProvider === 'wrapper-route' && wrapper.agentModel === 'wrapper-model' &&
+    check(`${driver}：规范化结果不含角色包裹字段`,
+      !('agentProvider' in plain) && !('agentModel' in plain));
+    check(`${driver}：残留包裹路由忽略且不影响 CLI 执行字段`,
+      !('agentProvider' in wrapper) && !('agentModel' in wrapper) &&
       wrapper.model === raw.model && JSON.stringify(wrapper.cli) === JSON.stringify(plain.cli));
     const empty = normalizeRoles([{ ...raw, agentProvider: ' ', agentModel: '' }]).roles[0];
-    check(`${driver}：空包裹路由继承且不填入执行字段`,
-      empty.agentProvider === undefined && empty.agentModel === undefined &&
+    check(`${driver}：残留空包裹路由不填入规范化或执行字段`,
+      !('agentProvider' in empty) && !('agentModel' in empty) &&
       JSON.stringify(empty.cli) === JSON.stringify(plain.cli));
   }
   const unknown = { ...mk('unknown', 'codex'), cliDriver: 'custom', cliCommand: 'arbitrary-cli' };

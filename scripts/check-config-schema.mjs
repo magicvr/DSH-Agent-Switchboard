@@ -208,8 +208,6 @@ const expectedRoleFields = [
   'title',
   'description',
   'provider',
-  'agentProvider',
-  'agentModel',
   'model',
   'effort',
   'instructions',
@@ -237,13 +235,25 @@ for (const want of expectedRoleFields) {
 }
 
 for (const key of ['agentProvider', 'agentModel']) {
-  const node = deref(roleFields[key]);
-  if (node?.type === 'string' && !node.meta?.required && /继承父代理/.test(node.meta?.description ?? '')) {
-    console.log(`PASS  ${key} 为可选字符串，留空继承父代理路由`);
+  if (!Object.hasOwn(roleFields, key)) {
+    console.log(`PASS  roles[] 不再声明 ${key}`);
   } else {
-    console.error(`FAIL  ${key} 必须是带继承说明的可选字符串`);
+    console.error(`FAIL  roles[] 仍声明 ${key}`);
     process.exitCode = 1;
   }
+}
+
+function check(label, condition) {
+  console[condition ? 'log' : 'error'](`${condition ? 'PASS' : 'FAIL'}  ${label}`);
+  if (!condition) process.exitCode = 1;
+}
+for (const key of ['wrapperProvider', 'wrapperModel', 'wrapperEffort']) {
+  const node = deref(volDict[key]);
+  check(`volatile.${key} 为可选字符串并说明继承语义`,
+    node?.type === 'string' && !node.meta?.required && /留空继承父代理/.test(node.meta?.description ?? ''));
+  const resolved = mod.Config({ volatile: { [key]: '' } });
+  check(`${key} 接受空字符串且不生成路由默认值`, mod.readVolatile(resolved)[key] === '' &&
+    mod.readVolatile(mod.Config({}))[key] === undefined);
 }
 
 // effort / backend 必须带取值约束，否则用户能配出运行时才失败的值

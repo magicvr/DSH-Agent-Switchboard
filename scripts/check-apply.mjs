@@ -1046,6 +1046,151 @@ section('隔离 DSH_HOME：残留运行期限不影响配置加载或健康状�
   check('残留旧字段不造成配置错误', results.length === 3 && results.every(r => r.configErrors === '' && r.fatal === ''));
 }
 
+section('统一包裹路由：根配置桥接、preset 优先级、清空与非法强度');
+{
+  const { cliFieldsFor } = await import('../src/cli/drivers.js');
+  const role = { id: 'cli-route', description: 'd', instructions: 'i', backend: 'cli',
+    model: 'external', effort: 'low', cliCwd: 'C:/w', cliDriver: 'codex', ...cliFieldsFor('codex', false) };
+  const path = configPathFor(fixtureHome);
+  writeConfigFile(path, initialConfig([role], { provider: 'self', volatile: { cliTimeoutSec: 'legacy' } }));
+  const rootRoute = { wrapperProvider: ' root-route ', wrapperModel: 'root-model', wrapperEffort: 'high' };
+  apply(makeCtx(), Config({ volatile: rootRoute }));
+  let file = JSON.parse(readFileSync(path, 'utf8'));
+  check('根实例无 roles 也同步统一三字段，并保留现有角色与兼容字段',
+    file.roles[0].id === role.id && file.volatile.wrapperProvider === 'root-route' &&
+    file.volatile.wrapperModel === 'root-model' && file.volatile.wrapperEffort === 'high' && file.volatile.cliTimeoutSec === 'legacy');
+  const mount = async (config) => {
+    const ctx = makeCtx();
+    const configs = [];
+    const plugin = ctx.plugin;
+    ctx.plugin = function (module, cfg) { configs.push(cfg); return plugin.call(this, module, cfg); };
+    apply(ctx, Config({ mount: true, provider: 'self', ...config }));
+    await import('@deepseek-ai/dsh-tool-subagent');
+    await new Promise(setImmediate);
+    return { configs, result: await ctx.tools.get('switchboard_selftest').execute({}), ctx };
+  };
+  const scoped = { ...role, id: 'preset-role', model: 'preset-external' };
+  let outcome = await mount({ roles: [scoped], volatile: { wrapperProvider: 'preset-route', wrapperModel: 'preset-model', wrapperEffort: 'low' } });
+  check('preset 角色优先，但统一包裹路由取根文件而非 preset', outcome.configs.length === 1 &&
+    outcome.configs[0].toolName === 'delegate_to_preset_role' &&
+    JSON.stringify(outcome.configs[0].agentOptions) === JSON.stringify({ provider: 'root-route', model: 'root-model', reasoningEffort: 'high' }));
+  apply(makeCtx(), Config({ provider: 'self', roles: [role] }));
+  file = JSON.parse(readFileSync(path, 'utf8'));
+  check('根清空统一路由后文件保存三个空值，避免回落旧 preset',
+    ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile[key] === ''));
+  outcome = await mount({ volatile: { wrapperProvider: 'preset-route' } });
+  check('根三个空值优先：CLI 不设置 agentOptions', outcome.configs.length === 1 && !('agentOptions' in outcome.configs[0]));
+  writeConfigFile(path, initialConfig([role], { provider: 'self' }));
+  outcome = await mount({ volatile: { wrapperModel: 'fallback-model' } });
+  check('文件尚无统一路由时回落当前实例，仅设置非空模型',
+    JSON.stringify(outcome.configs[0]?.agentOptions) === JSON.stringify({ model: 'fallback-model' }));
+  for (const effort of ['', ' ', 'low', 'medium', 'high', 'xhigh', 'max']) {
+    outcome = await mount({ volatile: { wrapperEffort: effort } });
+    check(`统一强度 ${JSON.stringify(effort)} 合法且能挂载`, outcome.configs.length === 1 && outcome.result.ok);
+  }
+  const before = readFileSync(path, 'utf8');
+  const invalidRoot = makeCtx();
+  apply(invalidRoot, Config({ volatile: { wrapperEffort: 'invalid' } }));
+  const rootHealth = await invalidRoot.tools.get('switchboard_selftest').execute({});
+  check('根非法 wrapperEffort 明确报错且不写文件', !rootHealth.ok && /wrapperEffort.*非法/.test(rootHealth.configErrors) && readFileSync(path, 'utf8') === before);
+  outcome = await mount({ volatile: { wrapperEffort: 'invalid' } });
+  check('preset 非法 wrapperEffort 阻止全部角色与 CLI 工具挂载', outcome.configs.length === 0 &&
+    !outcome.ctx.registered.some(name => name.startsWith('switchboard_cli_run_')) && /wrapperEffort.*非法/.test(outcome.result.configErrors));
+  writeConfigFile(path, initialConfig([role], { volatile: { wrapperEffort: 'invalid' } }));
+  outcome = await mount({});
+  check('桥接文件非法 wrapperEffort 也阻止挂载', outcome.configs.length === 0 && /wrapperEffort.*非法/.test(outcome.result.configErrors));
+  writeConfigFile(path, initialConfig([role], { volatile: { wrapperEffort: 123 } }));
+  outcome = await mount({});
+  check('桥接文件非字符串 wrapperEffort 明确报错并阻止挂载',
+    outcome.configs.length === 0 && outcome.result.configErrors.includes('wrapperEffort 必须是字符串'));
+  rmSync(path);
+  apply(makeCtx(), Config({ volatile: { wrapperProvider: 'only-route' } }));
+  file = JSON.parse(readFileSync(path, 'utf8'));
+  check('首次仅保存包裹设置也创建合法配置文件，空角色可保留设置',
+    Array.isArray(file.roles) && file.roles.length === 0 && typeof file.formatVersion === 'number' &&
+    file.volatile.wrapperProvider === 'only-route');
+}
+
+section('真实 Cordis 更新瀑布：volatile 不重挂载时仍同步根包裹路由');
+{
+  const path = configPathFor(fixtureHome);
+  writeConfigFile(path, initialConfig([fixtureRole], { provider: 'self' }));
+  const root = new Context();
+  let applies = 0;
+  let continued = 0;
+  let ctx;
+  const fiber = root.plugin({
+    Config,
+    apply(actual, config) {
+      applies++;
+      ctx = makeCtx();
+      ctx.on = actual.on.bind(actual);
+      apply(ctx, config);
+      // 模拟 Loader 的 volatile 就地更新：下游不调用 next，不重新 apply。
+      actual.on('internal/update', () => { continued++; });
+    },
+  }, { provider: 'self', volatile: { wrapperModel: 'initial' } });
+  try {
+    await fiber.await();
+    fiber.update({ provider: 'self', volatile: { wrapperModel: 'live-model', wrapperEffort: 'high' } });
+    await new Promise(setImmediate);
+    let file = JSON.parse(readFileSync(path, 'utf8'));
+    check('真实 update 钩子同步新模型/强度并继续瀑布，不依赖重挂载', applies === 1 && continued === 1 &&
+      file.volatile.wrapperModel === 'live-model' && file.volatile.wrapperEffort === 'high');
+    fiber.update({ provider: 'self', volatile: {} });
+    await new Promise(setImmediate);
+    file = JSON.parse(readFileSync(path, 'utf8'));
+    check('真实 update 清空统一路由，仍不重挂载', applies === 1 && continued === 2 &&
+      ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile[key] === ''));
+    const before = readFileSync(path, 'utf8');
+    fiber.update({ provider: 'self', volatile: { wrapperEffort: 'invalid' } });
+    await new Promise(setImmediate);
+    const health = await ctx.tools.get('switchboard_selftest').execute({});
+    check('就地更新非法强度进入诊断且不覆盖有效文件', !health.ok && /wrapperEffort.*非法/.test(health.configErrors) &&
+      readFileSync(path, 'utf8') === before && continued === 3);
+    fiber.update({ provider: 'self', volatile: { wrapperEffort: 'low' } });
+    await new Promise(setImmediate);
+    const recovered = await ctx.tools.get('switchboard_selftest').execute({});
+    check('就地修正强度后清除本次路由错误并恢复同步', recovered.ok &&
+      JSON.parse(readFileSync(path, 'utf8')).volatile.wrapperEffort === 'low');
+  } finally { await fiber.dispose(); }
+}
+
+section('残留角色包裹路由：兼容加载与模块级一次性诊断');
+{
+  const legacyRole = { ...fixtureRole, agentProvider: { obsolete: true }, agentModel: 123 };
+  const legacy = initialConfig([legacyRole], { provider: 'self' });
+  const path = configPathFor(fixtureHome);
+  writeConfigFile(path, legacy);
+  const before = readFileSync(path, 'utf8');
+  const loaded = Config['~standard'].validate({ provider: 'self', roles: [legacyRole] });
+  check('Config standard-schema 接受任意类型的残留 agentProvider/agentModel', !loaded.issues && loaded.value !== undefined);
+  const logs = [];
+  const originalError = console.error;
+  const results = [];
+  console.error = (...args) => logs.push(args.join(' '));
+  try {
+    for (const config of [{}, { mount: true, roles: [legacyRole] }, { mount: true }]) {
+      const ctx = makeCtx();
+      apply(ctx, Config({ provider: 'self', ...config }));
+      await import('@deepseek-ai/dsh-tool-subagent');
+      await new Promise(setImmediate);
+      results.push(await ctx.tools.get('switchboard_selftest').execute({}));
+    }
+  } finally { console.error = originalError; }
+  check('根、preset 与仅文件残留均健康且自检含弃用诊断', results.length === 3 && results.every(r =>
+    r.ok && r.roleConfigStatus.includes('角色 agentProvider / agentModel 已废弃并忽略')));
+  check('角色包裹字段弃用日志每次模块加载只打印一次',
+    logs.filter(line => line.includes('角色 agentProvider / agentModel 已废弃并忽略')).length === 1);
+  check('残留角色字段加载不改写原文件', readFileSync(path, 'utf8') === before);
+  writeConfigFile(path, { ...legacy, volatile: { cliTimeoutSec: 'legacy' } });
+  const ctx = makeCtx();
+  apply(ctx, Config({ provider: 'self' }));
+  const combined = await ctx.tools.get('switchboard_selftest').execute({});
+  check('两种旧配置同时残留时弃用诊断互不覆盖', combined.roleConfigStatus.includes('cliTimeoutSec 已废弃并忽略') &&
+    combined.roleConfigStatus.includes('角色 agentProvider / agentModel 已废弃并忽略'));
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 } finally {
   if (previousDshHome === undefined) delete process.env.DSH_HOME;

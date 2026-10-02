@@ -315,6 +315,8 @@ window.__ModuleLoader__.load({
         return {
           ok: true,
           roles,
+          wrapper: Object.fromEntries(['wrapperProvider', 'wrapperModel', 'wrapperEffort']
+            .map((key) => [key, row.value?.volatile?.[key] ?? ''])),
           revision: row.revision,
           writable: row.writable,
           missing: roles.length === 0,
@@ -418,7 +420,7 @@ window.__ModuleLoader__.load({
      * @param {number|undefined} revision - 读取时拿到的 revision，用于并发保护。
      * @returns {Promise<{ok: boolean, message: string}>} 结果。
      */
-    async function saveRoles(ctx, roles, revision) {
+    async function saveRoles(ctx, roles, revision, wrapper) {
       const { channel, tried } = writeChannel(ctx, CONFIG_NS);
       if (channel === undefined) {
         return {
@@ -431,7 +433,9 @@ window.__ModuleLoader__.load({
       try {
         const response = await channel.mutate(
           CONFIG_NS,
-          [{ op: 'set', path: ['roles'], value: roles }],
+          [{ op: 'set', path: ['roles'], value: roles },
+            ...(wrapper === undefined ? [] : ['wrapperProvider', 'wrapperModel', 'wrapperEffort']
+              .map((key) => ({ op: 'set', path: ['volatile', key], value: (wrapper[key] ?? '').trim() })))],
           revision,
         );
         if (response && response.ok === false) {
@@ -472,7 +476,7 @@ window.__ModuleLoader__.load({
         /** 读角色。 */
         read: () => fetchRoles(ctx),
         /** 写角色；`revision` 来自上一次读。 */
-        write: (roles, revision) => saveRoles(ctx, roles, revision),
+        write: (roles, revision, wrapper) => saveRoles(ctx, roles, revision, wrapper),
       };
     }
 
@@ -554,6 +558,15 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /** 带标签的字段容器；角色与统一包裹设置共用。 */
+    const field = (label, control) =>
+      h(
+        'label',
+        { style: { display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '11px' } },
+        h('span', { style: { color: 'var(--dsw-alias-label-secondary)' } }, label),
+        control,
+      );
+
     /**
      * 一个角色编辑行。
      *
@@ -592,15 +605,6 @@ window.__ModuleLoader__.load({
        * @param {object} patch - 要合并进本行的字段。
        */
       const setMany = (patch) => onChange(index, { ...role, ...patch });
-
-      /** 带标签的字段容器。 */
-      const field = (label, control) =>
-        h(
-          'label',
-          { style: { display: 'flex', flexDirection: 'column', gap: '2px', fontSize: '11px' } },
-          h('span', { style: { color: 'var(--dsw-alias-label-secondary)' } }, label),
-          control,
-        );
 
       /** 统一样式的文本输入。 */
       const text = (key, placeholder, trim = false) =>
@@ -805,8 +809,6 @@ window.__ModuleLoader__.load({
                 { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
                 driverHint,
               ),
-              field('包裹会话 Provider（LLM route）', text('agentProvider', '留空继承父代理路由', true)),
-              field('包裹会话模型（非外部 CLI 模型）', text('agentModel', '留空继承父代理模型', true)),
               h(
                 'span',
                 { style: { fontSize: '10px', color: 'var(--dsw-alias-label-secondary)' } },
@@ -814,6 +816,26 @@ window.__ModuleLoader__.load({
               ),
             )
           : null,
+      );
+    }
+
+    /** 插件级统一路由始终可见，仅影响外部 CLI 的转交代理。 */
+    function WrapperSettings({ wrapper, onChange, disabled }) {
+      const control = (key, placeholder) => h('input', {
+        type: 'text', value: wrapper[key] ?? '', placeholder, disabled,
+        onChange: (e) => onChange({ ...wrapper, [key]: e.target.value }),
+        style: inputStyle(),
+      });
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+        h('h4', { style: { margin: 0 } }, '包裹子代理（外部 CLI 角色的转交代理）'),
+        h('span', null, '仅对 CLI 角色生效；内置角色仍使用各自的 Provider、模型和思考强度。'),
+        field('Provider（LLM route）', control('wrapperProvider', '留空继承父代理路由')),
+        field('模型（非外部 CLI 模型）', control('wrapperModel', '留空继承父代理模型')),
+        field('思考强度', h('select', {
+          value: wrapper.wrapperEffort ?? '', disabled, style: selectStyle(),
+          onChange: (e) => onChange({ ...wrapper, wrapperEffort: e.target.value }),
+        }, h('option', { value: '' }, '留空继承父代理强度'),
+        EFFORTS.map((effort) => h('option', { key: effort, value: effort }, effort)))),
       );
     }
 
@@ -837,6 +859,7 @@ window.__ModuleLoader__.load({
       //    会拿不到远程命名空间（实测：读得到 configForms、写不到 remote.settings）。
       const store = props.store;
       const [draft, setDraft] = useState(null);
+      const [wrapper, setWrapper] = useState({});
       const [status, setStatus] = useState('loading');
       const [notice, setNotice] = useState(null);
       const [busy, setBusy] = useState(false);
@@ -861,7 +884,8 @@ window.__ModuleLoader__.load({
             return;
           }
           setDraft(cloneRoles(result.roles));
-          savedRef.current = JSON.stringify(result.roles);
+          setWrapper(result.wrapper ?? {});
+          savedRef.current = JSON.stringify({ roles: result.roles, wrapper: result.wrapper ?? {} });
           // revision 用于并发保护：写回时必须带上读取时的那一个。
           setRevision(result.revision);
           setStatus(result.roles.length > 0 ? 'ready' : result.missing === true ? 'missing' : 'empty');
@@ -877,7 +901,7 @@ window.__ModuleLoader__.load({
       }, [store, refresh]);
 
       const roles = draft ?? [];
-      const dirty = draft !== null && JSON.stringify(roles) !== savedRef.current;
+      const dirty = draft !== null && JSON.stringify({ roles, wrapper }) !== savedRef.current;
 
       /** 改某一行。 */
       const changeRole = (index, next) =>
@@ -914,7 +938,9 @@ window.__ModuleLoader__.load({
        *
        * @returns {string|null} 错误信息，或 null 表示通过。
        */
-      const validate = () => validateRoles(roles);
+      const validate = () => validateRoles(roles) ||
+        (wrapper.wrapperEffort?.trim() && !EFFORTS.includes(wrapper.wrapperEffort.trim())
+          ? '包裹子代理思考强度非法' : null);
 
       /** 保存角色列表。 */
       const save = async () => {
@@ -926,10 +952,10 @@ window.__ModuleLoader__.load({
         }
         setBusy(true);
         // 角色是变长数组，整体提交语义明确 —— 不必算易错的逐字段 diff。
-        const result = await store.write(roles, revision);
+        const result = await store.write(roles, revision, wrapper);
         setBusy(false);
         if (result.ok) {
-          savedRef.current = JSON.stringify(roles);
+          savedRef.current = JSON.stringify({ roles, wrapper });
           setNotice({
             kind: 'ok',
             text: `已保存 ${roles.length} 个角色。选中 Switchboard preset 的新会话会使用它们。`,
@@ -1007,6 +1033,8 @@ window.__ModuleLoader__.load({
                 notice.text,
               )
             : null,
+          draft !== null && !status.startsWith('error:')
+            ? h(WrapperSettings, { wrapper, onChange: setWrapper, disabled: busy }) : null,
           children,
           footer,
         );

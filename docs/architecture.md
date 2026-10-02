@@ -352,7 +352,19 @@
 provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliTool`，没有第二条可执行派发路径。
 自检同时查询两个工具，专属工具注册失败会阻止对应 delegate 挂载，任一工具缺失都报告角色不可用。
 
-包裹路由只取 `agentProvider` / `agentModel`，按需组合；都留空时完全不设 `agentOptions`，继承父代理。
+包裹路由取插件级 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`（D22）。
+根实例通过既有 `$DSH_HOME/agent-switchboard/roles.json` 的 `volatile` 同步三字段；不新增服务或文件。
+根实例在 apply 和 Cordis 的 `internal/update` 瀑布中同步路由，更新钩子继续 next，不改变重挂载决策；
+因此 volatile 就地更新时也能让新 preset 实例读到新设置；已挂载的子代理配置仍以挂载时值为准。
+挂载实例优先取文件中已同步的根设置，包含显式空值；文件尚无这三字段时才回落当前实例配置。
+这与角色列表「本作用域非空 roles 优先，否则读文件」的优先级不同：preset 可独立选择角色，不能覆盖已经同步的统一包裹路由。
+根字段留空或移除会把已保存的统一设置清为空字符串，避免回落到 preset 的旧值；同步失败进入配置错误诊断。
+仅 CLI 角色把非空 provider / model / effort 映射为 agentOptions.provider / model / reasoningEffort；
+三者全空完全不设 `agentOptions`，继承父代理。强度必须属于 `EFFORT_VALUES`，非法值阻止挂载；文件读取路径同样校验。
+内置 spawn / fork 保持角色自身 provider / model / effort，角色级 Provider 控件仍只对内置后端显示。
+面板顶部统一小节始终显示并说明仅 CLI 生效；保存时以同一 revision 原子提交 `['roles']` 与三条 `['volatile', 'wrapper…']` 操作。
+旧角色 agentProvider / agentModel 接受残留但不再使用；每激活实例记录弃用诊断，每次模块加载只打印一次告警。
+以上作用域桥接已通过离线夹具验证，真实设置往返、根同步与 preset 激活时序仍待真机验收。
 CLI 出站使用 allow：`allowNestedDispatch: false` 时仍包含本角色专属 CLI 工具，并非空 allow；为 true 时另允许已挂载的受控委派工具。
 CLI allow 不开放其他角色的底层 CLI 执行工具。内置角色不设置 allow，使用 deny 保留派发采集时可见的普通工具与后注册普通工具的动态可见性。
 deny 合成当前可用的非受控派发入口、全部当前可用的底层 CLI 工具、关闭嵌套时已挂载的受控委派工具、只读时当前可用的写工具；

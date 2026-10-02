@@ -545,6 +545,8 @@ npm 入口、文档及脚本用法与运行时命令同步更新。离线 `check
 
 ## D16 · CLI 收敛为两种预设与每角色包裹路由
 
+> **后续修正：** 每角色包裹路由已由 D22 的插件级统一设置取代；本节保留历史裁决与实现阶段记录。
+
 **决策：** 当前只支持 `codex` / `grok`，移除 `custom` 兜底。可执行文件与参数仍来自用户配置，
 沿用已验证的预设模板；Host 必须核对实际 command / prefixArgs / args / delivery，不能只信
 `cliDriver` 标签，并独立校验 `readOnly` 与沙箱参数。客户端切换只读时原子同步预设字段。
@@ -595,6 +597,8 @@ subagent 与 subprocess 不强制默认期限。用户用现有会话停止取�
 ---
 
 ## D18 · CLI 改为内置 spawn 包裹与角色专属工具（批次 3a）
+
+> **后续修正：** 本节每角色 agentProvider / agentModel 的路由来源已由 D22 取代；spawn 包裹与专属工具架构保留。
 
 > **后续修正：** 本节「allow 仅本角色专属工具」已由 [D21](#d21--入站深度预算与出站委派权限分离) 的出站开关规则扩展；角色指令确定性前置限于 stdin / promptFile 模式，argv 保持任务参数原值。
 
@@ -723,3 +727,26 @@ CLI 自身工具与受控委派白名单、只读 deny、`allow: []` 拒绝继�
 `ERR_MODULE_NOT_FOUND`；只装服务不能创建子代理。在不引入依赖的范围内不搭伪集成。
 尚需真机验证真实 spawn 上下文隔离、preset 工具继承、完整派发链中的 child 工具过滤，以及不同父深度下
 叶子可被调用、组织角色受剩余预算拒绝、子代理不可调用 workflow 或其他角色底层 CLI 工具。
+
+## D22 · CLI 包裹路由改为插件级统一设置
+
+**决策：** 按用户新裁决，包裹子代理的 provider、model、effort 统一放在插件 Config 的
+`volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`，取代 D16 / D18 的每角色
+`agentProvider` / `agentModel`。三项可选字符串，空白继承父代理；强度限定为
+`EFFORT_VALUES`，非法值报配置错误并阻止挂载。仅影响外部 CLI 的内置 spawn 转交代理，
+不改变外部 CLI 的角色 model / effort，也不改变内置 spawn / fork 的角色 provider / model / effort。
+
+**作用域与写入：** 三字段放在 volatile 子树以满足 SettingsForms 可写路径约束。
+面板列表前始终展示统一小节，注明仅 CLI 生效；角色与三字段草稿在一次 mutate 中用同一 revision 保存。
+根配置沿现有 roles.json 桥接到 preset，文件中的统一路由（含显式空值）优先；文件尚未保存统一设置时
+回落当前实例配置。角色列表仍采用本作用域非空 roles 优先、否则读文件，两个来源不能混为一谈。
+根字段移除或留空会清除已保存的统一路由。旧角色字段兼容加载但忽略，逐实例记录诊断，模块只告警一次。
+根 apply 与 internal/update 更新瀑布均同步三字段，更新钩子继续 next；volatile 就地更新也可供新 preset 读取，
+已挂载的子代理保持挂载时路由。该钩子以本地 Cordis 源码及真实 Cordis 离线更新测试核实，DSH Loader 往返仍待真机验证。
+
+**理由与代价：** 用户裁决统一转交代理，减少重复配置与角色间包裹模型漂移。
+代价是不能逐 CLI 角色选择不同包裹模型；根配置到 preset 仍依赖文件同步与激活时序。
+不新增配置服务、文件、依赖或执行路径，不变更 D21 权限模型与 CLI 生命周期。
+
+**验证边界：** 离线检查覆盖路由组合、清空、非法值、根/preset 优先级、兼容加载与 UI 原子路径；
+关键断言以生产代码变异验证判别力。真实设置往返、重启后 preset 路由、父代理继承仍需真机验收。

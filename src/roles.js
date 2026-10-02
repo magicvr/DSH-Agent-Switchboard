@@ -248,8 +248,6 @@ export function normalizeRole(raw, index, defaultProvider, defaultCwd) {
       title: read('title'),
       description,
       provider,
-      agentProvider: read('agentProvider') || undefined,
-      agentModel: read('agentModel') || undefined,
       model,
       effort,
       instructions,
@@ -309,6 +307,7 @@ export function normalizeRoles(rawRoles, defaultProvider, defaultCwd) {
  * @param {number} options.maxDepth - 第一层之外，**额外**可用的层数。
  * @param {string[]} [options.delegateToolNames] - 当前作用域已挂载的受控委派工具名。
  * @param {string[]} [options.availableToolNames] - 当前作用域已挂载的工具名。
+ * @param {object} [options.wrapperRoute] - 插件级包裹路由（provider / model / effort）。
  * @returns {object} `dsh-tool-subagent` 的 Config。
  */
 export function toolConfigFor(role, options) {
@@ -324,13 +323,14 @@ export function toolConfigFor(role, options) {
   };
 
   if (isCli) {
-    // 包裹路由只取专用字段；完全留空时不设 agentOptions，继承父代理路由。
-    if (role.agentProvider || role.agentModel) {
-      config.agentOptions = {
-        ...(role.agentProvider ? { provider: role.agentProvider } : {}),
-        ...(role.agentModel ? { model: role.agentModel } : {}),
-      };
+    // 统一包裹路由与外部 CLI 的角色模型/强度无关；空白继承父代理。
+    const route = options.wrapperRoute ?? {};
+    const agentOptions = {};
+    for (const [key, target] of [['provider', 'provider'], ['model', 'model'], ['effort', 'reasoningEffort']]) {
+      const value = typeof route[key] === 'string' ? route[key].trim() : '';
+      if (value) agentOptions[target] = value;
     }
+    if (Object.keys(agentOptions).length > 0) config.agentOptions = agentOptions;
     config.persona = cliPersonaFor(role, permissions);
     config.enableRunInBackground = false;
     config.modelSelectionSettings = false;

@@ -421,12 +421,13 @@ section('CLI 后端角色');
     toolConfigFor({ ...ok.role, allowNestedDispatch: true }, { maxDepth: 3 }).maxDepth === 4);
   check('CLI 显式关闭后台运行', cfg.enableRunInBackground === false && cfg.backgroundMode === 'one-shot');
   check('CLI 显式关闭包裹模型选择', cfg.modelSelectionSettings === false);
-  for (const options of [{ agentProvider: 'wrapper' }, { agentModel: 'wrapper-model' },
-    { agentProvider: 'wrapper', agentModel: 'wrapper-model' }]) {
-    const configured = toolConfigFor({ ...ok.role, ...options }, { maxDepth: 3 });
-    const expected = { ...(options.agentProvider ? { provider: options.agentProvider } : {}),
-      ...(options.agentModel ? { model: options.agentModel } : {}) };
-    check(`包裹路由组合 ${Object.keys(options).join('+')}`, JSON.stringify(configured.agentOptions) === JSON.stringify(expected));
+  for (let mask = 0; mask < 8; mask++) {
+    const wrapperRoute = { provider: mask & 1 ? ' wrapper ' : '', model: mask & 2 ? 'wrapper-model' : ' ', effort: mask & 4 ? 'high' : '' };
+    const configured = toolConfigFor(ok.role, { maxDepth: 3, wrapperRoute });
+    const expected = { ...(mask & 1 ? { provider: 'wrapper' } : {}),
+      ...(mask & 2 ? { model: 'wrapper-model' } : {}), ...(mask & 4 ? { reasoningEffort: 'high' } : {}) };
+    check(`插件级包裹路由组合 ${mask}：仅设置非空项`, mask === 0 ? !('agentOptions' in configured)
+      : JSON.stringify(configured.agentOptions) === JSON.stringify(expected));
   }
   for (const constraint of ['完整任务', '不要自行实施', '不要改写命令', '不要切换角色', '等待工具返回',
     '不轮询', '不重复启动', '交付物', '验证证据', '错误', '未完成项', '取消或失败不得自动重试',
@@ -445,6 +446,12 @@ section('CLI 后端角色');
   check('builtin 仍设置 agentOptions', 'agentOptions' in bCfg);
   check('builtin 仍设置 persona', 'persona' in bCfg);
   check('builtin 仍设置插件绝对 maxDepth', bCfg.maxDepth === 4);
+  for (const backend of ['spawn', 'fork']) {
+    const role = { ...builtin, backend, effort: 'medium' };
+    check(`${backend} 的 agentOptions 不受统一包裹路由影响`,
+      JSON.stringify(toolConfigFor(role, { maxDepth: 3, wrapperRoute: { provider: 'other', model: 'other', effort: 'high' } }).agentOptions)
+      === JSON.stringify({ provider: 'p', model: 'm', reasoningEffort: 'medium' }));
+  }
 }
 
 section('回归：入站深度独立于目标出站权限');

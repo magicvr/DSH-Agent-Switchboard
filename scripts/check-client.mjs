@@ -40,10 +40,10 @@ function section(title) {
 const CLIENT_SRC = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
 // 执行真实客户端源码，仅在测试副本中暴露 RoleRow；生产模块不增加测试导出。
 const clientWindow = { __ModuleLoader__: { load: (spec) => { clientWindow.spec = spec; } } };
-new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleRow, // **读**走'))(clientWindow);
+new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleRow, WrapperSettings, makeRoleStore, SwitchboardSettings, // **读**走'))(clientWindow);
 const clientData = new Function(`${CLIENT_SRC.slice(0, CLIENT_SRC.indexOf('\nwindow.__ModuleLoader__.load'))}\nreturn { CLI_DRIVER_OPTIONS, DEFAULT_CLI_DRIVER, cliFieldsFor, inferCliDriver };`)();
 const rowReact = { createElement: (type, props, ...children) => ({ type, props, children }) };
-const { RoleRow } = clientWindow.spec.factory(() => rowReact);
+const { RoleRow, WrapperSettings, makeRoleStore } = clientWindow.spec.factory(() => rowReact);
 function rowElements(role, writes) {
   const tree = RoleRow({ role, index: 3, onChange: (index, value) => writes.push({ index, value }), onRemove: () => {}, disabled: false });
   const all = [];
@@ -498,7 +498,7 @@ section('RoleRow 真实事件回调：预设与只读切换原子更新');
 
 section('面板字段：源码结构与桩化 RoleRow（不替代真机验收）');
 {
-  const rowSource = CLIENT_SRC.slice(CLIENT_SRC.indexOf('    function RoleRow('), CLIENT_SRC.indexOf('    function SwitchboardSettings('));
+  const rowSource = CLIENT_SRC.slice(CLIENT_SRC.indexOf('    function RoleRow('), CLIENT_SRC.indexOf('    function WrapperSettings('));
   const renderSource = rowSource.slice(rowSource.indexOf('      return h('));
   // 用条件分支锚点约束控件位置；再对 spawn / fork / cli 的元素树验证显示条件。
   check('Provider 输入位于 builtin 条件分支',
@@ -507,8 +507,7 @@ section('面板字段：源码结构与桩化 RoleRow（不替代真机验收）
   const cliBranch = renderSource.slice(renderSource.indexOf('        isCli\n'));
   check('CLI 分支无 provider 输入', !/text\('provider'/.test(cliBranch));
   for (const key of ['agentProvider', 'agentModel']) {
-    check(`${key} 输入仅在 CLI 分支源码中出现`,
-      (renderSource.match(new RegExp(`text\\('${key}'`, 'g')) ?? []).length === 1 && cliBranch.includes(`text('${key}'`));
+    check(`${key} 角色输入已从源码移除`, !CLIENT_SRC.includes(`text('${key}'`));
   }
   check('instructions 恒显且为多行输入',
     /h\('textarea', \{\s*rows: 5,\s*value: role\.instructions \?\? '',[\s\S]*?set\('instructions', e\.target\.value\)/.test(renderSource.slice(0, renderSource.indexOf('        isCli\n'))));
@@ -520,7 +519,7 @@ section('面板字段：源码结构与桩化 RoleRow（不替代真机验收）
   check('预设说明不再显示命令参数细节',
     !rowSource.includes('driverDef.description') && !renderSource.includes('-s read-only'));
   check('外部模型与包裹模型标签明确区分',
-    renderSource.includes("isCli ? '外部 CLI 模型' : '模型'") && cliBranch.includes('包裹会话模型（非外部 CLI 模型）'));
+    renderSource.includes("isCli ? '外部 CLI 模型' : '模型'") && CLIENT_SRC.includes('模型（非外部 CLI 模型）'));
   for (const backend of ['spawn', 'fork', 'cli']) {
     const role = {
       id: 'r', backend, description: '描述', instructions: '原始指令\n第二行',
@@ -539,12 +538,7 @@ section('面板字段：源码结构与桩化 RoleRow（不替代真机验收）
     check(`${backend}：provider 仅内置显示`, Boolean(provider) === (backend !== 'cli'));
     for (const [key, placeholder] of [['agentProvider', '留空继承父代理路由'], ['agentModel', '留空继承父代理模型']]) {
       const control = textInput(placeholder);
-      check(`${backend}：${key} 仅 CLI 显示`, Boolean(control) === (backend === 'cli'));
-      if (control) {
-        control.props.onChange({ target: { value: '  ' } });
-        check(`${key}：空白输入写为未设置且保留其他字段`,
-          JSON.stringify(writes.at(-1)?.value) === JSON.stringify({ ...role, [key]: undefined }));
-      }
+      check(`${backend}：残留 ${key} 不显示角色控件`, control === undefined);
     }
     if (provider) {
       provider.props.onChange({ target: { value: '  other-route  ' } });
@@ -569,6 +563,113 @@ section('面板字段：源码结构与桩化 RoleRow（不替代真机验收）
         JSON.stringify([['', true], ['codex', false], ['grok', false]]));
     }
   }
+}
+
+section('统一包裹小节：真实控件、读取与原子写入');
+{
+  const all = [];
+  const walk = (node) => {
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (!node || typeof node !== 'object') return;
+    all.push(node); node.children?.forEach(walk);
+  };
+  const wrapper = { wrapperProvider: 'route', wrapperModel: 'model', wrapperEffort: 'high' };
+  const writes = [];
+  walk(WrapperSettings({ wrapper, onChange: (next) => writes.push(next), disabled: false }));
+  check('小节标题及仅 CLI 生效说明存在', all.some(n => n.children.includes('包裹子代理（外部 CLI 角色的转交代理）')) &&
+    all.some(n => n.children.includes('仅对 CLI 角色生效；内置角色仍使用各自的 Provider、模型和思考强度。')));
+  for (const [key, placeholder] of [['wrapperProvider', '留空继承父代理路由'], ['wrapperModel', '留空继承父代理模型']]) {
+    const control = all.find(n => n.type === 'input' && n.props.placeholder === placeholder);
+    check(`${key} 统一文本控件读取已保存值`, control?.props.value === wrapper[key]);
+    control?.props.onChange({ target: { value: '  ' } });
+    check(`${key} 空白草稿保留其他统一字段`, JSON.stringify(writes.at(-1)) === JSON.stringify({ ...wrapper, [key]: '  ' }));
+  }
+  const select = all.find(n => n.type === 'select');
+  const { EFFORT_VALUES } = await import('../src/roles.js');
+  check('统一思考强度下拉含空继承项与全部 EFFORT_VALUES', select?.props.value === 'high' &&
+    JSON.stringify(select.children.flat().map(n => n.props.value)) === JSON.stringify(['', ...EFFORT_VALUES]));
+  select?.props.onChange({ target: { value: '' } });
+  check('强度可清空且不修改其他字段', JSON.stringify(writes.at(-1)) === JSON.stringify({ ...wrapper, wrapperEffort: '' }));
+  const calls = [];
+  const store = makeRoleStore({
+    configForms: { describe: () => ({ ensure: async () => {}, getSnapshot: () => ({ view: { namespaces: [
+      { ns: 'agent-switchboard', value: { roles: [], volatile: wrapper }, revision: 23 },
+    ] } }) }) },
+    remote: { settings: { mutate: async (...args) => { calls.push(args); return { ok: true }; } } },
+  });
+  const read = await store.read();
+  check('镜像读取统一三字段并保留同一 revision', JSON.stringify(read.wrapper) === JSON.stringify(wrapper) && read.revision === 23);
+  const saved = await store.write([], read.revision, { wrapperProvider: ' route ', wrapperModel: ' ', wrapperEffort: '' });
+  check('角色与 volatile 三路径在同一次 mutate 提交，使用读取 revision', saved.ok && calls.length === 1 &&
+    JSON.stringify(calls[0]) === JSON.stringify(['agent-switchboard', [
+      { op: 'set', path: ['roles'], value: [] },
+      { op: 'set', path: ['volatile', 'wrapperProvider'], value: 'route' },
+      { op: 'set', path: ['volatile', 'wrapperModel'], value: '' },
+      { op: 'set', path: ['volatile', 'wrapperEffort'], value: '' },
+    ], 23]));
+  check('小节位于角色列表之前且不以 CLI 角色数量为显示条件',
+    /h\(WrapperSettings, \{ wrapper, onChange: setWrapper, disabled: busy \}\) : null,\s*children,/.test(CLIENT_SRC));
+  check('保存与 dirty 比较包含包裹草稿', CLIENT_SRC.includes('JSON.stringify({ roles, wrapper }) !== savedRef.current') &&
+    CLIENT_SRC.includes('store.write(roles, revision, wrapper)'));
+}
+
+section('统一包裹草稿：组件编辑、保存、清空与非法值的真实回调');
+{
+  const states = [], refs = [], effects = [];
+  let stateIndex = 0, refIndex = 0;
+  const react = {
+    ...rowReact,
+    useState: (initial) => {
+      const index = stateIndex++;
+      if (!(index in states)) states[index] = initial;
+      return [states[index], value => { states[index] = typeof value === 'function' ? value(states[index]) : value; }];
+    },
+    useRef: (initial) => refs[refIndex++] ?? (refs[refIndex - 1] = { current: initial }),
+    useEffect: (effect) => effects.push(effect),
+    useCallback: (fn) => fn,
+  };
+  const { SwitchboardSettings } = clientWindow.spec.factory(() => react);
+  const calls = [];
+  let wrapper = { wrapperProvider: '', wrapperModel: '', wrapperEffort: '' };
+  let revision = 31;
+  const store = {
+    read: async () => ({ ok: true, roles: [], wrapper, revision, missing: true }),
+    write: async (roles, rev, next) => { calls.push({ roles, rev, next }); wrapper = next; revision++; return { ok: true }; },
+  };
+  const render = () => {
+    stateIndex = 0; refIndex = 0;
+    const all = [];
+    const walk = (node) => {
+      if (Array.isArray(node)) return node.forEach(walk);
+      if (!node || typeof node !== 'object') return;
+      all.push(node); node.children?.forEach(walk);
+    };
+    walk(SwitchboardSettings({ store }));
+    return all;
+  };
+  const saveButton = all => all.find(n => n.type === 'button' && n.children.some(c => typeof c === 'string' && c.startsWith('保存')));
+  render(); effects[0](); await new Promise(setImmediate);
+  let nodes = render();
+  let sectionNode = nodes.find(n => n.type?.name === 'WrapperSettings');
+  check('没有任何 CLI 或角色时仍显示统一小节，初始保存禁用', sectionNode !== undefined && saveButton(nodes)?.props.disabled === true);
+  sectionNode.props.onChange({ ...wrapper, wrapperModel: 'new-model', wrapperEffort: 'high' });
+  nodes = render();
+  check('仅编辑包裹字段就标记 dirty 并允许保存', saveButton(nodes)?.children.includes('保存 *') && !saveButton(nodes)?.props.disabled);
+  await saveButton(nodes).props.onClick(); await new Promise(setImmediate);
+  check('保存真实回调提交包裹草稿及原读取 revision', calls.length === 1 && calls[0].rev === 31 && calls[0].roles.length === 0 &&
+    JSON.stringify(calls[0].next) === JSON.stringify({ wrapperProvider: '', wrapperModel: 'new-model', wrapperEffort: 'high' }));
+  nodes = render();
+  check('保存后刷新统一字段与 revision，dirty 清除', saveButton(nodes)?.props.disabled &&
+    nodes.find(n => n.type?.name === 'WrapperSettings')?.props.wrapper.wrapperModel === 'new-model');
+  nodes.find(n => n.type?.name === 'WrapperSettings').props.onChange({ wrapperProvider: '', wrapperModel: '', wrapperEffort: '' });
+  nodes = render(); await saveButton(nodes).props.onClick(); await new Promise(setImmediate);
+  check('清空后仍能保存，使用刷新后的 revision', calls.length === 2 && calls[1].rev === 32 &&
+    Object.values(calls[1].next).every(v => v === ''));
+  nodes = render();
+  nodes.find(n => n.type?.name === 'WrapperSettings').props.onChange({ ...wrapper, wrapperEffort: 'invalid' });
+  nodes = render(); await saveButton(nodes).props.onClick();
+  check('非法包裹强度不调用写通道并给错误提示', calls.length === 2 &&
+    render().some(n => n.children.includes('包裹子代理思考强度非法')));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

@@ -143,14 +143,71 @@ export const inject = ['tools', 'subagents', 'agents', 'systemPrompt', 'subproce
 
 /** 弃用日志每次模块加载只发一次；各激活实例仍保留自己的诊断。 */
 let warnedLegacyTimeout = false;
+let warnedLegacyWrapper = false;
+
+/** 旧角色包裹字段仍可加载，但不再参与路由；各实例都记录，模块只告警一次。 */
+function noteLegacyWrapper(value, diagnostics) {
+  const roles = readVolatileField(value, 'roles');
+  if (!Array.isArray(roles) || !roles.some((role) => role &&
+    ['agentProvider', 'agentModel'].some((key) => Object.hasOwn(role, key)))) return;
+  const message = '角色 agentProvider / agentModel 已废弃并忽略；请使用插件级 volatile.wrapperProvider / wrapperModel / wrapperEffort';
+  if (!diagnostics.deprecatedConfig.includes(message)) {
+    diagnostics.deprecatedConfig = [diagnostics.deprecatedConfig, message].filter(Boolean).join('；');
+  }
+  if (!warnedLegacyWrapper) {
+    warnedLegacyWrapper = true;
+    console.error(`[${name}] ${message}`);
+  }
+}
+
+/** 空白等同未设置；离线文件与直接 apply 路径也必须校验强度。 */
+function wrapperRouteFrom(value) {
+  const volatile = readVolatile(value);
+  const route = {};
+  const errors = [];
+  for (const key of ['provider', 'model', 'effort']) {
+    const field = `wrapper${key[0].toUpperCase()}${key.slice(1)}`;
+    const raw = volatile[field];
+    if (raw !== undefined && raw !== null && typeof raw !== 'string') {
+      errors.push(`volatile.${field} 必须是字符串`);
+    }
+    if (typeof raw === 'string' && raw.trim()) route[key] = raw.trim();
+  }
+  if (route.effort && !EFFORT_VALUES.includes(route.effort)) {
+    errors.push(`volatile.wrapperEffort "${route.effort}" 非法：只能是 ${EFFORT_VALUES.join(' / ')}`);
+  }
+  return { route, errors };
+}
+
+/** 用既有文件桥接根配置与 preset；显式空值确保清除后不回落 preset 的旧值。 */
+function syncWrapperRouteToFile(resolved, roleConfigPath, diagnostics) {
+  const current = readRoleConfigFile(roleConfigPath);
+  const fields = ['wrapperProvider', 'wrapperModel', 'wrapperEffort'];
+  const root = readVolatile(resolved);
+  const existing = current.ok ? current.value : {};
+  if (!fields.some((key) => Object.hasOwn(root, key) || Object.hasOwn(existing.volatile ?? {}, key))) return;
+  if (!current.ok) {
+    diagnostics.configErrors.push(current.detail);
+    return;
+  }
+  const volatile = { ...existing.volatile };
+  for (const key of fields) volatile[key] = typeof root[key] === 'string' ? root[key].trim() : '';
+  if (JSON.stringify(volatile) === JSON.stringify(existing.volatile)) return;
+  const written = writeConfigFile(roleConfigPath, current.missing
+    ? initialConfig([], { volatile }) : { ...existing, volatile });
+  if (!written.ok) diagnostics.configErrors.push(`包裹路由同步失败：${written.error}`);
+}
 
 /** 每激活实例保留诊断；弃用日志每次模块加载最多打印一次。 */
 function noteLegacyTimeout(value, diagnostics) {
   if (!Object.hasOwn(readVolatile(value), 'cliTimeoutSec') && !Object.hasOwn(value ?? {}, 'cliTimeoutSec')) return;
-  diagnostics.deprecatedConfig = 'cliTimeoutSec 已废弃并忽略；CLI 无运行期限，可通过会话停止取消';
+  const message = 'cliTimeoutSec 已废弃并忽略；CLI 无运行期限，可通过会话停止取消';
+  if (!diagnostics.deprecatedConfig.includes(message)) {
+    diagnostics.deprecatedConfig = [diagnostics.deprecatedConfig, message].filter(Boolean).join('；');
+  }
   if (!warnedLegacyTimeout) {
     warnedLegacyTimeout = true;
-    console.error(`[${name}] ${diagnostics.deprecatedConfig}`);
+    console.error(`[${name}] ${message}`);
   }
 }
 
@@ -185,6 +242,7 @@ function newDiagnostics() {
     roleConfigPath: undefined,
     roleConfigRead: undefined,
     roleConfigSync: undefined,
+    deprecatedConfig: '',
     fatal: undefined,
   };
 }
@@ -261,7 +319,9 @@ export const Config = z.object({
       //    取舍说明：「会执行本机命令」这件事的可控性现在依赖两点 —— 角色的 `backend`
       //    必须被显式设为 `cli`，且该角色只在 Switchboard preset 会话里存在。这比一个
       //    看不见的全局开关更容易理解和审计。
-      // 保留空 volatile 容器以兼容旧配置；已废弃字段不参与运行控制。
+      wrapperProvider: z.string().description('统一包裹外部 CLI 角色的 LLM route；留空继承父代理路由，仅对 CLI 角色生效'),
+      wrapperModel: z.string().description('统一包裹外部 CLI 角色的模型（非外部 CLI 模型）；留空继承父代理模型，仅对 CLI 角色生效'),
+      wrapperEffort: z.string().description(`统一包裹外部 CLI 角色的思考强度；留空继承父代理强度，可选 ${EFFORT_VALUES.join(' / ')}，仅对 CLI 角色生效`),
     })
     .default({})
     .volatile(),
@@ -305,8 +365,6 @@ export const Config = z.object({
         description: z.string().required(),
         // --- builtin 后端需要：DSH 的 LLM route ---
         provider: z.string(),
-        agentProvider: z.string().description('包裹该 CLI 角色的内置子代理所用的 LLM route；留空表示继承父代理路由'),
-        agentModel: z.string().description('包裹该 CLI 角色的内置子代理所用的模型；留空表示继承父代理模型'),
         // model 对 CLI 后端是「外部 CLI 的模型 id」，对 builtin 后端是 DSH route 的
         // model。两者共用一个字段是有意的：同一个角色只应有一个模型来源（见 D12）。
         model: z.string(),
@@ -646,7 +704,7 @@ function mountedRoleOptions(ctx, roles, maxDepth) {
   };
 }
 
-async function mountRoleTool(ctx, role, toolModule, maxDepth, roles) {
+async function mountRoleTool(ctx, role, toolModule, maxDepth, roles, wrapperRoute) {
   if (typeof ctx.plugin !== 'function') {
     return { ok: false, detail: 'ctx.plugin 不可用' };
   }
@@ -661,7 +719,7 @@ async function mountRoleTool(ctx, role, toolModule, maxDepth, roles) {
     ctx.plugin({
       ...toolModule,
       apply: (toolCtx, config) => toolModule.apply(toolCtx, liveConfig(config)),
-    }, liveConfig(toolConfigFor(role, { maxDepth })));
+    }, liveConfig(toolConfigFor(role, { maxDepth, wrapperRoute })));
   } catch (error) {
     return { ok: false, detail: error instanceof Error ? error.message : String(error) };
   }
@@ -750,6 +808,7 @@ function applyInner(ctx, config) {
   // 会让后一次激活清空前一次的记录（实测出现自相矛盾的自检输出）。
   const diagnostics = newDiagnostics();
   noteLegacyTimeout(resolved, diagnostics);
+  noteLegacyWrapper(resolved, diagnostics);
 
   // 说明：这里刻意**不**报告「本插件处于哪个 preset 作用域」。
   // `agentPresets.composedPreset(ctx)` 是从传入的上下文向上找最近的 preset 挂载，
@@ -760,6 +819,12 @@ function applyInner(ctx, config) {
 
   // 自检工具总是注册：即使角色配置全错，也要能用它看到错在哪。
   ctx.tools.register(selftestTool(ctx, diagnostics));
+  const wrapper = wrapperRouteFrom(resolved);
+  if (wrapper.errors.length > 0) {
+    diagnostics.configErrors = wrapper.errors;
+    for (const error of wrapper.errors) console.error(`[${name}] ${error}`);
+    return;
+  }
 
   // --- 角色配置的来源：插件自己的文件（见 src/config-file.js 顶部的架构说明）------
   //
@@ -805,6 +870,20 @@ function applyInner(ctx, config) {
   //    调不到；留着它只会平添「注册失败拖垮启动」的风险。现在客户端走 `settings`。
   if (!mountHere) {
     syncRolesToFile({ resolved, roleConfigPath, diagnostics });
+    syncWrapperRouteToFile(resolved, roleConfigPath, diagnostics);
+    // volatile 更新可能被 Loader 就地处理，不触发重新 apply；在更新瀑布中先同步根路由。
+    // 继续调用 next，不改变既有更新/重挂载决策；监听随根实例销毁而释放。
+    ctx.on?.('internal/update', (updated, _noSave, next) => {
+      const wrapper = wrapperRouteFrom(updated);
+      diagnostics.configErrors = diagnostics.configErrors.filter((error) => !error.startsWith('volatile.wrapper'));
+      if (wrapper.errors.length > 0) {
+        diagnostics.configErrors.push(...wrapper.errors);
+        for (const error of wrapper.errors) console.error(`[${name}] ${error}`);
+      } else {
+        syncWrapperRouteToFile(updated, roleConfigPath, diagnostics);
+      }
+      return next();
+    });
     return;
   }
 
@@ -827,6 +906,7 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics }) {
   const current = readRoleConfigFile(roleConfigPath);
   diagnostics.roleConfigRead = current.detail;
   if (current.ok) noteLegacyTimeout(current.value, diagnostics);
+  if (current.ok) noteLegacyWrapper(current.value, diagnostics);
   // 根实例保留原始数量与校验错误，但不挂载、不查询这些角色的工具可见性。
   const rawRoles = Array.isArray(cordisRoles) && cordisRoles.length > 0
     ? cordisRoles : current.ok ? current.value.roles : [];
@@ -866,6 +946,7 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics }) {
       provider: existing.provider ?? resolved.provider,
       cwd: existing.cwd ?? resolved.cwd,
       maxDepth: existing.maxDepth ?? resolved.maxDepth,
+      ...(existing.volatile ? { volatile: existing.volatile } : {}),
     }),
   );
   diagnostics.roleConfigSync = written.ok
@@ -898,6 +979,16 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
   // 因此必须确认 preset 实例能否看到根条目的配置；两条都记进诊断，一次重启即可判明。
   const fromFile = readRoleConfigFile(roleConfigPath);
   if (fromFile.ok) noteLegacyTimeout(fromFile.value, diagnostics);
+  if (fromFile.ok) noteLegacyWrapper(fromFile.value, diagnostics);
+  // 根实例经文件同步的包裹路由优先，包括空值；角色仍保持本作用域优先。
+  const hasRootRoute = fromFile.ok && ['wrapperProvider', 'wrapperModel', 'wrapperEffort']
+    .some((key) => Object.hasOwn(fromFile.value.volatile ?? {}, key));
+  const wrapper = wrapperRouteFrom(hasRootRoute ? fromFile.value : resolved);
+  if (wrapper.errors.length > 0) {
+    diagnostics.configErrors = wrapper.errors;
+    for (const error of wrapper.errors) console.error(`[${name}] ${error}`);
+    return;
+  }
   const fromCordis = readVolatileField(resolved, 'roles');
   const cordisRoles = Array.isArray(fromCordis) ? fromCordis : [];
   diagnostics.roleConfigRead =
@@ -1025,7 +1116,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
           continue;
         }
         // `mountRoleTool` 会核实工具是否真的注册成功（见其 JSDoc）。
-        const outcome = await mountRoleTool(ctx, role, toolModule, maxDepth, roles);
+        const outcome = await mountRoleTool(ctx, role, toolModule, maxDepth, roles, wrapper.route);
         diagnostics.mounts.push({ id: role.id, ok: outcome.ok, detail: outcome.detail });
         if (!outcome.ok) console.error(`[${name}] 角色 "${role.id}" 挂载失败：${outcome.detail}`);
       }
