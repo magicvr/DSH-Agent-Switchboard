@@ -412,7 +412,7 @@ section('CLI 后端角色');
   check('CLI 叶子默认深度使用插件绝对上限 4', cfg.maxDepth === 4);
   check('CLI allow 仅包含自己的专属工具',
     JSON.stringify(cfg.toolFilter) === JSON.stringify({ allow: ['switchboard_cli_run_codex_worker'] }));
-  check('包裹路由留空时完全不设 agentOptions', !('agentOptions' in cfg));
+  check('包裹路由留空时完全不设 agentOptions', cfg.agentOptions === undefined);
   check('CLI persona 写明工具名', cfg.persona.includes('switchboard_cli_run_codex_worker'));
   check('仍有 toolName', cfg.toolName === 'delegate_to_codex_worker');
   const ro = normalizeRole({ ...base, readOnly: true }, 0, undefined, 'C:/w').role;
@@ -428,7 +428,7 @@ section('CLI 后端角色');
     const configured = toolConfigFor(ok.role, { maxDepth: 3, wrapperRoute });
     const expected = { ...(mask & 1 ? { provider: 'wrapper' } : {}),
       ...(mask & 2 ? { model: 'wrapper-model' } : {}), ...(mask & 4 ? { reasoningEffort: 'high' } : {}) };
-    check(`插件级包裹路由组合 ${mask}：仅设置非空项`, mask === 0 ? !('agentOptions' in configured)
+    check(`插件级包裹路由组合 ${mask}：仅设置非空项`, mask === 0 ? configured.agentOptions === undefined
       : JSON.stringify(configured.agentOptions) === JSON.stringify(expected));
   }
   for (const constraint of ['完整任务', '不要自行实施', '不要改写命令', '不要切换角色', '等待工具返回',

@@ -5,6 +5,8 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { StringDecoder } from 'node:string_decoder';
 import { cliToolName, routeSummaryFor } from '../roles.js';
+import { validateTemplate } from './argv.js';
+import { validateCliPreset } from './drivers.js';
 import { runCli } from './runner.js';
 
 /** 按 UTF-8 字节截断，不返回半个字符；tail 用于错误尾部。 */
@@ -19,16 +21,26 @@ function bounded(text, limit, tail = false) {
 }
 
 /** 构造工具，不注册 provider；spawn 与解析器由同一 preset 实例注入。 */
-export function createCliTool({ role, spawn, resolveExecutable, ctx = { get: () => undefined } }) {
-  if (!role.cli) throw new Error(`角色 "${role.id}" 使用 cli 后端但缺少 cli 配置`);
-  // 保存配置快照，调用参数和外部对象变更均不能改变已绑定的执行边界。
-  const boundRole = structuredClone(role);
-  const cli = boundRole.cli;
-  const outputLimit = cli.maxOutputBytes ?? 1_000_000;
-  const errorLimit = cli.maxErrorBytes ?? 100_000;
+export function createCliTool({ role, getRole, spawn, resolveExecutable, ctx = { get: () => undefined } }) {
+  const initialRole = role;
+  if (!initialRole?.cli) throw new Error(`角色 "${initialRole?.id}" 使用 cli 后端但缺少 cli 配置`);
+  const currentRole = () => {
+    const value = typeof getRole === 'function' ? getRole() : initialRole;
+    if (!value?.cli) throw new Error(`角色 "${initialRole.id}" 使用 cli 后端但缺少 cli 配置`);
+    const preset = value.cliDriver === undefined
+      ? { errors: validateTemplate(value.cli.args, { promptDelivery: value.cli.promptDelivery }) }
+      : validateCliPreset({
+        cliDriver: value.cliDriver, readOnly: value.readOnly,
+        cliCommand: value.cli.command, cliPrefixArgs: value.cli.prefixArgs,
+        cliArgs: value.cli.args, cliPromptDelivery: value.cli.promptDelivery,
+      });
+    if (preset.errors.length > 0) throw new Error(`CLI 角色 "${value.id}" 配置无效：${preset.errors.join('；')}`);
+    return structuredClone(value);
+  };
+  const cli = initialRole.cli;
   return defineTool({
-    name: cliToolName(boundRole.id),
-    description: `仅供子代理转交 ${boundRole.id} 角色的完整 CLI 任务；等待结束后返回有界结果。`,
+    name: cliToolName(initialRole.id),
+    description: `仅供子代理转交 ${initialRole.id} 角色的完整 CLI 任务；等待结束后返回有界结果。`,
     parameters: {
       prompt: { type: 'string', required: true, description: '完整任务正文；不要改写角色规则或命令。' },
     },
@@ -58,6 +70,8 @@ export function createCliTool({ role, spawn, resolveExecutable, ctx = { get: () 
         throw new Error('专属 CLI 工具仅供子代理执行；请通过对应 delegate_to_* 工具派发任务');
       }
       if (typeof args?.prompt !== 'string') throw new Error('prompt 必须是字符串');
+      const boundRole = currentRole();
+      const currentCli = boundRole.cli;
       const controller = new AbortController();
       // 调用方停止、Jobs 面板取消及 owner 销毁共用同一取消入口。
       const cancel = reason => { if (!controller.signal.aborted) controller.abort(reason); };
@@ -109,9 +123,9 @@ export function createCliTool({ role, spawn, resolveExecutable, ctx = { get: () 
         // 所有终态都不主动 remove，留给客户端按偏移延后读取。
         // 记录交由 Jobs 的保留策略处理（未核实），不改 owner、不延时删除。
       }
-      const stdout = bounded(result.stdout, outputLimit);
+      const stdout = bounded(result.stdout, currentCli.maxOutputBytes ?? 1_000_000);
       // 失败路径可能追加诊断，再次限额；返回 stderr 尾部，路由事实已由 runner 提取。
-      const stderr = bounded(result.stderrTail ?? result.stderr, errorLimit, true);
+      const stderr = bounded(result.stderrTail ?? result.stderr, currentCli.maxErrorBytes ?? 100_000, true);
       const route = bounded(`${routeSummaryFor(boundRole)}；cli-route=${JSON.stringify(result.route)}`, 4096);
       const diagnostic = bounded([result.diagnostic ?? (result.ok && !result.stdout.trim()
         ? 'CLI 成功退出但没有输出内容' : ''), feedbackDiagnostic].filter(Boolean).join('\n'), 4096);

@@ -310,43 +310,53 @@ export function normalizeRoles(rawRoles, defaultProvider, defaultCwd) {
  * @param {object} [options.wrapperRoute] - 插件级包裹路由（provider / model / effort）。
  * @returns {object} `dsh-tool-subagent` 的 Config。
  */
-export function toolConfigFor(role, options) {
-  const isCli = role.backend === CLI_BACKEND;
-  const permissions = dispatchPermissionsFor(role, options);
-
-  /** @type {Record<string, unknown>} */
-  const config = {
-    provider: isCli ? 'spawn' : role.backend,
-    toolName: role.toolName,
-    backgroundMode: 'one-shot',
-    toolFilter: permissions.toolFilter,
+export function toolConfigFor(role, options = {}) {
+  const getRole = typeof options.getRole === 'function' ? options.getRole : () => role;
+  const getMaxDepth = typeof options.getMaxDepth === 'function'
+    ? options.getMaxDepth
+    : () => options.maxDepth;
+  const getWrapperRoute = typeof options.getWrapperRoute === 'function'
+    ? options.getWrapperRoute
+    : () => options.wrapperRoute;
+  const getPermissions = () => {
+    const current = getRole() ?? role;
+    return dispatchPermissionsFor(current, {
+      delegateToolNames: options.getDelegateToolNames?.() ?? options.delegateToolNames ?? [],
+      availableToolNames: options.getAvailableToolNames?.() ?? options.availableToolNames ?? [],
+    });
   };
-
-  if (isCli) {
-    // 统一包裹路由与外部 CLI 的角色模型/强度无关；空白字段省略，遵循宿主路由继承规则。
-    const route = options.wrapperRoute ?? {};
-    const agentOptions = {};
-    for (const [key, target] of [['provider', 'provider'], ['model', 'model'], ['effort', 'reasoningEffort']]) {
-      const value = typeof route[key] === 'string' ? route[key].trim() : '';
-      if (value) agentOptions[target] = value;
-    }
-    if (Object.keys(agentOptions).length > 0) config.agentOptions = agentOptions;
-    config.persona = cliPersonaFor(role, permissions);
+  const config = {
+    get provider() { return (getRole() ?? role).backend === CLI_BACKEND ? 'spawn' : (getRole() ?? role).backend; },
+    get toolName() { return (getRole() ?? role).toolName; },
+    backgroundMode: 'one-shot',
+    get toolFilter() { return getPermissions().toolFilter; },
+    get agentOptions() {
+      const current = getRole() ?? role;
+      if (current.backend === CLI_BACKEND) {
+        const route = getWrapperRoute() ?? {};
+        const agentOptions = {};
+        for (const [key, target] of [['provider', 'provider'], ['model', 'model'], ['effort', 'reasoningEffort']]) {
+          const value = typeof route[key] === 'string' ? route[key].trim() : '';
+          if (value) agentOptions[target] = value;
+        }
+        return Object.keys(agentOptions).length > 0 ? agentOptions : undefined;
+      }
+      return {
+        provider: current.provider,
+        model: current.model,
+        ...(current.effort === undefined ? {} : { reasoningEffort: current.effort }),
+      };
+    },
+    get persona() {
+      const current = getRole() ?? role;
+      return current.backend === CLI_BACKEND ? cliPersonaFor(current, getPermissions()) : current.instructions;
+    },
+    get maxDepth() { return absoluteDepthLimit(getMaxDepth() ?? 3); },
+  };
+  if (role.backend === CLI_BACKEND) {
     config.enableRunInBackground = false;
     config.modelSelectionSettings = false;
-  } else {
-    // 角色级固定模型与强度，主代理无权覆盖（decisions.md D12）。
-    config.agentOptions = {
-      provider: role.provider,
-      model: role.model,
-      ...(role.effort === undefined ? {} : { reasoningEffort: role.effort }),
-    };
-    config.persona = role.instructions;
   }
-
-  // 内置后端使用绝对深度：第一层为 1，嵌套预算为额外层数。
-  config.maxDepth = absoluteDepthLimit(options.maxDepth);
-
   return config;
 }
 

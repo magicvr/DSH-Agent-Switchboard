@@ -82,7 +82,7 @@
 
 21. **当前组合是「根条目启用 + preset 显式 `mount: true`」。** 根实例提供配置同步与自检；角色工具和路由指引只在声明了 `mount: true` 的作用域挂载。
     - **历史实测（以下禁用根条目的方案已被后续 D13 / D14 取代）：** 早期先只「加上 preset 声明」，插件仍报告挂在根上；再把 profile 全局条目设为 `disabled: true`，角色工具才只在选中该 preset 的会话里生效，其他会话连 `switchboard_selftest` 都看不到。当时以 Loader 按包名处理解释该现象，采用了「preset 声明 + 移除全局挂载」。这不是当前的挂载门禁。
-    - preset 条目的 `config` 会作为插件配置传入（历史实测 `provider/maxDepth/cwd/roles` 均正确到达）。**当前 preset 不再携带 `roles`**，只声明挂载等作用域配置；常驻 preset 在启动时从 `$DSH_HOME/agent-switchboard/roles.json` 读取，运行期由根实例写盘后的专用广播驱动重新读取与代际重挂（见第 36 条及 D24）。
+    - preset 条目的 `config` 会作为插件配置传入（历史实测 `provider/maxDepth/cwd/roles` 均正确到达）。**当前 preset 不再携带 `roles`**，只声明挂载等作用域配置；常驻 preset 在启动时从 `$DSH_HOME/agent-switchboard/roles.json` 读取，运行期由根实例的 `loader/volatile-update` 持久化后，静态工具在执行期通过文件 resolver 读取（见 D25）。
     - 历史上「bundle 声明 `disabled: true` + preset 再声明一次」确实能激活 preset 插件，`[]` 也曾被确认语法合法；**该方案已被后续决策取代，不能据此禁用当前根条目**。客户端模块扫描跳过 disabled 条目，禁用根条目会让「角色与派发」设置页**静默消失，没有报错**（`cordis.patch.yml` 第 5–15 行）。
     - 历史 A/B 对照曾是：未选 preset 看不到自检和委派工具，选中后有 30 个工具（含自检与 4 个委派工具）。**当前自检在 `mount` 判断之前注册，根作用域及继承它的会话都可看到 `switchboard_selftest`；`delegate_to_*` 仍只在挂载角色的作用域可见。** 不应把旧工具数量或自检不可见作为当前验收条件。
 22. **`agentPresets.composedPreset(ctx)` 必须传入「处于该作用域内」的 ctx，否则永远返回 `undefined`。**
@@ -194,7 +194,7 @@
     | `settings.replace(ns, section, rev)` | 否 | **否** |
 
     - 因此编辑 `roles` 有两条路：**甲**给 `roles` 标 `.volatile()` 并用 `mutate` 下标路径；**乙**不改 schema，用 `replace` 整块写 `{roles: [...]}`。
-    - 本插件选**甲**（`roles` 已标 volatile），设置页整体提交 `set(['roles'], value)` 并携带 `revision` 做并发保护；Host 根实例将角色立即同步到文件。Switchboard preset 是启动时加载的常驻单例，新会话只继承它，不会重新执行 `apply` 或重读文件；根实例写盘后广播 `agent-switchboard/config-changed`，常驻实例准备新一代工具并同步替换公开入口，后续委派与下次系统提示组装使用有效新快照。**保存成功不等于挂载成功；失败保留上一代并由自检报告。** 乙是保留方案。
+    - 本插件选**甲**（`roles` 已标 volatile），设置页整体提交 `set(['roles'], value)` 并携带 `revision` 做并发保护；Host 根实例将角色立即同步到文件。Switchboard preset 是启动时加载的常驻单例，新会话只继承它，不会重新执行 `apply` 或重读文件；根实例写盘后不广播重挂；常驻工具骨架保持不变，后续委派与提示组装通过文件 resolver 使用新快照。文件损坏保留最近有效缓存并由自检报告。 乙是保留方案。
     - 另注：`write` 还要求 `volatileForm(schema) !== undefined`，否则抛 `Plugin entry "…" has no volatile…` —— 一个 volatile 字段都没有的插件**完全无法通过设置页写入**。
 29. **`describe()` 是同步的**，返回**数组**（其 JSDoc 写「keyed by unique profile entry ids」，与实现不一致，以实现为准）。行的关键字段：`ns` / `schema` / `value` / `revision` / `writable` / `base` / `user` / `autoGenerate` / `applies`。**没有 `patch` 字段**。
     - 行会被**丢弃**的条件：`schema` 取不到、`entry.fiber` 不存在、`fiber.runtime === null`、`fiber.state !== 2`（ACTIVE），或 `volatileForm(schema) === undefined`。
@@ -270,7 +270,7 @@
     - `dsh.profile.bundles` **必须含本包**（`dependencies` 里有**不够**）：Loader 只加载
       `bundles` 列出的包。缺失后果是**应用正常启动、但插件完全不存在**，且**没有任何报错**
       （实测踩到：Loader 条目数 187 而非 188，`include:agent-switchboard` 从未创建）。
-    - 根条目**必须启用**，bundle 声明不必携带 `config.roles`；设置页读 `configForms`、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，Host 根实例将角色同步到 `$DSH_HOME/agent-switchboard/roles.json`。标准 preset 中本包只需 `mount: true`，**不得再携带 `roles`**；兼容自定义 preset 的本作用域显式角色数组（含 `[]` 清空），启动和热重载均优先于文件，仅 `undefined` 回落文件。新会话继承现有实例，不重新执行 `apply`；根实例写盘广播驱动已有 preset 重新读取、准备和替换角色工具。
+    - 根条目**必须启用**，bundle 声明不必携带 `config.roles`；设置页读 `configForms`、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，Host 根实例将角色同步到 `$DSH_HOME/agent-switchboard/roles.json`。标准 preset 中本包只需 `mount: true`，**不得再携带 `roles`**；兼容自定义 preset 的本作用域显式角色数组（含 `[]` 清空），启动和热重载均优先于文件，仅 `undefined` 回落文件。新会话继承现有实例，不重新执行 `apply`；根实例通过 `loader/volatile-update` 写盘；已有 preset 不重挂，执行期读取文件。
     - `scripts/check-profile-wiring.mjs` 显式断言根条目未禁用、preset 的 `mount: true` 及 `selfRow?.config?.roles === undefined`（找不到默认 profile 时跳过；显式目标缺失则失败）。
 37. **禁用/启用插件这个操作本身会重写 profile，且只保留它认识的条目。** 实测两次：一次
     web boot 失败后，profile 的 `cordis.patch.yml` 从 41,802 字节被削到 670 字节，
@@ -354,20 +354,15 @@ provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliT
 
 包裹路由取插件级 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`（D22）。
 根实例通过既有 `$DSH_HOME/agent-switchboard/roles.json` 的 `volatile` 同步三字段；不新增服务、文件类型或路径。
-根实例在 apply 和 Cordis 的 `internal/update` 瀑布中同步路由，更新钩子继续 next，不改变重挂载决策。
-根同步使用 `internal/update` 全局瀑布的前置监听，并按 receiver 的 Fiber uid 严格过滤，只处理自身根实例。
-原因：先注册的私有就地更新钩子可以消费瀑布而不调用 next，后注册的私有同步钩子因而收不到更新；真实 Cordis 离线夹具已复现。
-当前 Cordis 私有 hook 的 DisposableList 没有 unshift，不能直接对私有钩子使用 prepend。
-生产代码仍显式使用 `ctx.effect(() => ctx.on(...))`，使监听随本次激活释放，重启后不残留旧闭包。
-监听继续 next，不改变 Loader 的重挂载决策；同步异常进入根自检健康门禁并记录日志。
-先注册监听再验证初始配置，初始非法也可经就地更新修正并恢复根实例到文件的同步；写盘成功后向全局同名 hook 表广播 `agent-switchboard/config-changed`，payload 为 `{ roleConfigPath }`，不带 receiver。真实 Cordis 离线集成已验证跨 scope 可达。
-本次环境没有运行时 inspect 与可用 DSH asar，因此尚未核实真机 Loader 的钩子注册顺序，不能将离线复现直接当作本次真机症状的已确认根因，也不能据此确定回归由哪次提交引入。
-常驻 preset 的监听按路径匹配，串行处理并合并快速保存，以版本检查丢弃过时准备代；不依赖再次 `apply`、文件监听、定时器或 `tools/change`。每代在私有 scope 准备 CLI 配置快照与委派子 Fiber，等待 Fiber 激活并核实本代注册定义，不能把父层旧工具当成新代挂载成功。短同步提交段注销旧委派入口并注册新入口；注册失败撤销新入口、恢复旧定义，旧 Fiber 无需重启。
-实例级自检与动态 text guidance 仅注册一次；guidance 在提示组装时读取当前有效角色与工具清单。配置代持有私有 scope、子 Fiber、私有工具与公开入口 disposer；委派 execute 从预检开始持有租约，subagents.start 从启动至结果持有租约，后台 Job 从入队至 hooks.done 持有租约。私有 scope 通过保留本作用域隔离/拦截的扩展 ctx 创建，Fiber 归应用根所有；配置重载仅退休旧代，活跃归零后显式释放 scope/Fiber，不 abort signal、不主动销毁子会话或 CLI 进程。实例卸载（含 preset scope 卸载）执行 teardown，撤销公开入口、自检、guidance 与监听并退休全部代际；在途私有环境保留到租约归零后显式释放，不再接受新派发或更新。应用根卸载/关闭 DSH 仍整体拆毁，租约不保证应用服务继续存活。
-CLI 公开工具名保持稳定，入口通过 WeakMap 中的真实 `run.localAgent` 身份选择代际私有工具快照；未由对应角色派发的 Agent 拒绝执行，防止旧内置子代理的 deny 快照漏掉新 CLI 名。退休代的 CLI 入口保留至租约归零，已启动包裹仍使用原角色/命令/参数。不存在租约之外的额外运行期限。
+根实例在 apply 时同步初值，直接监听 owning Fiber 的 `loader/volatile-update` 同步保存值。载荷是路径数组的数组；Loader 先提交 Volatile 再普通 emit，通过发送侧 `Context.filter` 只投递 owning Fiber。监听器不使用 next、prepend 或 receiver 过滤，也无需额外 effect 包装。
+工具骨架只注册一次，官方 `dsh-tool-subagent` 在 execute 内读取 getter；每次派发现读 model/effort/instructions/readOnly/maxDepth、权限清单与包裹路由。提示组装也现读角色与可见工具。
+文件 resolver 用 mtimeMs+size 缓存：未变不重读，改变重读；损坏保留上一有效快照并标 stale，无有效缓存拒绝挂载/派发且自检不健康。显式 preset roles（含 []）优先，undefined 才回落文件，source 区分 preset/file。
+CLI 工具每次执行先复验当前角色的 driver、模板与 readOnly 兼容性，再复制执行快照；命令通过 `ctx.get('subprocess').resolveExecutable` 执行期解析，spawn 使用 argv 数组与 shell:false。装载自检标记“待执行时解析（尚未验证）”，执行后报告解析结果或本次解析失败，不冒充无 CLI 角色。runner 原有解析失败回落字面命令的行为保留，失败会进入可执行文件诊断。
+已开始的内置请求和 CLI 执行保留起始快照；工具返回、Jobs 结算、客户端读取分离，owner 仍为子会话，无主动 remove 或运行期限。实例卸载使用官方插件生命周期，不再管理私有代际或租约。
+增删角色/改 id/toolName/backend 仍会改变工具集（阶段 3，未实现）；当前实例拒绝结构变化的派发并明确报告需重新挂载，不能宣称已热更新。Host 源码改动仍需重启一次加载。
 有效文件 `maxDepth` 优先，缺失或无效时回落 preset，最后默认 3；根就地更新会同步已有文件的 maxDepth。角色配置、CLI 预设/参数和包裹路由用于后续派发；历史模型上下文、正在执行的子代理/CLI/后台 Job 不被改写。
-`switchboard_selftest` 的 `roleRoutes` 及渲染文本报告当前已提交代每个角色的后端、provider、model、effort；CLI 另列外部 CLI 模型/强度，与包裹 LLM 路由区分。
-重载失败继续报告上一有效代，工具不可用时标注未挂载。继承项明确标为继承/未指定，不冒充已解析的父会话或模型默认值；根实例提示在 Switchboard preset 内查看生效路由。
+`switchboard_selftest` 的 `roleRoutes` 报告当前 resolver 每个角色的后端、角色 model/effort、source=preset/file 与 stale；CLI 的角色模型/强度指外部 CLI，包裹路由由独立 getter 提供给派发请求，当前 roleRoutes 不单列包裹 LLM 路由。
+文件损坏时继续报告上一有效缓存并标 stale=true，工具不可用时标注未挂载；根实例提示在 Switchboard preset 内查看生效路由。
 挂载实例只校验有效路由来源：文件含任一 wrapper 字段即整个路由对象优先（包含显式空值），不逐字段补入 preset；
 被覆盖的非法 preset 路由忽略。文件没有任何 wrapper 字段时才回落当前实例配置。
 这与角色列表的优先级不同——角色列表是「本作用域**未提供** roles 时才回落读文件；显式空数组表示清空，不得复活文件里的旧角色」，而包裹路由是文件优先：preset 可独立选择角色，不能覆盖已经同步的统一包裹路由。
@@ -387,7 +382,7 @@ CLI 公开工具名保持稳定，入口通过 WeakMap 中的真实 `run.localAg
 内置 spawn / fork 保持角色自身 provider / model / effort，角色级 Provider 控件仍只对内置后端显示。
 面板顶部统一小节始终显示并说明仅 CLI 生效；保存时按角色列表与各包裹字段各自的 dirty 状态，以同一 revision 原子提交对应操作。仅改包裹字段不提交 `['roles']`，角色删空仍提交 `[]`；未改包裹字段不提交对应 `['volatile', 'wrapper…']` 操作。
 旧角色 agentProvider / agentModel 接受残留但不再使用；每激活实例记录弃用诊断，每次模块加载只打印一次告警。
-以上作用域桥接与「保存即由根实例同步到 roles.json」已通过离线夹具及真机核验；preset 的常驻单例生命周期已确认。D24 热重载机制通过真实 Cordis、ToolRuntime、真实 Config/角色文件/工具插件及假 subagents.start 的离线集成验证，真实设置保存往返和在途 CLI 真机验收尚未执行。历史离线测试曾手动再次调用 `apply` 验证其能读到文件，这只能证明重新挂载时可读盘，不能证明运行中配置会自动刷新；此前把该测试假设写成运行时事实，已在 D22 后续修正中更正。
+当前阶段 0 离线检查使用真实 Cordis 事件过滤、真实 Volatile 提交入口、真实工具插件与假 subagents.start/进程，验证保存返回前写盘、单次注册下动态派发、在途快照和缓存。历史 D24 的代际重挂检查只证明已退役实现；本轮未进行真实设置页保存往返或真实外部 CLI 验收。
 CLI 出站使用 allow：`allowNestedDispatch: false` 时仍包含本角色专属 CLI 工具，并非空 allow；为 true 时另允许已挂载的受控委派工具。
 CLI allow 不开放其他角色的底层 CLI 执行工具。内置角色不设置 allow，使用 deny 保留派发采集时可见的普通工具与后注册普通工具的动态可见性。
 deny 合成当前可用的非受控派发入口、全部当前可用的底层 CLI 工具、关闭嵌套时已挂载的受控委派工具、只读时当前可用的写工具；
@@ -559,3 +554,9 @@ jobId 由 Jobs 管理，schema、返回值与 render 均不暴露它；客户端
 调用 `agent.cancel({ kind: 'user' })`；`dsh-tool-subagent/lib/index.js` 的前台派发
 把 `exec.signal` 传给 `subagents.start`。假进程验证取消能终止并清理；
 DSH GUI 的完整按钮链与 codex/grok 进程树清理仍需真机验收，本批次不新增 UI。
+
+## 当前机制说明（D25）
+
+现行数据流是：根条目提交 Volatile -> owning Fiber 收到 `loader/volatile-update` -> 原子写入 `roles.json` -> 静态工具在下一次执行时通过 mtime/size resolver 读取。`internal/update`、generation、租约、影子服务、跨作用域广播和 `ctx.root.fiber` 归属均为历史失败路径，不是当前机制。Host 源码改动仍需重启一次加载。
+
+**已确认的边界：** 在途快照保证目前从内置 subagents.start 请求组装完成及 CLI execute 起始快照算起。官方工具在 LLM 路由预检 await 前读取 agentOptions、之后读取 persona/toolFilter/maxDepth；该等待期间保存配置可能混用旧模型和新指令，独立离线探针已复现。若要求从 delegate execute 入口原子冻结整次配置，独立 getter 方案需要新增调用级快照边界；此项 BLOCKED BY DESIGN，待架构决策，不能宣称已解决。

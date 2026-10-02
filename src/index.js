@@ -4,8 +4,8 @@
  * 职责：把「角色」变成主代理可用的委派工具。
  *
  * 设计要点（依据见 docs/decisions.md）：
- *   - 根 Config 经文件桥接给常驻 preset，写盘广播驱动代际重挂。
- *     增删角色无需重启；Host 源码改动仍需重启一次装载。
+ *   - 根 Config 经 loader/volatile-update 持久化到文件；工具骨架只注册一次，执行期现读角色配置。
+ *     增删角色仍需改变工具集；Host 源码改动仍需重启一次装载。
  *   - 角色级固定 model / effort（D12），主代理无权覆盖。
  *   - `readOnly` 通过 `toolFilter.deny` 落地——这是**工具级**约束而非沙箱级，
  *     因为 `SubagentStartRequest` 没有沙箱字段（已核实）。
@@ -21,7 +21,7 @@
  */
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { createScope, scopeOf } from '@deepseek-ai/dsh-scope';
+import { scopeOf } from '@deepseek-ai/dsh-scope';
 import { join } from 'node:path';
 import {
   CLI_BACKEND,
@@ -34,7 +34,7 @@ import {
   toolConfigFor,
 } from './roles.js';
 import { createCliTool } from './cli/provider.js';
-import { configPathFor, readConfigFile, writeConfigFile, initialConfig } from './config-file.js';
+import { configPathFor, readConfigFile, createConfigFileResolver, writeConfigFile, initialConfig } from './config-file.js';
 
 /**
  * 从插件自己的配置文件读取角色。
@@ -61,8 +61,6 @@ function readRoleConfigFile(path) {
 
 /** Loader 条目名，与 package.json 的 `name` 保持一致。 */
 export const name = 'agent-switchboard';
-const generationKey = Symbol.for('agent-switchboard.generation');
-const publicContextKey = Symbol('agent-switchboard.public-context');
 
 /**
  * 读取 `volatile` 子对象的实际取值。
@@ -428,14 +426,14 @@ export const Config = z.object({
  * @returns {object} `SubprocessHandle`
  */
 function safeSpawn(ctx, spec) {
-  // ⚠️ 服务一律走 `get()`：generation / private / extended ctx **没有声明 inject**，
+  // ⚠️ 服务一律走 `get()`：扩展 ctx **没有声明 inject**，
   //    在它们上面做 `ctx.subprocess` 直接属性访问会抛
   //    `cannot get property "subprocess" without inject`（本族缺陷的真机表现）。
   const subprocess = typeof ctx.get === 'function' ? ctx.get('subprocess') : ctx.subprocess;
   if (!subprocess || typeof subprocess.spawn !== 'function') {
     throw new Error('subprocess.spawn 不可用：没有挂载 subprocess 服务实现');
   }
-  return subprocess.spawn(spec);
+  return subprocess.spawn({ ...spec, shell: false });
 }
 
 /**
@@ -599,6 +597,7 @@ export function selftestTool(ctx, diagnostics) {
       },
     },
     async execute() {
+      diagnostics.refresh?.();
       // preset 诊断是异步的，且可能失败；失败不应让整个自检失败。
       const [presetRoster, presetBroken] = await Promise.all([
         presets.roster().catch((e) => `读取异常：${e?.message ?? e}`),
@@ -737,63 +736,34 @@ function mountedRoleOptions(ctx, roles, maxDepth) {
   };
 }
 
-async function mountRoleTool(ctx, role, toolModule, maxDepth, roles, wrapperRoute) {
-  if (typeof ctx.plugin !== 'function') {
-    return { ok: false, detail: 'ctx.plugin 不可用' };
-  }
+async function mountRoleTool(ctx, role, toolModule, resolver, roles, maxDepth, wrapperRoute) {
+  if (typeof ctx.plugin !== 'function') return { ok: false, detail: 'ctx.plugin 不可用' };
   try {
-    // Cordis 的 Config 校验会物化 getter；在 apply 之后恢复运行时读取。
-    // 派发时才枚举当前作用域：后挂载、注册失败或已卸载的工具不能靠配置名假定存在。
-    const liveConfig = (base) => ({
-      ...base,
-      get persona() { return toolConfigFor(role, mountedRoleOptions(ctx, roles, maxDepth)).persona; },
-      get toolFilter() { return toolConfigFor(role, mountedRoleOptions(ctx, roles, maxDepth)).toolFilter; },
+    const liveRole = () => {
+      const current = resolver().roles.find(item => item.id === role.id);
+      if (current?.cliBlockReason) throw new Error(current.cliBlockReason);
+      return current;
+    };
+    const liveConfig = toolConfigFor(role, {
+      getRole: liveRole,
+      getMaxDepth: () => resolver().maxDepth,
+      getWrapperRoute: () => resolver().wrapperRoute,
+      maxDepth, wrapperRoute,
+      availableToolNames: ctx.get('tools').schemas(scopeOf(ctx)).map(tool => tool.name),
+      delegateToolNames: roles.map(item => item.toolName),
+      getAvailableToolNames: () => ctx.get('tools').schemas(scopeOf(ctx)).map(tool => tool.name),
+      getDelegateToolNames: () => roles.filter(item => ctx.get('tools').get(item.toolName, scopeOf(ctx))).map(item => item.toolName),
     });
-    const fiber = ctx.plugin({
-      ...toolModule,
-      apply: (toolCtx, config) => toolModule.apply(
-        ctx[generationKey] ? ctx[generationKey].runtime(toolCtx, role) : toolCtx,
-        liveConfig(config)),
-    }, liveConfig(toolConfigFor(role, { maxDepth, wrapperRoute })));
-    ctx[generationKey]?.fibers.push(fiber);
+    const fiber = ctx.plugin({ ...toolModule, apply: (toolCtx, config) => toolModule.apply(toolCtx, config) }, liveConfig);
     if (typeof fiber?.await === 'function') await fiber.await();
-  } catch (error) {
-    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
-  }
-
-  // 给 fiber 两个微任务的激活机会，再记录首次核验快照；注入/provider 可能稍后才就绪。
-  // 此处失败不代表永久失败，自检以调用时的实时注册表为准。
-  await Promise.resolve();
-  await Promise.resolve();
-
-  const tools = ctx.get('tools');
-  if (tools === undefined) {
-    return { ok: false, detail: '无法核实：ctx.get("tools") 不可用' };
-  }
-  if (typeof tools.get !== 'function') {
-    return { ok: false, detail: '无法核实：tools.get 不可用' };
-  }
-  let registered;
-  try {
-    registered = tools.get(role.toolName, scopeOf(ctx));
-  } catch (error) {
-    return {
-      ok: false,
-      detail: `核实注册时抛错：${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
-  if (registered === undefined || registered === null ||
-    (ctx[generationKey] && !ctx[generationKey].definitions.has(role.toolName))) {
-    return {
-      ok: false,
-      detail: '工具尚未出现在工具注册表中（可能等待注入/provider 就绪，或 fiber 装载失败；见 Host 日志）',
-    };
-  }
-  return { ok: true, detail: '已挂载并核实' };
+  } catch (error) { return { ok: false, detail: error instanceof Error ? error.message : String(error) }; }
+  await Promise.resolve(); await Promise.resolve();
+  const registered = ctx.get('tools')?.get(role.toolName, scopeOf(ctx));
+  return registered == null ? { ok: false, detail: '工具尚未出现在工具注册表中' } : { ok: true, detail: '已挂载并核实' };
 }
 
 /**
- * 在 `ctx.profileContext` 不可用时推断 `$DSH_HOME`。
+ * 在 `ctx.profileContext`'@+' [regex]::Escape(' 不可用时推断 `$DSH_HOME`。') + '@' 不可用时推断 `$DSH_HOME`。
  *
  * 依据 `dsh-home-paths` 的语义：优先 `$DSH_HOME` 环境变量，否则 `~/.dsh`。
  * 这一层兜底是为了让 headless / sdk / acp 启动形态下角色配置仍可用 ——
@@ -901,40 +871,33 @@ function applyInner(ctx, config) {
   //    （客户端只装载构建期生成的静态贡献清单，且没有 Proxy），那个服务客户端根本
   //    调不到；留着它只会平添「注册失败拖垮启动」的风险。现在客户端走 `settings`。
   if (!mountHere) {
-    // volatile 更新可能被 Loader 就地处理，不触发重新 apply；先注册保证非法初值可恢复。
     const sync = (updated, syncDepth = false) => {
       const wrapper = wrapperRouteFrom(updated);
       diagnostics.configErrors = diagnostics.configErrors.filter((error) => !error.startsWith('volatile.wrapper'));
       if (wrapper.errors.length > 0) {
         diagnostics.configErrors.push(...wrapper.errors);
         for (const error of wrapper.errors) console.error(`[${name}] ${error}`);
-      } else {
-        // 非数组 roles 是非法输入，整次同步不得写盘（包括包裹字段）。
-        if (syncRolesToFile({ resolved: updated, roleConfigPath, diagnostics, syncDepth }) !== false) {
-          syncWrapperRouteToFile(updated, roleConfigPath, diagnostics);
-          const saved = readRoleConfigFile(roleConfigPath);
-          if (saved.ok && !saved.missing && !diagnostics.wrapperSyncError) {
-            ctx.emit?.('agent-switchboard/config-changed', { roleConfigPath });
-          }
-        }
+        return;
+      }
+      if (syncRolesToFile({ resolved: updated, roleConfigPath, diagnostics, syncDepth }) !== false) {
+        syncWrapperRouteToFile(updated, roleConfigPath, diagnostics);
       }
     };
-    // Loader 的就地更新钩子可能消费瀑布、不调用 next；同步须先于它执行。
-    // Cordis 私有 hook 的 DisposableList 没有 unshift，不能在私有钩子上 prepend。
-    // 使用全局瀑布前置监听，但按 receiver Fiber 严格过滤；effect 保持激活期归属。
-    if (ctx.on) ctx.effect(() => ctx.on('internal/update', function (updated, _noSave, next) {
-      // ctx.fiber 可能是 Cordis 的服务视图代理，身份比较使用 Fiber 的稳定 uid。
-      if (ctx.fiber && this?.uid !== ctx.fiber.uid) return next();
-      try {
-        sync(updated, true);
-      } catch (error) {
+    if (ctx.on) ctx.on('loader/volatile-update', paths => {
+      if (!Array.isArray(paths)) return;
+      const relevant = paths.some(path => Array.isArray(path) && (
+        path.length === 1 && ['roles', 'maxDepth'].includes(path[0]) ||
+        path.length === 2 && path[0] === 'volatile' && ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].includes(path[1])
+      ));
+      if (!relevant) return;
+      try { sync(resolved, true); }
+      catch (error) {
         const detail = `根配置同步异常：${error instanceof Error ? error.message : String(error)}`;
         diagnostics.roleConfigSync = detail;
         diagnostics.configErrors = [detail];
         console.error(`[${name}] ${detail}`);
       }
-      return next();
-    }, { global: true, prepend: true }));
+    });
     sync(resolved);
     return;
   }
@@ -1032,417 +995,102 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
  * @param {object} options.diagnostics - 诊断记录。
  */
 function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, disposeSelftest }) {
-  let current;
-  let committed = false;
-  let revision = 0;
-  let running = false;
-  let closed = false;
-  const generations = new Set();
-  // 身份不来自模型参数；仅接受本实例为该角色启动并返回的真实 localAgent。
-  const wrappers = new WeakMap();
-  const cliEntries = new Map();
-  const dispose = value => typeof value === 'function' ? value() : value?.dispose();
-  const report = error => {
-    const detail = error instanceof Error ? error.message : String(error);
-    const initial = !committed;
-    diagnostics.configErrors = [`${initial ? '初始挂载失败' : '热重载失败，保留上一代'}：${detail}`];
-    if (initial) diagnostics.fatal = diagnostics.configErrors[0];
-    console.error(`[${name}] ${diagnostics.configErrors[0]}`);
+  const loaded = readRoleConfigFile(roleConfigPath);
+  diagnostics.roleConfigRead = loaded.detail;
+  if (loaded.ok) { noteLegacyTimeout(loaded.value, diagnostics); noteLegacyWrapper(loaded.value, diagnostics); }
+  // 保留 preset 显式 roles（包括 []）及真实 Volatile 引用，文件只补缺省来源。
+  const read = createRoleResolver(roleConfigPath, { ...resolved });
+  const initial = read();
+  const roles = initial.roles;
+  const resolver = () => {
+    const current = read();
+    const changed = JSON.stringify(current.roles.map(item => [item.id, item.toolName, item.backend])) !==
+      JSON.stringify(roles.map(item => [item.id, item.toolName, item.backend]));
+    const errors = [...current.errors, ...(!current.ok && current.error ? [current.error] : []),
+      ...(changed ? ['角色工具集已改变（增删角色/id/toolName/backend）；阶段 3 未实现，请重新挂载'] : [])];
+    diagnostics.roleRoutes = current.routes;
+    diagnostics.configErrors = errors;
+    if (!current.ok || errors.length) throw new Error(errors.join('；') || '角色配置不可用');
+    return current;
   };
-  const release = generation => {
-    if (!generation.retired || generation.active !== 0 || generation.released) return;
-    generation.released = true;
-    for (const entry of cliEntries.values()) {
-      entry.generations.delete(generation);
-      if (entry.generations.size === 0) {
-        dispose(entry.dispose);
-        cliEntries.delete(entry.name);
-      }
-    }
-    generations.delete(generation);
-    Promise.resolve(generation.scope.dispose()).catch(report);
-  };
-  const lease = generation => {
-    generation.active++;
-    let held = true;
-    return () => {
-      if (!held) return;
-      held = false;
-      generation.active--;
-      release(generation);
-    };
-  };
-  const registerPublic = (generation, definition) => {
-    if (definition.name.startsWith('switchboard_cli_run_')) {
-      let entry = cliEntries.get(definition.name);
-      if (!entry) {
-        const publicTool = { ...definition, async execute(args, exec) {
-          const bound = wrappers.get(exec?.agent);
-          if (!bound?.tool || bound.tool.name !== definition.name || bound.generation.released) {
-            throw new Error('CLI 包裹身份不匹配；请通过对应 delegate_to_* 工具重新派发');
-          }
-          const done = lease(bound.generation);
-          try { return await bound.tool.execute(args, exec); } finally { done(); }
-        } };
-        entry = { name: definition.name, generations: new Set(), dispose: ctx.tools.register(publicTool) };
-        cliEntries.set(definition.name, entry);
-      }
-      entry.generations.add(generation);
-      return;
-    }
-    const publicTool = { ...definition, async execute(args, exec) {
-      const done = lease(generation);
-      try { return await definition.execute(args, exec); } finally { done(); }
-    } };
-    generation.publicDisposers.set(definition.name, ctx.tools.register(publicTool));
-  };
-  const prepare = async initial => {
-    const generation = { active: 0, retired: false, released: false, initial,
-      definitions: new Map(), privateDisposers: new Map(), publicDisposers: new Map(), fibers: [], roles: [], maxDepth: 3 };
-    // 保留本作用域服务隔离与拦截，但私有 Fiber 归根所有，避免实例卸载隐式拆毁在途环境。
-    // 实例 teardown 退休全部代际，release 在租约归零后显式释放；应用根卸载仍会整体拆毁。
-    const ownerCtx = ctx.root?.fiber ? ctx.extend({ fiber: ctx.root.fiber }) : ctx;
-    generation.scope = createScope(ownerCtx, {}, { parent: scopeOf(ctx) });
-    generations.add(generation);
-    const privateCtx = generation.scope.ctx;
-    // ⚠️ 新建 scope 的 ctx **没有声明 inject**：在它上面做服务属性访问会抛
-    //    `cannot get property "tools" without inject`（本项目在 jobs 上踩过同类坑）。
-    //    服务会沿作用域向下继承，所以这里用免声明的 `get()` 解析。
-    try {
-      const privateTools = privateCtx.get('tools');
-      if (!privateTools) throw new Error('私有 scope 解析不到 tools 服务；本代角色工具无法挂载');
-      const tools = Object.create(privateTools);
-      tools.register = definition => {
-        const undo = privateTools.register(definition);
-        generation.definitions.set(definition.name, definition);
-        // 首次装载仍允许 provider 延迟就绪；替换代必须全部准备成功后才公开。
-        if (generation === current && !generation.retired) registerPublic(generation, definition);
-        const unregister = () => {
-          dispose(undo);
-          if (generation.definitions.get(definition.name) !== definition) return;
-          generation.definitions.delete(definition.name);
-          generation.privateDisposers.delete(definition.name);
-          dispose(generation.publicDisposers.get(definition.name));
-          generation.publicDisposers.delete(definition.name);
-        };
-        generation.privateDisposers.set(definition.name, unregister);
-        return unregister;
-      };
-      generation.runtime = (toolCtx, role) => {
-        // 影子对象只用于替换 `start` 这一个方法；**内层必须打到真实服务**，否则自我递归。
-        // 沿用 :1084 的教训：在新建/扩展 ctx 上避免直接属性访问。
-        const realSubagents = toolCtx.get('subagents');
-        const subagents = Object.create(realSubagents);
-        subagents.start = async (provider, request) => {
-          const done = lease(generation);
-          try {
-            const run = await realSubagents.start(provider, request);
-            if (role.backend === CLI_BACKEND && run.localAgent) {
-              wrappers.set(run.localAgent, { generation, tool: generation.definitions.get(cliToolName(role.id)) });
-            }
-            // 保留启动及结果租约，不调用 run.dispose、不触碰 signal。
-            Promise.resolve(run.result).then(done, done);
-            return run;
-          } catch (error) { done(); throw error; }
-        };
-        return toolCtx.extend({ tools, subagents, get(key) {
-          if (key === 'tools') return tools;
-          const service = toolCtx.get(key);
-          if (key !== 'jobs' || !service) return service;
-          const jobs = Object.create(service);
-          jobs.start = spec => {
-            // 从 Job 入队开始持有，覆盖延迟 run；不改变 owner/cancel/结算策略。
-            const done = lease(generation);
-            try {
-              return service.start({ ...spec, run(job) {
-                try {
-                  const hooks = spec.run(job);
-                  Promise.resolve(hooks.done).then(done, done);
-                  return hooks;
-                } catch (error) { done(); throw error; }
-              } });
-            } catch (error) { done(); throw error; }
-          };
-          return jobs;
-        } });
-      };
-      const buildCtx = privateCtx.extend({ tools, [publicContextKey]: ctx, [generationKey]: generation,
-        get(key) { return key === 'tools' ? tools : privateCtx.get(key); } });
-      const nextDiagnostics = newDiagnostics();
-      nextDiagnostics.mountHere = true;
-      nextDiagnostics.roleConfigPath = roleConfigPath;
-      if (initial) current = generation;
-      await buildRoleGeneration(buildCtx, { roleConfigPath, resolved: { ...resolved },
-        diagnostics: nextDiagnostics, generation });
-      if (initial && nextDiagnostics.configErrors.length) {
-        nextDiagnostics.fatal = `初始挂载失败：${nextDiagnostics.configErrors.join('；')}`;
-      }
-      if (!initial && (nextDiagnostics.configErrors.length || nextDiagnostics.blocked.length || nextDiagnostics.fatal ||
-        nextDiagnostics.mounts.some(mount => !mount.ok))) {
-        throw new Error([...nextDiagnostics.configErrors, ...nextDiagnostics.blocked.map(item => item.reason),
-          nextDiagnostics.fatal, ...nextDiagnostics.mounts.filter(item => !item.ok).map(item => item.detail)].filter(Boolean).join('；'));
-      }
-      generation.diagnostics = nextDiagnostics;
-      return generation;
-    } catch (error) {
-      generation.retired = true;
-      release(generation);
-      throw error;
-    }
-  };
-  const replace = generation => {
-    const previous = current;
-    // 短同步提交段：旧 Fiber 不销毁，任何入口注册失败均恢复旧入口。
-    for (const undo of previous?.publicDisposers.values() ?? []) dispose(undo);
-    previous?.publicDisposers.clear();
-    try {
-      for (const definition of generation.definitions.values()) registerPublic(generation, definition);
-    } catch (error) {
-      for (const undo of generation.publicDisposers.values()) dispose(undo);
-      generation.publicDisposers.clear();
-      if (previous) for (const definition of previous.definitions.values()) {
-        if (!definition.name.startsWith('switchboard_cli_run_')) registerPublic(previous, definition);
-      }
-      generation.retired = true;
-      release(generation);
-      throw error;
-    }
-    current = generation;
-    Object.assign(diagnostics, generation.diagnostics);
-    committed = true;
-    if (previous && previous !== generation) { previous.retired = true; release(previous); }
-  };
-  const reload = async () => {
-    if (running || closed) return;
-    running = true;
-    try {
-      while (!closed) {
-        const wanted = revision;
-        let generation;
-        try {
-          generation = await prepare(current === undefined);
-          if (closed || wanted !== revision) {
-            generation.retired = true;
-            if (current === generation) current = undefined;
-            for (const undo of generation.publicDisposers.values()) dispose(undo);
-            generation.publicDisposers.clear();
-            release(generation);
-          } else replace(generation);
-        } catch (error) { report(error); }
-        if (wanted === revision) break;
-      }
-    } finally { running = false; }
-  };
-  const disposeGuidance = ctx.systemPrompt.section({ name: 'agent-switchboard:roles', order: 10500,
-    text: () => current ? roleGuidanceText(current.roles, mountedRoleOptions(ctx, current.roles, current.maxDepth)) : '' });
-  const disposeListener = ctx.on?.('agent-switchboard/config-changed', payload => {
-    if (payload?.roleConfigPath !== roleConfigPath || closed) return;
-    revision++;
-    void reload();
-  });
-  ctx.effect?.(() => () => {
-    closed = true;
-    dispose(disposeListener);
-    dispose(disposeGuidance);
-    dispose(disposeSelftest);
-    for (const generation of generations) {
-      for (const undo of generation.publicDisposers.values()) dispose(undo);
-      generation.publicDisposers.clear();
-      generation.retired = true;
-      release(generation);
-    }
-  });
-  void reload();
-}
-
-function buildRoleGeneration(ctx, { roleConfigPath, resolved, diagnostics, generation }) {
-
-  // 角色来源有两个候选，**先记下各自看到什么**，再决定用哪个。
-  //
-  // 为什么要两条路（实测约束决定的）：
-  //   - 客户端唯一可写通道是 `settings.mutate(ns, …)`，而 `ns` 只能是**根条目** id
-  //     （`configEditor.entries()` 只取 `parent.tree.ctx.fiber.entry?.id === "include"`
-  //     的条目，preset 内的插件声明没有 settings 行）。所以「UI 可编辑」要求角色落在
-  //     **根条目的 Cordis 配置**里。
-  //   - 而真正挂载角色工具的是 **preset 实例**，它读的是自己那份配置。
-  // 因此必须确认 preset 实例能否看到根条目的配置；两条都记进诊断，一次重启即可判明。
-  const fromFile = readRoleConfigFile(roleConfigPath);
-  if (fromFile.ok) noteLegacyTimeout(fromFile.value, diagnostics);
-  if (fromFile.ok) noteLegacyWrapper(fromFile.value, diagnostics);
-  // 只校验有效来源：文件有任一包裹字段即整个路由对象优先（含空值），不逐字段合并。
-  // 被覆盖的 preset 路由不校验；角色仍保持本作用域优先。
-  const hasRootRoute = fromFile.ok && ['wrapperProvider', 'wrapperModel', 'wrapperEffort']
-    .some((key) => Object.hasOwn(fromFile.value.volatile ?? {}, key));
-  const wrapper = wrapperRouteFrom(hasRootRoute ? fromFile.value : resolved);
-  if (wrapper.errors.length > 0) {
-    diagnostics.configErrors = wrapper.errors;
-    for (const error of wrapper.errors) console.error(`[${name}] ${error}`);
+  diagnostics.refresh = () => { try { resolver(); } catch {} };
+  diagnostics.roleRoutes = initial.routes;
+  diagnostics.configuredRoles = roles.map(role => ({ id: role.id, toolName: role.toolName,
+    ...(role.backend === CLI_BACKEND ? { cliToolName: cliToolName(role.id) } : {}) }));
+  diagnostics.configuredRoleCount = roles.length;
+  diagnostics.mountHere = true;
+  if (!initial.ok || initial.errors.length > 0) {
+    diagnostics.configErrors = initial.errors.length ? initial.errors : [initial.error];
+    diagnostics.fatal = diagnostics.configErrors.join('；');
     return;
   }
-  const fromCordis = readVolatileField(resolved, 'roles');
-  const cordisRoles = fromCordis;
-  diagnostics.roleConfigRead =
-    `${fromFile.detail}；本作用域 Cordis 配置里 roles=${Array.isArray(cordisRoles) ? cordisRoles.length : cordisRoles === undefined ? '未提供' : '非法'} 个`;
-
-  // 非数组不得静默当空或回落文件；与根同步边界采用同一三分支判据。
-  if (cordisRoles !== undefined && !Array.isArray(cordisRoles)) {
-    diagnostics.configErrors = ['roles 必须是数组（undefined 表示未提供）'];
-    console.error(`[${name}] ${diagnostics.configErrors[0]}`);
-    return;
-  }
-  // `undefined` 表示本作用域未提供 roles，才允许回落文件；显式 [] 表示清空，不能复活旧角色。
-  const rawRoles = cordisRoles === undefined
-    ? fromFile.ok ? fromFile.value.roles : []
-    : cordisRoles;
-  diagnostics.configuredRoleCount = rawRoles.length;
-  const defaults = {
-    provider: (fromFile.ok && fromFile.value.provider) || resolved.provider,
-    cwd: (fromFile.ok && fromFile.value.cwd) || resolved.cwd,
-  };
-  const fileDepth = fromFile.ok ? fromFile.value.maxDepth : undefined;
-  const maxDepth = Number.isInteger(fileDepth) && fileDepth >= 0 ? fileDepth
-    : typeof resolved.maxDepth === 'number' ? resolved.maxDepth : 3;
-  generation.maxDepth = maxDepth;
-  if (rawRoles.length === 0) {
-    if (!fromFile.ok) {
-      diagnostics.configErrors = [fromFile.detail];
-      console.error(`[${name}] ${fromFile.detail}`);
-      return;
-    }
-    console.error(`[${name}] 本作用域没有角色（Cordis 配置与文件都为空）`);
-    return;
-  }
-
-  const { roles, errors } = normalizeRoles(rawRoles, defaults.provider, defaults.cwd);
-  generation.roles = roles;
-  // 随已提交代的诊断一起替换；重载失败继续展示上一代，不能把磁盘新值称为生效值。
-  diagnostics.roleRoutes = roles.map(role => {
-    const options = toolConfigFor(role, { maxDepth, wrapperRoute: wrapper.route }).agentOptions ?? {};
-    const summary = `backend=${role.backend} provider=${options.provider || '继承父代理'} model=${options.model || '继承父代理'} effort=${options.reasoningEffort || '未指定（按实际路由继承/默认）'}`;
-    return { id: role.id, summary: role.backend === CLI_BACKEND ? `${summary}; 外部 CLI ${routeSummaryFor(role)}` : summary };
-  });
-  diagnostics.configErrors = errors;
-  // 记录「本作用域配置了哪些角色」——自检在解析不出工具时据此说明原因，
-  // 而不是含糊地报「工具未出现在工具注册表中」。
-  diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName,
-    ...(r.backend === CLI_BACKEND ? { cliToolName: cliToolName(r.id) } : {}) }));
-  if (errors.length > 0) {
-    // 配置有错时不挂载任何角色工具：半挂载会让主代理看到一批语义不明的工具。
-    console.error(`[${name}] 角色配置有 ${errors.length} 处错误，未挂载任何角色工具：`);
-    for (const line of errors) console.error(`[${name}]   - ${line}`);
-    return;
-  }
-  if (roles.length === 0) return;
-
-  // 角色工具的宿主描述无法区分角色；路由指引由实例级动态 section 提供，
-  // 这里只准备代际配置，不重复注册 guidance 或 tools/change 监听。
-
   const { active: activeCliRoles, blocked: blockedCliRoles } = planCliMounts(roles);
-
-  // 专属工具先注册在 preset 层，子代理继承可见性；execute 仍拒绝主代理直调。
-  // 两个工具使用同一挂载计划，任何注册失败都阻止该角色的委派工具挂载。
-  const failedCliTools = [];
-  if (blockedCliRoles.length > 0) {
-    diagnostics.blocked = blockedCliRoles;
-    console.error(
-      `[${name}] ${blockedCliRoles.length} 个 CLI 角色未挂载：` +
-        blockedCliRoles.map((b) => `${b.id}(${b.reason})`).join(', '),
-    );
-  }
-
+  diagnostics.blocked = blockedCliRoles;
   for (const role of activeCliRoles) {
     try {
-      const tool = createCliTool({
-        role,
-        ctx,
-        spawn: (spec) => safeSpawn(ctx, spec),
-        resolveExecutable: async (command, env, signal) => {
-          // 同 safeSpawn：generation ctx 未声明 inject，必须走 get()。
+      const executable = { id: role.id, command: role.cli.command, ok: true, resolved: '待执行时解析（尚未验证）' };
+      diagnostics.executables.push(executable);
+      const tool = createCliTool({ role, getRole: () => {
+        const current = resolver().roles.find(item => item.id === role.id);
+        if (current?.cliBlockReason) throw new Error(current.cliBlockReason);
+        return current;
+      }, ctx,
+        spawn: spec => safeSpawn(ctx, spec), resolveExecutable: async (command, env, signal) => {
+          executable.command = command;
           try {
-            const subprocess = ctx.get('subprocess');
-            if (!subprocess || typeof subprocess.resolveExecutable !== 'function') {
-              throw new Error('subprocess.resolveExecutable 不可用：没有挂载 subprocess 服务实现');
-            }
-            const path = await subprocess.resolveExecutable(command, env, signal);
-            diagnostics.executables.splice(0, diagnostics.executables.length,
-              ...diagnostics.executables.filter(item => item.id !== role.id));
-            diagnostics.executables.push({ id: role.id, command, resolved: path, ok: true });
-            return path;
+            const result = await ctx.get('subprocess').resolveExecutable(command, env, signal);
+            Object.assign(executable, { ok: true, resolved: result, detail: undefined });
+            return result;
           } catch (error) {
-            const detail = `本次未解析可执行文件，执行器将尝试配置命令：${error instanceof Error ? error.message : String(error)}`;
-            diagnostics.executables.splice(0, diagnostics.executables.length,
-              ...diagnostics.executables.filter(item => item.id !== role.id));
-            diagnostics.executables.push({ id: role.id, command, ok: false, detail });
-            console.error(`[${name}] CLI 角色 "${role.id}"：${detail}`);
+            Object.assign(executable, { ok: false, resolved: undefined,
+              detail: `本次未解析可执行文件：${error.message ?? error}` });
             throw error;
           }
-        },
-      });
+        } });
       ctx.get('tools').register(tool);
-      if (ctx.get('tools')?.get(tool.name, scopeOf(ctx)) == null || !generation.definitions.has(tool.name)) {
-        throw new Error(`专属 CLI 工具未注册：${tool.name}`);
-      }
+      if (!ctx.get('tools').get(tool.name, scopeOf(ctx))) throw new Error('专属 CLI 工具未注册');
       diagnostics.providers.push({ id: role.id, name: tool.name, ok: true, detail: '已注册专属工具' });
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      failedCliTools.push({ id: role.id, reason: detail });
-      diagnostics.providers.push({ id: role.id, name: cliToolName(role.id), ok: false, detail });
-      console.error(`[${name}] CLI 工具 "${role.id}" 注册失败：${detail}`);
+      diagnostics.blocked.push({ id: role.id, reason: error instanceof Error ? error.message : String(error) });
     }
   }
-  diagnostics.blocked.push(...failedCliTools);
+  import('@deepseek-ai/dsh-tool-subagent').then(async toolModule => {
+    for (const role of roles) {
+      const blocked = diagnostics.blocked.find(item => item.id === role.id);
+      if (blocked) { diagnostics.mounts.push({ id: role.id, ok: false, detail: blocked.reason }); continue; }
+      const outcome = await mountRoleTool(ctx, role, toolModule, resolver, roles, initial.maxDepth, initial.wrapperRoute);
+      diagnostics.mounts.push({ id: role.id, ok: outcome.ok, detail: outcome.detail });
+    }
+  }).catch(error => { diagnostics.fatal = `无法 import @deepseek-ai/dsh-tool-subagent：${error.message ?? error}`; });
+  const disposeGuidance = ctx.get('systemPrompt').section({ name: 'agent-switchboard:roles', order: 10500,
+    text: () => { let current; try { current = resolver(); } catch { return '角色配置不可派发；请检查 switchboard_selftest。'; } return roleGuidanceText(current.roles, {
+      availableToolNames: ctx.get('tools').schemas(scopeOf(ctx)).map(tool => tool.name),
+      delegateToolNames: roles.filter(role => ctx.get('tools').get(role.toolName, scopeOf(ctx))).map(role => role.toolName),
+    }); } });
+  ctx.effect?.(() => () => { disposeGuidance?.(); disposeSelftest?.(); });
+}
 
-  // CLI 角色的**装载期**校验：把「命令根本不存在」这类问题在启动时就报出来，
-  // 而不是等第一次派发。解析失败不阻断装载（可能依赖运行期 PATH），只作为诊断。
-  for (const role of activeCliRoles) {
-    Promise.resolve()
-      .then(() => {
-        // 同 safeSpawn：generation ctx 未声明 inject，必须走 get()。
-        const subprocess = ctx.get('subprocess');
-        if (!subprocess || typeof subprocess.resolveExecutable !== 'function') {
-          throw new Error('subprocess.resolveExecutable 不可用：没有挂载 subprocess 服务实现');
-        }
-        return subprocess.resolveExecutable(role.cli.command, role.cli.env);
-      })
-      .then((path) => {
-        diagnostics.executables.push({ id: role.id, command: role.cli.command, resolved: path, ok: true });
-      })
-      .catch((error) => {
-        const detail = error instanceof Error ? error.message : String(error);
-        diagnostics.executables.push({ id: role.id, command: role.cli.command, ok: false, detail });
-        console.error(`[${name}] CLI 角色 "${role.id}" 的可执行文件无法解析：${detail}`);
-      });
-  }
-
-  // 动态 import：把「工具包取不到」变成可上报的诊断，而不是整个插件激活失败。
-  return import('@deepseek-ai/dsh-tool-subagent')
-    .then(async (toolModule) => {
-      for (const role of roles) {
-        // 预设不合法或专属工具注册失败时，该角色不可派发。
-        const blocked = [...blockedCliRoles, ...failedCliTools].find((b) => b.id === role.id);
-        if (blocked) {
-          diagnostics.mounts.push({
-            id: role.id,
-            ok: false,
-            detail: `${blocked.reason}，故未挂载（专属 CLI 工具不可用）`,
-          });
-          continue;
-        }
-        // `mountRoleTool` 会核实工具是否真的注册成功（见其 JSDoc）。
-        const outcome = await mountRoleTool(ctx, role, toolModule, maxDepth, roles, wrapper.route);
-        diagnostics.mounts.push({ id: role.id, ok: outcome.ok, detail: outcome.detail });
-        if (!outcome.ok) console.error(`[${name}] 角色 "${role.id}" 挂载失败：${outcome.detail}`);
-      }
-      const okCount = diagnostics.mounts.filter((m) => m.ok).length;
-      console.error(
-        `[${name}] 已挂载 ${okCount}/${roles.length} 个角色工具：` +
-          diagnostics.mounts.filter((m) => m.ok).map((m) => m.id).join(', '),
-      );
-    })
-    .catch((error) => {
-      diagnostics.fatal = `无法 import @deepseek-ai/dsh-tool-subagent：${
-        error instanceof Error ? error.message : String(error)
-      }`;
-      console.error(`[${name}] ${diagnostics.fatal}`);
-    });
+function createRoleResolver(roleConfigPath, resolved) {
+  const file = createConfigFileResolver(roleConfigPath);
+  return () => {
+    const fromFile = file.read();
+    const value = fromFile.ok && fromFile.value ? fromFile.value : {};
+    const configuredRoles = readVolatileField(resolved, 'roles');
+    const raw = configuredRoles !== undefined ? configuredRoles : Array.isArray(value.roles) ? value.roles : [];
+    const defaults = { provider: value.provider || resolved.provider, cwd: value.cwd || resolved.cwd };
+    const normalized = raw !== undefined && !Array.isArray(raw)
+      ? { roles: [], errors: ['roles 必须是数组'] } : normalizeRoles(raw, defaults.provider, defaults.cwd);
+    if (Array.isArray(raw) && raw.some(item => item?.toolName !== undefined &&
+      item.toolName !== normalized.roles.find(role => role.id === item.id)?.toolName)) {
+      normalized.errors.push('toolName 改动会改变角色工具集；阶段 3 未实现，请使用由 id 派生的工具名');
+    }
+    const maxDepth = Number.isInteger(value.maxDepth) && value.maxDepth >= 0 ? value.maxDepth
+      : typeof resolved.maxDepth === 'number' ? resolved.maxDepth : 3;
+    const wrapperRoute = wrapperRouteFrom(fromFile.ok && value.volatile ? value : resolved);
+    const routes = normalized.roles.map(role => ({ id: role.id,
+      summary: `${routeSummaryFor(role)} source=${configuredRoles !== undefined ? 'preset' : 'file'} stale=${fromFile.stale === true}` }));
+    return { ok: fromFile.ok && wrapperRoute.errors.length === 0, roles: normalized.roles,
+      errors: [...normalized.errors, ...wrapperRoute.errors], error: fromFile.error,
+      maxDepth, wrapperRoute: wrapperRoute.route, routes, source: fromFile.source ?? 'preset', stale: fromFile.stale === true };
+  };
 }

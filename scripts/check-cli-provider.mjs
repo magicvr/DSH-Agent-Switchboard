@@ -217,18 +217,18 @@ section('argv 与 stdio：绑定配置，不接受模型覆盖');
   const role = codexRole();
   const { spawn, calls } = makeSpawn({ stdout: 'ANSWER', exitCode: 0 });
   const p = createCliTool({ role, spawn });
-  // 注册后修改原对象不能改变已绑定的命令、参数、模型或 cwd。
-  role.cli.command = 'malicious'; role.cli.args.push('--unconfigured'); role.model = 'wrong-model';
+  // 用户修改配置不重挂，下次执行现读；模型调用参数仍不能覆盖配置。
+  role.cli.command = 'C:/new-node.exe'; role.cli.args.push('--configured-new'); role.model = 'new-model';
   const result = await p.execute({ prompt: 'the task', driver: 'other', cwd: 'wrong', readOnly: false,
     cliCommand: 'wrong', cliArgs: ['wrong'], model: 'wrong', instructions: 'wrong' }, childExec());
   check('spawn 被调用一次', calls.length === 1);
   const spec = calls[0];
-  check('argv[0] 是绑定可执行文件', spec.argv[0] === 'C:/node.exe');
+  check('argv[0] 是当前用户配置的可执行文件', spec.argv[0] === 'C:/new-node.exe');
   check('prefixArgs 紧随其后', spec.argv[1] === 'C:/codex.js');
-  check('model 来自注册快照', spec.argv.includes('gpt-6-luna'));
+  check('model 来自执行期用户配置', spec.argv.includes('new-model') && !spec.argv.includes('wrong'));
   check('effort 来自角色配置', spec.argv.includes('model_reasoning_effort=medium'));
   check('权限参数不能被调用参数改写', spec.argv.includes('read-only'));
-  check('注册后模板变更不生效', !spec.argv.includes('--unconfigured'));
+  check('注册后用户模板变更在下次执行生效', spec.argv.includes('--configured-new') && !spec.argv.includes('wrong'));
   check('stdin 模式：提示词不进 argv', !spec.argv.includes('the task'));
   check('stdin 模式：提示词经 stdin 传入', spec.stdio.stdin.data === 'the task');
   check('cwd 来自绑定配置', spec.cwd === 'C:/work');
@@ -316,11 +316,12 @@ section('失败语义与解析器回退');
   check('失败 stderr 原样保留', r.stderr === 'stream error: model not found');
   check('失败不是取消', r.cancelled === false);
   const h = makeSpawn();
-  const bad = await createCliTool({ role: codexRole({ args: ['exec', '{modle}', '-'] }), spawn: h.spawn })
-    .execute({ prompt: 'T' }, childExec());
+  let bad;
+  try { await createCliTool({ role: codexRole({ args: ['exec', '{modle}', '-'] }), spawn: h.spawn })
+    .execute({ prompt: 'T' }, childExec()); } catch (error) { bad = error; }
   check('模板错误不 spawn', h.calls.length === 0);
-  check('模板错误归类 start-failed', bad.status === 'start-failed');
-  check('模板错误保留诊断', bad.diagnostic.includes('参数模板错误'));
+  check('执行前模板错误明确拒绝，不伪装进程结果', bad instanceof Error && bad.message.includes('配置无效'));
+  check('模板错误保留具体未知占位符诊断', bad?.message.includes('{modle}'));
   const missing = await createCliTool({ role: codexRole(), spawn: () => { throw new Error('ENOENT'); } })
     .execute({ prompt: 'T' }, childExec());
   check('spawn 异常归类 start-failed', missing.status === 'start-failed');
@@ -337,6 +338,28 @@ section('失败语义与解析器回退');
   const empty = await createCliTool({ role: codexRole(), spawn: makeSpawn().spawn }).execute({ prompt: 'T' }, childExec());
   check('无正文时仍报告成功退出', empty.status === 'completed');
   check('无正文诊断如实记录', empty.diagnostic.includes('没有输出内容'));
+}
+
+section('执行期配置快照：解析等待期间修改不影响当前 CLI');
+{
+  const role = codexRole();
+  role.instructions = 'OLD-RULES';
+  let release;
+  const h = makeSpawn();
+  const tool = createCliTool({ role, getRole: () => role, spawn: h.spawn,
+    resolveExecutable: () => new Promise(resolve => { release = resolve; }) });
+  const task = tool.execute({ prompt: 'TASK' }, childExec());
+  role.model = 'NEXT-MODEL'; role.effort = 'high'; role.instructions = 'NEXT-RULES';
+  role.cli.args.push('--next-config');
+  release('C:/resolved/old.exe'); await task;
+  check('解析等待期间改配置不影响已开始 CLI 的模型/强度/指令/argv',
+    h.calls[0].argv.includes('gpt-6-luna') && h.calls[0].argv.includes('model_reasoning_effort=medium')
+      && !h.calls[0].argv.includes('--next-config') && h.calls[0].stdio.stdin.data === 'OLD-RULES\n\n---\n\nTASK');
+  const next = tool.execute({ prompt: 'TASK' }, childExec());
+  release('C:/resolved/next.exe'); await next;
+  check('同一 CLI 工具下次执行读到新模型/强度/指令/argv', h.calls[1].argv.includes('NEXT-MODEL')
+    && h.calls[1].argv.includes('model_reasoning_effort=high') && h.calls[1].argv.includes('--next-config')
+    && h.calls[1].stdio.stdin.data === 'NEXT-RULES\n\n---\n\nTASK');
 }
 
 section('工具结果容量：正文、错误尾部、元信息与失败诊断均有界');

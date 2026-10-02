@@ -40,7 +40,7 @@
 
 ### 2. 派发方式（Dispatch）
 
-每个角色独立选择派发后端。两种后端**收敛到同一个 `SubagentProvider` 抽象**，主代理与工具层看不到线路差异：
+每个角色独立选择派发后端。两种后端均通过角色委派工具调用内置 `SubagentProvider`，主代理与工具层看不到线路差异：
 
 - **`builtin`** — 复用 DSH 已注册的子代理 provider（`spawn` / `fork`）。上下文、沙箱、权限、流式事件都由 DSH 统一管，行为最可预期，也是默认选项。
 - **`cli`** — 内置 spawn 子代理调用角色专属 CLI 工具，通过 `ctx.subprocess` 执行外部编码代理；结束后返回有界结果，由子代理简洁汇报。适合复用已有模型、额度或工具链。
@@ -55,17 +55,17 @@ Jobs 不可用时 CLI 照常执行，结果标注回流不可用。CLI 没有运
 
 ### 3. 配置（Plugin Panel）
 
-内置 `spawn` / `fork` 显示角色级 **Provider** 文本输入，留空使用插件默认 provider；CLI 模式仍隐藏该角色输入。角色列表前始终显示「包裹子代理」小节，插件级统一配置 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`，仅用于外部 CLI 角色的内置 spawn 转交代理。Provider / 模型留空遵循宿主的路由继承规则；思考强度的空选项为「留空：不指定强度」。留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。「父代理当前强度」指最近一次请求配置；尚无请求时取创建配置。包裹模型与外部 CLI 的角色 `model` 分开标注；内置角色仍使用自身的 provider / model / effort。根设置经既有角色文件同步给 preset，文件已保存的统一设置优先于 preset 自身设置（包含空值）；旧角色 `agentProvider` / `agentModel` 可加载但已忽略，并给弃用诊断。所有后端都有必填的多行「角色指令」输入，描述不会代填指令。本轮已通过离线检查；保存配置驱动常驻 preset 代际重挂，后续派发无需重启即可使用新配置，真实 DSH 热重载仍待验收。
+内置 `spawn` / `fork` 显示角色级 **Provider** 文本输入，留空使用插件默认 provider；CLI 模式仍隐藏该角色输入。角色列表前始终显示「包裹子代理」小节，插件级统一配置 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`，仅用于外部 CLI 角色的内置 spawn 转交代理。Provider / 模型留空遵循宿主的路由继承规则；思考强度的空选项为「留空：不指定强度」。留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。「父代理当前强度」指最近一次请求配置；尚无请求时取创建配置。包裹模型与外部 CLI 的角色 `model` 分开标注；内置角色仍使用自身的 provider / model / effort。根设置经 `loader/volatile-update` 原子同步到角色文件；静态工具骨架只注册一次，后续派发执行期现读文件缓存。文件已保存的统一设置优先于 preset 自身设置（包含空值）；增删角色或改变工具标识仍需工具集变化。所有后端都有必填的多行「角色指令」输入，描述不会代填指令。Host 源码改动仍需重启一次加载。
 
-角色配置文件为 **`$DSH_HOME/agent-switchboard/roles.json`**，由 DSH 启动时加载的常驻 Switchboard preset 读取。设置页保存后，根实例写盘并广播专用事件，驱动 preset 代际重挂；既有 Switchboard 会话的后续委派和下次提示组装使用新配置，无需重启。配置非法或挂载失败时保留上一代，自检显示热重载失败。
+角色配置文件为 **`$DSH_HOME/agent-switchboard/roles.json`**，由 DSH 启动时加载的常驻 Switchboard preset 读取。设置页保存后，根实例监听 `loader/volatile-update` 并在事件返回前写盘；既有 Switchboard 会话的工具骨架不重挂，后续委派和下次提示组装执行期读取新配置。文件损坏时保留上一份有效缓存并标记陈旧；无有效缓存时拒绝派发。
 设置面板读 `configForms` 镜像、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，
 Host 根实例将配置同步到文件。根条目保持启用，但只在 `mount: true` 的作用域挂载角色工具；
 文件含任一 wrapper 字段即整个包裹路由对象优先（包含空值），不逐字段补入 preset；只校验有效来源，被覆盖的非法 preset 路由忽略。
 包裹同步以 `{ ...existing, volatile }` 写回，保留现有角色、顶层其它字段与 volatile 其它字段。
 仅保存合法包裹设置且文件缺失时创建 `roles: []` 桥接文件；空角色仍等待用户配置或迁移播种。
-特殊 `internal/update` 监听的 disposer 由显式 `ctx.effect` 管理；初始非法也先注册监听，后续就地修正可恢复同步。
-包裹同步错误与失败日志去重，恢复后清除旧错误。迁移脚本也会播种空 roles 文件，并在删除源角色前复读验证（详见 D22）。
-**preset 不再携带 `config.roles`**。preset 仍是常驻单例，新会话只继承它，不重新执行 `apply`；配置更新由根广播事件驱动。角色增删、后端/模型/强度/Provider、指令/描述、嵌套/只读、CLI 预设与参数、插件 `maxDepth` 和包裹路由用于后续派发；有效文件 `maxDepth` 优先。已经发给模型的上下文、正在执行的子代理/CLI/后台 Job 和已启动包裹参数保持原快照。旧代际在调用与后台租约归零后释放，本轮机制通过离线集成验证，真实 DSH 热重载仍待验收。Host 源码改动仍需重启一次装载。文件形状如下（**示意**）：
+根条目直接注册 owning Fiber 的 `loader/volatile-update` 监听；事件载荷只含路径，监听器从 Volatile 引用读取已提交新值。
+包裹同步错误与失败日志去重，恢复后清除旧错误。CLI 可执行文件在执行期解析；自检装载时明确标“尚未验证”，执行后报告解析结果或失败。迁移脚本也会播种空 roles 文件，并在删除源角色前复读验证（详见 D22）。
+**preset 不再携带 `config.roles`**。preset 仍是常驻单例，新会话只继承它，不重新执行 `apply`；配置更新由文件 resolver 驱动。增删角色/改 id/toolName/backend 仍会改变工具集（阶段 3，未实现）；当前实例拒绝结构变化的派发并在自检中明确提示需重新挂载。model/effort/instructions/readOnly/maxDepth 与 CLI 参数用于后续派发；已进入 subagents.start 的请求和已开始的 CLI 执行保持起始快照。delegate 的 LLM 预检等待期间仍可能混用旧模型和新指令，该边界尚待调用级快照设计，详见架构文档末节。Host 源码改动仍需重启一次加载。文件形状如下（**示意**）：
 
 ```jsonc
 {

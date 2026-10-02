@@ -370,8 +370,8 @@ if (rest.length === 0 && op.op === "unset") result.splice(index, 1); // 删除�
 > **记录性质与当前实现补记：** 下文保留当时落地路径与事故取证。第 1、6 条关于 profile 根条目必须携带 `config.roles`、文件仅为派生产物的描述，是历史实现路径，已由后续文件存储与配置桥接实现修订；不能据此要求 bundle / preset 再携带角色列表。
 >
 > - 当前角色文件为 `$DSH_HOME/agent-switchboard/roles.json`（`src/config-file.js:63`）。bundle 根条目启用且不携带 config；preset 中本插件只带 `mount: true`（`presets/switchboard.patch.yml:18`），不得带 `roles`（`scripts/check-profile-wiring.mjs:115`）。
-> - **设置页并未直接读写文件。** 它仍读 `configForms` 的根命名空间 `roles`，写 `settings.mutate`（`src/client/index.js:294`、`:432`）；Host 根实例对非空 Cordis 角色做校验、比对并同步文件，根配置为空时保留已有文件（`src/index.js:788`）。
-> - 挂载实例兼容本作用域显式 Cordis 角色数组（含 `[]` 清空），启动与热重载均优先于文件；标准 preset 不携带角色，因此走文件。历史上保存不刷新已挂载工具的限制已由 D24 代际热重载取代。
+> - **设置页并未直接读写文件。** 它仍读 `configForms` 的根命名空间 `roles`，写 `settings.mutate`；Host 根实例校验、比对并同步显式角色数组（含 [] 清空），仅未提供 roles 时保留已有文件。
+> - 挂载实例兼容本作用域显式 Cordis 角色数组（含 `[]` 清空），启动与热重载均优先于文件；标准 preset 不携带角色，因此走文件。历史上保存不刷新已挂载工具的限制已由 D25 执行期延迟解析取代。
 > - 第 6 条所引 profile 检查的当前断言是 bundles / dependencies、bundle 条目启用、preset `mount:true` 且无 `roles`，以及角色文件可解析；不再断言 profile 根条目必须带 `config.roles`（`scripts/check-profile-wiring.mjs:58`、`:79`、`:96`、`:121`）。
 
 **为什么要有这一条：** D13 把「自建 Client 设置页 + `configForms` 写回」定为方案，但落地时连续踩到三类失败，最终**推翻了 D13 中关于存储位置与通道的具体判断**。D13 的**目标**不变（机制是角色的属性、要有 UI 配置入口），改的是**做法**。以下是已核实的事实，替代 D13 中相应的推断。
@@ -744,11 +744,7 @@ CLI 自身工具与受控委派白名单、只读 deny、`allow: []` 拒绝继�
 根字段移除或留空会清除已保存的统一路由。同步先保留现有 volatile 其它字段，再以 `{ ...existing, volatile }`
 写回，保留 roles、provider、cwd、maxDepth、formatVersion 与顶层其它字段，不是整份配置替换。
 旧角色字段兼容加载但忽略，逐实例记录诊断，模块只告警一次。
-根 apply 与 internal/update 更新瀑布均同步三字段，更新钩子继续 next；特殊 `internal/update` 注册返回的
-disposer 不会自动纳入 effect，必须显式用 `ctx.effect(() => ctx.on(...))` 归属本次激活，重启和卸载时释放（F2）。
-根实例先注册监听，再验证并同步初始值；初始非法也保留监听，后续就地修正可清除错误并恢复同步，不依赖重新 apply（F3）。
-volatile 就地更新可供新 preset 读取，已挂载的子代理保持挂载时路由。
-该钩子以本地 Cordis 源码及真实 Cordis 离线更新测试核实，DSH Loader 往返仍待真机验证。
+**现行修订（D25）：** 根 apply 同步初值；保存由 owning Fiber 的 `loader/volatile-update` 监听在事件返回前写盘。该事件先提交 Volatile 后普通 emit，不使用私有更新瀑布、next、prepend 或 receiver 过滤；监听随实例自动释放。初始非法仍保留监听，后续就地修正可恢复同步。固定工具骨架在下一次派发读取更新后的路由，已开始的执行保留起始快照。历史的 internal/update 检查不再证明当前 Loader 契约。
 
 **缺文件与迁移（F1）：** 首次仅保存包裹设置且角色文件缺失时，只记等待角色写入（`wrapperSyncPending`），
 不创建 `roles: []` 文件；设置仍保留在根配置，后续角色写入时一并同步。迁移脚本对缺文件和已有空 roles 文件均播种，
@@ -773,12 +769,12 @@ volatile 就地更新可供新 preset 读取，已挂载的子代理保持挂载
 生产 `toolConfigFor` 输出交给真实 `resolveChildAgentOptions`，覆盖全空、显式同路由、仅改 model、仅改 provider、显式 effort，以及最新请求无 effort 不恢复创建值；另覆盖尚无请求的创建配置回落及不同模型标识。
 关键断言以生产代码变异验证判别力。此离线解析不覆盖 provider 默认路由预检、真实 spawn 或 LLM 默认强度解析；这些项目仍需真机验收。
 
-**历史修正（运行期生效条件；当时没有热重载，D24 后续新增更新机制）：**
+**历史修正（运行期生效条件；D24 曾新增重挂机制，现已由 D25 替代）：**
 - 上述离线验证通过手动再次调用 `apply` 检查新设置可从文件读取；它验证的是重新挂载时可读盘，不是运行时更新行为。此前把这个测试假设当作「新会话会重新读取」的运行时事实，属于过度推断。
 - 真机核实 Switchboard preset 的 inline plugin 在 DSH 启动时 eager load，形成常驻单例 Fiber。创建新会话只通过 `composeFrom(childCtx, parent.ctx)` 继承已存在的 preset，不会再次执行 `apply`；会话结束也不卸载它。
 - 当时根实例的 `internal/update` 会立即把角色与包裹配置写入 `$DSH_HOME/agent-switchboard/roles.json`，保存链路本身正常；常驻 preset 不订阅更新、不监听文件、没有定时重读或 settings 订阅，故不会读取新文件内容。
 - 当时 `tools/change` 使用启动时闭包捕获的 roles 重建系统提示，不重读文件；CLI 角色工具注册没有保留 disposer，委派工具子 Fiber 也未追踪，无法在运行期替换角色工具。
-- 当时任何角色配置变更（增删角色、backend、model、effort、provider、instructions、description、allowNestedDispatch、readOnly），以及插件级 `maxDepth`、`volatile.wrapper*` 变更，都必须重启 DSH 才生效。这个历史结论由 D24 的新机制替代；保存成功仍不等于挂载成功，须以当前自检和后续派发核验。
+- 当时任何角色配置变更（增删角色、backend、model、effort、provider、instructions、description、allowNestedDispatch、readOnly），以及插件级 `maxDepth`、`volatile.wrapper*` 变更，都必须重启 DSH 才生效。这个历史结论由 D25 的延迟解析替代；保存成功仍不等于挂载成功，须以当前自检和后续派发核验。
 
 **后续修正（R1 / R2 / R3、M1 / M2，取代上述部分历史描述）：**
 - R2 取代「本作用域非空 roles 优先、否则读文件」：只有 `undefined`（未提供）才回落文件；
@@ -816,7 +812,7 @@ volatile 就地更新可供新 preset 读取，已挂载的子代理保持挂载
 
 ## D24 · 根广播驱动常驻 preset 的代际热重载
 
-**状态：实现与离线集成已落地；真实 DSH 设置保存往返和在途 CLI 热重挂待验收。** preset 启动 eager load、常驻单例、新会话只 composeFrom 而不重新 apply 的事实保持不变。保留 D22 的测试教训：手动再 apply 可读盘不等于运行时自动更新。
+**状态：历史实现，已退役，由 D25 替代。以下取证和验证只描述当时的实现，不是当前行为。** preset 启动 eager load、常驻单例、新会话只 composeFrom 而不重新 apply 的事实保持不变。保留 D22 的测试教训：手动再 apply 可读盘不等于运行时自动更新。
 
 **信号与来源：** 根实例在角色、maxDepth 与包裹路由同步成功后，无 receiver 地广播 `agent-switchboard/config-changed`，payload 为 `{ roleConfigPath }`。普通广播遍历全局同名 hook 表，与 scopeTarget carrier 的向上路由不同；真实 Cordis 离线跨 scope 已验证。文件仍是唯一配置桥梁，事件只通知重读；internal/update 同步监听只处理自身根 Fiber，不把 tools/change 当重读来源。直接手改文件没有广播，须经设置保存或重新装载。
 
@@ -831,3 +827,16 @@ volatile 就地更新可供新 preset 读取，已挂载的子代理保持挂载
 **验证：** check-apply 的 H01–H24 使用真实 Cordis、ToolRuntime、Config、角色文件、工具插件和假 subagents.start/进程覆盖单次 apply、跨 scope 事件、增删改、连续保存、非法配置与公开注册失败回滚、预检/后台/CLI 在途租约、动态 guidance、文件深度优先、身份拒绝、CLI 预设/参数更新与旧 scope/Fiber 自然释放；10 个关键生产分支通过变异实验确认失败，并恢复备份后校验 SHA-256 字节一致。不调用真实 CLI，不以此冒充真实 spawn、LLM 或设置页往返验收。
 
 **审查修正验证：** H04/H12 增加真实 scope/子 Fiber 存活判据，H25–H34 补显式角色与空数组跨广播保留、父实例及 preset scope 卸载时 teardown/在途私有环境、结束后显式清理及泄漏检查。父 Fiber 归属、清空 roles、忽略租约、漏退休及漏私有释放五组生产变异分别触发失败；每组恢复 raw 备份并校验 SHA-256 字节一致。仍不涉及真机配置或外部 CLI 调用。
+
+---
+
+## D25 · 延迟解析而非运行期重挂（阶段 0 + 阶段 1）
+
+**决策：** 角色配置是纯状态；工具骨架启动时注册一次，动态值在每次提示词组装、派发和 CLI 执行时现读。根条目直接监听 owning Fiber 的 `loader/volatile-update`，从 Volatile 引用读取已提交新值并原子写入 `roles.json`。文件按 `mtimeMs + size` 轻量缓存；损坏时保留上一份有效缓存并标记陈旧，无有效缓存则拒绝派发并进入健康门禁。
+
+**退役说明：** D24 中的 generation、lease、广播、跨 scope 重挂与 `ctx.root.fiber` 归属已退役；D24 的离线结果只证明历史实现。D23 的观察生命周期仍仅负责订阅、监听和本地缓冲，不依赖配置代际。
+
+**边界：** 角色增删、`id`/`toolName`、backend 改变工具集，阶段 3 才实现最小工具 diff；本阶段不得宣称这些变化已热更新；固定骨架检测到结构变化时拒绝派发并使自检不健康。Host 源码改动仍需重启一次加载。
+**阶段 0 验证：** check-apply 的 S00–S27 与 F01–F07 覆盖真实 Volatile 提交后普通 emit、owning Fiber 过滤、保存返回前写盘、连续动态派发、内置/CLI 在途快照、安全复验、陈旧缓存、结构变化拒绝派发、动态同步错误去重及恢复、restart 监听与旧闭包释放。CLI 可执行文件在执行期通过 ctx.get 解析并写回诊断；装载期明确标尚未验证。本轮离线结果不代表真机设置页往返或外部 CLI 验收。
+
+**待决的调用快照边界：** 已启动的 subagents.start 请求及 CLI execute 快照不会随保存改写；但官方 delegate 在路由预检 await 前读取 agentOptions，之后读取 persona/toolFilter/maxDepth，独立探针确认等待期间保存可混用旧模型与新指令。若要求 execute 入口即冻结整次派发，必须设计调用级快照边界，当前独立 getter 不足以保证；WORKER 未擅自引入新架构，此项 BLOCKED BY DESIGN，须交 ARCHITECT 决策。

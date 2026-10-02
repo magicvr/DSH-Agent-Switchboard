@@ -45,6 +45,13 @@ function section(title) {
   console.log(`\n=== ${title} ===`);
 }
 
+// Loader 的提交顺序：先写入真实 Volatile 引用，再向 owning Fiber 普通 emit。
+function commitVolatile(ref, value) {
+  const write = Object.getOwnPropertySymbols(ref).find(key => key.description === 'cosmokit.volatile.write');
+  if (!write) throw new Error('夹具未找到真实 Volatile 写入口');
+  ref[write](value);
+}
+
 /**
  * 造一个足够真的假 Cordis ctx。
  *
@@ -203,20 +210,15 @@ section('夹具保真：未 inject 抛错、服务按私有 scope 绑定、初�
     && healthy.mounted === 'fixture=OK', JSON.stringify(healthy));
 
   const broken = makeCtx();
-  const originalExtend = broken.extend;
-  broken.extend = function (properties) {
-    const child = originalExtend.call(this, properties);
-    if (scopeOf(child) !== scopeOf(this)) child.get = key => {
-      if (key === 'tools') throw new Error('fixture-private-tools-unavailable');
-      return this.get(key);
-    };
-    return child;
+  const register = broken.tools.register;
+  broken.tools.register = function (def) {
+    if (def.name === 'delegate_to_fixture') throw new Error('fixture-tools-unavailable');
+    return register.call(this, def);
   };
   apply(broken, { mount: true, roles: [fixtureRole], provider: 'self' });
   await new Promise(setImmediate);
   const failed = await broken.tools.get('switchboard_selftest').execute({});
-  check('初始私有构建异常使健康门禁失败且显式记录 configErrors/fatal', !failed.ok && failed.roleCount === 0
-    && failed.configErrors.includes('初始挂载失败') && failed.fatal.includes('fixture-private-tools-unavailable'), JSON.stringify(failed));
+  check('初始角色注册异常使健康门禁失败且显式记录原因', !failed.ok && failed.roleCount === 0 && failed.mounted.includes('fixture-tools-unavailable'), JSON.stringify(failed));
 }
 
 section('Config：mount 字段与内置 roles 字段是否冲突');
@@ -807,7 +809,7 @@ section('CLI 逐角色阻塞：未知配置不注册工具、不解析命令、�
   await import('@deepseek-ai/dsh-tool-subagent');
   await new Promise(setImmediate);
   check('未知配置不注册工具且不解析/启动其命令，旧 provider 不再注册',
-    providers.length === 0 && resolved.join(',') === 'grok' && spawned === 0
+    providers.length === 0 && resolved.length === 0 && spawned === 0
       && !ctx.registered.includes('switchboard_cli_run_legacy') && ctx.registered.includes('switchboard_cli_run_valid'));
   check('旧 custom 阻塞不影响有效 CLI 和内置角色工具',
     !ctx.registered.includes('delegate_to_legacy') && ctx.registered.includes('delegate_to_valid') && ctx.registered.includes('delegate_to_builtin'));
@@ -889,7 +891,7 @@ section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失
       const degraded = await cliTool.execute({ prompt: 'T' }, exec);
       check('apply 路径 Jobs 卸载后照常执行并报告降级', degraded.status === 'completed'
         && degraded.outputFeedback === 'unavailable' && starts.length === 1);
-      check('generation ctx 的 safeSpawn 与 resolveExecutable 均可用', degraded.status === 'completed'
+      check('实例 ctx.get 的 safeSpawn 与执行期 resolveExecutable 均可用', degraded.status === 'completed'
         && (await selftest.execute({})).executables.includes('C:/fake/node.exe'));
       ctx.subprocess.resolveExecutable = () => { throw new Error('fixture-runtime-resolution-failed'); };
       const fallback = await cliTool.execute({ prompt: 'T' }, exec);
@@ -943,14 +945,14 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
     if (section.name === 'agent-switchboard:roles') guidance = section.text;
     return () => {};
   };
-  // 真实 Config 的 standard-schema 校验先物化输入；再执行真实工具插件的 apply。
+  // 独立验证真实 Config；官方插件 apply 仍接收原 getter 对象，不冻结成校验产物。
   const scopePlugin = ctx.plugin;
   ctx.plugin = function (module, config) {
     if (!config) return scopePlugin.call(this, module, config);
     const validated = module.Config['~standard'].validate(config);
     if (validated.issues) throw new Error(JSON.stringify(validated.issues));
     validatedConfigs.push(validated.value);
-    module.apply(this, validated.value);
+    module.apply(this, config); // 官方 apply 直接读取 getter；schema 仅作独立契约校验。
     return { dispose() {} };
   };
   ctx.tools.register({ name: 'read' });
@@ -1201,13 +1203,14 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   updateCtx.on = (_event, callback) => { update = callback; return () => {}; };
   updateCtx.effect = callback => callback();
   const beforeInvalidUpdate = readFileSync(path);
-  apply(updateCtx, Config({ roles: null }));
+  const updating = Config({ roles: null });
+  apply(updateCtx, updating);
   let updateThrew = false;
-  try { update(Config({ roles: null, volatile: { wrapperModel: 'must-not-write' } }), false, () => {}); }
+  try { commitVolatile(updating.roles, null); update([['roles']]); }
   catch { updateThrew = true; }
   check('M2：非法 roles 就地更新仍不写盘、不伪健康', !updateThrew && readFileSync(path).equals(beforeInvalidUpdate) &&
     !(await updateCtx.tools.get('switchboard_selftest').execute({})).ok);
-  update(Config({ roles: [role], volatile: rootRoute }), false, () => {});
+  commitVolatile(updating.roles, [role]); commitVolatile(updating.volatile, rootRoute); update([['roles'], ['volatile', 'wrapperModel']]);
   check('M2：非法 roles 可经合法数组就地修复，清除诊断并恢复健康',
     (await updateCtx.tools.get('switchboard_selftest').execute({})).ok);
   const beforeOmittedRoles = JSON.parse(readFileSync(path, 'utf8'));
@@ -1245,18 +1248,17 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   check('根清空统一路由后文件保存三个空值，避免回落旧 preset',
     ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile[key] === ''));
   outcome = await mount({ volatile: { wrapperProvider: 'preset-route' } });
-  check('根三个空值优先：CLI 不设置 agentOptions', outcome.configs.length === 1 && !('agentOptions' in outcome.configs[0]));
+  check('根三个空值优先：CLI 不设置 agentOptions', outcome.configs.length === 1 && outcome.configs[0].agentOptions === undefined);
   outcome = await mount({ volatile: { wrapperEffort: 'invalid' } });
   check('有效根空路由覆盖非法 preset，仍健康挂载', outcome.configs.length === 1 && outcome.result.ok &&
-    !('agentOptions' in outcome.configs[0]));
+    outcome.configs[0].agentOptions === undefined);
   writeConfigFile(path, initialConfig([role], { provider: 'self', volatile: { wrapperModel: 'partial-root' } }));
   outcome = await mount({ volatile: { wrapperProvider: 'preset-route', wrapperEffort: 'invalid' } });
   check('部分文件路由仍对象级优先，不补入 preset provider/非法 effort', outcome.configs.length === 1 && outcome.result.ok &&
     JSON.stringify(outcome.configs[0].agentOptions) === JSON.stringify({ model: 'partial-root' }));
   writeFileSync(path, '{broken');
   outcome = await mount({ roles: [role], volatile: { wrapperModel: 'local-fallback' } });
-  check('坏文件但本地角色非空：回落本地角色与路由并正常挂载', outcome.configs.length === 1 && outcome.result.ok &&
-    JSON.stringify(outcome.configs[0].agentOptions) === JSON.stringify({ model: 'local-fallback' }));
+  check('坏文件且无有效缓存：拒绝挂载，不冒充本地回落成功', outcome.configs.length === 0 && !outcome.result.ok && outcome.result.configErrors.length > 0, JSON.stringify(outcome.result));
   writeConfigFile(path, initialConfig([role], { provider: 'self' }));
   outcome = await mount({ volatile: { wrapperModel: 'fallback-model' } });
   check('文件尚无统一路由时回落当前实例，仅设置非空模型',
@@ -1285,7 +1287,8 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   let pendingUpdate;
   pendingCtx.on = (_event, listener) => { pendingUpdate = listener; return () => {}; };
   pendingCtx.effect = execute => execute();
-  apply(pendingCtx, Config({ volatile: { wrapperProvider: 'only-route' } }));
+  const pendingConfig = Config({ volatile: { wrapperProvider: 'only-route' } });
+  apply(pendingCtx, pendingConfig);
   const bridge = readConfigFile(path);
   check('R1：首次仅保存包裹设置创建合法空角色桥接文件', bridge.ok && !bridge.missing &&
     bridge.value.formatVersion === 1 && JSON.stringify(bridge.value.roles) === '[]' &&
@@ -1297,7 +1300,7 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   outcome = await mount({ roles: [role], volatile: { wrapperProvider: 'preset-route', wrapperModel: 'preset-model', wrapperEffort: 'low' } });
   check('R1：空角色桥接文件路由覆盖 preset 自身整套 wrapper', outcome.configs.length === 1 && outcome.result.ok &&
     JSON.stringify(outcome.configs[0].agentOptions) === JSON.stringify({ provider: 'only-route' }));
-  pendingUpdate(Config({ volatile: {} }), false, () => {});
+  commitVolatile(pendingConfig.volatile, {}); pendingUpdate([['volatile', 'wrapperProvider']]);
   file = JSON.parse(readFileSync(path, 'utf8'));
   check('R1：桥接后就地清空保留空 roles 并写三空值', JSON.stringify(file.roles) === '[]' &&
     ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile[key] === ''));
@@ -1349,152 +1352,6 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
     file.volatile.wrapperProvider === 'only-route');
 }
 
-section('真实 Cordis 更新瀑布：volatile 不重挂载时仍同步根包裹路由');
-{
-  const path = configPathFor(fixtureHome);
-  writeConfigFile(path, initialConfig([fixtureRole], { provider: 'self' }));
-  const root = new Context();
-  let applies = 0;
-  let continued = 0;
-  let ctx;
-  let currentHome = fixtureHome;
-  const restartHome = mkdtempSync(join(tmpdir(), 'switchboard-restart-'));
-  const fiber = root.plugin({
-    Config,
-    apply(actual, config) {
-      applies++;
-      ctx = makeCtx();
-      ctx.get = key => key === 'profileContext' ? { home: currentHome } : undefined;
-      ctx.fiber = actual.fiber;
-      ctx.on = actual.on.bind(actual);
-      ctx.effect = actual.effect.bind(actual);
-      apply(ctx, config);
-      // 模拟 Loader 的 volatile 就地更新：下游不调用 next，不重新 apply。
-      actual.effect(() => actual.on('internal/update', () => { continued++; }));
-    },
-  }, { provider: 'self', volatile: { wrapperEffort: 'invalid' } });
-  try {
-    await fiber.await();
-    const initialHealth = await ctx.tools.get('switchboard_selftest').execute({});
-    check('初始非法路由仍注册一个插件更新钩子并可诊断', !initialHealth.ok &&
-      /wrapperEffort.*非法/.test(initialHealth.configErrors) && fiber._hooks['internal/update'].length === 1 && root.events._hooks['internal/update'].length === 2);
-    fiber.update({ provider: 'self', volatile: { wrapperModel: 'live-model', wrapperEffort: 'high' } });
-    await new Promise(setImmediate);
-    let file = JSON.parse(readFileSync(path, 'utf8'));
-    check('真实 update 钩子同步新模型/强度并继续瀑布，不依赖重挂载', applies === 1 && continued === 1 &&
-      file.volatile?.wrapperModel === 'live-model' && file.volatile?.wrapperEffort === 'high');
-    check('初始非法改合法后不重挂载也同步且清除错误', applies === 1 &&
-      (await ctx.tools.get('switchboard_selftest').execute({})).ok);
-    fiber.update({ provider: 'self', volatile: {} });
-    await new Promise(setImmediate);
-    file = JSON.parse(readFileSync(path, 'utf8'));
-    check('真实 update 清空统一路由，仍不重挂载', applies === 1 && continued === 2 &&
-      ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile?.[key] === ''));
-    const before = readFileSync(path, 'utf8');
-    fiber.update({ provider: 'self', volatile: { wrapperEffort: 'invalid' } });
-    await new Promise(setImmediate);
-    const health = await ctx.tools.get('switchboard_selftest').execute({});
-    check('就地更新非法强度进入诊断且不覆盖有效文件', !health.ok && /wrapperEffort.*非法/.test(health.configErrors) &&
-      readFileSync(path, 'utf8') === before && continued === 3);
-    fiber.update({ provider: 'self', volatile: { wrapperEffort: 'low' } });
-    await new Promise(setImmediate);
-    const recovered = await ctx.tools.get('switchboard_selftest').execute({});
-    check('就地修正强度后清除本次路由错误并恢复同步', recovered.ok &&
-      JSON.parse(readFileSync(path, 'utf8')).volatile.wrapperEffort === 'low');
-    const oldCtx = ctx;
-    const oldBytes = readFileSync(path, 'utf8');
-    currentHome = restartHome;
-    writeConfigFile(configPathFor(restartHome), initialConfig([fixtureRole], { provider: 'self' }));
-    await fiber.restart();
-    await fiber.restart();
-    check('两次 restart 仅保留一个插件钩子和一个 Loader 钩子', applies === 3 &&
-      fiber._hooks['internal/update'].length === 1 && root.events._hooks['internal/update'].length === 2);
-    fiber.update({ provider: 'self', volatile: { wrapperModel: 'new-path', wrapperEffort: 'high' } });
-    await new Promise(setImmediate);
-    check('restart 后只写新路径，旧闭包不再写原路径', readFileSync(path, 'utf8') === oldBytes &&
-      JSON.parse(readFileSync(configPathFor(restartHome), 'utf8')).volatile?.wrapperModel === 'new-path');
-    fiber.update({ provider: 'self', volatile: { wrapperEffort: 'invalid' } });
-    await new Promise(setImmediate);
-    check('restart 后旧诊断闭包不再受更新影响', (await oldCtx.tools.get('switchboard_selftest').execute({})).ok &&
-      !(await ctx.tools.get('switchboard_selftest').execute({})).ok);
-  } finally {
-    await fiber.dispose();
-    rmSync(restartHome, { recursive: true, force: true });
-  }
-  check('卸载后 internal/update 钩子全部释放', fiber._hooks['internal/update'].length === 0 && root.events._hooks['internal/update'].length === 1);
-}
-
-section('包裹路由同步失败：当前错误去重、日志与修复恢复');
-{
-  const path = configPathFor(fixtureHome);
-  writeConfigFile(path, initialConfig([fixtureRole], { provider: 'self' }));
-  const root = new Context();
-  let ctx;
-  const fiber = root.plugin({
-    Config,
-    apply(actual, config) {
-      ctx = makeCtx();
-      ctx.fiber = actual.fiber;
-      ctx.on = actual.on.bind(actual);
-      ctx.effect = actual.effect.bind(actual);
-      apply(ctx, config);
-      actual.effect(() => actual.on('internal/update', () => {}));
-    },
-  }, { provider: 'self', volatile: { wrapperModel: 'before-failure' } });
-  const logs = [];
-  const originalError = console.error;
-  try {
-    await fiber.await();
-    console.error = (...args) => logs.push(args.join(' '));
-    // 用目录占据目标文件，稳定触发真实读写错误，避免平台权限差异。
-    rmSync(path);
-    mkdirSync(path);
-    const update = async () => {
-      fiber.update({ provider: 'self', volatile: { wrapperModel: 'after-repair' } });
-      await new Promise(setImmediate);
-      return ctx.tools.get('switchboard_selftest').execute({});
-    };
-    const failed = await update();
-    const repeated = await update();
-    check('同步失败进入健康诊断，重复失败仅一个当前同步错误', !failed.ok && !repeated.ok &&
-      repeated.configErrors.split('\n').filter(line => line.startsWith('包裹路由同步失败')).length === 1);
-    check('相同同步失败主动记日志但不重复追加', logs.filter(line => line.includes('包裹路由同步失败')).length === 1);
-    rmSync(path, { recursive: true });
-    writeConfigFile(path, initialConfig([fixtureRole], { provider: 'self' }));
-    const recovered = await update();
-    check('同步失败修复后当前错误清除且健康恢复', recovered.ok && recovered.configErrors === '' &&
-      JSON.parse(readFileSync(path, 'utf8')).volatile.wrapperModel === 'after-repair');
-    const rename = fs.renameSync;
-    try {
-      fs.renameSync = (source, target) => {
-        if (target === path) throw Object.assign(new Error('fixture-wrapper-write'), { code: 'EIO' });
-        return rename(source, target);
-      };
-      syncBuiltinESMExports();
-      for (let i = 0; i < 2; i++) {
-        fiber.update({ provider: 'self', volatile: { wrapperModel: 'write-recovered' } });
-        await new Promise(setImmediate);
-      }
-      const failedWrite = await ctx.tools.get('switchboard_selftest').execute({});
-      check('原子写失败重复发生仍仅一个当前同步错误并主动日志', !failedWrite.ok &&
-        failedWrite.configErrors.split('\n').filter(line => line.startsWith('包裹路由同步失败')).length === 1 &&
-        logs.filter(line => line.includes('包裹路由同步失败：fixture-wrapper-write')).length === 1 &&
-        JSON.parse(readFileSync(path, 'utf8')).volatile.wrapperModel === 'after-repair');
-    } finally {
-      fs.renameSync = rename;
-      syncBuiltinESMExports();
-    }
-    fiber.update({ provider: 'self', volatile: { wrapperModel: 'write-recovered' } });
-    await new Promise(setImmediate);
-    const writeRecovered = await ctx.tools.get('switchboard_selftest').execute({});
-    check('原子写失败解除后同步成功清除旧错误', writeRecovered.ok && writeRecovered.configErrors === '' &&
-      JSON.parse(readFileSync(path, 'utf8')).volatile.wrapperModel === 'write-recovered');
-  } finally {
-    console.error = originalError;
-    await fiber.dispose();
-  }
-}
-
 section('残留角色包裹路由：兼容加载与模块级一次性诊断');
 {
   const legacyRole = { ...fixtureRole, agentProvider: { obsolete: true }, agentModel: 123 };
@@ -1530,422 +1387,274 @@ section('残留角色包裹路由：兼容加载与模块级一次性诊断');
     combined.roleConfigStatus.includes('角色 agentProvider / agentModel 已废弃并忽略'));
 }
 
-section('根同步：先注册的就地更新钩子消费瀑布');
+
+section('阶段 0：文件 resolver mtime+size 缓存与源码静态契约');
 {
-  const root = new Context();
+  const { createConfigFileResolver } = await import('../src/config-file.js');
   const path = configPathFor(fixtureHome);
-  const role = { ...fixtureRole, model: 'root-old' };
-  writeConfigFile(path, initialConfig([role], { provider: 'self' }));
-  let ctx, consumed = 0, applies = 0, writes = 0, notices = 0;
-  const rename = fs.renameSync;
-  const fiber = root.plugin({ Config, apply(actual, config) {
-    applies++;
-    // 模拟 Loader 先注册，消费 volatile 更新而不调用 next。
-    actual.effect(() => actual.on('internal/update', () => { consumed++; }));
-    ctx = makeCtx();
-    ctx.fiber = actual.fiber;
-    ctx.on = actual.on.bind(actual);
-    ctx.effect = actual.effect.bind(actual);
-    ctx.emit = actual.emit.bind(actual);
-    apply(ctx, config);
-  } }, { provider: 'self', roles: [role] });
-  root.on('agent-switchboard/config-changed', () => { notices++; });
+  writeConfigFile(path, initialConfig([fixtureRole], { provider: 'self' }));
+  const resolver = createConfigFileResolver(path);
+  let reads = 0;
+  const original = fs.readFileSync;
   try {
-    await fiber.await();
-    fs.renameSync = (source, target) => {
-      if (target === path) writes++;
-      return rename(source, target);
-    };
+    fs.readFileSync = (file, ...args) => { if (file === path) reads++; return original(file, ...args); };
     syncBuiltinESMExports();
-    const save = model => fiber.update({ provider: 'self', roles: [{ ...role, model }] });
-    check('B01：事件前仍为旧模型且未写入', JSON.parse(readFileSync(path)).roles[0].model === 'root-old' && writes === 0);
-    save('root-new');
-    check('B02：根保存事件返回前文件立即写入新模型', JSON.parse(readFileSync(path)).roles[0].model === 'root-new' && writes === 1);
-    check('B03：同步先于消费钩子且继续瀑布，无重新 apply', consumed === 1 && applies === 1 && notices === 2);
-    save('root-new');
-    check('B04：相同值保存不原子重写', writes === 1);
-    save('root-latest');
-    check('B05：连续保存用当次配置而非闭包旧值', JSON.parse(readFileSync(path)).roles[0].model === 'root-latest' && writes === 2);
-    fs.renameSync = (source, target) => {
-      if (target === path) throw new Error('fixture-root-sync-failure');
-      return rename(source, target);
-    };
-    syncBuiltinESMExports();
-    save('root-failed');
-    const health = await ctx.tools.get('switchboard_selftest').execute({});
-    check('B06：角色同步失败自检不健康并显示错误', !health.ok && health.configErrors.includes('fixture-root-sync-failure') && health.roleConfigStatus.includes('同步失败'));
-    check('B07：失败保留旧文件且不广播成功', JSON.parse(readFileSync(path)).roles[0].model === 'root-latest' && notices === 4);
-    fs.renameSync = rename;
-    syncBuiltinESMExports();
-    save('root-recovered');
-    check('B08：再次保存修复同步错误恢复健康', JSON.parse(readFileSync(path)).roles[0].model === 'root-recovered' && (await ctx.tools.get('switchboard_selftest').execute({})).ok);
-    await fiber.restart();
-    check('B09：重挂不积累更新钩子', fiber._hooks['internal/update'].length === 1 && root.events._hooks['internal/update'].length === 2);
-    const beforeRestartSave = notices;
-    save('root-after-restart');
-    check('B11：重挂后的全局监听仅广播一次', notices === beforeRestartSave + 1 && JSON.parse(readFileSync(path)).roles[0].model === 'root-after-restart');
-    const foreign = root.plugin({ Config, apply(actual) {
-      actual.effect(() => actual.on('internal/update', () => {}));
-    } }, {});
-    await foreign.await();
-    const ownBytes = readFileSync(path);
-    foreign.update({ roles: [{ ...role, model: 'foreign-model' }] });
-    check('B12：全局前置监听拒绝其它 Fiber 的配置事件', readFileSync(path).equals(ownBytes) && notices === beforeRestartSave + 1);
-    await foreign.dispose();
-    const emit = ctx.emit;
-    const beforeEventConsumed = consumed;
-    ctx.emit = () => { throw new Error('fixture-root-event-failure'); };
-    save('root-event-failed');
-    const eventHealth = await ctx.tools.get('switchboard_selftest').execute({});
-    check('B17：同步链意外异常进入可见诊断且继续更新瀑布', !eventHealth.ok && eventHealth.configErrors.includes('根配置同步异常：fixture-root-event-failure') && consumed === beforeEventConsumed + 1);
-    ctx.emit = emit;
-    save('root-event-recovered');
-    check('B18：同步链异常恢复后清除当前错误', (await ctx.tools.get('switchboard_selftest').execute({})).ok);
-  } finally {
-    fs.renameSync = rename;
-    syncBuiltinESMExports();
-    await fiber.dispose();
+    const first = resolver.read(); const same = resolver.read();
+    check('F01：mtime+size 未变不重读且复用有效缓存', reads === 1 && !first.cached && same.cached && same.value === first.value);
+    writeConfigFile(path, initialConfig([{ ...fixtureRole, model: 'changed-size-model' }]));
+    const changed = resolver.read();
+    check('F02：mtime 或 size 改变重读且取得新值', reads === 2 && !changed.cached && changed.value.roles[0].model === 'changed-size-model');
+    writeFileSync(path, '{broken');
+    const stale = resolver.read();
+    check('F03：损坏保留上一有效缓存并标 stale 与错误', stale.ok && stale.stale && stale.error && stale.value === changed.value);
+    check('F04：相同坏文件不反复重读且持续陈旧', resolver.read().stale && reads === 3);
+    const fresh = createConfigFileResolver(path).read();
+    check('F05：无有效缓存时坏文件不可派发', !fresh.ok && fresh.stale && !fresh.value);
+    writeConfigFile(path, initialConfig([fixtureRole]));
+    check('F06：修复文件后重读并清除 stale', resolver.read().ok && !resolver.read().stale);
+  } finally { fs.readFileSync = original; syncBuiltinESMExports(); }
+  for (const file of ['index.js', 'roles.js', 'config-file.js', 'cli/provider.js']) {
+    const source = readFileSync(new URL(`../src/${file}`, import.meta.url), 'utf8');
+    check(`F07：${file} 无已删除的代际/广播/私有 Fiber 路径`,
+      !/generation|config-changed|internal\/update|root\.fiber|createScope|\blease\(/.test(source));
   }
-  check('B10：卸载释放全部根更新钩子', fiber._hooks['internal/update'].length === 0 && root.events._hooks['internal/update'].length === 1);
 }
 
-section('热重载：真实 Cordis 跨 scope 广播、代际回滚与在途保护（preset 只 apply 一次）');
+section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发');
 {
   const { cliFieldsFor } = await import('../src/cli/drivers.js');
-  const home = mkdtempSync(join(tmpdir(), 'switchboard-hot-reload-'));
-  const path = configPathFor(home);
+  const path = configPathFor(fixtureHome);
+  const builtin = { ...fixtureRole, id: 'hot', effort: 'low', readOnly: false };
+  const cli = { ...fixtureRole, id: 'hot-cli', backend: 'cli', cliDriver: 'codex',
+    cliCwd: 'C:/fixture', ...cliFieldsFor('codex', false) };
+  writeConfigFile(path, initialConfig([builtin, cli], { provider: 'self', maxDepth: 3 }));
   const root = new Context();
-  const sections = new Map();
-  const generations = new Set();
-  const requests = [], runs = [], pendingJobs = [];
-  const rapidGuidance = [];
-  let recordRapid = false;
-  let preflight;
-  let holdRun = false;
-  let missingProvider = false;
-  let rootApplies = 0, presetApplies = 0, broadcasts = 0, guidanceRegisters = 0;
-  root.provide('profileContext', { home, dir: home });
-  root.provide('systemPrompt', {
-    tools() {}, context() {}, getContextOrder() { return 0; }, getSectionOrder() { return 0; },
-    section(section) {
-      if (section.name === 'agent-switchboard:roles') guidanceRegisters++;
-      sections.set(section.name, section);
-      return () => { if (sections.get(section.name) === section) sections.delete(section.name); };
-    },
-  });
-  new ToolRuntime(root);
-  root.tools.register({ name: 'write', parameters: { type: 'object', properties: {} },
-    output: { schema: { type: 'string' }, render: () => [] }, execute: async () => 'fixture' });
-  root.provide('agents', { list: () => [] });
-  root.provide('sessionProjections', { register() { return () => {}; } });
-  root.provide('llm', { async resolveCallConfig(config) { if (preflight) await preflight.promise; return config; } });
-  root.provide('subprocess', {
-    resolveExecutable: async () => 'fixture-executable',
-    spawn: () => ({ done: Promise.resolve({ exitCode: 0 }), collected: {}, waitForExit: async () => true }),
-  });
+  let rootConfig, rootCtx, ownerUid, observer = 0, applies = 0;
+  let currentHome = fixtureHome;
+  const restartHome = mkdtempSync(join(tmpdir(), 'switchboard-dynamic-restart-'));
+  const owner = root.plugin({ Config, apply(actual, config) {
+    applies++;
+    ownerUid = actual.fiber.uid;
+    rootConfig = config; rootCtx = makeCtx();
+    const fixtureGet = rootCtx.get.bind(rootCtx);
+    rootCtx.get = key => key === 'profileContext' ? { home: currentHome } : fixtureGet(key);
+    rootCtx.on = actual.on.bind(actual);
+    rootCtx.effect = actual.effect.bind(actual);
+    apply(rootCtx, config);
+    actual.on('loader/volatile-update', paths => {
+      observer++;
+      if (!paths.every(Array.isArray)) return;
+      check('S00：事件为路径数组的数组且监听器已读到提交的新 Volatile',
+        paths.every(Array.isArray) && rootConfig.roles.get()[0].model === latestModel);
+    });
+  } }, { provider: 'self', roles: [builtin, cli] });
+  let latestModel = builtin.model;
+  const other = root.plugin(actual => actual.on('loader/volatile-update', () => { throw new Error('事件泄漏到其它 Fiber'); }));
+  const requests = [], invocations = [];
+  let finish;
+  let hold = false;
+  const ctx = makeCtx({ scope: {} });
+  const originalGet = ctx.get.bind(ctx);
+  ctx.sessionProjections = { register() {} };
+  const dynamicEvents = new Map();
+  ctx.on = (name, callback) => {
+    if (!dynamicEvents.has(name)) dynamicEvents.set(name, new Set());
+    dynamicEvents.get(name).add(callback);
+    return () => dynamicEvents.get(name).delete(callback);
+  };
+  ctx.get = key => key === 'llm' ? { async resolveCallConfig(value) { return value; } } : originalGet(key);
+  ctx.subagents.resolveMaxDepth = depth => depth;
   const providers = new Map(['spawn', 'fork'].map(name => [name, { name, inheritsParentContext: false,
     capabilities: { depthLimit: true, agentOptions: true, persona: true, toolFilter: true } }]));
-  root.provide('subagents', {
-    resolveMaxDepth: depth => depth,
-    getProvider: name => missingProvider ? undefined : providers.get(name),
-    async start(provider, request) {
-      resolveChildDepth(request.parent, request.maxDepth);
-      requests.push({ provider, request });
-      const completion = Promise.withResolvers();
-      const localAgent = { id: `hot-child-${runs.length}`, session: { header: { origin: 'subagent' } } };
-      const run = { id: localAgent.id, localAgent, result: completion.promise, disposed: 0,
-        dispose() { this.disposed++; }, finish: () => completion.resolve({ stopReason: 'completed', output: [] }) };
-      runs.push(run);
-      if (!holdRun) run.finish();
-      return run;
-    },
-  });
-  root.provide('jobs', { start(spec) { pendingJobs.push(spec); return `hot-job-${pendingJobs.length}`; } });
-  root.on('agent-switchboard/config-changed', payload => { if (payload.roleConfigPath === path) broadcasts++; });
-  root.on('tools/change', () => {
-    if (recordRapid) rapidGuidance.push(sections.get('agent-switchboard:roles')?.text({}) ?? '');
-  });
-  root.on('internal/status', fiber => {
-    const generation = fiber.ctx[Symbol.for('agent-switchboard.generation')];
-    if (generation) generations.add(generation);
-  });
-  const role = { ...fixtureRole, id: 'hot', model: 'first-model', allowNestedDispatch: true };
-  writeConfigFile(path, initialConfig([role], { provider: 'self', maxDepth: 2 }));
-  const rootFiber = root.plugin({ Config, apply(actual, config) {
-    rootApplies++;
-    actual.effect(() => actual.on('internal/update', () => {}));
-    apply(actual, config);
-  } }, { provider: 'self' });
-  const presetScope = createScope(root, {});
-  const presetFiber = presetScope.ctx.plugin({ Config, apply(actual, config) {
-    presetApplies++;
-    apply(actual, config);
-  } }, { mount: true, provider: 'self', maxDepth: 7 });
-  const scope = scopeOf(presetScope.ctx);
-  const getTool = name => root.tools.get(name, scope);
-  const tick = async () => { for (let i = 0; i < 6; i++) await new Promise(setImmediate); };
-  const save = (roles, options = {}) => rootFiber.update({ provider: 'self', roles, maxDepth: 2, ...options });
-  const parent = { id: 'hot-parent', ctx: presetScope.ctx, options: { provider: 'self', model: 'parent-model' },
-    session: { header: { origin: 'user' }, requestHeader: () => undefined } };
-  const controller = new AbortController();
-  const exec = { agent: parent, signal: controller.signal };
-  const call = name => getTool(name).execute({ prompt: 'T', description: '热重载测试' }, exec);
-  const guidance = () => sections.get('agent-switchboard:roles')?.text({ scope }) ?? '';
+  ctx.subagents.getProvider = name => providers.get(name);
+  ctx.subagents.start = async (_provider, request) => {
+    resolveChildDepth(request.parent, request.maxDepth);
+    requests.push(request);
+    return { id: 'dynamic-run', result: hold ? new Promise(resolve => { finish = resolve; })
+      : Promise.resolve({ stopReason: 'completed', output: [] }), dispose() {} };
+  };
+  ctx.plugin = function (module, config) { module.apply(this, config); return { dispose() {} }; };
+  ctx.tools.register({ name: 'write' }); ctx.tools.register({ name: 'read' });
+  let resolvedCommands = [];
+  ctx.subprocess.resolveExecutable = async command => { resolvedCommands.push(command); return 'C:/resolved/node.exe'; };
+  let releaseCli;
+  let holdCli = false;
+  ctx.subprocess.spawn = spec => {
+    invocations.push(spec);
+    return { collected: {}, done: holdCli ? new Promise(resolve => { releaseCli = resolve; }) : Promise.resolve({ exitCode: 0 }),
+      waitForExit: async () => true };
+  };
+  const tick = () => new Promise(setImmediate);
+  const parent = { id: 'dynamic-parent', options: { provider: 'self', model: 'parent' },
+    session: { requestHeader: () => undefined, header: { origin: 'user' } } };
+  const exec = { agent: parent, signal: new AbortController().signal };
+  const childExec = { agent: { id: 'dynamic-child', session: { header: { origin: 'subagent' } } } };
+  const scope = scopeOf(ctx);
+  const getTool = name => ctx.tools.get(name, scope);
+  const health = () => getTool('switchboard_selftest').execute({});
+  // Loader 的发送侧 Context.filter 限制 owning Fiber；插件监听器无需 receiver 过滤。
+  const emit = paths => root.emit({ [Context.filter]: target => target.fiber.uid === ownerUid }, 'loader/volatile-update', paths);
+  const save = (roles, route = {}, extraPaths = []) => {
+    latestModel = roles[0]?.model;
+    commitVolatile(rootConfig.roles, roles); commitVolatile(rootConfig.volatile, route);
+    emit([['roles'], ['volatile', 'wrapperModel'], ...extraPaths]);
+    const file = readConfigFile(path).value;
+    check('S01：保存事件返回前 roles.json 已是新值', JSON.stringify(file.roles) === JSON.stringify(roles)
+      && (file.volatile?.wrapperModel ?? '') === (route.wrapperModel ?? ''));
+  };
   try {
-    await rootFiber.await();
-    await presetFiber.await();
-    await tick();
-    check('H01：真实 preset 首次挂载工具且只有一次 apply', !!getTool('delegate_to_hot') && presetApplies === 1);
-    await call('delegate_to_hot');
-    check('H02：真实 Config/文件/工具插件的首派发 maxDepth 文件 2 优先于 preset 7',
-      requests.at(-1).request.maxDepth === 3 && requests.at(-1).request.agentOptions.model === 'first-model');
-
-    const firstGeneration = [...generations].find(g => g.roles.some(r => r.model === 'first-model'));
-    preflight = Promise.withResolvers();
-    const inFlight = call('delegate_to_hot');
-    await tick();
-    save([{ ...role, model: 'second-model', description: '更新后的热角色', instructions: '新规则',
-      backend: 'fork', provider: 'new-provider', effort: 'high', readOnly: true, allowNestedDispatch: false },
-      { ...fixtureRole, id: 'added' }], { maxDepth: 4 });
-    await tick();
-    check('H03：根更新跨 scope 广播驱动替换，不重新 apply preset 或根',
-      broadcasts >= 1 && rootApplies === 1 && presetApplies === 1 && !!getTool('delegate_to_added'));
-    check('B13：热重挂前根事件已把新模型写到真实文件', JSON.parse(readFileSync(path)).roles[0].model === 'second-model');
-    check('H04：预检租约保留旧 scope/Fiber，原 signal 不 abort 且会话未销毁',
-      firstGeneration?.active > 0 && !firstGeneration?.released && firstGeneration.scope.ctx.fiber.uid !== null
-      && firstGeneration.fibers.length > 0 && firstGeneration.fibers.every(fiber => fiber.uid !== null) && !controller.signal.aborted && runs.every(run => run.disposed === 1));
-    check('H05：guidance 只注册一次且不发 tools/change 就读取新角色说明',
-      guidanceRegisters === 1 && guidance().includes('更新后的热角色') && guidance().includes('delegate_to_added'));
-    preflight.resolve();
-    preflight = undefined;
-    await inFlight;
-    await tick();
-    check('H06：跨重挂预检任务用旧模型正常完成，活跃归零后释放旧 scope',
-      requests.at(-1).request.agentOptions.model === 'first-model' && firstGeneration?.released === true
-      && firstGeneration.scope.ctx.fiber.uid === null && !controller.signal.aborted);
-    await call('delegate_to_hot');
-    const routed = await getTool('switchboard_selftest').execute({});
-    check('B14：自检报告已提交角色 provider/model/effort', routed.roleRoutes.includes('provider=new-provider model=second-model effort=high'));
-    check('B15：自检文本渲染路由对主代理可见', getTool('switchboard_selftest').output.render({}, routed).some(block => block.text.includes(routed.roleRoutes)));
-    check('H07：改 backend/model/effort/provider/instructions/maxDepth 后新派发全部取新快照',
-      requests.at(-1).provider === 'fork' && requests.at(-1).request.agentOptions.model === 'second-model'
-      && requests.at(-1).request.agentOptions.provider === 'new-provider'
-      && requests.at(-1).request.agentOptions.reasoningEffort === 'high'
-      && requests.at(-1).request.persona === '新规则' && requests.at(-1).request.maxDepth === 5
-      && requests.at(-1).request.toolFilter.deny.includes('write')
-      && requests.at(-1).request.toolFilter.deny.includes('delegate_to_added'));
-
-    recordRapid = true;
-    save([{ ...role, model: 'third-model' }]);
-    save([{ ...role, model: 'fourth-model' }, { ...fixtureRole, id: 'rapid' }]);
-    save([{ ...role, model: 'latest-model' }]);
-    await tick();
-    recordRapid = false;
-    await call('delegate_to_hot');
-    check('H08：连续快速保存只公开最新一代，无旧角色/重名/准备代残留',
-      requests.at(-1).request.agentOptions.model === 'latest-model' && !getTool('delegate_to_added') && !getTool('delegate_to_rapid')
-      && root.tools.schemas(scope).filter(tool => tool.name === 'delegate_to_hot').length === 1
-      && [...generations].filter(g => !g.released).length === 1
-      && !rapidGuidance.some(text => text.includes('third-model') || text.includes('fourth-model')));
-
-    const oldTool = getTool('delegate_to_hot');
-    save([{ ...role, model: '' }]);
-    await tick();
-    const health = await getTool('switchboard_selftest').execute({});
-    await call('delegate_to_hot');
-    check('H09：非法文件回滚保留旧入口可派发且自检诊断可见',
-      getTool('delegate_to_hot') === oldTool && requests.at(-1).request.agentOptions.model === 'latest-model'
-      && !health.ok && health.configErrors.includes('热重载失败') && health.configErrors.includes('model'));
-    check('B16：重载失败路由报告上一有效代而非磁盘坏值', health.roleRoutes.includes('model=latest-model'));
-    save([role]);
-    await tick();
-    check('H10：修正配置后诊断恢复健康', (await getTool('switchboard_selftest').execute({})).ok);
-    const beforeMissingProvider = getTool('delegate_to_hot');
-    missingProvider = true;
-    save([{ ...role, model: 'provider-not-ready' }]); await tick();
-    missingProvider = false;
-    if (getTool('delegate_to_hot')) await call('delegate_to_hot');
-    check('H22：准备代无自己的工具时不能借祖先旧定义假成功，保留旧入口及诊断',
-      getTool('delegate_to_hot') === beforeMissingProvider && requests.at(-1).request.agentOptions.model === 'first-model'
-      && (await getTool('switchboard_selftest').execute({})).configErrors.includes('工具尚未出现在工具注册表'));
-
-    // 公开注册失败发生在旧入口注销之后；旧私有 Fiber 必须保持可用以恢复入口。
-    const layers = root.tools.layers;
-    const originalEffect = layers.effect;
-    let rejectPublic = true;
-    layers.effect = function (actual, callback, options) {
-      if (rejectPublic && scopeOf(actual) === scope && options?.label === 'tools.register()') {
-        rejectPublic = false;
-        throw new Error('hot-public-commit-failed');
-      }
-      return originalEffect.call(this, actual, callback, options);
-    };
-    try { save([{ ...role, model: 'commit-rejected' }]); await tick(); }
-    finally { layers.effect = originalEffect; }
-    if (getTool('delegate_to_hot')) await call('delegate_to_hot');
-    check('H11：同步公开替换失败恢复旧工具及旧 Fiber，无需重启它',
-      !!getTool('delegate_to_hot') && requests.at(-1).request.agentOptions.model === 'first-model'
-      && (await getTool('switchboard_selftest').execute({})).configErrors.includes('hot-public-commit-failed'));
-
-    save([role]); await tick();
-    const backgroundGeneration = [...generations].find(g => !g.released);
-    const background = await getTool('delegate_to_hot').execute({ prompt: 'BG', description: '延迟后台', run_in_background: true }, exec);
-    save([{ ...fixtureRole, id: 'replacement' }]); await tick();
-    check('H12：后台 Job 入队即持租约，重挂后尚未启动也不会销毁旧 scope',
-      background.kind === 'background' && backgroundGeneration?.active === 1 && !backgroundGeneration?.released
-      && backgroundGeneration.scope.ctx.fiber.uid !== null && backgroundGeneration.fibers.every(fiber => fiber.uid !== null)
-      && !getTool('delegate_to_hot') && !!getTool('delegate_to_replacement'));
-    holdRun = true;
-    const jobHooks = pendingJobs.shift().run({ append() {} });
-    await tick();
-    const backgroundRun = runs.at(-1);
-    check('H13：重挂之后旧后台启动链正常，独立 signal 未 abort、run 未 dispose',
-      requests.at(-1).request.agentOptions.model === 'first-model' && backgroundRun.disposed === 0
-      && !requests.at(-1).request.signal.aborted);
-    backgroundRun.finish(); await jobHooks.done; await tick(); holdRun = false;
-    check('H14：后台自然结算后旧代归零并释放，无提前销毁', backgroundGeneration?.released && backgroundRun.disposed === 1);
-
-    const cliRole = { id: 'hot-cli', description: 'CLI', instructions: 'CLI 规则', backend: 'cli', model: 'external-old',
-      cliDriver: 'grok', cliCwd: 'C:/fixture', ...cliFieldsFor('grok', false) };
-    save([cliRole], { volatile: { wrapperModel: 'wrapper-old', wrapperEffort: 'low' } }); await tick();
-    holdRun = true;
-    const cliCall = call('delegate_to_hot_cli'); await tick();
-    const wrapper = runs.at(-1);
-    const cliGeneration = [...generations].find(g => !g.released);
-    save([{ ...cliRole, model: 'external-new', description: '新 CLI' }],
-      { volatile: { wrapperProvider: 'route-new', wrapperModel: 'wrapper-new', wrapperEffort: 'high' } }); await tick();
-    check('H15：CLI 包裹在途不被重挂误杀，旧快照、signal 与 run 保持有效',
-      !cliGeneration?.released && wrapper.disposed === 0 && !requests.at(-1).request.signal.aborted
-      && requests.at(-1).request.agentOptions.model === 'wrapper-old');
-    let wrongIdentity;
-    try { await getTool('switchboard_cli_run_hot_cli').execute({ prompt: 'T' },
-      { agent: { id: 'old-builtin', session: { header: { origin: 'subagent' } } }, signal: controller.signal }); }
-    catch (error) { wrongIdentity = error; }
-    check('H16：旧 builtin deny 快照漏掉新增 CLI 名也被包裹身份校验拒绝', /包裹身份/.test(wrongIdentity?.message ?? ''));
-    // 移除 Jobs 桩，CLI 执行用假进程；没有调用外部 CLI。
-    // 真实工具读取的是构造时 buildCtx：通过临时释放可选 Jobs 服务测执行器降级路径。
-    const removeJobs = root.get('jobs');
-    removeJobs.start = () => { throw new Error('offline CLI jobs disabled'); };
-    const cliResult = await getTool('switchboard_cli_run_hot_cli').execute({ prompt: 'T' },
-      { agent: wrapper.localAgent, signal: controller.signal });
-    check('H17：旧包裹经当前公开 CLI 入口仍使用旧外部模型快照',
-      cliResult.status === 'completed' && cliResult.routeSummary.includes('external-old') && !cliResult.routeSummary.includes('external-new')
-      && cliGeneration.definitions.has('switchboard_cli_run_hot_cli'));
-    wrapper.finish(); await cliCall; await tick(); holdRun = false;
-    await call('delegate_to_hot_cli');
-    check('H18：新 CLI 派发采用新包裹路由，旧代际自然释放',
-      requests.at(-1).request.agentOptions.provider === 'route-new'
-      && requests.at(-1).request.agentOptions.model === 'wrapper-new'
-      && requests.at(-1).request.agentOptions.reasoningEffort === 'high' && cliGeneration?.released);
-    let invocation;
-    root.get('subprocess').spawn = spec => {
-      invocation = spec;
-      return { done: Promise.resolve({ exitCode: 0 }), collected: {}, waitForExit: async () => true };
-    };
-    save([{ ...cliRole, cliDriver: 'codex', ...cliFieldsFor('codex', false), model: 'external-codex', effort: 'high' }]);
-    await tick(); await call('delegate_to_hot_cli');
-    const newCliResult = await getTool('switchboard_cli_run_hot_cli').execute({ prompt: '新预设' },
-      { agent: runs.at(-1).localAgent, signal: controller.signal });
-    check('H24：后续 CLI 执行采用新预设/参数模板/模型/强度，无真实进程调用',
-      newCliResult.status === 'completed' && invocation.argv.includes('external-codex')
-      && invocation.argv.includes('model_reasoning_effort=high') && invocation.argv.includes('exec'));
-    holdRun = true;
-    const executingWrapper = call('delegate_to_hot_cli'); await tick();
-    const executingRun = runs.at(-1);
-    const executingGeneration = [...generations].find(g => !g.released);
-    const processDone = Promise.withResolvers();
-    let processSignal, killed = 0;
-    const subprocess = root.get('subprocess');
-    subprocess.spawn = spec => {
-      processSignal = spec.signal;
-      return { done: processDone.promise, collected: {}, waitForExit: async () => true, terminate() { killed++; } };
-    };
-    const executingCli = getTool('switchboard_cli_run_hot_cli').execute({ prompt: '正在运行' },
-      { agent: executingRun.localAgent, signal: controller.signal });
-    await tick();
-    save([]); await tick();
-    check('H20：删角色时正在执行的 CLI 进程、包裹和调用 signal 均未误杀',
-      executingGeneration?.active > 0 && !executingGeneration?.released && executingRun.disposed === 0
-      && !controller.signal.aborted && processSignal instanceof AbortSignal && !processSignal.aborted && killed === 0);
-    processDone.resolve({ exitCode: 0 });
-    const executingResult = await executingCli;
-    executingRun.finish(); await executingWrapper; await tick(); holdRun = false;
-    check('H21：跨重挂 CLI 正常完成后释放旧 scope/Fiber，旧专属入口消失',
-      executingResult.status === 'completed' && executingGeneration?.released && executingGeneration.scope.ctx.fiber.uid === null
-      && executingGeneration.fibers.every(fiber => fiber.uid === null) && killed === 0 && !getTool('switchboard_cli_run_hot_cli'));
-    check('H19：删光角色注销所有入口，guidance 不再列旧角色，自检仍仅一个',
-      !getTool('delegate_to_hot_cli') && !getTool('switchboard_cli_run_hot_cli') && !guidance().includes('delegate_to_hot_cli')
-      && root.tools.schemas(scope).filter(tool => tool.name === 'switchboard_selftest').length === 1);
-
-    // 显式数组与 undefined 必须跨同一广播保留各自来源，包括显式清空。
-    for (const localRoles of [[{ ...fixtureRole, id: 'local', model: 'local-model' }], []]) {
-      const localScope = createScope(root, {});
-      const known = new Set(generations);
-      const localKey = scopeOf(localScope.ctx);
-      const privateFibers = [];
-      const unwatch = root.on('internal/plugin', fiber => {
-        if (fiber.uid !== null && fiber.parent.fiber === root.fiber && scopeOf(fiber.parent) === localKey) privateFibers.push(fiber);
-      });
-      const localFiber = localScope.ctx.plugin({ Config, apply }, { mount: true, provider: 'self', roles: localRoles });
-      const localTool = name => root.tools.get(name, localKey);
-      try {
-        await localFiber.await(); await tick();
-        const initialLocal = [...generations].find(g => !known.has(g));
-        const empty = localRoles.length === 0;
-        check(empty ? 'H26：preset 显式空 roles 初始清空' : 'H25：preset 显式 local roles 初始优先',
-          empty ? !localTool('delegate_to_local') : !!localTool('delegate_to_local'));
-        save([{ ...fixtureRole, id: 'file-only' }]); await tick();
-        const nextLocal = [...generations].find(g => !known.has(g) && g !== initialLocal && !g.released
-          && scopeOf(g.scope.ctx.fiber.parent) === localKey);
-        check(empty ? 'H28：preset 显式空 roles 跨广播仍清空，不被文件覆盖' : 'H27：preset local roles 跨广播仍优先，不消失',
-          privateFibers.length === 2 && privateFibers[0].uid === null && privateFibers[1].uid !== null
-          && !localTool('delegate_to_file_only')
-          && (empty ? !localTool('delegate_to_local')
-            : initialLocal?.released && nextLocal?.roles.length === 1 && nextLocal.roles[0].model === 'local-model' && !!localTool('delegate_to_local')));
-      } finally {
-        await localFiber.dispose(); await localScope.dispose(); unwatch(); await tick();
-        check(localRoles.length ? 'H33：显式角色实例卸载无私有 Fiber 泄漏' : 'H34：空角色实例卸载无私有 Fiber 泄漏',
-          privateFibers.length === 2 && privateFibers.every(fiber => fiber.uid === null));
-      }
+    await owner.await(); await other.await();
+    apply(ctx, { mount: true, provider: 'self' }); await tick(); await tick();
+    check('S19：动态夹具初始角色真实挂载健康', (await health()).ok && (await health()).roleCount === 2, JSON.stringify(await health()));
+    const count = ctx.registered.length;
+    check('S02：当前 CLI 显示待执行解析而非无角色',
+      (await health()).executables.includes('hot-cli:') && (await health()).executables.includes('尚未验证'));
+    const delegate = getTool('delegate_to_hot');
+    for (const [field, value] of [['model', 'new-model'], ['effort', 'high'], ['instructions', 'NEW-RULES'], ['readOnly', true]]) {
+      builtin[field] = value; save([builtin, cli]);
+      await delegate.execute({ prompt: 'T', description: 'dynamic' }, exec);
+      const request = requests.at(-1);
+      check(`S03：不重挂连续改 ${field} 后下一次派发使用新值`, ctx.registered.length === count
+        && request.agentOptions.model === builtin.model && request.agentOptions.reasoningEffort === builtin.effort
+        && request.persona === builtin.instructions && request.toolFilter.deny.includes('write') === builtin.readOnly);
     }
-
-    save([role]); await tick();
-    holdRun = true;
-    const unloadingCall = call('delegate_to_hot'); await tick();
-    const unloadingRun = runs.at(-1);
-    const unloadingGeneration = [...generations].find(g => !g.released);
-    const privateKey = scopeOf(unloadingGeneration.scope.ctx);
-    check('H29：父卸载夹具确实持有在途租约及私有注册', unloadingGeneration.active > 0
-      && root.tools.get('delegate_to_hot', privateKey) !== undefined);
-    await presetFiber.dispose(); await presetScope.dispose(); await tick();
-    check('H30：父实例卸载触发 teardown，但在途私有 scope/Fiber 与工具仍在',
-      presetFiber.uid === null && unloadingGeneration.retired && unloadingGeneration.active > 0
-      && !unloadingGeneration.released && unloadingGeneration.scope.ctx.fiber.uid !== null
-      && unloadingGeneration.fibers.length > 0 && unloadingGeneration.fibers.every(fiber => fiber.uid !== null)
-      && unloadingGeneration.definitions.has('delegate_to_hot') && root.tools.get('delegate_to_hot', privateKey) !== undefined
-      && !getTool('delegate_to_hot') && getTool('switchboard_selftest') === root.tools.get('switchboard_selftest')
-      && !sections.has('agent-switchboard:roles') && unloadingRun.disposed === 0 && !controller.signal.aborted);
-    const countAfterUnload = generations.size;
-    root.emit('agent-switchboard/config-changed', { roleConfigPath: path }); await tick();
-    check('H31：父卸载注销更新监听，后续广播不新建代际', generations.size === countAfterUnload);
-    unloadingRun.finish(); await unloadingCall; await tick(); holdRun = false;
-    check('H32：父卸载后自然结束仍显式释放所有代际，无私有 scope/Fiber 或工具泄漏',
-      unloadingGeneration.active === 0 && unloadingGeneration.released
-      && [...generations].every(g => g.released && g.scope.ctx.fiber.uid === null && g.fibers.every(fiber => fiber.uid === null))
-      && !root.tools.layers.scoped.has(privateKey) && unloadingRun.disposed === 1);
-  } finally {
-    await presetFiber.dispose();
-    await presetScope.dispose();
-    await rootFiber.dispose();
-    const generationCount = generations.size;
-    root.emit('agent-switchboard/config-changed', { roleConfigPath: path }); await tick();
-    check('H23：实例释放后监听和 guidance 注销，不残留重载或私有 scope/Fiber',
-      generations.size === generationCount && !sections.has('agent-switchboard:roles')
-      && [...generations].every(g => g.released && g.scope.ctx.fiber.uid === null) && root.tools.layers.scoped.size === 0);
-    rmSync(home, { recursive: true, force: true });
-  }
+    // 普通对象 maxDepth 非 volatile：模拟文件修改；工具 getter 仍动态读取。
+    const depthValue = readConfigFile(path).value; depthValue.maxDepth = 7; writeConfigFile(path, depthValue);
+    await delegate.execute({ prompt: 'T', description: 'depth' }, exec);
+    check('S04：maxDepth 文件变更下一次派发使用新上限且不重挂', requests.at(-1).maxDepth === 8 && ctx.registered.length === count);
+    hold = true;
+    const task = delegate.execute({ prompt: 'OLD-TASK', description: 'snapshot' }, exec); await tick();
+    const snapshot = requests.at(-1);
+    builtin.model = 'after-start'; builtin.instructions = 'AFTER-RULES'; save([builtin, cli]);
+    check('S05：在途内置请求保留起始 model/effort/instructions 快照且不取消',
+      snapshot.agentOptions.model === 'new-model' && snapshot.persona === 'NEW-RULES' && !snapshot.signal.aborted);
+    finish({ stopReason: 'completed', output: [] }); await task; hold = false;
+    cli.model = 'external-new'; cli.effort = 'high'; cli.instructions = 'CLI-NEW';
+    Object.assign(cli, cliFieldsFor('codex', true), { readOnly: true });
+    save([builtin, cli], { wrapperModel: 'wrapper-new', wrapperEffort: 'high' });
+    await getTool('delegate_to_hot_cli').execute({ prompt: 'T', description: 'wrapper' }, exec);
+    check('S06：下次 CLI 包裹派发读取新统一路由', requests.at(-1).agentOptions.model === 'wrapper-new'
+      && requests.at(-1).agentOptions.reasoningEffort === 'high' && ctx.registered.length === count);
+    const cliTool = getTool('switchboard_cli_run_hot_cli');
+    await cliTool.execute({ prompt: 'TASK & $() ;', cliCommand: 'model-command', model: 'model-override' }, childExec);
+    const spec = invocations.at(-1);
+    check('S07：CLI 执行时解析当前用户命令，argv 使用绝对解析路径与新模型强度',
+      resolvedCommands.at(-1).toLowerCase() === process.execPath.toLowerCase() && spec.argv[0] === 'C:/resolved/node.exe'
+      && spec.argv.includes('external-new') && spec.argv.includes('model_reasoning_effort=high')
+      && spec.argv.includes('read-only') && !spec.argv.includes('model-override') && !spec.argv.includes('model-command'));
+    check('S08：CLI 安全 argv 数组、shell:false 与用户正文不进入 shell', Array.isArray(spec.argv)
+      && spec.shell === false && spec.stdio.stdin.data === 'CLI-NEW\n\n---\n\nTASK & $() ;');
+    check('S09：执行后自检可执行文件诊断记录解析结果与当前 source/file 新路由',
+      (await health()).executables.includes('C:/resolved/node.exe') && (await health()).roleRoutes.includes('model=external-new')
+      && (await health()).roleRoutes.includes('source=file stale=false'));
+    holdCli = true;
+    const cliTask = cliTool.execute({ prompt: 'SNAPSHOT' }, childExec); await tick();
+    const oldSpec = invocations.at(-1);
+    cli.model = 'external-after'; cli.instructions = 'AFTER-CLI'; save([builtin, cli]);
+    check('S10：在途 CLI 使用启动时 argv 与前置指令且不取消', oldSpec.argv.includes('external-new')
+      && oldSpec.stdio.stdin.data.startsWith('CLI-NEW') && !oldSpec.signal.aborted);
+    releaseCli({ exitCode: 0 }); await cliTask; holdCli = false;
+    for (const [label, changed] of [
+      ['未知 driver', { cliDriver: 'unknown' }], ['未知占位符', { cliArgs: ['{unsafe}'] }],
+      ['readOnly 与模板冲突', { readOnly: false }], ['非法 argv', { cliArgs: 'shell command' }],
+    ]) {
+      const before = invocations.length;
+      save([builtin, { ...cli, ...changed }]);
+      let refused = false; try { await cliTool.execute({ prompt: 'T' }, childExec); } catch { refused = true; }
+      check(`S11：执行前安全校验拒绝 ${label} 且不 spawn`, refused && invocations.length === before);
+    }
+    save([builtin, cli]);
+    await delegate.execute({ prompt: 'T', description: 'cache' }, exec);
+    writeFileSync(path, '{broken');
+    await delegate.execute({ prompt: 'T', description: 'stale' }, exec);
+    check('S12：文件损坏保留上份有效缓存，路由显式 stale:true', requests.at(-1).agentOptions.model === builtin.model
+      && (await health()).roleRoutes.includes('stale=true'));
+    save([builtin, cli]);
+    for (const [label, roles] of [
+      ['增角色', [builtin, cli, { ...fixtureRole, id: 'added' }]], ['删角色', [builtin]],
+      ['改 id', [{ ...builtin, id: 'renamed' }, cli]], ['改 toolName', [{ ...builtin, toolName: 'delegate_custom' }, cli]],
+      ['改 backend', [{ ...builtin, backend: 'fork' }, cli]],
+    ]) {
+      save(roles); let refused = false;
+      try { await delegate.execute({ prompt: 'T', description: 'structure' }, exec); } catch { refused = true; }
+      check(`S13：${label} 未误报已热更新，拒绝派发且不改变注册数`, refused && !(await health()).ok
+        && (await health()).configErrors.includes('阶段 3 未实现') && ctx.registered.length === count);
+    }
+    save([builtin, cli]);
+    check('S14：合法配置恢复健康，固定骨架仍可派发', (await health()).ok && ctx.registered.length === count);
+    const validBytes = readFileSync(path);
+    commitVolatile(rootConfig.volatile, { wrapperEffort: 'invalid' });
+    emit([['volatile', 'wrapperEffort']]);
+    check('S20：动态非法包裹路由不覆盖有效文件且根自检不健康', readFileSync(path).equals(validBytes)
+      && !(await rootCtx.tools.get('switchboard_selftest').execute({})).ok);
+    commitVolatile(rootConfig.volatile, { wrapperModel: 'repaired', wrapperEffort: 'low' });
+    emit([['volatile', 'wrapperEffort']]);
+    check('S21：动态修复包裹路由后清除根错误并同步新值',
+      (await rootCtx.tools.get('switchboard_selftest').execute({})).ok && readConfigFile(path).value.volatile.wrapperModel === 'repaired');
+    const originalWrite = fs.writeFileSync;
+    const logs = [];
+    const originalError = console.error;
+    try {
+      console.error = (...args) => logs.push(args.join(' '));
+      fs.writeFileSync = (target, ...args) => {
+        if (String(target).startsWith(`${path}.`)) throw new Error('dynamic-write-failed');
+        return originalWrite(target, ...args);
+      };
+      syncBuiltinESMExports();
+      commitVolatile(rootConfig.volatile, { wrapperModel: 'pending-new' });
+      emit([['volatile', 'wrapperModel']]); emit([['volatile', 'wrapperModel']]);
+      const failed = await rootCtx.tools.get('switchboard_selftest').execute({});
+      check('S22：重复写盘失败进入当前健康诊断且错误/失败日志去重', !failed.ok
+        && failed.configErrors.split('dynamic-write-failed').length === 2
+        && logs.filter(line => line.includes('dynamic-write-failed')).length === 1);
+    } finally { fs.writeFileSync = originalWrite; syncBuiltinESMExports(); console.error = originalError; }
+    emit([['volatile', 'wrapperModel']]);
+    check('S23：写盘修复后清除旧错误并立即同步', (await rootCtx.tools.get('switchboard_selftest').execute({})).ok
+      && readConfigFile(path).value.volatile.wrapperModel === 'pending-new');
+    const bytes = readFileSync(path);
+    emit(['roles']);
+    emit([['unrelated']]);
+    check('S15：根同步忽略错误载荷与无关路径', readFileSync(path).equals(bytes));
+    check('S16：普通 emit 下多个监听器均执行，不依赖 next 与重复 apply', observer > 0 && applies === 1);
+    const oldCtx = rootCtx;
+    const oldBytes = readFileSync(path);
+    currentHome = restartHome;
+    writeConfigFile(configPathFor(restartHome), initialConfig([builtin, cli], { provider: 'self' }));
+    await owner.restart(); await owner.restart();
+    const previousObserver = observer;
+    commitVolatile(rootConfig.volatile, { wrapperModel: 'restart-new-path' });
+    emit([['volatile', 'wrapperModel']]);
+    check('S25：两次 restart 后仅本次同步与观察监听运行一次', applies === 3 && observer === previousObserver + 1);
+    check('S26：restart 后只写新路径，旧闭包不再写原路径', readFileSync(path).equals(oldBytes)
+      && readConfigFile(configPathFor(restartHome)).value.volatile.wrapperModel === 'restart-new-path');
+    commitVolatile(rootConfig.volatile, { wrapperEffort: 'invalid' });
+    emit([['volatile', 'wrapperEffort']]);
+    check('S27：restart 后旧诊断闭包不受新无效更新影响',
+      (await oldCtx.tools.get('switchboard_selftest').execute({})).ok
+      && !(await rootCtx.tools.get('switchboard_selftest').execute({})).ok);
+  } finally { await owner.dispose(); await other.dispose(); rmSync(restartHome, { recursive: true, force: true }); }
+  const bytes = readFileSync(path);
+  root.emit('loader/volatile-update', [['roles']]);
+  check('S17：父卸载后根监听器释放，无后续写盘', readFileSync(path).equals(bytes));
+  writeFileSync(path, '{no-cache');
+  const broken = makeCtx(); apply(broken, { mount: true, provider: 'self' }); await tick();
+  const brokenHealth = await broken.tools.get('switchboard_selftest').execute({});
+  check('S18：没有有效缓存的坏文件拒绝挂载并自检不健康', !brokenHealth.ok && brokenHealth.roleCount === 0
+    && !broken.registered.some(name => name.startsWith('delegate_to_')) && brokenHealth.configErrors.length > 0);
+  writeConfigFile(path, initialConfig([fixtureRole], { provider: 'self' }));
+  const threeCli = makeCtx();
+  let resolveCount = 0;
+  threeCli.subprocess.resolveExecutable = () => { resolveCount++; throw new Error('不可装载期解析'); };
+  apply(threeCli, { mount: true, roles: [0, 1, 2].map(index => ({ ...cli, id: `diagnostic-${index}` })), provider: 'self' });
+  await tick(); await tick();
+  const cliHealth = await threeCli.tools.get('switchboard_selftest').execute({});
+  check('S24：三个 CLI 角色均有待执行解析诊断，装载不调用外部命令',
+    cliHealth.ok && cliHealth.roleCount === 3 && resolveCount === 0 && cliHealth.roleRoutes.includes('source=preset stale=false')
+      && [0, 1, 2].every(index => cliHealth.executables.includes(`diagnostic-${index}:`))
+      && !cliHealth.executables.includes('无 CLI 角色'));
 }
 
+// 动态契约替代旧私有代际/租约测试；固定工具骨架不再测试旧内部生命周期。
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 } finally {
   if (previousDshHome === undefined) delete process.env.DSH_HOME;

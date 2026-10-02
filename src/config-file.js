@@ -41,7 +41,7 @@
  *
  * 本模块只依赖 `node:fs`，不依赖任何 DSH 运行时服务，因此可在 Node 里离线测试。
  */
-import { mkdirSync, readFileSync, existsSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, existsSync, statSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
@@ -105,6 +105,43 @@ export function readConfigFile(path) {
     return { ok: false, error: '配置文件缺少 roles 数组' };
   }
   return { ok: true, value: parsed };
+}
+
+/**
+ * 创建一个按文件 mtime/size 缓存的读取器。
+ * 文件损坏时保留上次成功快照，但显式标记 stale；从未成功读取则返回不可派发状态。
+ */
+export function createConfigFileResolver(path) {
+  let fingerprint;
+  let cached;
+  let lastError;
+  return {
+    read() {
+      let stat;
+      try {
+        stat = statSync(path);
+      } catch (error) {
+        if (error?.code === 'ENOENT') return { ok: true, missing: true, value: undefined, source: 'file', stale: false, cached: false };
+        lastError = `配置文件状态读取失败：${error instanceof Error ? error.message : String(error)}`;
+        return cached ? { ok: true, value: cached, source: 'file', stale: true, cached: true, error: lastError }
+          : { ok: false, error: lastError, source: 'file', stale: true, cached: false };
+      }
+      const next = `${stat.mtimeMs}:${stat.size}`;
+      if (next === fingerprint && cached) return { ok: true, value: cached, source: 'file', stale: Boolean(lastError), cached: true };
+      const result = readConfigFile(path);
+      fingerprint = next;
+      if (result.ok && !result.missing) {
+        cached = result.value;
+        lastError = undefined;
+        return { ok: true, value: cached, source: 'file', stale: false, cached: false };
+      }
+      if (result.missing) return { ok: true, missing: true, value: undefined, source: 'file', stale: false, cached: false };
+      lastError = result.error;
+      return cached ? { ok: true, value: cached, source: 'file', stale: true, cached: true, error: lastError }
+        : { ok: false, error: lastError, source: 'file', stale: true, cached: false };
+    },
+    get cache() { return cached; },
+  };
 }
 
 /**
