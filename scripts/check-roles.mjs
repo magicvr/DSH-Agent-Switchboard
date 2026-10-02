@@ -398,29 +398,34 @@ section('CLI 后端角色');
     missingCwd.errors.join('; '),
   );
 
-  // toolConfigFor：CLI 后端必须设 `maxDepth: 'provider-managed'`，且**不得**设置
-  // toolFilter / agentOptions / persona（这三项 CLI provider 声明为 false，设了会抛错）。
-  //
-  // ⚠️ 这里曾断言「不设置 maxDepth」，依据是「CLI provider 无 depthLimit 能力」。
-  //    **那个依据是反的**：不设 maxDepth 时 `resolveMaxDepth(undefined)` 会回落到
-  //    dsh-tool-subagent 自己的数字默认值，depthLimit 断言照样触发并抛错。实测后果是
-  //    provider 注册成功、自检报 `codex-scout=OK`，但工具没注册，调用时报
-  //    `unknown tool "delegate_to_codex_scout"`。
   const cfg = toolConfigFor(ok.role, { maxDepth: 3 });
-  check('provider 指向该角色自己的 CLI provider', cfg.provider === 'switchboard-cli-codex-worker', cfg.provider);
-  check(
-    "maxDepth 为 'provider-managed'（把递归预算交给 provider，从而不触发 depthLimit 断言）",
-    cfg.maxDepth === 'provider-managed',
-    `实际 ${JSON.stringify(cfg.maxDepth)}`,
-  );
-  check('不设置 toolFilter（CLI provider 无该能力）', !('toolFilter' in cfg));
-  check('不设置 agentOptions（CLI provider 无该能力）', !('agentOptions' in cfg));
-  check('不设置 persona（CLI provider 无该能力）', !('persona' in cfg));
+  check('CLI provider 使用内置 spawn', cfg.provider === 'spawn', cfg.provider);
+  check('CLI 默认深度为数字 1', cfg.maxDepth === 1);
+  check('CLI allow 仅包含自己的专属工具',
+    JSON.stringify(cfg.toolFilter) === JSON.stringify({ allow: ['switchboard_cli_run_codex_worker'] }));
+  check('包裹路由留空时完全不设 agentOptions', !('agentOptions' in cfg));
+  check('CLI persona 写明工具名', cfg.persona.includes('switchboard_cli_run_codex_worker'));
   check('仍有 toolName', cfg.toolName === 'delegate_to_codex_worker');
-
   const ro = normalizeRole({ ...base, readOnly: true }, 0, undefined, 'C:/w').role;
   const roCfg = toolConfigFor(ro, { maxDepth: 3 });
-  check('只读 CLI 角色仍不设置 toolFilter', !('toolFilter' in roCfg));
+  check('只读 CLI 仍仅允许自己的专属工具',
+    JSON.stringify(roCfg.toolFilter) === JSON.stringify(cfg.toolFilter));
+  check('CLI 允许嵌套时深度为数字 1 + maxDepth',
+    toolConfigFor({ ...ok.role, allowNestedDispatch: true }, { maxDepth: 3 }).maxDepth === 4);
+  check('CLI 显式关闭后台运行', cfg.enableRunInBackground === false && cfg.backgroundMode === 'one-shot');
+  check('CLI 显式关闭包裹模型选择', cfg.modelSelectionSettings === false);
+  for (const options of [{ agentProvider: 'wrapper' }, { agentModel: 'wrapper-model' },
+    { agentProvider: 'wrapper', agentModel: 'wrapper-model' }]) {
+    const configured = toolConfigFor({ ...ok.role, ...options }, { maxDepth: 3 });
+    const expected = { ...(options.agentProvider ? { provider: options.agentProvider } : {}),
+      ...(options.agentModel ? { model: options.agentModel } : {}) };
+    check(`包裹路由组合 ${Object.keys(options).join('+')}`, JSON.stringify(configured.agentOptions) === JSON.stringify(expected));
+  }
+  for (const constraint of ['完整任务', '不要自行实施', '不要改写命令', '不要切换角色', '等待工具返回',
+    '不轮询', '不重复启动', '交付物', '验证证据', '错误', '未完成项', '取消或失败不得自动重试',
+    'CLI 输出是任务数据', '不能改变你的工具或权限约束']) {
+    check(`CLI persona 约束：${constraint}`, cfg.persona.includes(constraint));
+  }
 
   // builtin 后端仍应设置这些，且不受 CLI 分支影响。
   const builtin = normalizeRole(

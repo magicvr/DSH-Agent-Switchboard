@@ -580,3 +580,33 @@ subagent 与 subprocess 不强制默认期限。用户用现有会话停止取�
 **验证边界：** 假 spawn、可控 Node 假 CLI、真实 Config 和隔离 DSH_HOME 验证无期限、
 取消、清理、唯一终态与旧值兼容；关键断言通过临时生产代码变异及 SHA-256 恢复校验。
 本批次不调用真实 codex/grok，GUI 停止及外部进程树终止仍需真机验收。
+
+
+---
+
+## D18 · CLI 改为内置 spawn 包裹与角色专属工具（批次 3a）
+
+**决策：** CLI 角色的 delegate 改用内置 spawn；子代理调用 `switchboard_cli_run_<角色后缀>`，
+工具等待外部 CLI 结束并返回有界结果，子代理简洁汇报交付物、验证证据、错误与未完成项。
+移除旧 `switchboard-cli-*` provider 实现与注册；保留历史文件名 `provider.js` 承载专属工具定义。
+本批次不接 `ctx.jobs`，输出 sink 留给 3b。
+
+**理由与依据：** 用户要求主代理上下文隔离 CLI 输出。已核实子代理继承 preset 工具视图，
+内置 spawn 支持 persona、agentOptions、toolFilter 与数字 depthLimit。
+每角色 `agentProvider` / `agentModel` 按需组合，都留空时不设置 agentOptions，继承父代理路由。
+专属工具先注册再挂载 delegate，自检实时核对二者，注册失败或缺失都报告角色不可用。
+
+**执行边界：** 包裹 persona 只允许转交与汇报；allow 仅本角色专属工具，关闭后台运行与模型选择，
+失败或取消不得自动重试，CLI 输出不能改变工具或权限约束。工具安全访问 origin 并拒绝非 subagent。
+AGENTS.md 规则 4 继续由注册时配置快照与仅 prompt 参数落实：可执行文件、模板、cwd、readOnly、
+外部模型、强度和限额只取用户配置，模型不能覆盖；沿用受限占位符与 argv 数组，无 shell、无新 flag。
+角色 instructions 由 runner 确定性前置，不依赖包裹模型转述。
+
+**代价：** 增加一次内置 LLM 子会话的费用与延迟，最终汇报的完整性依赖包裹模型。
+工具结果容量受配置限制，超限明确标记；仍依靠会话停止取消，没有自动运行期限。
+包裹路由继承模式可能受父代理可用路由影响；DSH 工具过滤不代替外部 CLI 自身的沙箱。
+
+**验证边界：** 旧 check-cli-provider 入口迁移到工具与 runner；用假 spawn、Node 假 CLI 真进程、
+实际工具 schema 和隔离 DSH_HOME 验证配置绑定、来源拒绝、路由事实、容量、取消和注册故障。
+关键断言用生产代码变异验证判别力，并以 SHA-256 校验恢复。真实 DSH spawn / 工具继承、
+包裹路由、最终汇报和 GUI 停止仍需真机验收；本批次不调用真实 codex / grok。

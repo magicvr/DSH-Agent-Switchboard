@@ -26,14 +26,14 @@ import { join } from 'node:path';
 import {
   CLI_BACKEND,
   EFFORT_VALUES,
-  cliProviderName,
+  cliToolName,
   normalizeRoles,
   planCliMounts,
   roleGuidanceText,
   routeSummaryFor,
   toolConfigFor,
 } from './roles.js';
-import { createCliProvider } from './cli/provider.js';
+import { createCliTool } from './cli/provider.js';
 import { configPathFor, readConfigFile, writeConfigFile, initialConfig } from './config-file.js';
 
 /**
@@ -215,15 +215,18 @@ export function liveRoleTools(ctx, roles) {
   }
   return roles.map((role) => {
     let found;
+    let cliFound = true;
     try {
       found = tools.get(role.toolName, scopeOf(ctx));
+      if (role.cliToolName) cliFound = tools.get(role.cliToolName, scopeOf(ctx)) != null;
     } catch (error) {
       return { id: role.id, ok: false, detail: `查询抛错：${error instanceof Error ? error.message : String(error)}` };
     }
     return {
       id: role.id,
-      ok: found !== undefined && found !== null,
-      detail: found === undefined || found === null ? '工具未注册' : '已注册',
+      ok: found !== undefined && found !== null && cliFound,
+      detail: !cliFound ? `专属 CLI 工具未注册：${role.cliToolName}`
+        : found === undefined || found === null ? '工具未注册' : '已注册',
     };
   });
 }
@@ -249,7 +252,7 @@ export const Config = z.object({
       //    1. 它是**在 UI 上无法打开、却能让角色静默不挂载**的开关。面板上的那个开关后来
       //       被移除（角色工具改由 `mount` 控制作用域），但这个执行期的门禁留着，于是
       //       CLI 角色永远挂不上，而界面上只看到「工具不存在」。实测踩到：
-      //           scout=失败(allowCrossCli 未开启，故未挂载（provider 也未注册）)
+      //           scout=失败(allowCrossCli 未开启，故未挂载（专属 CLI 工具不可用）)
       //       这正是本项目一路在消灭的「静默不存在」。
       //    2. **它是冗余的**。「要不要走外部 CLI」已经由每个角色自己的 `backend: 'cli'`
       //       显式表达，而角色只在声明了 `mount: true` 的 Switchboard preset 会话里挂载。
@@ -499,7 +502,7 @@ export function selftestTool(ctx, diagnostics) {
           `preset 异常行：${value.presetBroken}`,
           `settings 命名空间：${value.settingsNamespaces}`,
           `roleConfig 状态：${value.roleConfigStatus}`,
-          `CLI provider：${value.providers}`,
+          `CLI 专属工具：${value.providers}`,
           `CLI 可执行文件：${value.executables}`,
           // 「跨 CLI 总开关」已移除，因此这里不再是「因开关未挂载」，而是
           // 「因预设兼容性或执行一致性校验被拦下」。
@@ -811,7 +814,8 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics }) {
   const { roles, errors } = normalizeRoles(rawRoles,
     (current.ok && current.value.provider) || resolved.provider,
     (current.ok && current.value.cwd) || resolved.cwd);
-  diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName }));
+  diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName,
+    ...(r.backend === CLI_BACKEND ? { cliToolName: cliToolName(r.id) } : {}) }));
   diagnostics.configErrors = errors;
   if (!Array.isArray(cordisRoles) || cordisRoles.length === 0) {
     // 根条目没有角色时实际依赖文件；读取失败不能被空数组的校验结果覆盖。
@@ -901,7 +905,8 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
   diagnostics.configErrors = errors;
   // 记录「本作用域配置了哪些角色」——自检在解析不出工具时据此说明原因，
   // 而不是含糊地报「工具未出现在工具注册表中」。
-  diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName }));
+  diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName,
+    ...(r.backend === CLI_BACKEND ? { cliToolName: cliToolName(r.id) } : {}) }));
   if (errors.length > 0) {
     // 配置有错时不挂载任何角色工具：半挂载会让主代理看到一批语义不明的工具。
     console.error(`[${name}] 角色配置有 ${errors.length} 处错误，未挂载任何角色工具：`);
@@ -931,13 +936,9 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
 
   const { active: activeCliRoles, blocked: blockedCliRoles } = planCliMounts(roles);
 
-  // 注册 CLI 角色各自的 provider 实例。
-  //
-  // 为什么**每个角色一个实例**而不是一个共享 provider：provider 的 `start()`
-  // 只能从 `request` 里看到提示词与父代理，无法知道是哪个角色发起的调用，
-  // 而角色级命令/参数模板/模型/强度各不相同。注册名必须与
-  // `toolConfigFor()` 写进工具配置的 provider 名一致（由 check-cli.mjs 的
-  // 跨模块断言锁住）。
+  // 专属工具先注册在 preset 层，子代理继承可见性；execute 仍拒绝主代理直调。
+  // 两个工具使用同一挂载计划，任何注册失败都阻止该角色的委派工具挂载。
+  const failedCliTools = [];
   if (blockedCliRoles.length > 0) {
     diagnostics.blocked = blockedCliRoles;
     console.error(
@@ -948,21 +949,24 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
 
   for (const role of activeCliRoles) {
     try {
-      const provider = createCliProvider({
+      const tool = createCliTool({
         role,
         spawn: (spec) => safeSpawn(ctx, spec),
         resolveExecutable: (command, env, signal) => ctx.subprocess.resolveExecutable(command, env, signal),
-        // 与系统提示词里的路由指引同一套措辞，让主代理能对照「本该走哪条」与「实际走哪条」。
-        routeSummary: routeSummaryFor(role),
       });
-      ctx.subagents.registerProvider(provider);
-      diagnostics.providers.push({ id: role.id, name: provider.name, ok: true, detail: '已注册' });
+      ctx.tools.register(tool);
+      if (ctx.get('tools')?.get(tool.name, scopeOf(ctx)) == null) {
+        throw new Error(`专属 CLI 工具未注册：${tool.name}`);
+      }
+      diagnostics.providers.push({ id: role.id, name: tool.name, ok: true, detail: '已注册专属工具' });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      diagnostics.providers.push({ id: role.id, name: cliProviderName(role.id), ok: false, detail });
-      console.error(`[${name}] CLI provider "${role.id}" 注册失败：${detail}`);
+      failedCliTools.push({ id: role.id, reason: detail });
+      diagnostics.providers.push({ id: role.id, name: cliToolName(role.id), ok: false, detail });
+      console.error(`[${name}] CLI 工具 "${role.id}" 注册失败：${detail}`);
     }
   }
+  diagnostics.blocked.push(...failedCliTools);
 
   // CLI 角色的**装载期**校验：把「命令根本不存在」这类问题在启动时就报出来，
   // 而不是等第一次派发。解析失败不阻断装载（可能依赖运行期 PATH），只作为诊断。
@@ -983,20 +987,13 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
   import('@deepseek-ai/dsh-tool-subagent')
     .then(async (toolModule) => {
       for (const role of roles) {
-        // ⚠️ 必须**按角色**复用同一个判定，不能只 gate provider 注册。
-        //
-        // `dsh-tool-subagent` 装载时**不检查** provider 是否存在：它拿 provider 名
-        // 去查，查不到也不会在装载期抛错。因此「provider 没注册但工具挂上了」会
-        // 形成最糟的形态 —— 主代理看得见这个工具，一调用就失败。
-        //
-        // 这是 Phase 2 记录过的同类故障（`4/4 OK` 但只有 1 个能用），当时靠真实
-        // 派发才发现；这里必须在挂载前就拦住。
-        const blocked = blockedCliRoles.find((b) => b.id === role.id);
+        // 预设不合法或专属工具注册失败时，该角色不可派发。
+        const blocked = [...blockedCliRoles, ...failedCliTools].find((b) => b.id === role.id);
         if (blocked) {
           diagnostics.mounts.push({
             id: role.id,
             ok: false,
-            detail: `${blocked.reason}，故未挂载（provider 也未注册）`,
+            detail: `${blocked.reason}，故未挂载（专属 CLI 工具不可用）`,
           });
           continue;
         }

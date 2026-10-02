@@ -696,7 +696,7 @@ section('诊断边界：不可查询、零角色、非法配置与服务注册 s
     spy.provided.join(','));
 }
 
-section('CLI 逐角色阻塞：未知配置不注册 provider、不解析命令、不执行');
+section('CLI 逐角色阻塞：未知配置不注册工具、不解析命令、不执行');
 {
   const { cliFieldsFor } = await import('../src/cli/drivers.js');
   const ctx = makeCtx();
@@ -715,14 +715,70 @@ section('CLI 逐角色阻塞：未知配置不注册 provider、不解析命令�
   apply(ctx, { mount: true, provider: 'self', cwd: 'C:/w', roles: [legacy, valid, { ...fixtureRole, id: 'builtin' }] });
   await import('@deepseek-ai/dsh-tool-subagent');
   await new Promise(setImmediate);
-  check('未知配置不注册 provider 且不解析/启动其命令',
-    providers.length === 1 && resolved.join(',') === 'grok' && spawned === 0);
+  check('未知配置不注册工具且不解析/启动其命令，旧 provider 不再注册',
+    providers.length === 0 && resolved.join(',') === 'grok' && spawned === 0
+      && !ctx.registered.includes('switchboard_cli_run_legacy') && ctx.registered.includes('switchboard_cli_run_valid'));
   check('旧 custom 阻塞不影响有效 CLI 和内置角色工具',
     !ctx.registered.includes('delegate_to_legacy') && ctx.registered.includes('delegate_to_valid') && ctx.registered.includes('delegate_to_builtin'));
   const result = await ctx.tools.get('switchboard_selftest').execute({});
   check('自检与主代理指引都显示旧配置待迁移',
     result.blocked.includes('legacy') && result.blocked.includes('待迁移') && guidance.includes('不得派发'));
   check('装载后旧 custom 原始配置保持不变', JSON.stringify([legacy, valid]) === before);
+}
+
+section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失不可冒充健康');
+{
+  const { cliFieldsFor } = await import('../src/cli/drivers.js');
+  const role = { id: 'cli-worker', description: 'd', instructions: 'i', backend: 'cli', model: 'external-model',
+    cliDriver: 'grok', cliCwd: 'C:/w', ...cliFieldsFor('grok', false) };
+  for (const mode of ['success', 'throw', 'missing', 'delegate-missing']) {
+    const scope = {};
+    const ctx = makeCtx({ scope });
+    const originalRegister = ctx.tools.register.bind(ctx.tools);
+    const originalGet = ctx.tools.get.bind(ctx.tools);
+    const configs = [];
+    let registeredBeforeDelegate = false;
+    ctx.tools.register = def => {
+      if (def.name === 'switchboard_cli_run_cli_worker') {
+        if (mode === 'throw') throw new Error('fixture-cli-register-failed');
+        if (mode === 'missing') return () => {};
+      }
+      return originalRegister(def);
+    };
+    const originalPlugin = ctx.plugin.bind(ctx);
+    ctx.plugin = (module, config) => {
+      configs.push(config);
+      registeredBeforeDelegate = originalGet('switchboard_cli_run_cli_worker', scope) != null;
+      return mode === 'delegate-missing' ? { dispose() {} } : originalPlugin(module, config);
+    };
+    apply(ctx, { mount: true, roles: [role, { ...fixtureRole, id: 'independent' }], provider: 'self' });
+    await import('@deepseek-ai/dsh-tool-subagent');
+    await new Promise(setImmediate);
+    const selftest = ctx.tools.get('switchboard_selftest', scope);
+    const result = await selftest.execute({});
+    if (mode === 'success') {
+      check('CLI 专属工具与委派工具都在 preset 层注册', ctx.tools.get('switchboard_cli_run_cli_worker', scope)
+        && ctx.tools.get('delegate_to_cli_worker', scope) && !ctx.tools.get('switchboard_cli_run_cli_worker'));
+      check('专属 CLI 工具先于角色插件挂载', registeredBeforeDelegate
+        && ctx.registered.indexOf('switchboard_cli_run_cli_worker') < ctx.registered.indexOf('delegate_to_cli_worker'));
+      check('apply 的 CLI 配置使用 spawn 和自身 allow', configs[0].provider === 'spawn'
+        && JSON.stringify(configs[0].toolFilter.allow) === '["switchboard_cli_run_cli_worker"]');
+      check('CLI 两个工具齐全时自检健康', result.ok && result.roleCount === 2);
+      ctx.tools.get = (name, viewingScope) => name === 'switchboard_cli_run_cli_worker' ? undefined : originalGet(name, viewingScope);
+      const absent = await selftest.execute({});
+      check('CLI 工具后来缺失时自检失败且不计入角色数量', !absent.ok && absent.roleCount === 1);
+      check('委派工具存在也如实报告专属工具缺失', absent.mounted.includes('专属 CLI 工具未注册'));
+    } else {
+      check(`${mode}：角色不可用时自检失败`, !result.ok && !result.mounted.includes('cli-worker=OK'));
+      if (mode !== 'delegate-missing') {
+        check(`${mode}：不挂载依赖失败 CLI 工具的 delegate`, !configs.some(c => c.toolName === 'delegate_to_cli_worker'));
+        check(`${mode}：自检保留注册失败或未注册原因`, result.blocked.includes(mode === 'throw'
+          ? 'fixture-cli-register-failed' : '专属 CLI 工具未注册'));
+        check(`${mode}：失败不阻断无关内置角色`, result.roleCount === 1 && result.mounted.includes('independent=OK'));
+      } else check('CLI 工具存在但委派工具缺失仍失败', ctx.tools.get('switchboard_cli_run_cli_worker', scope)
+        && result.mounted.includes('工具未注册'));
+    }
+  }
 }
 
 section('隔离 DSH_HOME：残留运行期限不影响配置加载或健康状态');

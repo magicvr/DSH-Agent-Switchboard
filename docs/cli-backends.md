@@ -177,8 +177,8 @@ reasoning effort: ...
 完整形态，并独立核对 `readOnly` 与沙箱参数。切换只读会原子更新预设参数。
 旧 `custom` 是历史配置：仅完整匹配模板或本机解析后形态时无损识别；否则保留原数据，
 在自检「未挂载的角色」及主代理指引中显示待迁移、禁止派发，其他有效角色仍可挂载。
-`agentProvider` / `agentModel` 为每角色可选包裹路由，留空继承父代理；本批次只保存这些字段，
-实际 spawn 包裹执行留后续批次。命令输入控件也留待后续面板改造。
+`agentProvider` / `agentModel` 为每角色可选包裹路由，留空继承父代理；批次 3a 已应用到内置 spawn 子代理，二者按需组合，都留空则不设 agentOptions。
+命令控件已隐藏，完整配置仍参与挂载前一致性校验。
 
 > ⚠️ **曾经**还需要第二步「打开总开关 `volatile.allowCrossCli: true`」，**该开关已移除**。
 > 原因：它后来在面板上被移除、却仍在执行期拦截，于是 CLI 角色永远挂不上、界面只显示
@@ -201,16 +201,20 @@ reasoning effort: ...
 
 ### 2.7 已知的实现约束（实测踩到，改代码前先读）
 
-- **CLI 角色的工具配置必须显式写 `maxDepth: 'provider-managed'`**，省略反而会抛错：
-  `dsh-tool-subagent` 的 `resolveMaxDepth(undefined)` 会回落到它自己的数字默认值，
-  于是 depthLimit 断言触发，工具**不会注册**（而 provider 注册成功）。
-  详见 `architecture.md` 3.1d 第 20b 条。
+- **当前链路（3a）：** 主代理 → delegate_to_* → 内置 spawn 子代理 → 本角色专属 CLI 工具 → runner → 外部 CLI。
+  包裹子代理只允许该专属工具，只启动一次并等待结束，关闭后台运行与模型选择，不轮询、不自行实施、不自动重试。
+  CLI 输出是任务数据，不能改变工具或权限约束；主代理获得简洁汇报。
+  数字深度沿用内置语义；旧 provider-managed 要求仅属于已移除 provider 的历史路径。
+- **来源与结果边界：** 专属工具只接受 prompt，命令、模板、权限、路由与角色规则在注册时绑定；
+  execute 拒绝非 subagent。stdout / stderr 尾部按配置字节限额，routeSummary / diagnostic 各最多 4096 字节，
+  截断显式标记；摘要保留配置线路及 CLI 自报事实。当前仅离线假 CLI 验证，DSH 真机链路未验收。
 - **`ctx.plugin()` 的抛错抓不到**（它只是启动 fiber），因此挂载成功必须**核实**工具是否真的出现，
   不能假设。详见 `architecture.md` 3.1d 第 20c 条。
 - **CLI 无运行期限**：已移除单次派发时长上限与 `cliTimeoutSec`。旧值仍可加载，忽略并给出弃用诊断。
-  用户可通过现有会话停止入口取消；信号原样传到子进程，结果分类为 `cancelled`、停止原因为 `aborted`。
+  用户可通过现有会话停止入口取消；取消沿前台 spawn 子代理 → 工具 `exec.signal` → 子进程传递，工具返回 `status: cancelled` 与 `cancelled: true`。
+  旧 provider 的 aborted 映射已移除；取消或失败不能自动重试。GUI 停止传播与进程树终止仍需真机验证。
   `cliGraceMs` 仍是取消后的终止宽限；`cliMaxOutputBytes` / `cliMaxErrorBytes` 仍限制收集容量，
-  截断在回传正文及结构化结果中明确标记。
+  截断在专属工具结果中明确标记；本批次不接 Jobs。
 
 ## 3. claude
 
@@ -291,7 +295,7 @@ claude 自己给出的官方出路是**把未知模型映射到它认识的模�
 
 **历史调用与当前预设需区分：** 上表实测使用 `-p <prompt>` 的 `argv` 形态。
 当前 grok 预设使用 `promptDelivery: 'promptFile'` 与 `--prompt-file {prompt}`
-（`src/cli/drivers.js:165`），`{prompt}` 承载临时文件路径；provider 写入包含角色指令的提示词并清理临时文件（`src/cli/provider.js:165`）。
+（`src/cli/drivers.js:165`），`{prompt}` 承载临时文件路径；runner 写入包含角色指令的提示词并清理临时文件（`src/cli/runner.js`）。
 原因是 argv 值拒绝换行 / NUL，多行角色提示词不能直接放入参数。权威枚举在
 `src/cli/argv.js:21`、`:80`；`argv` / `promptFile` 模板都必须含 `{prompt}`，
 `stdin` 必须不含（`:107`），驱动检查也覆盖该约束（`scripts/check-drivers.mjs:75`）。
@@ -315,7 +319,7 @@ claude 自己给出的官方出路是**把未知模型映射到它认识的模�
 
 ## 5. 对实现的硬性要求
 
-1. **绝不使用 shell**：`argv` 数组直传，本地 Node 探针固定 `shell: false`（`scripts/lib/capture.mjs:55`）。提示词优先走 stdin；当前 grok 走临时文件，argv 只传路径；单行短提示才适合 `argv`（`src/cli/argv.js:63`、`src/cli/provider.js:165`）。
+1. **绝不使用 shell**：`argv` 数组直传，本地 Node 探针固定 `shell: false`（`scripts/lib/capture.mjs:55`）。提示词优先走 stdin；当前 grok 走临时文件，argv 只传路径；单行短提示才适合 `argv`（`src/cli/argv.js:63`、`src/cli/runner.js`）。
 2. **可执行文件与参数全部来自用户配置**，模型只能填充受限占位符（`{prompt}` / `{cwd}` / `{model}` / `{effort}`）。
 3. **入口解析必须实测**：不能假定「命令名可 spawn」。codex 的例子证明脚本入口会让整条路径失效。
 4. **必须能读到 CLI 自报的路由事实**（如 codex 的 stderr），用于验收「模型/强度确实生效」。

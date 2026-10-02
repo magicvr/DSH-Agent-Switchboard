@@ -1,11 +1,7 @@
-// CLI provider 的离线验证：注入 fake spawn，不调用任何真实 CLI。
+// 历史检查入口原位迁移到专属工具与 runner，不调用任何真实 CLI。
 // 用法：node scripts/check-cli-provider.mjs
-import {
-  CLI_CAPABILITIES,
-  CLI_INHERITS_PARENT_CONTEXT,
-  createCliProvider,
-  promptText,
-} from '../src/cli/provider.js';
+import { createCliTool } from '../src/cli/provider.js';
+import { validateArgs, validateJsonSchemaValue } from '@deepseek-ai/dsh-tools';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, openSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,9 +24,7 @@ function section(title) {
   console.log(`\n=== ${title} ===`);
 }
 
-/** 造一个只含 text 块的 prompt。 */
-const textPrompt = (t) => [{ type: 'text', text: t }];
-
+const childExec = (signal) => ({ agent: { id: 'child-1', session: { header: { origin: 'subagent' } } }, signal });
 /**
  * 造一个可控的 fake spawn。返回句柄与「被调用记录」。
  *
@@ -88,300 +82,190 @@ function codexRole(overrides = {}) {
       args: ['exec', '-s', 'read-only', '-m', '{model}', '-c', 'model_reasoning_effort={effort}', '-'],
       cwd: 'C:/work',
       graceMs: 3000,
+      maxOutputBytes: 1_000_000,
+      maxErrorBytes: 100_000,
       ...overrides,
     },
   };
 }
 
-section('promptText');
-{
-  const a = promptText(textPrompt('hello'));
-  check('单文本块', a.text === 'hello' && a.ignoredBlocks.length === 0);
-
-  const b = promptText([
-    { type: 'text', text: 'a' },
-    { type: 'text', text: 'b' },
-  ]);
-  check('多文本块以换行连接', b.text === 'a\nb', JSON.stringify(b.text));
-
-  const c = promptText([
-    { type: 'text', text: 'keep' },
-    { type: 'image', attachment: {} },
-    { type: 'file', attachment: {} },
-  ]);
-  check('忽略非文本块但如实记录类型', c.text === 'keep' && c.ignoredBlocks.join(',') === 'image,file', JSON.stringify(c));
-
-  check('非数组输入 → 空', promptText(undefined).text === '' && promptText('nope').text === '');
-  check('无 text 字段的块被忽略', promptText([{ type: 'text' }]).text === '');
-}
-
-section('provider 元信息');
+section('专属工具定义：单一必填正文、有界结构化结果');
 {
   const { spawn } = makeSpawn();
-  const p = createCliProvider({ role: codexRole(), spawn });
-  check('provider 名含角色 id', p.name === 'switchboard-cli-scout', p.name);
-  check('capabilities 全为 false', Object.values(p.capabilities).every((v) => v === false));
-  check('capabilities 与导出常量一致', JSON.stringify(p.capabilities) === JSON.stringify(CLI_CAPABILITIES));
-  check('不继承父上下文', p.inheritsParentContext === false && CLI_INHERITS_PARENT_CONTEXT === false);
+  const p = createCliTool({ role: codexRole(), spawn });
+  check('工具名含角色后缀', p.name === 'switchboard_cli_run_scout', p.name);
+  check('不再导出 provider 的 start/capabilities', !('start' in p) && !('capabilities' in p));
+  check('parameters 只有 prompt', Object.keys(p.parameters.properties).join(',') === 'prompt');
+  check('prompt 为必填 string', p.parameters.properties.prompt.type === 'string'
+    && JSON.stringify(p.parameters.required) === '["prompt"]');
+  for (const args of [{}, { prompt: 42 }, { prompt: null }, { prompt: ['T'] }]) {
+    let refused = false;
+    try { validateArgs(p.parameters, args); } catch { refused = true; }
+    check(`参数 schema 拒绝非法正文 ${JSON.stringify(args)}`, refused);
+  }
+  check('output 为封闭对象且必需字段齐全', p.output.schema.type === 'object'
+    && p.output.schema.additionalProperties === false
+    && p.output.schema.required.includes('routeSummary') && p.output.schema.required.includes('cancelled'));
   check('缺少 cli 配置时抛错', (() => {
-    try {
-      createCliProvider({ role: { id: 'x' }, spawn });
-      return false;
-    } catch {
-      return true;
-    }
+    try { createCliTool({ role: { id: 'x' }, spawn }); return false; } catch { return true; }
   })());
 }
 
-section('argv 与 stdio：stdin 模式');
+section('执行防御：只允许 subagent，拒绝时不能启动进程');
+{
+  const h = makeSpawn();
+  const p = createCliTool({ role: codexRole(), spawn: h.spawn });
+  for (const [label, exec] of [['缺少 exec', undefined], ['缺少 agent', {}], ['缺少 session', { agent: {} }],
+    ['主代理', { agent: { session: { header: { origin: 'user' } } } }],
+    ['其它 origin', { agent: { session: { header: { origin: 'other' } } } }]]) {
+    let error;
+    try { await p.execute({ prompt: 'T' }, exec); } catch (e) { error = e; }
+    check(`非子代理拒绝：${label}`, error?.message.includes('仅供子代理执行') && h.calls.length === 0);
+  }
+  let invalid;
+  try { await p.execute({ prompt: 1 }, childExec()); } catch (e) { invalid = e; }
+  check('直接 execute 也拒绝非字符串', invalid instanceof Error && h.calls.length === 0);
+}
+
+section('argv 与 stdio：绑定配置，不接受模型覆盖');
 {
   const role = codexRole();
   const { spawn, calls } = makeSpawn({ stdout: 'ANSWER', exitCode: 0 });
-  const p = createCliProvider({ role, spawn });
-  const run = await p.start({ prompt: textPrompt('the task'), parent: { id: 'parent-1' } });
-
+  const p = createCliTool({ role, spawn });
+  // 注册后修改原对象不能改变已绑定的命令、参数、模型或 cwd。
+  role.cli.command = 'malicious'; role.cli.args.push('--unconfigured'); role.model = 'wrong-model';
+  const result = await p.execute({ prompt: 'the task', driver: 'other', cwd: 'wrong', readOnly: false,
+    cliCommand: 'wrong', cliArgs: ['wrong'], model: 'wrong', instructions: 'wrong' }, childExec());
   check('spawn 被调用一次', calls.length === 1);
   const spec = calls[0];
-  // argv[0] 是可执行文件，其后是 prefixArgs（node 形态下是脚本路径），再后是模板。
-  check('argv[0] 是可执行文件', spec.argv[0] === 'C:/node.exe', JSON.stringify(spec.argv));
-  check('prefixArgs 紧随其后', spec.argv[1] === 'C:/codex.js', JSON.stringify(spec.argv));
-  // 占位符取自**角色顶层**的 model/effort（同一字段在 builtin 后端下是 DSH route，
-  // 在 cli 后端下是外部 CLI 的模型 id —— 命名空间不同但只应有一个来源，见 D12）。
-  check('role.model 占位符已替换', spec.argv.includes('gpt-6-luna'), JSON.stringify(spec.argv));
-  check('role.effort 占位符已替换', spec.argv.includes('model_reasoning_effort=medium'), JSON.stringify(spec.argv));
-  check('stdin 模式：提示词不进 argv', !spec.argv.includes('the task'), JSON.stringify(spec.argv));
-  check('stdin 模式：提示词经 stdin 传入', JSON.stringify(spec.stdio.stdin) === JSON.stringify({ data: 'the task' }));
-  check('cwd 来自配置', spec.cwd === 'C:/work');
+  check('argv[0] 是绑定可执行文件', spec.argv[0] === 'C:/node.exe');
+  check('prefixArgs 紧随其后', spec.argv[1] === 'C:/codex.js');
+  check('model 来自注册快照', spec.argv.includes('gpt-6-luna'));
+  check('effort 来自角色配置', spec.argv.includes('model_reasoning_effort=medium'));
+  check('权限参数不能被调用参数改写', spec.argv.includes('read-only'));
+  check('注册后模板变更不生效', !spec.argv.includes('--unconfigured'));
+  check('stdin 模式：提示词不进 argv', !spec.argv.includes('the task'));
+  check('stdin 模式：提示词经 stdin 传入', spec.stdio.stdin.data === 'the task');
+  check('cwd 来自绑定配置', spec.cwd === 'C:/work');
   check('graceMs 来自配置', spec.graceMs === 3000);
-  check('传入了 abort signal 字段', 'signal' in spec);
-
-  const result = await run.result;
-  check('run.localAgent 为 undefined', run.localAgent === undefined);
-  check('成功 → stopReason completed', result.stopReason === 'completed', result.stopReason);
-  check('正文回传', result.output[0].text.includes('ANSWER'));
-  check('structured 含退出码', result.structured.exitCode === 0);
-  check('dispose 可调用', typeof run.dispose === 'function');
+  check('传入了 signal 字段', 'signal' in spec);
+  check('成功状态与退出码', result.status === 'completed' && result.exitCode === 0 && result.signal === null);
+  check('正文原样回传', result.stdout === 'ANSWER');
+  check('正常完成不是取消', result.cancelled === false);
+  check('工具结果通过实际 output schema', validateJsonSchemaValue(p.output.schema, result).length === 0);
+  check('不回传完整 argv/实时日志', !('text' in result) && !('argv' in result) && !('logs' in result));
+  check('render 只显示有界结果', p.output.render({}, result)[0].text === JSON.stringify(result));
 }
 
 section('argv 与 stdio：argv 模式');
 {
-  const role = codexRole({ promptDelivery: 'argv', args: ['-p', '{prompt}'] });
   const { spawn, calls } = makeSpawn({ stdout: 'OK' });
-  const p = createCliProvider({ role, spawn });
-  await (await p.start({ prompt: textPrompt('task text') })).result;
-
-  check('argv 模式：提示词进入 argv', calls[0].argv.includes('task text'), JSON.stringify(calls[0].argv));
+  const p = createCliTool({ role: codexRole({ promptDelivery: 'argv', args: ['-p', '{prompt}'] }), spawn });
+  await p.execute({ prompt: 'task text' }, childExec());
+  check('argv 模式：提示词进入 argv', calls[0].argv.includes('task text'));
   check('argv 模式：stdin 为 ignore', calls[0].stdio.stdin === 'ignore');
 }
 
-section('argv 与 stdio：promptFile 模式');
+section('promptFile 与角色指令：确定性前置、临时文件清理');
 {
-  // 为什么需要这个模式：`argv` 模式把提示词当命令行参数，而**参数值不得含换行**
-  // （见 cli/argv.js），真实提示词几乎都是多行的。`promptFile` 把提示词写进临时文件、
-  // 只把**路径**放进 argv，从而绕开该限制。grok 就依赖它（`--prompt-file`）。
-  const role = codexRole({ promptDelivery: 'promptFile', args: ['--prompt-file', '{prompt}'] });
-  const { spawn, calls } = makeSpawn({ stdout: 'OK' });
-  const p = createCliProvider({ role, spawn });
-  // 刻意用**多行**提示词：这正是 argv 模式会失败的输入。
-  await (await p.start({ prompt: textPrompt('第一行\n第二行') })).result;
-
-  const argv = calls[0].argv;
-  const fileIdx = argv.indexOf('--prompt-file');
-  check('promptFile 模式：含 --prompt-file', fileIdx !== -1, JSON.stringify(argv));
-  const path = fileIdx === -1 ? undefined : argv[fileIdx + 1];
-  check('promptFile 模式：其后是一个文件路径', typeof path === 'string' && path.length > 0, String(path));
-  check('promptFile 模式：提示词本体**不进** argv', !argv.some((a) => a.includes('第一行')), JSON.stringify(argv));
-  check(
-    'promptFile 模式：路径不含换行（这正是它能绕开限制的原因）',
-    typeof path === 'string' && !/[\n\r]/.test(path),
-    String(path),
-  );
-  check('promptFile 模式：stdin 为 ignore（提示词走文件，不走 stdin）', calls[0].stdio.stdin === 'ignore');
-  check('promptFile 模式：运行结束后临时文件已清理', path !== undefined && !existsSync(path), String(path));
+  for (const delivery of ['stdin', 'promptFile']) {
+    const role = codexRole(delivery === 'promptFile' ? { promptDelivery: delivery, args: ['--prompt-file', '{prompt}'] } : {});
+    role.instructions = 'ROLE-INSTRUCTIONS-SENTINEL';
+    const h = makeSpawn({ stdout: 'OK' });
+    let content;
+    let path;
+    const p = createCliTool({ role, spawn: spec => {
+      if (delivery === 'promptFile') { path = spec.argv.at(-1); content = readFileSync(path, 'utf8'); }
+      else content = spec.stdio.stdin.data;
+      return h.spawn(spec);
+    } });
+    await p.execute({ prompt: '第一行\n第二行', instructions: 'OVERRIDE' }, childExec());
+    check(`${delivery}：角色规则精确前置`, content === 'ROLE-INSTRUCTIONS-SENTINEL\n\n---\n\n第一行\n第二行');
+    check(`${delivery}：不接受规则覆盖`, !content.includes('OVERRIDE'));
+    check(`${delivery}：正文不进入 argv`, !h.calls[0].argv.some(a => a.includes('第一行')));
+    if (delivery === 'promptFile') {
+      check('promptFile：含配置 flag', h.calls[0].argv.includes('--prompt-file'));
+      check('promptFile：路径不含换行', typeof path === 'string' && !/[\n\r]/.test(path));
+      check('promptFile：stdin 为 ignore', h.calls[0].stdio.stdin === 'ignore');
+      check('promptFile：运行后文件已清理', !existsSync(path));
+    } else check('stdin：使用配置 stdin 通道', typeof h.calls[0].stdio.stdin === 'object');
+  }
+  const role = codexRole(); role.instructions = '   ';
+  const h = makeSpawn();
+  await createCliTool({ role, spawn: h.spawn }).execute({ prompt: 'ONLY TASK' }, childExec());
+  check('空角色指令时不加分隔线', h.calls[0].stdio.stdin.data === 'ONLY TASK');
+  const h2 = makeSpawn();
+  const r = await createCliTool({ role: codexRole({ promptDelivery: 'argv', args: ['-p', '{prompt}'] }),
+    spawn: h2.spawn }).execute({ prompt: 'line1\nline2' }, childExec());
+  check('argv 多行正文被明确拒绝且不 spawn', h2.calls.length === 0 && r.status === 'start-failed');
+  check('argv 错误说明换行限制', r.diagnostic.includes('换行'));
 }
 
-section('回传日志必须让主代理看得出「走了哪条线路」');
+section('路由证据：配置摘要与 CLI 自报事实分别保留');
 {
-  // ⚠️ 主代理需要把「角色本该走哪条线路」与「实际走了哪条」对上。因此日志里要有一行
-  //    线路摘要，且措辞与系统提示词的 `routeSummaryFor` 一致（同一套措辞才能对照）。
-  const { spawn } = makeSpawn({ stdout: 'BODY' });
-  const p = createCliProvider({
-    role: codexRole(),
-    spawn,
-    routeSummary: 'backend=cli(codex) model=gpt-6-luna effort=medium',
-  });
-  const result = await (await p.start({ prompt: textPrompt('t') })).result;
-  const text = result.output[0].text;
-  check('日志含线路摘要行', text.includes('[switchboard] 线路=backend=cli(codex)'), text.slice(0, 240));
-  check('线路摘要含模型', text.includes('model=gpt-6-luna'), text.slice(0, 240));
-  check('日志仍含 role 行', text.includes('[switchboard] role='), text.slice(0, 240));
-
-  // 未提供摘要时不得出现半截的 `线路=undefined`（退化输入）。
-  const { spawn: spawn2 } = makeSpawn({ stdout: 'BODY' });
-  const p2 = createCliProvider({ role: codexRole(), spawn: spawn2 });
-  const text2 = (await (await p2.start({ prompt: textPrompt('t') })).result).output[0].text;
-  check('未提供摘要时不输出 undefined', !text2.includes('[switchboard] 线路=undefined'), text2.slice(0, 200));
-  check(
-    '未提供摘要时日志仍完整',
-    text2.includes('[switchboard] role=') && text2.includes('[switchboard] argv='),
-  );
+  const stderr = 'OpenAI Codex\nworkdir: C:/work\nmodel: actual-model\nprovider: openai\nsandbox: read-only\nreasoning effort: high';
+  const h = makeSpawn({ stdout: 'BODY', stderr });
+  const r = await createCliTool({ role: codexRole(), spawn: h.spawn }).execute({ prompt: 'T' }, childExec());
+  check('摘要含配置 driver', r.routeSummary.includes('backend=cli(codex)'));
+  check('摘要含配置模型', r.routeSummary.includes('model=gpt-6-luna'));
+  check('摘要含实际 CLI 模型', r.routeSummary.includes('"model":"actual-model"'));
+  check('摘要含实际 CLI 强度', r.routeSummary.includes('"reasoning effort":"high"'));
+  check('摘要含实际 CLI 权限', r.routeSummary.includes('"sandbox":"read-only"'));
+  check('stderr 保留自报事实', r.stderr === stderr);
+  check('正文独立保留', r.stdout === 'BODY');
+  const noFacts = await createCliTool({ role: codexRole(), spawn: makeSpawn().spawn }).execute({ prompt: 'T' }, childExec());
+  check('未自报时不编造路由', noFacts.routeSummary.endsWith('cli-route={}') && !noFacts.routeSummary.includes('undefined'));
 }
 
-section('路由事实被抽入 structured 与正文');
+section('失败语义与解析器回退');
 {
-  const stderr = [
-    'OpenAI Codex v0.159.2',
-    '--------',
-    'workdir: C:/work',
-    'model: gpt-6-astra',
-    'provider: openai',
-    'sandbox: read-only',
-    'reasoning effort: high',
-  ].join('\n');
-  const { spawn } = makeSpawn({ stdout: 'BODY', stderr });
-  const p = createCliProvider({ role: codexRole(), spawn });
-  const result = await (await p.start({ prompt: textPrompt('t') })).result;
-
-  check('structured.cliRoute.model 正确', result.structured.cliRoute.model === 'gpt-6-astra');
-  check('structured.cliRoute 含 strength', result.structured.cliRoute['reasoning effort'] === 'high');
-  check('正文含路由事实（可审计）', result.output[0].text.includes('gpt-6-astra'));
+  const r = await createCliTool({ role: codexRole(), spawn: makeSpawn({ exitCode: 1,
+    stderr: 'stream error: model not found' }).spawn }).execute({ prompt: 'T' }, childExec());
+  check('非零退出分类为 process-failed', r.status === 'process-failed');
+  check('退出码原样回传', r.exitCode === 1);
+  check('失败 stderr 原样保留', r.stderr === 'stream error: model not found');
+  check('失败不是取消', r.cancelled === false);
+  const h = makeSpawn();
+  const bad = await createCliTool({ role: codexRole({ args: ['exec', '{modle}', '-'] }), spawn: h.spawn })
+    .execute({ prompt: 'T' }, childExec());
+  check('模板错误不 spawn', h.calls.length === 0);
+  check('模板错误归类 start-failed', bad.status === 'start-failed');
+  check('模板错误保留诊断', bad.diagnostic.includes('参数模板错误'));
+  const missing = await createCliTool({ role: codexRole(), spawn: () => { throw new Error('ENOENT'); } })
+    .execute({ prompt: 'T' }, childExec());
+  check('spawn 异常归类 start-failed', missing.status === 'start-failed');
+  check('spawn 异常保留原始错误', missing.diagnostic.includes('ENOENT'));
+  const h1 = makeSpawn();
+  await createCliTool({ role: codexRole({ command: 'codex' }), spawn: h1.spawn,
+    resolveExecutable: async cmd => `RESOLVED(${cmd})` }).execute({ prompt: 'T' }, childExec());
+  check('使用解析后的可执行路径', h1.calls[0].argv[0] === 'RESOLVED(codex)');
+  const h2 = makeSpawn();
+  const fallback = await createCliTool({ role: codexRole({ command: 'codex' }), spawn: h2.spawn,
+    resolveExecutable: async () => { throw new Error('lookup failed'); } }).execute({ prompt: 'T' }, childExec());
+  check('解析失败回落字面命令', h2.calls[0].argv[0] === 'codex');
+  check('解析回落后仍可成功', fallback.status === 'completed');
+  const empty = await createCliTool({ role: codexRole(), spawn: makeSpawn().spawn }).execute({ prompt: 'T' }, childExec());
+  check('无正文时仍报告成功退出', empty.status === 'completed');
+  check('无正文诊断如实记录', empty.diagnostic.includes('没有输出内容'));
 }
 
-section('失败语义');
+section('工具结果容量：正文、错误尾部、元信息与失败诊断均有界');
 {
-  const { spawn } = makeSpawn({ exitCode: 1, stdout: '', stderr: 'stream error: model not found' });
-  const p = createCliProvider({ role: codexRole(), spawn });
-  const result = await (await p.start({ prompt: textPrompt('t') })).result;
-
-  check('非零退出 → stopReason error', result.stopReason === 'error', result.stopReason);
-  check('正文含退出码', result.output[0].text.includes('exit=1'));
-  check('正文保留 stderr', result.output[0].text.includes('model not found'));
-  check('正文说明失败原因', result.output[0].text.includes('失败原因'));
-}
-
-section('参数模板错误：在启动前失败，不 spawn');
-{
-  const role = codexRole({ args: ['exec', '{modle}', '-'] });
-  const { spawn, calls } = makeSpawn();
-  const p = createCliProvider({ role, spawn });
-  const result = await (await p.start({ prompt: textPrompt('t') })).result;
-
-  check('未调用 spawn', calls.length === 0);
-  check('stopReason error', result.stopReason === 'error');
-  check('正文说明模板错误', result.output[0].text.includes('参数模板错误'), result.output[0].text);
-}
-
-section('spawn 抛错：转为可读失败而非抛出');
-{
-  const p = createCliProvider({
-    role: codexRole(),
-    spawn: () => {
-      throw new Error('ENOENT: 找不到可执行文件');
-    },
-  });
-  const result = await (await p.start({ prompt: textPrompt('t') })).result;
-  check('stopReason error', result.stopReason === 'error');
-  check('正文含原始错误', result.output[0].text.includes('ENOENT'));
-}
-
-section('resolveExecutable 的使用与回退');
-{
-  // 解析成功：应该用解析结果替换配置里的命令名。
-  const { spawn, calls } = makeSpawn({ stdout: 'x' });
-  const p = createCliProvider({
-    role: codexRole({ command: 'codex' }),
-    spawn,
-    resolveExecutable: async (cmd) => `RESOLVED(${cmd})`,
-  });
-  await (await p.start({ prompt: textPrompt('t') })).result;
-  check('使用解析后的路径', calls[0].argv[0] === 'RESOLVED(codex)', calls[0].argv[0]);
-
-  // 解析失败：回退到配置的字面值，不应中断派发。
-  const s2 = makeSpawn({ stdout: 'x' });
-  const p2 = createCliProvider({
-    role: codexRole({ command: 'codex' }),
-    spawn: s2.spawn,
-    resolveExecutable: async () => {
-      throw new Error('lookup failed');
-    },
-  });
-  const r2 = await (await p2.start({ prompt: textPrompt('t') })).result;
-  check('解析失败时回退到字面命令', s2.calls[0].argv[0] === 'codex', s2.calls[0].argv[0]);
-  check('回退后仍成功', r2.stopReason === 'completed');
-}
-
-section('非文本提示块被如实报告');
-{
-  const { spawn } = makeSpawn({ stdout: 'x' });
-  const p = createCliProvider({ role: codexRole(), spawn });
-  const result = await (
-    await p.start({ prompt: [{ type: 'text', text: 'T' }, { type: 'image', attachment: {} }] })
-  ).result;
-  check('diagnostic 记录被忽略的块', typeof result.diagnostic === 'string' && result.diagnostic.includes('image'), String(result.diagnostic));
-}
-
-section('成功但无输出：如实标注');
-{
-  const { spawn } = makeSpawn({ exitCode: 0, stdout: '' });
-  const p = createCliProvider({ role: codexRole(), spawn });
-  const result = await (await p.start({ prompt: textPrompt('t') })).result;
-  check('stopReason 仍为 completed', result.stopReason === 'completed');
-  check('diagnostic 标注无输出', typeof result.diagnostic === 'string' && result.diagnostic.includes('没有输出内容'), String(result.diagnostic));
-}
-
-section('角色指令被前置进提示词');
-{
-  // CLI provider 的 persona 能力为 false，因此 provider 必须自己把角色指令
-  // 拼进提示词；否则 CLI 子代理不知道自己是什么角色。
-  const role = codexRole();
-  role.instructions = 'ROLE-INSTRUCTIONS-SENTINEL';
-  const { spawn, calls } = makeSpawn({ stdout: 'x' });
-  const p = createCliProvider({ role, spawn });
-  await (await p.start({ prompt: textPrompt('THE TASK') })).result;
-
-  const stdin = calls[0].stdio.stdin;
-  check('提示词经 stdin 传入', typeof stdin === 'object' && typeof stdin.data === 'string');
-  check('含角色指令', stdin.data.includes('ROLE-INSTRUCTIONS-SENTINEL'), stdin.data.slice(0, 120));
-  check('含任务正文', stdin.data.includes('THE TASK'));
-  check('角色指令在任务之前', stdin.data.indexOf('ROLE-INSTRUCTIONS-SENTINEL') < stdin.data.indexOf('THE TASK'));
-
-  // argv 模式：角色指令**不会**被前置（多行值不得进入 argv 元素）。
-  // 这是命令行传参的固有限制，不是疏漏 —— 断言把它固定下来，避免日后误以为
-  // 「argv 模式也能带角色指令」。
-  const role2 = codexRole({ promptDelivery: 'argv', args: ['-p', '{prompt}'] });
-  role2.instructions = 'ROLE-INSTRUCTIONS-SENTINEL';
-  const s2 = makeSpawn({ stdout: 'x' });
-  const p2 = createCliProvider({ role: role2, spawn: s2.spawn });
-  await (await p2.start({ prompt: textPrompt('THE TASK') })).result;
-  check('argv 模式确实调用了 spawn', s2.calls.length === 1);
-  const promptArg = s2.calls[0].argv.find((a) => a.includes('THE TASK'));
-  check('argv 模式的任务正文进入 argv', typeof promptArg === 'string', String(promptArg));
-  check(
-    'argv 模式不前置角色指令（多行值不得进 argv，属固有限制）',
-    typeof promptArg === 'string' && !promptArg.includes('ROLE-INSTRUCTIONS-SENTINEL'),
-    String(promptArg),
-  );
-
-  // 多行的提示词在 argv 模式下必须被明确拒绝，而不是悄悄截断或塞进去。
-  const s4 = makeSpawn({ stdout: 'x' });
-  const p4 = createCliProvider({ role: role2, spawn: s4.spawn });
-  const multi = await (
-    await p4.start({ prompt: [{ type: 'text', text: 'line1\nline2' }] })
-  ).result;
-  check('argv 模式下多行提示词被拒绝且不 spawn', s4.calls.length === 0 && multi.stopReason === 'error');
-  check(
-    '错误信息说明是换行导致',
-    multi.output[0].text.includes('换行'),
-    multi.output[0].text.slice(0, 160),
-  );
-
-  // 无角色指令时不应残留分隔线。
-  const role3 = codexRole();
-  role3.instructions = '   ';
-  const s3 = makeSpawn({ stdout: 'x' });
-  const p3 = createCliProvider({ role: role3, spawn: s3.spawn });
-  await (await p3.start({ prompt: textPrompt('ONLY TASK') })).result;
-  check('空角色指令时不加分隔线', s3.calls[0].stdio.stdin.data === 'ONLY TASK', s3.calls[0].stdio.stdin.data);
+  const role = codexRole({ maxOutputBytes: 4, maxErrorBytes: 16 });
+  const h = makeSpawn({ stdout: '中文abcdef', stderr: 'model: abc\n' + 'x'.repeat(100) + 'END-ERROR' });
+  const p = createCliTool({ role, spawn: h.spawn });
+  const r = await p.execute({ prompt: 'T' }, childExec());
+  check('工具正文限制 UTF-8 字节数', Buffer.byteLength(r.stdout) <= 4 && r.stdout === '中');
+  check('工具 stderr 有界且保留尾部', Buffer.byteLength(r.stderr) <= 16 && r.stderr.endsWith('END-ERROR'));
+  check('工具显式标记两路截断', r.stdoutTruncated && r.stderrTruncated);
+  const fail = await createCliTool({ role, spawn: () => { throw new Error('错'.repeat(5000)); } })
+    .execute({ prompt: 'T' }, childExec());
+  check('启动失败的 stderr 也受配置限制', Buffer.byteLength(fail.stderr) <= 16 && fail.stderrTruncated);
+  check('诊断有固定容量且标记截断', Buffer.byteLength(fail.diagnostic) <= 4096 && fail.diagnosticTruncated);
+  const huge = { ...role, model: 'm'.repeat(5000) };
+  const route = await createCliTool({ role: huge, spawn: makeSpawn().spawn }).execute({ prompt: 'T' }, childExec());
+  check('路由摘要有固定容量且标记截断', Buffer.byteLength(route.routeSummary) <= 4096 && route.routeSummaryTruncated);
+  check('截断结果仍通过实际 output schema', validateJsonSchemaValue(p.output.schema, r).length === 0);
 }
 
 // 取消代替旧超时保护，并覆盖清理、退出竞态和未来工具的回流接口。
@@ -424,19 +308,18 @@ section('取消：信号直通、终止、分类、审计与资源清理');
   const ac = new AbortController();
   const h = controlledSpawn();
   const role = codexRole({ promptDelivery: 'promptFile', args: ['--prompt-file', '{prompt}'] });
-  const p = createCliProvider({ role, spawn: h.spawn });
-  const started = p.start({ prompt: textPrompt('CANCEL ME'), signal: ac.signal });
+  const p = createCliTool({ role, spawn: h.spawn });
+  const started = p.execute({ prompt: 'CANCEL ME' }, childExec(ac.signal));
   const path = h.calls[0].argv.at(-1);
   check('运行中提示词文件存在', existsSync(path));
   check('request.signal 原样传入 spawn', h.calls[0].signal === ac.signal);
   ac.abort();
-  const result = await (await started).result;
+  const result = await started;
   check('调用方取消 → 子进程被中止', h.aborted());
-  check('取消 → stopReason aborted', result.stopReason === 'aborted');
-  check('取消正文标注 cancelled=true', result.output[0].text.includes('cancelled=true'));
-  check('取消原因是 cancelled 而不是 timeout', result.structured.status === 'cancelled'
-    && result.output[0].text.includes('失败原因：cancelled') && !/timeout|timedOut/.test(result.output[0].text));
-  check('取消仍有 argv 审计行', result.output[0].text.includes('[switchboard] argv='));
+  check('取消 → status cancelled', result.status === 'cancelled' && result.signal === 'SIGTERM');
+  check('取消标记为 true', result.cancelled === true);
+  check('取消原因是 cancelled 而不是 timeout', result.status === 'cancelled' && !/timeout|timedOut/.test(result.diagnostic));
+  check('取消仍有路由摘要', result.routeSummary.includes('backend=cli'));
   check('取消后临时提示词文件已清理', !existsSync(path));
   check('取消后全部 abort 监听器已移除', getEventListeners(ac.signal, 'abort').length === 0);
 }
@@ -597,6 +480,37 @@ const timer = setInterval(() => { if (existsSync(process.argv[3])) { clearInterv
       check(`${cancel ? '取消运行' : '正常运行'}：进程确已退出`, active.exitCode !== null || active.signalCode !== null);
       check(`${cancel ? '取消运行' : '正常运行'}：提示词文件已清理`, !existsSync(promptPath));
       check(`${cancel ? '取消运行' : '正常运行'}：终态唯一且监听器清理`, terminals === 1 && getEventListeners(ac.signal, 'abort').length === 0);
+    }
+    for (const cancel of [false, true]) {
+      const flag = join(dir, cancel ? 'tool-cancel' : 'tool-exit');
+      const ac = new AbortController();
+      const role = codexRole({ command: process.execPath, prefixArgs: [script], promptDelivery: 'promptFile',
+        args: ['{prompt}', flag], cwd: dir, maxOutputBytes: 12, maxErrorBytes: 20 });
+      role.instructions = 'TOOL-RULES';
+      const tool = createCliTool({ role, spawn });
+      let terminals = 0;
+      const task = tool.execute({ prompt: 'TOOL-TASK' }, childExec(ac.signal));
+      task.then(() => { terminals++; });
+      for (let guard = 0; guard < 100; guard++) {
+        if (existsSync(join(dir, 'stdout')) && readFileSync(join(dir, 'stdout'), 'utf8').includes('TOOL-TASK')) break;
+        await delay(20);
+      }
+      const label = cancel ? '专属工具取消' : '专属工具完成';
+      const promptPath = active.spawnargs[2];
+      check(`${label}：工具拉起真实 Node 假 CLI 且 argv 正确`, active.spawnargs[0] === process.execPath
+        && active.spawnargs[1] === script && active.spawnargs[3] === flag && active.spawnargs.length === 4);
+      check(`${label}：假 CLI 读取确定性前置的规则与正文`,
+        readFileSync(join(dir, 'stdout'), 'utf8').includes('TOOL-RULES\n\n---\n\nTOOL-TASK'));
+      check(`${label}：工具等待完成，不提前返回`, terminals === 0 && existsSync(promptPath));
+      if (cancel) ac.abort(); else writeFileSync(flag, 'exit');
+      const result = await task;
+      check(`${label}：有界正文与截断标记`, Buffer.byteLength(result.stdout) <= 12 && result.stdoutTruncated);
+      check(`${label}：有界 stderr 与实际路由证据`, Buffer.byteLength(result.stderr) <= 20
+        && result.routeSummary.includes('fake-model'));
+      check(`${label}：状态与取消标记正确`, result.status === (cancel ? 'cancelled' : 'completed')
+        && result.cancelled === cancel && (cancel ? result.signal !== null : result.exitCode === 0));
+      check(`${label}：退出后文件与信号监听器清理`, !existsSync(promptPath)
+        && getEventListeners(ac.signal, 'abort').length === 0 && terminals === 1);
     }
   } finally {
     if (active && active.exitCode === null && active.signalCode === null) active.kill();

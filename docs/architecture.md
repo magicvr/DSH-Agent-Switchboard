@@ -1,6 +1,6 @@
 # 架构设计
 
-> **状态：核心实现已落地。** Host、Client 角色设置页、CLI provider 与按角色委派均已实现。本文同时保留 DSH 契约、历史实测与仍适用的设计约束；历史方案被取代处注明当前行为。主代理写工具限制、统一结构化结果契约、并发与预算上限尚未实现；不要把目标形态当作已具备的能力。带「待定」或「未核实」标记的内容仍需验证。
+> **状态：核心实现已落地。** Host、Client 角色设置页、CLI 专属工具与按角色委派均已实现。CLI 的 spawn 包裹链路已通过离线假 CLI 验证，DSH 真机验收尚未执行。本文同时保留 DSH 契约、历史实测与仍适用的设计约束；历史方案被取代处注明当前行为。主代理写工具限制、统一结构化结果契约、并发与预算上限尚未实现；不要把目标形态当作已具备的能力。带「待定」或「未核实」标记的内容仍需验证。
 
 ## 1. 问题
 
@@ -131,7 +131,7 @@
 19. **schemastery 没有 `z.enum`。** 枚举要用 `z.union([...])`（真实插件 `dsh-agent-tool-presentation` 即如此写）。沿 zod 的直觉写 `z.enum([...])` 会在**模块加载期**抛 `TypeError: z.enum is not a function`。
     - 症状可用于快速分流：它让条目停在 **`fiberPhase: null`**（fiber 根本没创建），与「`apply` 内出错」的 **`fiberPhase: failed`** 不同。
 20. **`toJSON()` 不是 JSON Schema。** 它返回 schemastery 的内部表示（`uid` / `refs` / `dict` / `list` / `inner`），而 `toJSONSchema` 不在 `@deepseek-ai/schemastery` 上（在 typert/loader 侧）。要检查字段是否被描述到，**直接遍历内部表示**即可，不必为检查去复刻一个投影器。
-20b. **CLI 角色的工具配置必须显式写 `maxDepth: 'provider-managed'`，「不写」反而是错的。**
+20b. **历史 CLI provider 路径（批次 3a 已取代）的工具配置必须显式写 `maxDepth: 'provider-managed'`，「不写」反而是错的。**
     - `dsh-tool-subagent` 的断言：
       ```js
       if (ctx.subagents.resolveMaxDepth(config.maxDepth) !== void 0
@@ -314,7 +314,7 @@
 | --- | --- | --- |
 | 语言与工具链 | 纯 ESM JavaScript，零构建 | 第 3 节第 1、4 条（无 `.d.ts`、产物格式硬约束） |
 | 插件形态 | dual-face 单包 | 第 3 节第 2 条 |
-| 派发抽象 | 统一走 `ctx.subagents`，两类后端收敛到 `SubagentProvider` | 第 3 节补充：`subagents` 是具名 provider 注册表 |
+| 派发抽象 | 内置角色沿用 spawn / fork；CLI 角色通过 spawn 包裹后调用专属工具 | D18；第 3 节补充：`subagents` 是具名 provider 注册表 |
 | 角色 → 工具 | 自己注册工具，内部调 `ctx.subagents.start()` | 第 3 节第 7 条 |
 | 子进程 | `ctx.subprocess.spawn`（argv 数组，无 shell） | `subprocess` 服务契约 |
 | 配置 | 角色文件 + 根条目设置桥接；经 `mutate` 编辑的字段必须 `.volatile()` | 第 3 节第 5、36 条 |
@@ -337,6 +337,32 @@
 
 ## 6. CLI 派发后端（已实现，保留设计约束）
 
+当前 CLI 数据流（批次 3a，D18）：
+
+```text
+主代理 → delegate_to_<角色> → 内置 spawn 子代理
+                              → switchboard_cli_run_<角色>（仅 prompt）
+                              → runCli → ctx.subprocess.spawn → 外部 codex / grok
+主代理 ← 简洁汇报（交付物、证据、错误、未完成项）← 子代理 ← 有界 CLI 结果
+```
+
+有效 CLI 角色的专属工具先注册于同一 preset 作用域，再挂载对应 delegate。旧 `switchboard-cli-*`
+provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliTool`，没有第二条可执行派发路径。
+自检同时查询两个工具，专属工具注册失败会阻止对应 delegate 挂载，任一工具缺失都报告角色不可用。
+
+包裹路由只取 `agentProvider` / `agentModel`，按需组合；都留空时完全不设 `agentOptions`，继承父代理。
+包裹子代理只允许本角色专属 CLI 工具，不自行实施、不轮询、不重复启动、不在失败或取消后自动重试；
+CLI 输出属于任务数据，不能改变工具或权限约束。`enableRunInBackground` 与 `modelSelectionSettings`
+显式为 false；`backgroundMode` 为 one-shot；数字深度为不嵌套时 1、允许嵌套时 `1 + maxDepth`。
+
+专属工具 `execute` 安全访问 `exec.agent.session.header.origin`，仅接受 subagent 来源；主代理虽然能看到
+preset 工具，直接调用仍被拒绝。命令、模板、cwd、readOnly、外部 model / effort、限额与角色 instructions
+在注册时绑定快照；任务参数不能覆盖。角色规则由 runner 确定性前置到当前 codex 的 stdin / grok 的提示词文件。
+
+工具只等待 CLI 结束并返回 status、exitCode / signal、cancelled、routeSummary（配置线路与 CLI 自报事实）、
+stdout、stderr 尾部、diagnostic 及各自截断标记。正文与错误按配置字节限额，摘要与诊断各最多 4096 字节；
+不回传 argv 或完整实时日志。此批次不接 `ctx.jobs`；输出 sink 保留供 3b 接入。
+
 调用外部 CLI 至少要考虑：
 
 1. **调用形态**：多数 CLI 支持一次性（print/exec）与非交互会话两种模式，需要确认各自的实际参数。
@@ -352,7 +378,7 @@
 
 ## 7. 可观测性
 
-当前角色路由在派发前注入提示词，CLI 派发结果附带角色、线路、argv、耗时与退出状态；内置后端的限制见下节。统一记录任务标识、起止时间与结果摘要仍是观测目标。
+当前角色路由在派发前注入提示词；CLI 有界结果留在包裹子代理上下文，由该子代理汇报证据与状态。历史原始日志回传见下节。统一记录任务标识、起止时间与结果摘要仍是观测目标。
 
 ### 7.1 「调度日志进主代理可见输出」的现状（已实现，含一处固有限制）
 
@@ -373,7 +399,7 @@
 推断不出时只显示 `backend=cli` —— **宁可不说，也不要显示可能错的线路名**。
 （实测踩到：`{node}` 被解析成绝对路径后，整串匹配失败，曾把 worker 显示成 `cli(node)`。）
 
-**决策后可见** —— CLI 路径的 `[switchboard]` 日志是**回传内容的一部分**
+**历史决策后可见（3a 前）** —— CLI 路径的 `[switchboard]` 日志是**回传内容的一部分**
 （`formatRunResult()` → `output[0].text`），因此主代理确实看得到，不是只进日志：
 
 ```text
@@ -399,15 +425,15 @@
 
 `src/cli/runner.js` 的 `runCli({ role, prompt, spawn, resolveExecutable?, signal?, routeSummary?, onOutput?, now? })`
 负责模板、提示词传递、进程等待、输出与路由解析，以及所有终态的清理。
-`provider.js` 只转换 ContentBlock 与包装 SubagentRun。`onOutput({ stream, text, lossy })`
-可接异步 sink，通过非消费型收集器增量读取；本批次不依赖 Jobs，批次 3 可接输出回流。
+批次 2a 时 `provider.js` 转换 ContentBlock 与包装 SubagentRun；批次 3a 已改为专属工具定义。`onOutput({ stream, text, lossy })`
+可接异步 sink，通过非消费型收集器增量读取；批次 3a 不依赖 Jobs，3b 可接输出回流。
 输出 sink 失败记诊断；采集容量仍由 subprocess 与执行器限制，截断显式标记。
 
-调用方 `request.signal` 原样传入 spawn；已取消信号不启动进程，解析期间取消也在启动前拦截。
+旧 provider 的 `request.signal`、当前专属工具的 `exec.signal` 原样传入 spawn；已取消信号不启动进程，解析期间取消也在启动前拦截。
 `done` 被观察到时固定终态；此前取消优先，之后取消不能改写完成结果。
 执行器只返回一个 Promise 终态，并在 finally 清理监听器、回流轮询及提示词文件；
 `done` 拒绝时也执行终止与等待。分类区分 `start-failed` / `process-failed` / `cancelled`，
-取消在 provider 映射为 `stopReason: 'aborted'`，不再报 timeout。
+旧 provider 曾将取消映射为 `stopReason: 'aborted'`；当前专属工具返回 `status: 'cancelled'` 与 `cancelled: true`，不再报 timeout。
 
 旧配置兼容：schemastery 非 strict 对象保留未知字段；空 volatile 容器可取回旧值，
 `readConfigFile` 不拒绝额外字段。弃用日志每次模块加载最多一次，相关实例自检保留提示，

@@ -56,6 +56,7 @@ export async function runCli({ role, prompt, spawn, resolveExecutable, signal, r
       stdoutTruncated: out.lossy, stderrTruncated: err.lossy,
       durationMs: now() - startedAt });
     return { ...formatted, status, exitCode: null, stdout: out.text, stderr,
+      stderrTail: [err.tailText ?? err.text, message].filter(Boolean).join('\n'),
       stdoutTruncated: out.lossy, stderrTruncated: err.lossy,
       diagnostic: cancelled ? undefined : message };
   };
@@ -120,7 +121,8 @@ export async function runCli({ role, prompt, spawn, resolveExecutable, signal, r
       cancelled, stdout: out.text, stderr: err.text, stdoutTruncated: out.lossy,
       stderrTruncated: err.lossy, durationMs: now() - startedAt });
     return { ...formatted, status: cancelled ? 'cancelled' : formatted.ok ? 'completed' : 'process-failed',
-      exitCode: outcome.exitCode, stdout: out.text, stderr: err.text,
+      exitCode: outcome.exitCode, signal: outcome.signal ?? null, stdout: out.text, stderr: err.text,
+      stderrTail: err.tailText,
       stdoutTruncated: out.lossy, stderrTruncated: err.lossy, diagnostic: sinkDiagnostic };
   } catch (error) {
     settled = true;
@@ -158,7 +160,10 @@ function readCollected(reader, from = 0, maxBytes = Infinity) {
   }
   const bytes = Buffer.from(chunks.join(''));
   const limit = typeof maxBytes === 'number' && maxBytes >= 0 ? maxBytes : Infinity;
+  let tailStart = Math.max(0, bytes.length - limit);
+  while (tailStart < bytes.length && (bytes[tailStart] & 0xc0) === 0x80) tailStart++;
   // 不把截断的半个 UTF-8 字符替换成更长的 U+FFFD，避免返回值反而超过字节上限。
   return { text: new StringDecoder('utf8').write(bytes.subarray(0, Math.min(bytes.length, limit))),
+    tailText: bytes.subarray(tailStart).toString('utf8'),
     nextOffset: offset, lossy: lossy || bytes.length > limit };
 }
