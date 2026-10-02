@@ -267,8 +267,8 @@ export const Config = z.object({
     .volatile(),
   /** 角色默认使用的 LLM route provider；角色自身可用 provider 覆盖。 */
   provider: z.string().description('角色默认 LLM provider'),
-  /** 允许嵌套派发时，子代理可用的深度上限。 */
-  maxDepth: z.number().step(1).min(0).default(3).description('允许嵌套派发时的深度上限'),
+  /** 第一层之外的额外深度预算；与目标角色的出站派发权限无关。 */
+  maxDepth: z.number().step(1).min(0).default(3).description('第一层之外的额外深度预算：0 允许绝对深度 1，1 允许深度 1～2，3 允许深度 1～4；叶子角色同样可在预算内被调用'),
   /**
    * 是否在**本作用域**挂载角色工具。
    *
@@ -611,7 +611,7 @@ export function selftestTool(ctx, diagnostics) {
  * @param {object} ctx - Cordis 上下文。
  * @param {object} role - 规范化后的角色。
  * @param {object} toolModule - 已 import 的 `dsh-tool-subagent` 模块命名空间。
- * @param {number} maxDepth - 嵌套派发深度上限。
+ * @param {number} maxDepth - 第一层之外的额外层数。
  * @returns {{ ok: boolean, detail: string }}
  */
 /**
@@ -636,12 +636,32 @@ export function selftestTool(ctx, diagnostics) {
  * @param {number} maxDepth - 允许嵌套时的额外层数。
  * @returns {Promise<{ok: boolean, detail: string}>} 挂载结果。
  */
-async function mountRoleTool(ctx, role, toolModule, maxDepth) {
+function mountedRoleOptions(ctx, roles, maxDepth) {
+  const tools = ctx.get('tools');
+  const scope = scopeOf(ctx);
+  return {
+    maxDepth,
+    availableToolNames: tools.schemas(scope).map((tool) => tool.name),
+    delegateToolNames: roles.filter((role) => tools.get(role.toolName, scope) != null).map((role) => role.toolName),
+  };
+}
+
+async function mountRoleTool(ctx, role, toolModule, maxDepth, roles) {
   if (typeof ctx.plugin !== 'function') {
     return { ok: false, detail: 'ctx.plugin 不可用' };
   }
   try {
-    ctx.plugin(toolModule, toolConfigFor(role, { maxDepth }));
+    // Cordis 的 Config 校验会物化 getter；在 apply 之后恢复运行时读取。
+    // 派发时才枚举当前作用域：后挂载、注册失败或已卸载的工具不能靠配置名假定存在。
+    const liveConfig = (base) => ({
+      ...base,
+      get persona() { return toolConfigFor(role, mountedRoleOptions(ctx, roles, maxDepth)).persona; },
+      get toolFilter() { return toolConfigFor(role, mountedRoleOptions(ctx, roles, maxDepth)).toolFilter; },
+    });
+    ctx.plugin({
+      ...toolModule,
+      apply: (toolCtx, config) => toolModule.apply(toolCtx, liveConfig(config)),
+    }, liveConfig(toolConfigFor(role, { maxDepth })));
   } catch (error) {
     return { ok: false, detail: error instanceof Error ? error.message : String(error) };
   }
@@ -925,14 +945,20 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
   // 作用域说明：`ctx.systemPrompt.section()` 注册在全局层，因此**子代理也会看到**
   // 这段文本。代价是每个子代理多占少量上下文；收益是确定性（不依赖调用时的 scope）。
   // 若日后要收窄，可改为通过 agent 作用域注册。
-  ctx.systemPrompt.section({
-    name: 'agent-switchboard:roles',
-    // 10000 是 harness 身份段落所在的量级，放在其后以保证先读身份再读路由规则。
-    order: 10500,
-    text: roleGuidanceText(roles),
-  });
-
   const maxDepth = typeof resolved.maxDepth === 'number' ? resolved.maxDepth : 3;
+  let disposeGuidance;
+  const refreshGuidance = () => {
+    if (typeof disposeGuidance === 'function') disposeGuidance();
+    else disposeGuidance?.dispose();
+    disposeGuidance = ctx.systemPrompt.section({
+      name: 'agent-switchboard:roles',
+      // 10000 是 harness 身份段落所在的量级，放在其后以保证先读身份再读路由规则。
+      order: 10500,
+      text: roleGuidanceText(roles, mountedRoleOptions(ctx, roles, maxDepth)),
+    });
+  };
+  refreshGuidance();
+  ctx.on?.('tools/change', refreshGuidance);
 
   const { active: activeCliRoles, blocked: blockedCliRoles } = planCliMounts(roles);
 
@@ -999,11 +1025,12 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
           continue;
         }
         // `mountRoleTool` 会核实工具是否真的注册成功（见其 JSDoc）。
-        const outcome = await mountRoleTool(ctx, role, toolModule, maxDepth);
+        const outcome = await mountRoleTool(ctx, role, toolModule, maxDepth, roles);
         diagnostics.mounts.push({ id: role.id, ok: outcome.ok, detail: outcome.detail });
         if (!outcome.ok) console.error(`[${name}] 角色 "${role.id}" 挂载失败：${outcome.detail}`);
       }
       const okCount = diagnostics.mounts.filter((m) => m.ok).length;
+      refreshGuidance();
       console.error(
         `[${name}] 已挂载 ${okCount}/${roles.length} 个角色工具：` +
           diagnostics.mounts.filter((m) => m.ok).map((m) => m.id).join(', '),

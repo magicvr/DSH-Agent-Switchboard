@@ -3,6 +3,12 @@
 import {
   EFFORT_VALUES,
   WRITE_TOOLS,
+  UNCONTROLLED_DISPATCH_TOOLS,
+  absoluteDepthLimit,
+  canStartAtDepth,
+  cliPersonaFor,
+  cliToolName,
+  dispatchPermissionsFor,
   normalizeRole,
   normalizeRoles,
   planCliMounts,
@@ -11,6 +17,7 @@ import {
   toolConfigFor,
   toolDescriptionFor,
 } from '../src/roles.js';
+import { cliFieldsFor } from '../src/cli/drivers.js';
 
 let pass = 0;
 let fail = 0;
@@ -65,12 +72,12 @@ section('toolConfigFor：模型与强度进 agentOptions');
   check('agentOptions.reasoningEffort', cfg.agentOptions.reasoningEffort === 'high');
   check('persona = instructions', cfg.persona === 'i');
   check(
-    '禁止嵌套 → maxDepth 1（本层可派发，子代理不可再派）',
-    cfg.maxDepth === 1,
+    '禁止嵌套仍使用插件绝对上限 4（出站权限另行过滤）',
+    cfg.maxDepth === 4,
     `实际 ${cfg.maxDepth}；注意 0 会连第一层派发都拒绝`,
   );
   check('backgroundMode one-shot', cfg.backgroundMode === 'one-shot');
-  check('非只读 → 无 toolFilter', cfg.toolFilter === undefined);
+  check('非只读也过滤出站工具，空清单不假定权限', cfg.toolFilter.allow.length === 0);
 }
 
 section('只读角色：写入类工具被 deny');
@@ -80,7 +87,7 @@ section('只读角色：写入类工具被 deny');
     0,
     'p',
   );
-  const cfg = toolConfigFor(role, { maxDepth: 3 });
+  const cfg = toolConfigFor(role, { maxDepth: 3, availableToolNames: [...WRITE_TOOLS] });
   check('有 toolFilter', cfg.toolFilter !== undefined);
   const denied = new Set(cfg.toolFilter?.deny ?? []);
   check('write 被 deny', denied.has('write'));
@@ -88,8 +95,8 @@ section('只读角色：写入类工具被 deny');
   check('pwsh 被 deny', denied.has('pwsh'));
   check('deny 列表即 WRITE_TOOLS', denied.size === WRITE_TOOLS.length);
   check(
-    '只读且禁止嵌套 → maxDepth 仍为 1（只读不等于不可派发）',
-    cfg.maxDepth === 1,
+    '只读且禁止嵌套仍使用插件绝对上限 4',
+    cfg.maxDepth === 4,
     `实际 ${cfg.maxDepth}`,
   );
 }
@@ -104,7 +111,7 @@ section('深度语义：绝对深度而非相对层数');
       .role;
 
   const noNest = toolConfigFor(mk(false), { maxDepth: 3 });
-  check('禁止嵌套 → 1', noNest.maxDepth === 1, `实际 ${noNest.maxDepth}`);
+  check('禁止嵌套不降低入站上限 → 4', noNest.maxDepth === 4, `实际 ${noNest.maxDepth}`);
   check('禁止嵌套时绝不为 0（0 会拒绝第一层派发）', noNest.maxDepth !== 0);
 
   const nest = toolConfigFor(mk(true), { maxDepth: 5 });
@@ -202,12 +209,12 @@ section('toolDescriptionFor：包含用途与事实标签');
     0,
     'p',
   );
-  const desc = toolDescriptionFor(role);
+  const desc = toolDescriptionFor(role, dispatchPermissionsFor(role, { delegateToolNames: ['delegate_to_scout'] }));
   check('含用途', desc.includes('只读调研'));
   check('含角色名', desc.includes('侦察员'));
   check('标注只读', desc.includes('只读'));
   check('标注后端', desc.includes('spawn'));
-  check('含嵌套派发状态', desc.includes('可继续派发'));
+  check('含有效受控派发状态', desc.includes('可通过受控工具继续派发'));
   check(
     '不含 instructions 正文',
     !desc.includes('SENTINEL_INSTRUCTIONS_MUST_NOT_APPEAR'),
@@ -308,7 +315,7 @@ section('roleGuidanceText：每个角色必须带线路信息，且不泄漏 ins
     ],
     'p',
   );
-  const text = roleGuidanceText(roles);
+  const text = roleGuidanceText(roles, { delegateToolNames: roles.map((role) => role.toolName) });
 
   check('含章节标题', text.includes('Subagent roles'));
   check('声明主代理是 switchboard', text.includes('switchboard'));
@@ -400,7 +407,7 @@ section('CLI 后端角色');
 
   const cfg = toolConfigFor(ok.role, { maxDepth: 3 });
   check('CLI provider 使用内置 spawn', cfg.provider === 'spawn', cfg.provider);
-  check('CLI 默认深度为数字 1', cfg.maxDepth === 1);
+  check('CLI 叶子默认深度使用插件绝对上限 4', cfg.maxDepth === 4);
   check('CLI allow 仅包含自己的专属工具',
     JSON.stringify(cfg.toolFilter) === JSON.stringify({ allow: ['switchboard_cli_run_codex_worker'] }));
   check('包裹路由留空时完全不设 agentOptions', !('agentOptions' in cfg));
@@ -437,7 +444,80 @@ section('CLI 后端角色');
   const bCfg = toolConfigFor(builtin, { maxDepth: 3 });
   check('builtin 仍设置 agentOptions', 'agentOptions' in bCfg);
   check('builtin 仍设置 persona', 'persona' in bCfg);
-  check('builtin 仍设置 maxDepth', bCfg.maxDepth === 1);
+  check('builtin 仍设置插件绝对 maxDepth', bCfg.maxDepth === 4);
+}
+
+section('回归：入站深度独立于目标出站权限');
+{
+  for (const backend of ['cli', 'spawn', 'fork']) {
+    for (const maxDepth of [0, 1, 3]) {
+      const leaf = { id: 'leaf', backend, instructions: 'i', allowNestedDispatch: false };
+      const limit = toolConfigFor(leaf, { maxDepth }).maxDepth;
+      check(`${backend} 预算 ${maxDepth}：绝对上限为 ${1 + maxDepth}`, limit === 1 + maxDepth);
+      check(`${backend} 预算 ${maxDepth}：目标是否允许出站不改变入站上限`,
+        limit === toolConfigFor({ ...leaf, allowNestedDispatch: true }, { maxDepth }).maxDepth);
+      for (let parentDepth = 0; parentDepth <= 1 + maxDepth; parentDepth++) {
+        check(`${backend} 预算 ${maxDepth}：父深度 ${parentDepth} 的入站边界`,
+          canStartAtDepth(parentDepth, limit) === (parentDepth + 1 <= 1 + maxDepth));
+      }
+    }
+  }
+  const limit = toolConfigFor({ id: 'cli-leaf', backend: 'cli', allowNestedDispatch: false }, { maxDepth: 1 }).maxDepth;
+  check('回归：父深度 1 可调用叶子 CLI 角色（预算 1）', canStartAtDepth(1, limit));
+  check('绝对上限纯函数：预算 0/1/3 对应 1/2/4', [0, 1, 3].map(absoluteDepthLimit).join(',') === '1,2,4');
+  check('深度越过安全整数范围时拒绝', !canStartAtDepth(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER));
+}
+
+section('出站权限与三种提示使用同一有效结果');
+{
+  const delegateToolNames = ['delegate_to_self', 'delegate_to_other'];
+  const availableToolNames = ['read', ...WRITE_TOOLS, 'run_code', ...delegateToolNames, 'delegate_to_unmanaged',
+    'switchboard_cli_run_self', 'switchboard_cli_run_other', ...UNCONTROLLED_DISPATCH_TOOLS];
+  for (const backend of ['cli', 'spawn', 'fork']) {
+    for (const allowNestedDispatch of [false, true]) {
+      const role = normalizeRole({ id: 'self', backend, instructions: 'i', description: 'd', model: 'm', allowNestedDispatch,
+        ...(backend === 'cli' ? { cliDriver: 'grok', cliCwd: 'C:/w', ...cliFieldsFor('grok', false) } : {}) }, 0, 'p').role;
+      const options = { maxDepth: 3, delegateToolNames, availableToolNames };
+      const permissions = dispatchPermissionsFor(role, options);
+      const config = toolConfigFor(role, options);
+      const allowed = new Set(config.toolFilter.allow);
+      const tag = `${backend} ${allowNestedDispatch}`;
+      check(`${tag}：受控 delegate 权限精确符合开关`,
+        delegateToolNames.every((name) => allowed.has(name) === allowNestedDispatch));
+      check(`${tag}：不开放其他角色底层 CLI 工具`, !allowed.has('switchboard_cli_run_other'));
+      check(`${tag}：自身 CLI 工具仅 CLI 包裹可用`, allowed.has(cliToolName(role.id)) === (backend === 'cli'));
+      check(`${tag}：全部非受控派发入口与未知 delegate 被排除`,
+        [...UNCONTROLLED_DISPATCH_TOOLS, 'delegate_to_unmanaged'].every((name) => !allowed.has(name)));
+      check(`${tag}：普通工具保留在内置角色，保留传输不写入过滤`,
+        allowed.has('read') === (backend !== 'cli') && !allowed.has('run_code'));
+      check(`${tag}：配置使用同一权限过滤结果`, JSON.stringify(config.toolFilter) === JSON.stringify(permissions.toolFilter));
+      const description = toolDescriptionFor(role, permissions);
+      const guidance = roleGuidanceText([role], options);
+      const persona = cliPersonaFor(role, permissions);
+      check(`${tag}：description 与实际权限一致`,
+        allowNestedDispatch ? description.includes('可通过受控工具') && description.includes('剩余深度预算')
+          : description.includes('不可继续派发') && !description.includes('可通过受控工具'));
+      check(`${tag}：guidance 与实际权限一致`,
+        guidance.includes('may delegate further') === allowNestedDispatch
+          && guidance.includes('cannot delegate further') === !allowNestedDispatch);
+      check(`${tag}：persona 与实际权限一致`, allowNestedDispatch
+        ? persona.includes(delegateToolNames.join('、')) && persona.includes('剩余深度预算')
+          && !persona.includes('不要调用其他角色的工具')
+        : persona.includes('不可继续派发') && !persona.includes('可按任务需要'));
+      if (backend === 'cli') check(`${tag}：配置 persona 使用同一权限结果`, config.persona === persona);
+      const readOnly = toolConfigFor({ ...role, readOnly: true }, options);
+      check(`${tag}：只读过滤保留且不否定受控委派`, backend === 'cli'
+        ? JSON.stringify(readOnly.toolFilter) === JSON.stringify(config.toolFilter)
+        : WRITE_TOOLS.every((name) => readOnly.toolFilter.deny.includes(name))
+          && delegateToolNames.every((name) => readOnly.toolFilter.allow.includes(name) === allowNestedDispatch));
+      const empty = { ...options, delegateToolNames: [], availableToolNames: ['read'] };
+      const unavailable = dispatchPermissionsFor(role, empty);
+      check(`${tag}：无已挂载 delegate 时三种提示都不许宣称可继续派发`,
+        !toolDescriptionFor(role, unavailable).includes('可通过受控工具')
+          && !roleGuidanceText([role], empty).includes('may delegate further')
+          && !cliPersonaFor(role, unavailable).includes('可按任务需要'));
+    }
+  }
 }
 
 section('backend 取值校验');

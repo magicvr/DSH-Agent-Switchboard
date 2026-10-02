@@ -94,6 +94,13 @@ function makeCtx({ provideProfileContext = true, provideReflect = true, scope } 
         return (viewingScope !== undefined && viewingScope === scopeOf(ctx) ? scopedTools.get(name) : undefined)
           ?? globalTools.get(name);
       },
+      schemas(viewingScope) {
+        const visible = new Map(globalTools);
+        if (viewingScope !== undefined && viewingScope === scopeOf(ctx)) {
+          for (const [name, tool] of scopedTools) visible.set(name, tool);
+        }
+        return [...visible.values()];
+      },
     },
     // createScope 借助 extend 写入真实的私有 scope 标签；角色插件只模拟注册副作用。
     extend(properties) {
@@ -809,6 +816,90 @@ section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失
         && result.mounted.includes('工具未注册'));
     }
   }
+}
+
+section('实际工具插件：配置校验后仍按已挂载清单生成出站权限');
+{
+  const { cliFieldsFor } = await import('../src/cli/drivers.js');
+  const ctx = makeCtx({ scope: {} });
+  const requests = [], validatedConfigs = [], events = new Map();
+  let guidance = '';
+  ctx.on = (name, handler) => {
+    if (!events.has(name)) events.set(name, []);
+    events.get(name).push(handler);
+    return () => {};
+  };
+  ctx.sessionProjections = { register() {} };
+  ctx.subagents.resolveMaxDepth = depth => depth;
+  const providers = new Map(['spawn', 'fork'].map(name => [name, { name, inheritsParentContext: false,
+    capabilities: { depthLimit: true, agentOptions: true, persona: true, toolFilter: true } }]));
+  ctx.subagents.getProvider = name => providers.get(name);
+  ctx.subagents.start = async (_provider, request) => {
+    requests.push(request);
+    return { id: 'fixture-run', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose() {} };
+  };
+  ctx.systemPrompt.section = section => {
+    if (section.name === 'agent-switchboard:roles') guidance = section.text;
+    return () => {};
+  };
+  // 真实 Config 的 standard-schema 校验先物化输入；再执行真实工具插件的 apply。
+  ctx.plugin = (module, config) => {
+    const validated = module.Config['~standard'].validate(config);
+    if (validated.issues) throw new Error(JSON.stringify(validated.issues));
+    validatedConfigs.push(validated.value);
+    module.apply(ctx, validated.value);
+    return { dispose() {} };
+  };
+  ctx.tools.register({ name: 'read' });
+  ctx.tools.register({ name: 'workflow' });
+  ctx.tools.register({ name: 'subagent' });
+  const cli = { description: 'd', instructions: 'i', backend: 'cli', model: 'external', cliDriver: 'grok',
+    cliCwd: 'C:/w', ...cliFieldsFor('grok', false) };
+  apply(ctx, { mount: true, maxDepth: 1, provider: 'self', roles: [
+    { ...cli, id: 'organizer', allowNestedDispatch: true },
+    { ...cli, id: 'leaf' },
+    { ...fixtureRole, id: 'builtin-leaf' },
+    { ...fixtureRole, id: 'builtin-organizer', allowNestedDispatch: true },
+  ] });
+  await import('@deepseek-ai/dsh-tool-subagent');
+  await new Promise(setImmediate);
+  const scope = scopeOf(ctx);
+  const parent = { id: 'fixture-parent', options: { provider: 'self', model: 'm', delegationDepth: 1 },
+    session: { requestHeader: () => undefined, header: { origin: 'subagent' } } };
+  const exec = { agent: parent, signal: new AbortController().signal };
+  const organizer = ctx.tools.get('delegate_to_organizer', scope);
+  await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
+  const first = requests.at(-1);
+  check('真实插件校验后：CLI true 能看到后挂载的全部受控 delegate',
+    ['organizer', 'leaf', 'builtin_leaf', 'builtin_organizer'].every(id => first.toolFilter.allow.includes(`delegate_to_${id}`)));
+  check('真实插件请求不开放 workflow、通用 subagent 和其他角色 CLI 工具',
+    !first.toolFilter.allow.includes('workflow') && !first.toolFilter.allow.includes('subagent')
+      && !first.toolFilter.allow.includes('switchboard_cli_run_leaf'));
+  check('真实插件 persona 使用同一有效清单，保留预算提示', first.persona.includes('delegate_to_leaf')
+    && first.persona.includes('剩余深度预算') && !first.persona.includes('不要调用其他角色的工具'));
+  check('guidance 用实际挂载清单生成有效出站提示', guidance.includes('may delegate further')
+    && guidance.includes('cannot delegate further'));
+  await ctx.tools.get('delegate_to_leaf', scope).execute({ prompt: 'T', description: 'fixture' }, exec);
+  const leafRequest = requests.at(-1);
+  check('真实插件叶子 CLI 入站使用插件上限 2，出站只有专属 CLI 工具', leafRequest.maxDepth === 2
+    && JSON.stringify(leafRequest.toolFilter.allow) === '["switchboard_cli_run_leaf"]');
+  check('真实 Config 中所有目标角色都使用插件上限 2', validatedConfigs.length === 4
+    && validatedConfigs.every(config => config.maxDepth === 2));
+  const originalGet = ctx.tools.get.bind(ctx.tools);
+  const originalSchemas = ctx.tools.schemas.bind(ctx.tools);
+  ctx.tools.get = (name, viewingScope) => name.startsWith('delegate_to_') && name !== 'delegate_to_organizer'
+    ? undefined : originalGet(name, viewingScope);
+  ctx.tools.schemas = viewingScope => originalSchemas(viewingScope)
+    .filter(tool => !tool.name.startsWith('delegate_to_') || tool.name === 'delegate_to_organizer');
+  await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
+  check('delegate 卸载后运行时清单同步移除，persona 同步移除',
+    !requests.at(-1).toolFilter.allow.includes('delegate_to_leaf') && !requests.at(-1).persona.includes('delegate_to_leaf'));
+  ctx.tools.get = (name, viewingScope) => name.startsWith('delegate_to_') ? undefined : originalGet(name, viewingScope);
+  ctx.tools.schemas = viewingScope => originalSchemas(viewingScope).filter(tool => !tool.name.startsWith('delegate_to_'));
+  await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
+  for (const refresh of events.get('tools/change') ?? []) refresh();
+  check('全部 delegate 卸载后 persona、guidance 不再宣称可继续派发',
+    requests.at(-1).persona.includes('不可继续派发') && !guidance.includes('may delegate further'));
 }
 
 section('隔离 DSH_HOME：残留运行期限不影响配置加载或健康状态');
