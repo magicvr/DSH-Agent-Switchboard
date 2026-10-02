@@ -247,8 +247,8 @@
   镜像面（`ensure()` → `getSnapshot().view.namespaces`），**写**走
   `remote.settings.mutate(ns, [{op:'set',path:['roles'],value}], revision)`；Host 侧把角色
   同步到角色文件，并非客户端直接写 JSON。preset 中本插件只带 `mount: true`，不得携带 `roles`
-  （`scripts/check-profile-wiring.mjs`）；挂载实例在本作用域 Cordis 角色非空时优先使用它，否则读文件。
-  保存不等于已挂载会话立即更新工具。历史路径与当前边界见 `decisions.md` D14。
+  （`scripts/check-profile-wiring.mjs`）；启动时加载的常驻 preset 在本作用域 Cordis 角色非空时优先使用它，否则读文件。
+  根实例会立即把保存值写入文件，但新会话只继承现有 preset，不会重新读取或挂载角色工具；修改角色配置后必须重启 DSH 才生效。历史路径与当前边界见 `decisions.md` D14 及 D22 后续修正。
 - 并发与预算上限
 - README 补真实用法示例
 

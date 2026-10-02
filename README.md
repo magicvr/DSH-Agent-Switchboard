@@ -55,9 +55,9 @@ Jobs 不可用时 CLI 照常执行，结果标注回流不可用。CLI 没有运
 
 ### 3. 配置（Plugin Panel）
 
-内置 `spawn` / `fork` 显示角色级 **Provider** 文本输入，留空使用插件默认 provider；CLI 模式仍隐藏该角色输入。角色列表前始终显示「包裹子代理」小节，插件级统一配置 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`，仅用于外部 CLI 角色的内置 spawn 转交代理。Provider / 模型留空遵循宿主的路由继承规则；思考强度的空选项为「留空：不指定强度」。留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。「父代理当前强度」指最近一次请求配置；尚无请求时取创建配置。包裹模型与外部 CLI 的角色 `model` 分开标注；内置角色仍使用自身的 provider / model / effort。根设置经既有角色文件同步给 preset，文件已保存的统一设置优先于 preset 自身设置（包含空值）；旧角色 `agentProvider` / `agentModel` 可加载但已忽略，并给弃用诊断。所有后端都有必填的多行「角色指令」输入，描述不会代填指令。本轮已通过离线检查，仍待重启 DSH 后真机验收。
+内置 `spawn` / `fork` 显示角色级 **Provider** 文本输入，留空使用插件默认 provider；CLI 模式仍隐藏该角色输入。角色列表前始终显示「包裹子代理」小节，插件级统一配置 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`，仅用于外部 CLI 角色的内置 spawn 转交代理。Provider / 模型留空遵循宿主的路由继承规则；思考强度的空选项为「留空：不指定强度」。留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。「父代理当前强度」指最近一次请求配置；尚无请求时取创建配置。包裹模型与外部 CLI 的角色 `model` 分开标注；内置角色仍使用自身的 provider / model / effort。根设置经既有角色文件同步给 preset，文件已保存的统一设置优先于 preset 自身设置（包含空值）；旧角色 `agentProvider` / `agentModel` 可加载但已忽略，并给弃用诊断。所有后端都有必填的多行「角色指令」输入，描述不会代填指令。本轮已通过离线检查；修改配置后需重启 DSH 才会让常驻 preset 重新读取并应用。
 
-角色配置文件为 **`$DSH_HOME/agent-switchboard/roles.json`**，供选中 Switchboard preset 的会话读取。
+角色配置文件为 **`$DSH_HOME/agent-switchboard/roles.json`**，由 DSH 启动时加载的常驻 Switchboard preset 读取；保存修改会写入该文件，但当前实例不重读，需重启 DSH 才生效。
 设置面板读 `configForms` 镜像、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，
 Host 根实例将配置同步到文件。根条目保持启用，但只在 `mount: true` 的作用域挂载角色工具；
 文件含任一 wrapper 字段即整个包裹路由对象优先（包含空值），不逐字段补入 preset；只校验有效来源，被覆盖的非法 preset 路由忽略。
@@ -65,7 +65,7 @@ Host 根实例将配置同步到文件。根条目保持启用，但只在 `moun
 仅保存包裹设置且文件缺失时只记等待角色写入，不创建 `roles: []` 文件；后续角色写入时一并同步。
 特殊 `internal/update` 监听的 disposer 由显式 `ctx.effect` 管理；初始非法也先注册监听，后续就地修正可恢复同步。
 包裹同步错误与失败日志去重，恢复后清除旧错误。迁移脚本也会播种空 roles 文件，并在删除源角色前复读验证（详见 D22）。
-**preset 不再携带 `config.roles`**。保存的角色供新会话使用。文件形状如下（**示意**）：
+**preset 不再携带 `config.roles`**。保存的角色在 DSH 启动时由常驻 preset 读取；之后修改配置虽会立即写入文件，但当前进程中的 preset 不会重读，必须重启 DSH 才会生效。文件形状如下（**示意**）：
 
 ```jsonc
 {

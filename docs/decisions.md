@@ -771,7 +771,14 @@ volatile 就地更新可供新 preset 读取，已挂载的子代理保持挂载
 
 **验证边界：** 离线检查覆盖路由组合、清空、非法值、根/preset 优先级、兼容加载与 UI 原子路径；
 生产 `toolConfigFor` 输出交给真实 `resolveChildAgentOptions`，覆盖全空、显式同路由、仅改 model、仅改 provider、显式 effort，以及最新请求无 effort 不恢复创建值；另覆盖尚无请求的创建配置回落及不同模型标识。
-关键断言以生产代码变异验证判别力。此离线解析不覆盖 provider 默认路由预检、真实 spawn 或 LLM 默认强度解析；真实设置往返、重启后 preset 路由、完整父子路由链仍需真机验收。
+关键断言以生产代码变异验证判别力。此离线解析不覆盖 provider 默认路由预检、真实 spawn 或 LLM 默认强度解析；这些项目仍需真机验收。
+
+**后续修正（运行期生效条件，取代上述相关表述）：**
+- 上述离线验证通过手动再次调用 `apply` 检查新设置可从文件读取；它验证的是重新挂载时可读盘，不是运行时更新行为。此前把这个测试假设当作「新会话会重新读取」的运行时事实，属于过度推断。
+- 真机核实 Switchboard preset 的 inline plugin 在 DSH 启动时 eager load，形成常驻单例 Fiber。创建新会话只通过 `composeFrom(childCtx, parent.ctx)` 继承已存在的 preset，不会再次执行 `apply`；会话结束也不卸载它。
+- 根实例的 `internal/update` 会立即把角色与包裹配置写入 `$DSH_HOME/agent-switchboard/roles.json`，保存链路本身正常；常驻 preset 不订阅更新、不监听文件、没有定时重读或 settings 订阅，故不会读取新文件内容。
+- `tools/change` 使用启动时闭包捕获的 roles 重建系统提示，不重读文件；CLI 角色工具注册没有保留 disposer，委派工具子 Fiber 也未追踪，当前无法在运行期替换角色工具。
+- 因此任何角色配置变更（增删角色、backend、model、effort、provider、instructions、description、allowNestedDispatch、readOnly），以及插件级 `maxDepth`、`volatile.wrapper*` 变更，都必须重启 DSH 才生效。保存成功只表示文件已更新，不表示当前进程中的 preset 已应用新值。
 
 **后续修正（R1 / R2 / R3、M1 / M2，取代上述部分历史描述）：**
 - R2 取代「本作用域非空 roles 优先、否则读文件」：只有 `undefined`（未提供）才回落文件；
