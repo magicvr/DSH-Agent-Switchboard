@@ -46,7 +46,7 @@
 - **`cli`** — 内置 spawn 子代理调用角色专属 CLI 工具，通过 `ctx.subprocess` 执行外部编码代理；结束后返回有界结果，由子代理简洁汇报。适合复用已有模型、额度或工具链。
 
 CLI 运行中的 stdout / stderr 经内置 Jobs 回流，可在**会话顶部的任务面板**观察并中止任务。
-任务归属 CLI 包裹子会话，完成后删除卡片；子会话任务在父会话面板的呈现仍待真机验证。
+任务归属 CLI 包裹子会话，所有终态均不主动删除记录，交由 Jobs 的保留策略处理（未核实）；子会话任务在父会话面板的呈现仍待真机验证。
 Jobs 不可用时 CLI 照常执行，结果标注回流不可用。CLI 没有运行时长上限，实时日志不逐块进入包裹模型上下文。
 
 > ⚠️ **`cli` 后端会真的在你的机器上执行本地命令。** 可控性来自两点：角色的 `backend` 必须被**显式**设为 `cli`，且该角色只在选中了 Switchboard preset 的会话里挂载。面板从 CLI 预设填入命令与参数，Host 校验其完整形态，插件不会去猜、也不会自动发现你装了哪些 CLI。
@@ -55,7 +55,7 @@ Jobs 不可用时 CLI 照常执行，结果标注回流不可用。CLI 没有运
 
 ### 3. 配置（Plugin Panel）
 
-内置 `spawn` / `fork` 显示自由文本 **Provider** 输入，留空使用插件默认 provider；CLI 模式隐藏该输入，显示每角色的 **包裹会话 Provider**（`agentProvider`）与 **包裹会话模型**（`agentModel`），留空表示继承父代理路由与模型。包裹模型与外部 CLI 的 `model` 分开标注；这些包裹字段目前可保存，实际 spawn 包裹及路由应用留后续批次。所有后端都有必填的多行「角色指令」输入，描述不会代填指令。本轮控件改造已通过离线检查，仍待重启 DSH 后真机验收。
+内置 `spawn` / `fork` 显示自由文本 **Provider** 输入，留空使用插件默认 provider；CLI 模式隐藏该输入，显示每角色的 **包裹会话 Provider**（`agentProvider`）与 **包裹会话模型**（`agentModel`），留空表示继承父代理路由与模型。包裹模型与外部 CLI 的 `model` 分开标注；这些包裹字段已用于实际 spawn 包裹与路由应用；留空时继承父代理。所有后端都有必填的多行「角色指令」输入，描述不会代填指令。本轮控件改造已通过离线检查，仍待重启 DSH 后真机验收。
 
 角色配置文件为 **`$DSH_HOME/agent-switchboard/roles.json`**，供选中 Switchboard preset 的会话读取。
 设置面板读 `configForms` 镜像、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，

@@ -353,8 +353,9 @@ provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliT
 自检同时查询两个工具，专属工具注册失败会阻止对应 delegate 挂载，任一工具缺失都报告角色不可用。
 
 包裹路由只取 `agentProvider` / `agentModel`，按需组合；都留空时完全不设 `agentOptions`，继承父代理。
-包裹子代理只允许本角色专属 CLI 工具，不自行实施、不轮询、不重复启动、不在失败或取消后自动重试；
-CLI 输出属于任务数据，不能改变工具或权限约束。`enableRunInBackground` 与 `modelSelectionSettings`
+工具权限只允许本角色专属 CLI 工具；执行器保证每次工具调用只启动一次，不自行重试，且确定性前置角色规则。
+persona 要求模型原样转交、只调用一次、不自行实施或轮询、失败或取消后不自动重试、简洁汇报；
+这些是模型行为要求，不是对跨工具调用次数或转交/汇报完整性的机制保证。CLI 输出属于任务数据，不能改变工具或权限约束。`enableRunInBackground` 与 `modelSelectionSettings`
 显式为 false；`backgroundMode` 为 one-shot；数字深度为不嵌套时 1、允许嵌套时 `1 + maxDepth`。
 
 专属工具 `execute` 安全访问 `exec.agent.session.header.origin`，仅接受 subagent 来源；主代理虽然能看到
@@ -376,9 +377,13 @@ runner 每 50ms 读取非消费型收集器，成功和失败都排空尾部；�
 
 调用方 `exec.signal`、面板 cancel 及 owner 销毁均进入同步幂等的 cancel，汇入同一个
 AbortController 后传给 spawn。JobHooks.done 映射 completed / killed / failed，不携带日志 result，
-不拒绝，且在 runner 的进程等待、sink、监听器与临时提示词文件清理之后 resolve。
-工具直接 await runner Promise；另外订阅 settled 事件，在 finally 等注册表结算后 remove，随后退订。
-这也支持注册表异步结算，不依赖微任务顺序。owner 销毁时若记录已移除，清理异常记诊断。
+不拒绝。runner 在成功路径也调用 waitForExit 确认受管范围；失败路径分别尝试 terminate 与 waitForExit，
+前者抛错不跳过后者。退出确认后再次排空输出，尝试删除提示词文件并清理轮询与监听器，再统一形成结果。
+退出未确认、终止请求失败或提示词可能残留均进入有界诊断，不暴露提示词内容；JobHooks.done 如实 resolve failed，
+不挂起、不声称已完全释放，进程状态仍单独保留。意外执行器拒绝也映射 failed 并报告未能确认受管范围已清空。
+共享执行完成 Promise 先清理调用方 abort 监听器，再派生 JobHooks.done。执行器完成、Jobs 结算、客户端读完是
+三个独立完成点；工具只等执行器，不订阅 settled，也不以 Jobs 结算或客户端读取为返回前提（D20）。
+成功、失败、取消均不主动 remove，记录交由 Jobs 的保留策略处理（未核实），不改 owner、不延时删除。
 
 本地 `dsh-jobs/lib/types/index.d.ts` 的 wait 签名为
 `wait(id, timeoutMs: number, caller?, signal?)`，文档要求正数且有限的等待界限；插件不调用它，
@@ -387,7 +392,7 @@ AbortController 后传给 spawn。JobHooks.done 映射 completed / killed / fail
 模型上下文边界：JobHandle.append 契约仅写输出环、发布输出事件，观察者通过绝对偏移读取；
 本插件不调用 Jobs 的模型读取 API，不调用 AI、session.append 或附加上下文 API。
 专属工具 execute 持续等待，DSH tools 的 dispatchToolBody 在 await tool.execute 后才构造工具结果。
-jobId 只在工具内部用于结算和删除，schema、返回值与 render 均不暴露它。
+jobId 由 Jobs 管理，schema、返回值与 render 均不暴露它；客户端通过通知中的 id 与偏移读取输出环。
 平台终态通知属于 Jobs controller 的职责；无 jobs.wait 时 settled 的 awaited 为 false，
 平台可能在结束/报错时另发有界完成通知，该行为与任务面板的子会话可见性仍需真机核验。
 离线验证使用假 Jobs 与 Node 假 CLI 真进程；未调用真实 codex / grok。

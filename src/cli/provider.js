@@ -64,28 +64,23 @@ export function createCliTool({ role, spawn, resolveExecutable, ctx = { get: () 
       const onAbort = () => cancel(exec.signal.reason);
       if (exec.signal?.aborted) onAbort();
       else exec.signal?.addEventListener('abort', onAbort, { once: true });
-      let jobId;
       let execution;
-      let unsubscribe;
-      let settledJob;
       let outputFeedback = 'unavailable';
       let feedbackDiagnostic = '实时输出回流不可用：Jobs 服务未加载';
       let jobs;
       let result;
+      // 三个独立完成点：执行器完成（进程结果确定、输出排空、必要清理完成）、
+      // Jobs 结算、客户端读完。后两者不是工具返回的必要条件。
+      // 共享执行完成 Promise 先清理调用方监听器，再供工具与 JobHooks.done 使用。
       const run = onOutput => runCli({ role: boundRole, prompt: args.prompt, spawn,
-        resolveExecutable, signal: controller.signal, onOutput });
+        resolveExecutable, signal: controller.signal, onOutput })
+        .finally(() => exec.signal?.removeEventListener('abort', onAbort));
       try {
         // 可选服务不进 inject；每次调用读取，以支持运行时装卸。
         jobs = ctx.get('jobs');
         if (jobs) {
           try {
-            // 不用有有限等待期限的 jobs.wait；监听结算避免 remove 与注册表结算竞态。
-            settledJob = new Promise(resolve => {
-              unsubscribe = jobs.events.subscribe({ owner: exec.agent.id }, event => {
-                if (event.type === 'settled' && event.job.id === jobId) resolve();
-              });
-            });
-            jobId = jobs.start({
+            jobs.start({
               kind: 'cli', label: boundRole.title || boundRole.id, owner: exec.agent.id,
               // 仅限制模型侧的 Jobs 读取/结算通知；观察者容量由 Jobs 输出环管理。
               outputLimitBytes: 4096,
@@ -93,10 +88,10 @@ export function createCliTool({ role, spawn, resolveExecutable, ctx = { get: () 
                 execution = run(({ stream, text, lossy }) => job.append(text,
                   { channel: stream, ...(lossy ? { gapBefore: true } : {}) }));
                 return { cancel, done: execution.then(value => ({
-                  status: value.status === 'cancelled' ? 'killed'
+                  status: value.cleanupFailed ? 'failed' : value.status === 'cancelled' ? 'killed'
                     : value.status === 'completed' ? 'completed' : 'failed',
-                  detail: value.exitCode == null ? value.status : `exit code: ${value.exitCode}`,
-                }), () => ({ status: 'failed', detail: 'CLI 执行器失败' })) };
+                  detail: value.diagnostic || (value.exitCode == null ? value.status : `exit code: ${value.exitCode}`),
+                }), () => ({ status: 'failed', detail: 'CLI 执行器失败；未能确认受管进程范围已清空' })) };
               },
             });
             outputFeedback = 'jobs';
@@ -109,13 +104,10 @@ export function createCliTool({ role, spawn, resolveExecutable, ctx = { get: () 
         execution ??= run();
         result = await execution;
       } finally {
+        // ctx.get / 注册在执行前抛错时也释放监听器；正常路径已由共享 Promise 清理。
         exec.signal?.removeEventListener('abort', onAbort);
-        if (jobId !== undefined) {
-          await settledJob;
-          try { jobs.remove(jobId, exec.agent.id); }
-          catch { feedbackDiagnostic = '实时输出任务记录清理不可用（可能已随会话销毁）'; }
-        }
-        unsubscribe?.();
+        // 所有终态都不主动 remove，留给客户端按偏移延后读取。
+        // 记录交由 Jobs 的保留策略处理（未核实），不改 owner、不延时删除。
       }
       const stdout = bounded(result.stdout, outputLimit);
       // 失败路径可能追加诊断，再次限额；返回 stderr 尾部，路由事实已由 runner 提取。
@@ -130,7 +122,7 @@ export function createCliTool({ role, spawn, resolveExecutable, ctx = { get: () 
         stdout: stdout.text, stderr: stderr.text,
         stdoutTruncated: result.stdoutTruncated === true || stdout.truncated,
         stderrTruncated: result.stderrTruncated === true || stderr.truncated,
-        diagnostic: diagnostic.text, diagnosticTruncated: diagnostic.truncated,
+        diagnostic: diagnostic.text, diagnosticTruncated: result.diagnosticTruncated === true || diagnostic.truncated,
       };
     },
   });

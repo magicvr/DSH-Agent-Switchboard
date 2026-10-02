@@ -36,30 +36,14 @@ export async function runCli({ role, prompt, spawn, resolveExecutable, signal, r
   let invocation;
   let stage = '无法准备 CLI';
   let sinkDiagnostic;
+  let outcome;
+  let failure;
+  const cleanupDiagnostics = [];
   let pendingOutput = Promise.resolve();
   const offsets = { stdout: 0, stderr: 0 };
   const onAbort = () => { if (!settled) cancelled = true; };
   signal?.addEventListener('abort', onAbort, { once: true });
 
-  const failed = (message) => {
-    const status = cancelled ? 'cancelled' : handle ? 'process-failed' : 'start-failed';
-    let out = { text: '', lossy: false };
-    let err = { text: '', lossy: false };
-    try {
-      out = readCollected(handle?.collected?.stdout, 0, cli.maxOutputBytes);
-      err = readCollected(handle?.collected?.stderr, 0, cli.maxErrorBytes);
-    } catch { /* 收集器失败时仍回传原始错误 */ }
-    const stderr = [err.text, message].filter(Boolean).join('\n');
-    const formatted = formatRunResult({ roleId: role.id, command: cli.command,
-      argv: invocation?.argv ?? [], routeSummary, exitCode: null, cancelled,
-      startFailed: status === 'start-failed', stdout: out.text, stderr,
-      stdoutTruncated: out.lossy, stderrTruncated: err.lossy,
-      durationMs: now() - startedAt });
-    return { ...formatted, status, exitCode: null, stdout: out.text, stderr,
-      stderrTail: [err.tailText ?? err.text, message].filter(Boolean).join('\n'),
-      stdoutTruncated: out.lossy, stderrTruncated: err.lossy,
-      diagnostic: cancelled ? undefined : message };
-  };
   const emitOutput = () => {
     if (typeof onOutput !== 'function') return;
     for (const stream of ['stdout', 'stderr']) {
@@ -73,7 +57,7 @@ export async function runCli({ role, prompt, spawn, resolveExecutable, signal, r
 
   try {
     // 已取消时连文件和可执行文件解析都不发起；解析期间取消则在 spawn 前再次检查。
-    if (cancelled) return failed('调用方已取消');
+    if (cancelled) throw new Error('调用方已取消');
     const canCarryRole = cli.promptDelivery === 'stdin' || cli.promptDelivery === 'promptFile';
     const withRole = canCarryRole && role.instructions?.trim()
       ? `${role.instructions.trim()}\n\n---\n\n${prompt}` : prompt;
@@ -88,7 +72,7 @@ export async function runCli({ role, prompt, spawn, resolveExecutable, signal, r
       try { command = await resolveExecutable(cli.command, cli.env, signal); }
       catch { command = cli.command; /* 交给 spawn 报告字面命令的启动错误 */ }
     }
-    if (cancelled) return failed('调用方已取消');
+    if (cancelled) throw new Error('调用方已取消');
     stage = '参数模板错误';
     invocation = buildInvocation({ command, prefixArgs: cli.prefixArgs ?? [], args: cli.args,
       values: { prompt: cli.promptDelivery === 'argv' ? withRole
@@ -108,44 +92,71 @@ export async function runCli({ role, prompt, spawn, resolveExecutable, signal, r
         catch (error) { sinkDiagnostic ??= `输出读取失败：${error.message ?? error}`; }
       }, 50);
     }
-    const outcome = await handle.done;
+    outcome = await handle.done;
     // done 被观察到即固定终态，后续异步 sink 或取消不能改写已经退出的结果。
     settled = true;
     clearInterval(monitor);
     emitOutput();
     await pendingOutput;
-    const out = readCollected(handle.collected?.stdout, 0, cli.maxOutputBytes);
-    const err = readCollected(handle.collected?.stderr, 0, cli.maxErrorBytes);
-    const formatted = formatRunResult({ roleId: role.id, command: invocation.argv[0],
-      argv: invocation.argv, routeSummary, exitCode: outcome.exitCode, signal: outcome.signal,
-      cancelled, stdout: out.text, stderr: err.text, stdoutTruncated: out.lossy,
-      stderrTruncated: err.lossy, durationMs: now() - startedAt });
-    return { ...formatted, status: cancelled ? 'cancelled' : formatted.ok ? 'completed' : 'process-failed',
-      exitCode: outcome.exitCode, signal: outcome.signal ?? null, stdout: out.text, stderr: err.text,
-      stderrTail: err.tailText,
-      stdoutTruncated: out.lossy, stderrTruncated: err.lossy, diagnostic: sinkDiagnostic };
   } catch (error) {
     settled = true;
+    failure = `${stage}：${error.message ?? error}`;
     // done 拒绝也必须收尾。具体终止与宽限由 subprocess 负责，不另造期限。
     if (handle) {
-      try { await handle.terminate(); await handle.waitForExit(); }
-      catch { /* 保留原始失败诊断 */ }
+      try { await handle.terminate(); }
+      catch (error) { cleanupDiagnostics.push(`进程终止请求失败（${error.code ?? '未知错误'}）`); }
     }
     clearInterval(monitor);
     // 进程失败也排空最后一段输出，不重复已经交给 sink 的字节。
-    try { emitOutput(); } catch { /* 原始失败优先 */ }
+    try { emitOutput(); }
+    catch (error) { sinkDiagnostic ??= `输出读取失败：${error.message ?? error}`; }
     await pendingOutput;
-    return failed(`${stage}：${error.message ?? error}`);
   } finally {
     settled = true;
     clearInterval(monitor);
     signal?.removeEventListener('abort', onAbort);
     await pendingOutput;
+    // terminate 抛错也独立尝试；成功路径同样确认受管范围，而非只等 handle.done。
+    if (handle) {
+      try {
+        if (await handle.waitForExit() !== true) throw new Error('退出未确认');
+      } catch (error) {
+        cleanupDiagnostics.push(`未能确认受管进程范围已清空（${error.code ?? '未知错误'}）`);
+      }
+    }
+    // 退出确认期间新增的输出也排空；偏移保证不会重复已推送的字节。
+    try { emitOutput(); }
+    catch (error) { sinkDiagnostic ??= `输出读取失败：${error.message ?? error}`; }
+    await pendingOutput;
     if (promptFilePath) {
       try { rmSync(promptFilePath, { force: true }); }
-      catch { /* 清理失败不覆盖进程结果 */ }
+      // 不带错误 message / 文件内容；只报告操作与错误码，避免暴露提示词。
+      catch (error) { cleanupDiagnostics.push(`提示词临时文件删除失败，可能残留（${error.code ?? '未知错误'}）`); }
     }
   }
+  // 清理完成后统一形成结果，清理失败如实诊断，不挂起、不宣称资源已全部释放。
+  let out = { text: '', lossy: false };
+  let err = { text: '', lossy: false };
+  try {
+    out = readCollected(handle?.collected?.stdout, 0, cli.maxOutputBytes);
+    err = readCollected(handle?.collected?.stderr, 0, cli.maxErrorBytes);
+  } catch (error) { failure ??= `CLI 输出读取失败：${error.message ?? error}`; }
+  const stderr = [err.text, failure].filter(Boolean).join('\n');
+  const formatted = formatRunResult({ roleId: role.id, command: invocation?.argv[0] ?? cli.command,
+    argv: invocation?.argv ?? [], routeSummary, exitCode: outcome?.exitCode ?? null,
+    signal: outcome?.signal, cancelled, startFailed: Boolean(failure) && !handle,
+    stdout: out.text, stderr, stdoutTruncated: out.lossy, stderrTruncated: err.lossy,
+    durationMs: now() - startedAt });
+  // 清理事实优先保留，避免巨大的进程错误占满诊断容量。
+  const diagnosticBytes = Buffer.from([...cleanupDiagnostics, cancelled ? undefined : failure,
+    sinkDiagnostic].filter(Boolean).join('\n'));
+  return { ...formatted, status: cancelled ? 'cancelled' : failure
+    ? handle ? 'process-failed' : 'start-failed' : formatted.ok ? 'completed' : 'process-failed',
+    exitCode: outcome?.exitCode ?? null, signal: outcome?.signal ?? null,
+    stdout: out.text, stderr, stderrTail: [err.tailText ?? err.text, failure].filter(Boolean).join('\n'),
+    stdoutTruncated: out.lossy, stderrTruncated: err.lossy, cleanupFailed: cleanupDiagnostics.length > 0,
+    diagnostic: diagnosticBytes.length ? new StringDecoder('utf8').write(diagnosticBytes.subarray(0, 4096)) : undefined,
+    diagnosticTruncated: diagnosticBytes.length > 4096 };
 }
 
 /** 有界读取，保留收集器的丢失标志，并对非标准适配器防御性限制结果容量。 */

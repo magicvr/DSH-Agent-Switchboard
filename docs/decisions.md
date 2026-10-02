@@ -48,6 +48,8 @@
 
 ## D4 · 派发架构：统一走 `ctx.subagents`，角色映射为模型可见工具
 
+> **被取代范围：** CLI 自注册 provider 及其 provider-managed 深度约束已被 [D18](#d18--cli-改为内置-spawn-包裹与角色专属工具批次-3a) 的内置 spawn 包裹取代；下文仅保留历史。
+
 **决策：** 不发明新的派发层，复用 DSH 的 `ctx.subagents` 服务。两类后端统一到同一个 `SubagentProvider` 抽象之下：
 
 | backend | 实现方式 | 说明 |
@@ -103,6 +105,8 @@
 ---
 
 ## D7 · CLI provider 的能力声明（诚实降级）
+
+> **被取代范围：** CLI provider 能力声明随旧 provider 移除，当前内置 spawn 包裹与专属工具边界见 D18；历史理由保留。
 
 **决策：** CLI provider 声明最小能力集：
 
@@ -223,6 +227,8 @@ minimal | low | medium | high | xhigh | max
 
 ## D9 · 配置分两层，且必须区分 volatile
 
+> **被取代范围：** 运行时 cliTimeoutSec 已由 D17 移除；包裹路由、Jobs 回流与清理生命周期分别见 D18 / D19 / D20。本节表格保留历史，不代表当前字段。
+
 > **历史方案已被后续决策取代：** 下文「第一期角色列表来自 `cordis.patch.yml`」及复杂数组编辑器不可行的取舍，已被 D13 / D14 的自建设置页覆盖；原文保留。
 > 当前角色文件为 `$DSH_HOME/agent-switchboard/roles.json`，设置页仍经根配置桥接并由 Host 同步文件，preset 只携带 `mount: true`、不得携带 `roles`。依据见 D14 的当前实现补记。
 
@@ -273,6 +279,8 @@ minimal | low | medium | high | xhigh | max
 > **Q3 已被后续决策取代（D13 / D14）：** 上表保留当时裁决，不代表当前待办。角色与派发设置页已落地；当前文件、根配置桥接与 preset 挂载分工见 D14，Phase 4 不再等待评估可写面板。
 
 ## D11 · 嵌套派发默认关闭，逐角色放开
+
+> **被取代范围：** CLI provider 的 provider-managed / 提示词派发限制已随 D18 的 spawn 包裹取代；当前数字深度与工具过滤见 architecture.md 第 6 节。本轮 D20 不改深度或权限语义，外部 CLI 自身递归行为仍不由 DSH 机制保证。
 
 **决策：** 新增角色字段 `allowNestedDispatch`，**默认 `false`**。默认情况下角色子代理不得再往下派发子代理，需按角色显式开启。
 
@@ -615,6 +623,8 @@ AGENTS.md 规则 4 继续由注册时配置快照与仅 prompt 参数落实：�
 
 ## D19 · CLI 输出使用内置 Jobs 面板回流（批次 3b）
 
+> **被取代范围：** 本节 settled 等待、结算后 remove 与前台删除验收已被 [D20](#d20--cli-执行完成与-jobs结算客户端读取分离) 取代；其余回流路径、owner 和模型容量边界保留。
+
 **决策：** 使用会话顶部的内置任务面板，不新增客户端 UI。工具执行时通过 `ctx.get('jobs')`
 读取可选服务，注册 kind=cli、label=角色标题或 id、owner=调用方子会话 `exec.agent.id`。
 runner 增量 sink 向 job.append 推送 stdout / stderr，丢失字节显式标记；只使用推送一种路径。
@@ -633,3 +643,29 @@ Jobs 的模型侧读取与终态通知另限 4096 字节，客户端输出环沿
 **验证边界：** 假 Jobs 服务、Node 假 CLI 真进程与 apply 集成验证实时回流、取消、释放顺序、
 前台删除、降级、有界结果与来源防御；关键断言以生产代码变异及 SHA-256 字节校验验证判别力。
 不调用真实 codex / grok，不读写用户 DSH_HOME；真实任务面板和 CLI 进程树仍待验收。
+
+
+---
+
+## D20 · CLI 执行完成与 Jobs结算、客户端读取分离
+
+**决策：** 工具只等待共享执行完成 Promise；该 Promise 先清理调用方 abort 监听器，再派生不 reject 的
+JobHooks.done。移除 effect-scoped settled 订阅及等待，成功/失败/取消均不主动 remove。
+执行器完成、Jobs 结算、客户端读完互相独立；记录交由 Jobs 的保留策略处理（未核实），不改 owner、不延时删除。
+替代 D19 的结算等待与前台删除，D17 / D18 中「本批次不接 Jobs」仅是历史阶段范围，已由 D19 实施。
+D16 的包裹路由待实施也已由 D18 实施。
+
+**清理与失败结算：** 成功路径也尝试 waitForExit；失败路径分别尝试 terminate 与 waitForExit，
+前者抛错仍确认退出。确认后排空尾部、尝试删除提示词文件，再统一形成结果。终止请求失败、受管范围未确认、
+提示词可能残留进入有界诊断，不输出提示词内容。保留进程分类，清理失败的 JobHooks.done resolve failed，
+绝不永久挂起，也不声称已完全释放。意外执行器拒绝同样 resolve failed 并明确报告退出未确认。
+官方 dsh-tool-subagent 的 settleStart 捕获异常后结算 failed，是不阻塞 owner 销毁的先例。
+
+**保证边界：** 工具权限限制可调用工具；执行器保证每次调用单次启动、不自行重试、角色指令确定性前置。
+persona 的原样转交、只调用一次、不重试及简洁汇报属于模型行为要求；不构成跨调用次数或汇报完整性的机制保证。
+不修改 maxDepth / toolFilter，不新增运行期限，不新增客户端代码。
+
+**验证边界：** 假 Jobs 保存输出环、仅以 id / total 通知，工具返回且结算后按偏移读取尾部；
+模拟丢弃 settled、作用域释放、取消、退出确认失败、终止抛错及提示词删除失败。
+测试 watchdog 仅发现测试挂起，不是产品运行期限；关键断言以生产代码变异与 SHA-256 恢复校验验证。
+不调用真实 codex / grok、不触碰用户 DSH_HOME；面板可见性、延后读取、平台保留策略及受管进程树仍需真机核验。

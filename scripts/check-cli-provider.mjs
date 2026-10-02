@@ -8,6 +8,8 @@ import { join } from 'node:path';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { getEventListeners } from 'node:events';
 import { runCli } from '../src/cli/runner.js';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 
 let pass = 0;
 let fail = 0;
@@ -26,10 +28,16 @@ function section(title) {
 
 const childExec = (signal) => ({ agent: { id: 'child-1', session: { header: { origin: 'subagent' } } }, signal });
 
-// Jobs 桩保留真实契约：同步 starter/cancel、资源释放后 done、异步结算后才能 remove。
-function fakeJobs({ rejected = false, released = () => true } = {}) {
+// Jobs 桩：同步 starter/cancel、异步结算；通知与读取分离，remove 会真正销毁输出环。
+function fakeJobs({ rejected = false, released = () => true, dropSettled = false } = {}) {
   const specs = [], chunks = [], removals = [], outcomes = [], releaseChecks = [];
   const listeners = new Set();
+  const notifications = [];
+  let ring = Buffer.alloc(0);
+  let total = 0;
+  let removed = false;
+  let settle;
+  const settlement = new Promise(resolve => { settle = resolve; });
   let hooks;
   let settled = false;
   const id = 'cli-test-private-1';
@@ -41,27 +49,45 @@ function fakeJobs({ rejected = false, released = () => true } = {}) {
     start(spec) {
       specs.push(spec);
       if (rejected) throw new Error('no controller');
-      hooks = spec.run({ id, append(text, options) { chunks.push({ text, ...options }); } });
+      hooks = spec.run({ id, append(text, options) {
+        chunks.push({ text, ...options });
+        const bytes = Buffer.from(text);
+        total += bytes.length;
+        ring = Buffer.concat([ring, bytes]).subarray(-65536);
+        // 观察者只收到 id / total，不能借通知直接读到 append 文本。
+        notifications.push({ id, total });
+      } });
       hooks.done.then(outcome => {
         outcomes.push(outcome);
         releaseChecks.push(released());
-        // 不把「生产者 done」等同于「注册表已结算」，验证前台 remove 的竞态。
+        // 不把「生产者 done」等同于「注册表已结算」。
         setImmediate(() => {
           settled = true;
-          for (const listener of listeners) listener({ type: 'settled', job: { id }, awaited: false });
+          settle();
+          if (!dropSettled) for (const listener of listeners) listener({ type: 'settled', job: { id }, awaited: false });
         });
       }, () => {
         outcomes.push({ status: 'REJECTED' });
         setImmediate(() => {
           settled = true;
-          for (const listener of listeners) listener({ type: 'settled', job: { id }, awaited: false });
+          settle();
+          if (!dropSettled) for (const listener of listeners) listener({ type: 'settled', job: { id }, awaited: false });
         });
       });
       return id;
     },
     remove(jobId, owner) {
-      if (!settled) throw new Error('still live');
       removals.push({ id: jobId, owner });
+      if (!settled) throw new Error('still live');
+      removed = true;
+      ring = Buffer.alloc(0);
+    },
+    // 客户端按绝对字节偏移读输出环，与模型侧 read 区分。
+    readOutput(jobId, from) {
+      if (removed || jobId !== id) throw new Error('unknown job');
+      const start = total - ring.length;
+      return { text: ring.subarray(Math.max(from, start) - start).toString('utf8'),
+        nextOffset: total, lossy: from < start };
     },
     wait() { throw new Error('禁止有期限的 wait'); },
     read() { throw new Error('禁止模型读取实时日志'); },
@@ -80,7 +106,8 @@ function fakeJobs({ rejected = false, released = () => true } = {}) {
     get(key) { requested.push(key); return key === 'jobs' ? service : undefined; },
     get jobs() { throw new Error('必须用 ctx.get'); },
   };
-  return { service, ctx, specs, chunks, removals, outcomes, releaseChecks, requested,
+  return { service, ctx, specs, chunks, removals, outcomes, releaseChecks, requested, notifications, settlement,
+    releaseScope: () => listeners.clear(),
     hooks: () => hooks, listeners: () => listeners.size, id };
 }
 /**
@@ -328,6 +355,32 @@ section('工具结果容量：正文、错误尾部、元信息与失败诊断�
 
 // 取消代替旧超时保护，并覆盖清理、退出竞态和未来工具的回流接口。
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+// 短 watchdog 只在测试内发现挂起，不是产品运行期限，不会终止 CLI。
+async function watchdog(task, label) {
+  let timer;
+  try {
+    return await Promise.race([task, new Promise((_resolve, reject) => {
+      timer = setTimeout(() => {
+        check(`${label}：测试 watchdog 未发现挂起`, false);
+        reject(new Error(`测试挂起：${label}`));
+      }, 1500);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+async function observeTail(jobs, label, tail) {
+  await watchdog(jobs.settlement, `${label} Jobs 结算`);
+  // 工具返回、Jobs 结算后才读取；通知只用于偏移，不能从 chunks 获取正文。
+  const notice = jobs.notifications.at(-1);
+  let read;
+  try {
+    const from = Math.max(0, (notice?.total ?? 0) - Buffer.byteLength(tail));
+    read = jobs.service.readOutput(jobs.id, from);
+  } catch { /* unknown job 由断言报告 */ }
+  check(`${label}：通知仅含 id/total`, jobs.notifications.length > 0
+    && jobs.notifications.every(event => Object.keys(event).join(',') === 'id,total'));
+  check(`${label}：工具返回且结算后按偏移仍读到尾部`, read?.text === tail
+    && read.nextOffset === notice?.total && !read.lossy);
+}
 function controlledSpawn() {
   let finish;
   let reject;
@@ -389,7 +442,125 @@ section('取消：信号直通、终止、分类、审计与资源清理');
   check('取消后全部 abort 监听器已移除', getEventListeners(ac.signal, 'abort').length === 0);
 }
 
-section('Jobs 回流：可选降级、前台有界结果、结算与清理');
+section('Jobs 事件丢弃与作用域释放：独立完成点');
+{
+  for (const mode of ['drop', 'scope']) {
+    for (const cancel of [false, true]) {
+      const ac = new AbortController();
+      const h = controlledSpawn();
+      const jobs = fakeJobs({ dropSettled: mode === 'drop' });
+      let returned = false;
+      const task = createCliTool({ role: codexRole(), spawn: h.spawn, ctx: jobs.ctx })
+        .execute({ prompt: 'T' }, childExec(ac.signal));
+      task.then(() => { returned = true; });
+      if (mode === 'scope') jobs.releaseScope();
+      // 推进测试时间不会终止未完成 CLI；watchdog 仅在我们明确结束/取消后启用。
+      await delay(80);
+      const label = `${mode}/${cancel ? '取消' : '成功'}`;
+      check(`${label}：CLI 未完成时仍运行`, !returned && !h.aborted() && h.cleanups() === 0);
+      if (cancel) ac.abort('test cancel'); else h.finish();
+      if (cancel && !h.aborted()) h.finish();
+      const result = await watchdog(task, `${label} 工具完成`);
+      const outcome = await watchdog(jobs.hooks().done, `${label} JobHooks.done`);
+      check(`${label}：无 settled 通知工具仍完成且取消有效`, result.status === (cancel ? 'cancelled' : 'completed')
+        && h.aborted() === cancel);
+      check(`${label}：JobHooks.done 不 reject 且分类正确`, outcome.status === (cancel ? 'killed' : 'completed'));
+      check(`${label}：不 remove、不建立结算订阅`, jobs.removals.length === 0 && jobs.listeners() === 0);
+      check(`${label}：共享执行完成先释放调用方监听器`, getEventListeners(ac.signal, 'abort').length === 0);
+    }
+  }
+}
+
+section('清理失败诊断：独立退出确认、有界且不泄露提示词');
+{
+  for (const fails of [false, true]) {
+    let releaseExit;
+    let output = 'HEAD';
+    let returned = false;
+    const jobs = fakeJobs();
+    const ac = new AbortController();
+    const task = createCliTool({ role: codexRole(), ctx: jobs.ctx, spawn: () => ({
+      done: fails ? Promise.reject(new Error('done failed')) : Promise.resolve({ exitCode: 0 }),
+      collected: { stdout: { readFrom: from => ({ text: output.slice(from), nextOffset: output.length }) } },
+      terminate() {},
+      waitForExit: () => new Promise(resolve => { releaseExit = () => { output += '-TAIL'; resolve(true); }; }),
+    }) }).execute({ prompt: 'T' }, childExec(ac.signal));
+    task.then(() => { returned = true; });
+    await delay(20);
+    const label = `${fails ? '失败' : '成功'}退出确认`;
+    check(`${label}：handle.done 后仍等待受管范围确认`, !returned && jobs.outcomes.length === 0
+      && typeof releaseExit === 'function');
+    if (releaseExit) releaseExit();
+    await watchdog(task, label);
+    check(`${label}：确认期间尾部输出也排空且不重复`, jobs.chunks.map(chunk => chunk.text).join('') === 'HEAD-TAIL');
+    check(`${label}：done 前释放监听器`, getEventListeners(ac.signal, 'abort').length === 0);
+    await observeTail(jobs, label, '-TAIL');
+  }
+  for (const mode of ['success', 'failure', 'cancel']) {
+    const jobs = fakeJobs();
+    const ac = new AbortController();
+    let terminateCalls = 0;
+    let waitCalls = 0;
+    const result = await watchdog(createCliTool({ role: codexRole(), ctx: jobs.ctx, spawn: () => {
+      if (mode === 'cancel') ac.abort('cleanup cancel');
+      return { ...makeSpawn({ stdout: 'TAIL' }).spawn({}),
+        done: mode === 'success' ? Promise.resolve({ exitCode: 0 }) : Promise.reject(new Error('done failed')),
+        terminate() { terminateCalls++; throw new Error('terminate failed'); },
+        async waitForExit() { waitCalls++; throw new Error('wait failed'); },
+      };
+    } }).execute({ prompt: 'SECRET-PROMPT' }, childExec(ac.signal)), `${mode} 清理失败结算`);
+    const outcome = await watchdog(jobs.hooks().done, `${mode} 清理 JobHooks.done`);
+    check(`${mode}：terminate 抛错仍独立确认退出，成功路径也确认`, waitCalls === 1
+      && terminateCalls === (mode === 'success' ? 0 : 1));
+    check(`${mode}：退出未确认如实进入返回诊断`, result.diagnostic.includes('未能确认受管进程范围已清空')
+      && (mode === 'success' || result.diagnostic.includes('进程终止请求失败')));
+    check(`${mode}：done resolve failed 并携带清理诊断`, outcome.status === 'failed'
+      && outcome.detail.includes('未能确认受管进程范围已清空'));
+    check(`${mode}：保留进程分类、不 remove 且不泄露正文`, result.status === ({ success: 'completed', failure: 'process-failed', cancel: 'cancelled' })[mode]
+      && jobs.removals.length === 0 && !result.diagnostic.includes('SECRET-PROMPT'));
+  }
+  let waited = false;
+  const unconfirmed = await runCli({ role: codexRole(), prompt: 'T', spawn: () => ({
+    ...makeSpawn().spawn({}), waitForExit: async () => { waited = true; return false; },
+  }) });
+  check('waitForExit false 不能声称受管范围已清空', waited && unconfirmed.cleanupFailed
+    && unconfirmed.diagnostic.includes('未能确认受管进程范围已清空'));
+  for (const fails of [false, true]) {
+    let path;
+    let waitedWithFile = false;
+    const jobs = fakeJobs();
+    const originalRm = fs.rmSync;
+    const role = codexRole({ promptDelivery: 'promptFile', args: ['--prompt-file', '{prompt}'] });
+    let result;
+    try {
+      fs.rmSync = (target, options) => {
+        if (target === path) throw Object.assign(new Error('SECRET-PROMPT'), { code: 'EACCES' });
+        return originalRm(target, options);
+      };
+      syncBuiltinESMExports();
+      result = await createCliTool({ role, ctx: jobs.ctx, spawn: spec => {
+        path = spec.argv.at(-1);
+        return { ...makeSpawn().spawn(spec),
+          done: fails ? Promise.reject(new Error('x'.repeat(6000))) : Promise.resolve({ exitCode: 0 }),
+          async waitForExit() { waitedWithFile = existsSync(path); return true; },
+        };
+      } }).execute({ prompt: 'SECRET-PROMPT' }, childExec());
+      const label = `${fails ? '失败' : '成功'}删除失败`;
+      check(`${label}：先确认退出再尝试删除文件`, waitedWithFile && existsSync(path));
+      check(`${label}：提示词残留进入有界诊断且不泄露内容`, result.diagnostic.includes('提示词临时文件删除失败，可能残留（EACCES）')
+        && !result.diagnostic.includes('SECRET-PROMPT') && Buffer.byteLength(result.diagnostic) <= 4096);
+      check(`${label}：JobHooks.done failed 携带残留诊断`, (await jobs.hooks().done).status === 'failed'
+        && jobs.outcomes[0].detail.includes('提示词临时文件删除失败'));
+      if (fails) check('超长进程错误不淹没清理诊断且截断有标记', result.diagnosticTruncated);
+    } finally {
+      fs.rmSync = originalRm;
+      syncBuiltinESMExports();
+      if (path) originalRm(path, { force: true });
+    }
+  }
+}
+
+section('Jobs 回流：可选降级、前台有界结果、记录保留');
 {
   const h = makeSpawn({ stdout: 'ANSWER' });
   const reads = [];
@@ -404,7 +575,7 @@ section('Jobs 回流：可选降级、前台有界结果、结算与清理');
     .execute({ prompt: 'T' }, childExec());
   check('Jobs 预检拒绝只降级，不重复启动', fallback.calls.length === 1 && r.stdout === 'FALLBACK'
     && r.outputFeedback === 'unavailable' && r.diagnostic.includes('Jobs 注册失败'));
-  check('Jobs 预检拒绝不 remove 且退订', rejected.removals.length === 0 && rejected.listeners() === 0);
+  check('Jobs 预检拒绝不 remove 且无结算订阅', rejected.removals.length === 0 && rejected.listeners() === 0);
   const jobs = fakeJobs();
   const role = { ...codexRole({ maxOutputBytes: 4, maxErrorBytes: 4 }), title: '侦察角色' };
   const streamed = makeSpawn({ stdout: '0123456789', stderr: 'ERROR-TAIL' });
@@ -418,17 +589,18 @@ section('Jobs 回流：可选降级、前台有界结果、结算与清理');
     && jobs.chunks[1].channel === 'stderr' && jobs.chunks[1].text === 'ERROR-TAIL');
   check('Jobs 回流不扩大模型结果限额', value.stdout === '0123' && value.stderr === 'TAIL'
     && value.stdoutTruncated && value.stderrTruncated && value.outputFeedback === 'jobs');
-  check('结算后 remove 携带同一个 owner', jobs.removals.length === 1
-    && jobs.removals[0].id === jobs.id && jobs.removals[0].owner === 'child-1');
+  check('成功路径不主动 remove，owner 保持子会话', jobs.removals.length === 0
+    && jobs.specs[0].owner === 'child-1');
+  await observeTail(jobs, '成功路径', 'ERROR-TAIL');
   check('jobId 不进入返回值、render 或 schema', !JSON.stringify(value).includes(jobs.id)
     && !JSON.stringify(p.output.render({}, value)).includes(jobs.id) && !('jobId' in p.output.schema.properties));
-  check('Jobs done completed 不携带日志 result 且退订', jobs.outcomes[0].status === 'completed'
+  check('Jobs done completed 不携带日志 result 且无结算订阅', jobs.outcomes[0].status === 'completed'
     && !('result' in jobs.outcomes[0]) && jobs.listeners() === 0);
   const lossyJobs = fakeJobs();
   const lossy = await createCliTool({ role: codexRole(), ctx: lossyJobs.ctx, spawn: () => ({
     done: Promise.resolve({ exitCode: 0 }), collected: { stdout: {
       readFrom: from => ({ text: from === 0 ? 'tail' : '', nextOffset: 4, lossy: from === 0 }),
-    } },
+    } }, waitForExit: async () => true,
   }) }).execute({ prompt: 'T' }, childExec());
   check('丢失字节向 Jobs 观察者标记 gapBefore，避免静默拼接', lossyJobs.chunks.length === 1
     && lossyJobs.chunks[0].gapBefore === true && lossy.stdoutTruncated);
@@ -439,6 +611,8 @@ section('Jobs 回流：可选降级、前台有界结果、结算与清理');
   }) }).execute({ prompt: 'T' }, childExec());
   check('done 拒绝仍排空两路错误尾部且不重复', failedResult.status === 'process-failed'
     && failedJobs.chunks.length === 2 && failedJobs.chunks[0].text === 'LAST-OUT' && failedJobs.chunks[1].text === 'LAST-ERR');
+  check('失败路径不主动 remove', failedJobs.removals.length === 0);
+  await observeTail(failedJobs, '失败路径', 'LAST-ERR');
 }
 
 section('Jobs 取消：同步幂等、三来源合流、done 释放资源后结算');
@@ -472,7 +646,7 @@ section('Jobs 取消：同步幂等、三来源合流、done 释放资源后结�
     check(`${source}：done 不拒绝且 JobOutcome 分类正确`, jobs.outcomes.length === 1
       && jobs.outcomes[0].status === (source === 'failure' ? 'failed' : 'killed'));
     check(`${source}：done resolve 前已清理资源和调用方监听器`, jobs.releaseChecks[0] === true);
-    check(`${source}：结算后 remove 并退订`, jobs.removals.length === 1 && jobs.listeners() === 0);
+    check(`${source}：不主动 remove 且无结算订阅`, jobs.removals.length === 0 && jobs.listeners() === 0);
     check(`${source}：不暴露 jobId 且唯一终态`, !JSON.stringify(r).includes(jobs.id)
       && r.status === (source === 'failure' ? 'process-failed' : 'cancelled'));
     if (source !== 'failure' && source !== 'pre-abort') check(`${source}：同一 spawn 信号终止进程`, h.aborted());
@@ -486,20 +660,22 @@ section('Jobs 取消：同步幂等、三来源合流、done 释放资源后结�
   catch { refused = true; }
   check('主代理调用在读取 Jobs 和启动进程前拒绝', refused && jobs.requested.length === 0 && h.calls.length === 0);
   const brokenJobs = fakeJobs();
+  const brokenSignal = new AbortController();
   const originalNow = Date.now;
   let task;
   try {
     // 在 runner 的 try 外模拟意外拒绝，不能只测已经被 runner 归类的进程失败。
     Date.now = () => { throw new Error('clock unavailable'); };
     task = createCliTool({ role: codexRole(), spawn: makeSpawn().spawn, ctx: brokenJobs.ctx })
-      .execute({ prompt: 'T' }, childExec());
+      .execute({ prompt: 'T' }, childExec(brokenSignal.signal));
   } finally { Date.now = originalNow; }
   let error;
   try { await task; } catch (e) { error = e; }
   check('runner 意外拒绝仍将 Jobs done 转为 failed 而不 reject', brokenJobs.outcomes[0]?.status === 'failed'
-    && brokenJobs.outcomes[0]?.detail === 'CLI 执行器失败');
-  check('runner 意外拒绝保留工具错误且结算 remove/退订', error?.message === 'clock unavailable'
-    && brokenJobs.removals.length === 1 && brokenJobs.listeners() === 0);
+    && brokenJobs.outcomes[0]?.detail.includes('未能确认受管进程范围已清空'));
+  check('runner 意外拒绝保留工具错误、不 remove 且释放调用方监听器', error?.message === 'clock unavailable'
+    && brokenJobs.removals.length === 0 && brokenJobs.listeners() === 0
+    && getEventListeners(brokenSignal.signal, 'abort').length === 0);
 }
 
 section('已取消信号与解析期间取消：不得启动新进程');
@@ -709,11 +885,12 @@ const timer = setInterval(() => { if (existsSync(process.argv[3])) { clearInterv
       check(`${label}：退出后文件与信号监听器清理`, !existsSync(promptPath)
         && getEventListeners(ac.signal, 'abort').length === 0 && terminals === 1);
       check(`${label}：done 在真进程退出与文件清理后 resolve`, jobs.releaseChecks[0] === true);
-      check(`${label}：结算后 remove 且不泄露 jobId`, jobs.removals.length === 1
-        && jobs.removals[0].owner === 'child-1' && !JSON.stringify(result).includes(jobs.id) && jobs.listeners() === 0);
+      check(`${label}：不主动 remove 且不泄露 jobId`, jobs.removals.length === 0
+        && jobs.specs[0].owner === 'child-1' && !JSON.stringify(result).includes(jobs.id) && jobs.listeners() === 0);
       const stdout = jobs.chunks.filter(chunk => chunk.channel === 'stdout').map(chunk => chunk.text).join('');
       check(`${label}：增量输出无重复且正常退出尾部已排空`, stdout === readFileSync(join(dir, 'stdout'), 'utf8')
         && (cancel || stdout.endsWith('FINISHED\n')));
+      await observeTail(jobs, label, cancel ? readFileSync(join(dir, 'stderr'), 'utf8') : 'FINISHED\n');
     }
   } finally {
     if (active && active.exitCode === null && active.signalCode === null) active.kill();

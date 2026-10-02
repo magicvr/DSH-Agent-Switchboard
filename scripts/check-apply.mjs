@@ -782,14 +782,14 @@ section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失
       };
       const contextGet = ctx.get.bind(ctx);
       ctx.get = key => key === 'jobs' ? (jobsAvailable ? jobs : undefined) : contextGet(key);
-      ctx.subprocess.spawn = () => ({ done: Promise.resolve({ exitCode: 0 }), collected: {} });
+      ctx.subprocess.spawn = () => ({ done: Promise.resolve({ exitCode: 0 }), collected: {}, waitForExit: async () => true });
       const exec = { agent: { id: 'fixture-child', session: { header: { origin: 'subagent' } } } };
       const cliTool = ctx.tools.get('switchboard_cli_run_cli_worker', scope);
       const cliResult = await cliTool.execute({ prompt: 'T' }, exec);
       check('apply 将 ctx 传给专属工具，运行时读取 Jobs 与正确 owner', starts.length === 1
         && starts[0].kind === 'cli' && starts[0].owner === 'fixture-child' && cliResult.outputFeedback === 'jobs');
-      check('apply 路径结算后 remove，jobId 不进结果且退订', removed.length === 1
-        && removed[0].owner === 'fixture-child' && listeners.size === 0 && !JSON.stringify(cliResult).includes('cli-private-apply'));
+      check('apply 路径不主动 remove，jobId 不进结果且无结算订阅', removed.length === 0
+        && starts[0].owner === 'fixture-child' && listeners.size === 0 && !JSON.stringify(cliResult).includes('cli-private-apply'));
       jobsAvailable = false;
       const degraded = await cliTool.execute({ prompt: 'T' }, exec);
       check('apply 路径 Jobs 卸载后照常执行并报告降级', degraded.status === 'completed'
