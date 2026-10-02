@@ -16,7 +16,7 @@ import { ToolRuntime } from '@deepseek-ai/dsh-tools';
 import { applyChildComposition, delegationDepthOf, resolveChildDepth } from '@deepseek-ai/dsh-subagent';
 import { apply, Config, liveRoleTools, selftestTool } from '../src/index.js';
 import { toolConfigFor } from '../src/roles.js';
-import { configPathFor, initialConfig, writeConfigFile } from '../src/config-file.js';
+import { configPathFor, initialConfig, readConfigFile, writeConfigFile } from '../src/config-file.js';
 
 const fixtureHome = mkdtempSync(join(tmpdir(), 'switchboard-check-apply-'));
 const previousDshHome = process.env.DSH_HOME;
@@ -1153,12 +1153,63 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   pendingCtx.on = (_event, listener) => { pendingUpdate = listener; return () => {}; };
   pendingCtx.effect = execute => execute();
   apply(pendingCtx, Config({ volatile: { wrapperProvider: 'only-route' } }));
-  check('首次仅保存包裹设置不创建空角色文件', !existsSync(path));
-  check('缺文件路由同步在自检明确显示等待角色写入',
-    (await pendingCtx.tools.get('switchboard_selftest').execute({})).roleConfigStatus.includes('等待角色写入后同步'));
+  const bridge = readConfigFile(path);
+  check('R1：首次仅保存包裹设置创建合法空角色桥接文件', bridge.ok && !bridge.missing &&
+    bridge.value.formatVersion === 1 && JSON.stringify(bridge.value.roles) === '[]' &&
+    JSON.stringify(bridge.value.volatile) === JSON.stringify({ wrapperProvider: 'only-route', wrapperModel: '', wrapperEffort: '' }));
+  const bridgeHealth = await pendingCtx.tools.get('switchboard_selftest').execute({});
+  check('R1：创建成功清除 pending 且诊断说明桥接已建立', bridgeHealth.ok &&
+    bridgeHealth.roleConfigStatus.includes('已创建空角色文件以桥接根包裹路由') &&
+    !bridgeHealth.roleConfigStatus.includes('根设置尚未桥接'));
+  outcome = await mount({ roles: [role], volatile: { wrapperProvider: 'preset-route', wrapperModel: 'preset-model', wrapperEffort: 'low' } });
+  check('R1：空角色桥接文件路由覆盖 preset 自身整套 wrapper', outcome.configs.length === 1 && outcome.result.ok &&
+    JSON.stringify(outcome.configs[0].agentOptions) === JSON.stringify({ provider: 'only-route' }));
   pendingUpdate(Config({ volatile: {} }), false, () => {});
-  check('缺文件就地清空包裹设置后清除等待同步状态且仍不建文件', !existsSync(path) &&
-    !(await pendingCtx.tools.get('switchboard_selftest').execute({})).roleConfigStatus.includes('等待角色写入后同步'));
+  file = JSON.parse(readFileSync(path, 'utf8'));
+  check('R1：桥接后就地清空保留空 roles 并写三空值', JSON.stringify(file.roles) === '[]' &&
+    ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile[key] === ''));
+
+  writeConfigFile(path, initialConfig([], { formatVersion: 9, custom: { keep: true }, volatile: { other: 'keep' } }));
+  apply(makeCtx(), Config({ volatile: rootRoute }));
+  file = JSON.parse(readFileSync(path, 'utf8'));
+  check('R1：已有空 roles 更新 wrapper 且保留其它字段与版本', JSON.stringify(file.roles) === '[]' &&
+    file.formatVersion === 9 && file.custom.keep === true && file.volatile.other === 'keep' &&
+    file.volatile.wrapperProvider === 'root-route' && file.volatile.wrapperModel === 'root-model' && file.volatile.wrapperEffort === 'high');
+
+  rmSync(path);
+  const freshCtx = makeCtx();
+  apply(freshCtx, Config({ volatile: {} }));
+  const freshHealth = await freshCtx.tools.get('switchboard_selftest').execute({});
+  check('R1：首次无 wrapper 不建桥接文件且健康', !existsSync(path) && freshHealth.ok && freshHealth.configErrors === '' &&
+    !freshHealth.roleConfigStatus.includes('根设置尚未桥接'));
+  outcome = await mount({ roles: [role], volatile: { wrapperModel: 'fresh-preset' } });
+  check('R1：首次无根 wrapper 时 preset 仍取自身路由', !existsSync(path) && outcome.result.ok &&
+    JSON.stringify(outcome.configs[0]?.agentOptions) === JSON.stringify({ model: 'fresh-preset' }));
+
+  const failedCtx = makeCtx();
+  const originalWrite = fs.writeFileSync;
+  try {
+    fs.writeFileSync = (target, ...args) => {
+      if (String(target).startsWith(`${path}.`)) throw Object.assign(new Error('fixture-bridge-EACCES'), { code: 'EACCES' });
+      return originalWrite(target, ...args);
+    };
+    syncBuiltinESMExports();
+    apply(failedCtx, Config({ volatile: rootRoute }));
+  } finally {
+    fs.writeFileSync = originalWrite;
+    syncBuiltinESMExports();
+  }
+  const failedHealth = await failedCtx.tools.get('switchboard_selftest').execute({});
+  check('R1：创建失败不健康并报告同步错误与 pending', !existsSync(path) && !failedHealth.ok &&
+    failedHealth.configErrors.includes('包裹路由同步失败：fixture-bridge-EACCES') && failedHealth.roleConfigStatus.includes('根设置尚未桥接'));
+  const pendingOnly = await selftestTool(makeCtx(), { mountHere: false, configuredRoles: [], configuredRoleCount: 0,
+    mounts: [], configErrors: [], providers: [], executables: [], blocked: [], wrapperSyncPending: true }).execute({});
+  check('R1：pending 独立进入健康门禁，不依赖 configErrors', !pendingOnly.ok && pendingOnly.configErrors === '');
+  const missingInvalid = makeCtx();
+  apply(missingInvalid, Config({ volatile: { wrapperEffort: 'invalid' } }));
+  const invalidHealth = await missingInvalid.tools.get('switchboard_selftest').execute({});
+  check('R1：缺文件根非法 wrapper 不建文件且配置错误不健康', !existsSync(path) && !invalidHealth.ok &&
+    /wrapperEffort.*非法/.test(invalidHealth.configErrors));
   apply(makeCtx(), Config({ provider: 'self', roles: [role], volatile: { wrapperProvider: 'only-route' } }));
   file = JSON.parse(readFileSync(path, 'utf8'));
   check('后续写入角色一并同步此前保留的根包裹设置', file.roles[0].id === role.id &&

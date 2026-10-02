@@ -201,17 +201,20 @@ function syncWrapperRouteToFile(resolved, roleConfigPath, diagnostics) {
     fail(current.detail);
     return;
   }
-  // 仅路由不能冒充已播种角色；根配置仍保留设置，下次有角色写入时一并同步。
-  if (current.missing) {
-    diagnostics.wrapperSyncPending = true;
-    return;
-  }
-  diagnostics.wrapperSyncPending = false;
+  // 仅包裹设置也必须建立桥接文件；空 roles 仍可由迁移脚本后续播种。
+  // 创建失败时 preset 无法得知根设置，可能回落自身路由；pending 必须判为不健康。
+  diagnostics.wrapperSyncPending = current.missing === true;
   const volatile = { ...existing.volatile };
   for (const key of fields) volatile[key] = typeof root[key] === 'string' ? root[key].trim() : '';
   if (JSON.stringify(volatile) === JSON.stringify(existing.volatile)) return;
-  const written = writeConfigFile(roleConfigPath, { ...existing, volatile });
+  const written = writeConfigFile(roleConfigPath, current.missing
+    ? initialConfig([], { volatile })
+    : { ...existing, volatile });
   if (!written.ok) fail(written.error);
+  else {
+    diagnostics.wrapperSyncPending = false;
+    if (current.missing) diagnostics.roleConfigSync = '已创建空角色文件以桥接根包裹路由（角色待播种）';
+  }
 }
 
 /** 每激活实例保留诊断；弃用日志每次模块加载最多打印一次。 */
@@ -615,6 +618,7 @@ export function selftestTool(ctx, diagnostics) {
         ok:
           diagnostics.fatal === undefined &&
           diagnostics.configErrors.length === 0 &&
+          !diagnostics.wrapperSyncPending &&
           // 不可查询也逐角色返回失败；零角色不要求工具服务可查询。
           !mounted.some((m) => m.ok === false),
         phase: 'phase-3',
@@ -666,7 +670,7 @@ export function selftestTool(ctx, diagnostics) {
           `路径=${diagnostics.roleConfigPath ?? '未解析'}`,
           `读取=${diagnostics.roleConfigRead ?? '（本作用域未读取）'}`,
           `同步=${diagnostics.roleConfigSync ?? '（本作用域未同步）'}`,
-          ...(diagnostics.wrapperSyncPending ? ['包裹路由=等待角色写入后同步（未创建空角色文件）'] : []),
+          ...(diagnostics.wrapperSyncPending ? ['包裹路由=根设置尚未桥接（文件创建未成功，不能宣称已生效）'] : []),
           ...(diagnostics.deprecatedConfig ? [`弃用=${diagnostics.deprecatedConfig}`] : []),
         ].join(' | '),
         configErrors: diagnostics.configErrors.join('\n'),
