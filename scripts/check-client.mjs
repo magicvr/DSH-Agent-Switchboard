@@ -44,7 +44,7 @@ function section(title) {
 const CLIENT_SRC = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
 // 执行真实客户端源码，仅在测试副本中暴露内部函数；生产模块不增加测试导出。
 const clientWindow = { __ModuleLoader__: { load: (spec) => { clientWindow.spec = spec; } } };
-new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleRow, WrapperSettings, makeRoleStore, SwitchboardSettings, selectCliComposer, makeCliStore, CliReadOnlyComposer, CliOutputPanel, CliJobOutput, isAtScrollBottom, // **读**走'))(clientWindow);
+new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleCard, RoleRow, WrapperSettings, makeRoleStore, SwitchboardSettings, selectCliComposer, makeCliStore, CliReadOnlyComposer, CliOutputPanel, CliJobOutput, isAtScrollBottom, // **读**走'))(clientWindow);
 const clientData = new Function(`${CLIENT_SRC.slice(0, CLIENT_SRC.indexOf('\nwindow.__ModuleLoader__.load'))}\nreturn { CLI_DRIVER_OPTIONS, DEFAULT_CLI_DRIVER, cliFieldsFor, inferCliDriver };`)();
 const rowReact = { createElement: (type, props, ...children) => ({ type, props, children }) };
 const { RoleRow, WrapperSettings, makeRoleStore } = clientWindow.spec.factory(() => rowReact);
@@ -627,7 +627,7 @@ section('统一包裹小节：真实控件、读取与原子写入');
   check('保存按角色及各包裹字段 dirty 提交，未改 roles 传 undefined',
     CLIENT_SRC.includes('JSON.stringify(roles) !== JSON.stringify(saved.roles)') &&
     CLIENT_SRC.includes(".filter((key) => (wrapper[key] ?? '') !== (saved.wrapper?.[key] ?? ''))") &&
-    CLIENT_SRC.includes('store.write(rolesDirty ? roles : undefined, revision, wrapperChanges)'));
+    CLIENT_SRC.includes('store.write(forceRoles || rolesDirty ? nextRoles : undefined, revision, wrapperChanges)'));
 }
 
 section('统一包裹草稿：组件编辑、保存、清空与非法值的真实回调');
@@ -717,10 +717,9 @@ section('统一包裹草稿：组件编辑、保存、清空与非法值的真�
   render().find(n => n.type === 'button' && n.children.includes('放弃改动')).props.onClick();
   await new Promise(setImmediate);
   nodes = render();
-  nodes.find(n => n.type?.name === 'RoleRow').props.onRemove(0);
-  nodes = render();
-  check('删除全部角色仍为 dirty，允许保存', !saveButton(nodes).props.disabled);
-  await saveButton(nodes).props.onClick(); await new Promise(setImmediate);
+  await nodes.find(n => n.type?.name === 'RoleCard').props.onRemove();
+  await new Promise(setImmediate);
+  check('确认删除全部角色直接提交而非等待全局保存', calls.length === 3);
   check('删除全部角色明确提交 []，不提交未改包裹字段，并真正清空文件',
     JSON.stringify(calls[2]?.ops) === JSON.stringify([{ op: 'set', path: ['roles'], value: [] }]) &&
     readConfigFile(path).value?.roles.length === 0);
@@ -728,6 +727,107 @@ section('统一包裹草稿：组件编辑、保存、清空与非法值的真�
     rmSync(home, { recursive: true, force: true });
   }
 }
+
+section('角色卡片：真实编辑、草稿、校验、并发与增删回调');
+{
+  const contexts = new Map(); let active, used;
+  const react = { ...rowReact,
+    useState(initial) { const at = active.index++; if (!(at in active.states)) active.states[at] = typeof initial === 'function' ? initial() : initial;
+      const current = active; return [current.states[at], value => { current.states[at] = typeof value === 'function' ? value(current.states[at]) : value; }]; },
+    useRef(initial) { const at = active.refIndex++; return active.refs[at] ?? (active.refs[at] = { current: initial }); },
+    useCallback: fn => fn, useEffect: effect => { active.effects.push(effect); },
+  };
+  const api = clientWindow.spec.factory(() => react);
+  const good = { id: 'scout', title: '侦察员', backend: 'spawn', description: '描述', instructions: '指令', model: 'm', readOnly: true };
+  const cli = { ...good, id: 'worker', title: '执行员', backend: 'cli', cliDriver: 'codex', ...clientData.cliFieldsFor('codex', true) };
+  const mirror = { roles: [good, cli], volatile: {} }; let revision = 71, reject = false;
+  const calls = [];
+  const store = makeRoleStore({ configForms: { describe: () => ({ ensure: async () => {}, getSnapshot: () => ({ view: { namespaces: [
+    { ns: 'agent-switchboard', value: mirror, revision, writable: true },
+  ] } }) }) }, remote: { settings: { mutate: async (ns, ops, rev) => {
+    calls.push({ ns, ops: structuredClone(ops), rev });
+    if (reject) return { ok: false, error: { message: 'revision conflict' } };
+    for (const op of ops) if (op.path[0] === 'roles') mirror.roles = structuredClone(op.value); else mirror.volatile[op.path[1]] = op.value;
+    revision++; return { ok: true };
+  } } } });
+  function component(fn, props, key) {
+    used.add(key); const prior = active;
+    active = contexts.get(key) ?? { states: [], refs: [], effects: [] }; contexts.set(key, active);
+    active.index = 0; active.refIndex = 0; active.effects = [];
+    const tree = fn(props); active = prior; return tree;
+  }
+  function render() {
+    used = new Set(); const nodes = [];
+    const walk = node => {
+      if (Array.isArray(node)) return node.forEach(walk);
+      if (!node || typeof node !== 'object') return;
+      if (typeof node.type === 'function') return walk(component(node.type, node.props, node.type.name + ':' + (node.props.key ?? 'singleton')));
+      nodes.push(node); node.children?.forEach(walk);
+    };
+    walk(component(api.SwitchboardSettings, { store }, 'root'));
+    for (const key of contexts.keys()) if (!used.has(key)) contexts.delete(key);
+    return nodes;
+  }
+  const allOf = tree => { const nodes = []; const walk = n => { if (Array.isArray(n)) return n.forEach(walk); if (!n || typeof n !== 'object') return; nodes.push(n); n.children?.forEach(walk); }; walk(tree); return nodes; };
+  const cards = nodes => nodes.filter(n => n.props?.className === 'rowCard');
+  const buttonOf = (nodes, label) => nodes.find(n => n.type === 'button' && n.children.includes(label));
+  const inCard = (nodes, id) => allOf(cards(nodes).find(n => n.props['data-role-id'] === id));
+  const fieldOf = (nodes, label) => nodes.find(n => n.type === 'label' && n.children[0]?.children.includes(label))?.children[1];
+  const settle = () => new Promise(setImmediate);
+  render(); contexts.get('root').effects[0](); await settle();
+  let nodes = render();
+  check('卡片：每角色一张 li 卡片且带 rowHead', cards(nodes).length === 2 && cards(nodes).every(c => c.type === 'li' && allOf(c).some(n => n.props?.className === 'rowHead')));
+  const headerText = nodes.filter(n => n.props?.className === 'rowHead').map(n => allOf(n).flatMap(x => x.children ?? []).filter(x => typeof x === 'string').join('|')).join('|');
+  check('卡片头：标题、id、内置机制、外部 preset 与只读徽标', ['侦察员', 'scout', '内置 · spawn', '外部 · codex', '只读'].every(t => headerText.includes(t)));
+  check('卡片状态：合法配置为 8px 成功态且有 aria-label', nodes.filter(n => n.props?.['data-state']).length === 2 && nodes.filter(n => n.props?.['data-state']).every(n => n.props['data-state'] === 'success' && n.props['aria-label'] === '配置完整有效' && n.props.style.width === '8px' && n.props.style.background === 'var(--dsw-alias-state-success-primary)'));
+  check('卡片：初始折叠，无字段编辑器', !nodes.some(n => n.props?.className === 'rowEditor'));
+  buttonOf(inCard(nodes, 'scout'), '编辑').props.onClick(); nodes = render();
+  check('卡片聚焦：仅第一卡展开且 aria-expanded 同步', nodes.filter(n => n.props?.className === 'rowEditor').length === 1 && buttonOf(inCard(nodes, 'scout'), '收起').props['aria-expanded'] === true && buttonOf(inCard(nodes, 'worker'), '编辑').props['aria-expanded'] === false);
+  fieldOf(nodes, '角色标题').props.onChange({ target: { value: '未保存草稿' } }); nodes = render();
+  buttonOf(inCard(nodes, 'scout'), '取消').props.onClick(); nodes = render();
+  buttonOf(inCard(nodes, 'scout'), '编辑').props.onClick(); nodes = render();
+  check('卡片取消：重新展开丢弃本地草稿，未写入', fieldOf(nodes, '角色标题').props.value === '侦察员' && calls.length === 0);
+  fieldOf(nodes, '角色指令（必填，发送给子代理）').props.onChange({ target: { value: '' } }); nodes = render();
+  await buttonOf(inCard(nodes, 'scout'), '保存').props.onClick(); nodes = render();
+  check('卡片校验：空指令禁止写入且卡片内红色 alert', calls.length === 0 && inCard(nodes, 'scout').some(n => n.props?.role === 'alert' && n.props.style.color === 'var(--dsw-alias-state-error-primary)'));
+  fieldOf(nodes, '角色指令（必填，发送给子代理）').props.onChange({ target: { value: '新指令' } }); nodes = render();
+  await buttonOf(inCard(nodes, 'scout'), '保存').props.onClick(); await settle(); nodes = render();
+  check('卡片保存：恰好一次 mutate，roles 路径与读取 revision', calls.length === 1 && calls[0].ns === 'agent-switchboard' && calls[0].rev === 71 && calls[0].ops.length === 1 && JSON.stringify(calls[0].ops[0].path) === '["roles"]' && mirror.roles[0].instructions === '新指令' && mirror.roles[0].title === '侦察员');
+  buttonOf(inCard(nodes, 'scout'), '编辑').props.onClick(); nodes = render();
+  fieldOf(nodes, '角色标题').props.onChange({ target: { value: '切换焦点丢弃' } }); nodes = render();
+  buttonOf(inCard(nodes, 'worker'), '编辑').props.onClick(); nodes = render();
+  check('卡片聚焦：切换第二卡只展开一张，CLI 隐藏 Provider，包裹小节仍显示', nodes.filter(n => n.props?.className === 'rowEditor').length === 1 && !fieldOf(nodes, 'Provider') && Boolean(fieldOf(nodes, 'Provider（LLM route）')) && Boolean(fieldOf(nodes, '模型（非外部 CLI 模型）')));
+  buttonOf(inCard(nodes, 'scout'), '编辑').props.onClick(); nodes = render();
+  check('卡片聚焦：回到内置显示 Provider，切换时丢弃旧草稿', Boolean(fieldOf(nodes, 'Provider')) && fieldOf(nodes, '角色标题').props.value === '侦察员');
+  reject = true;
+  await buttonOf(inCard(nodes, 'scout'), '保存').props.onClick(); nodes = render();
+  check('卡片失败：revision 冲突留在卡片并显示失败，不收起', inCard(nodes, 'scout').some(n => n.props?.role === 'alert' && n.children.some(t => typeof t === 'string' && t.includes('revision conflict'))) && Boolean(fieldOf(nodes, '角色 id')));
+  reject = false; buttonOf(inCard(nodes, 'scout'), '取消').props.onClick(); nodes = render();
+  buttonOf(nodes, '+ 新增角色').props.onClick(); nodes = render();
+  check('卡片新增：原位新卡片，未保存不提交', cards(nodes).length === 3 && calls.length === 2);
+  for (const [label, value] of [['角色 id', 'new-role'], ['描述（主代理据此判断何时派给谁）', '新描述'], ['角色指令（必填，发送给子代理）', '新指令'], ['模型', 'new-model']]) {
+    fieldOf(nodes, label).props.onChange({ target: { value } }); nodes = render();
+  }
+  await buttonOf(inCard(nodes, ''), '保存').props.onClick(); await settle(); nodes = render();
+  check('卡片新增：显式保存后 roles 长度加一', mirror.roles.length === 3 && calls.length === 3 && calls[2].rev === 72);
+  buttonOf(inCard(nodes, 'new-role'), '删除').props.onClick(); nodes = render();
+  check('卡片删除：第一步仅出现确认，不提交', calls.length === 3 && Boolean(buttonOf(inCard(nodes, 'new-role'), '确认删除')));
+  buttonOf(inCard(nodes, 'new-role'), '取消').props.onClick(); nodes = render();
+  check('卡片删除：取消确认不写入且保留角色', calls.length === 3 && !buttonOf(inCard(nodes, 'new-role'), '确认删除') && cards(nodes).length === 3);
+  buttonOf(inCard(nodes, 'new-role'), '删除').props.onClick(); nodes = render();
+  await buttonOf(inCard(nodes, 'new-role'), '确认删除').props.onClick(); await settle(); nodes = render();
+  check('卡片删除：第二步恰好一次提交并使用新 revision', calls.length === 4 && mirror.roles.length === 2 && calls[3].rev === 73);
+  mirror.roles = [{ ...good, instructions: '' }, { ...cli, cliArgs: ['unknown'] }];
+  buttonOf(nodes, '放弃改动').props.onClick(); await settle(); nodes = render();
+  check('卡片状态：缺必填与未知 CLI 预设均为错误态及可读原因', nodes.filter(n => n.props?.['data-state']).every(n => n.props['data-state'] === 'error' && n.props['aria-label'].startsWith('配置错误：') && n.props.style.background === 'var(--dsw-alias-state-error-primary)') && nodes.some(n => n.props?.['aria-label']?.includes('需重选预设')));
+  mirror.roles[0] = good;
+  buttonOf(nodes, '放弃改动').props.onClick(); await settle(); nodes = render();
+  buttonOf(inCard(nodes, 'worker'), '编辑').props.onClick(); nodes = render();
+  await buttonOf(inCard(nodes, 'worker'), '保存').props.onClick(); nodes = render();
+  check('卡片校验：未识别预设独立阻止提交并显示需重选预设', calls.length === 4 && inCard(nodes, 'worker').some(n => n.props?.role === 'alert' && n.children.some(t => typeof t === 'string' && t.includes('需重选预设'))));
+  check('卡片无障碍：所有按钮 type=button', nodes.filter(n => n.type === 'button').every(n => n.props.type === 'button'));
+}
+check('面板无定时器：客户端无 setInterval/setTimeout', !/\b(?:setInterval|setTimeout)\s*\(/.test(CLIENT_SRC));
 
 // 可控远程流：不启动 CLI，不访问安装目录；保留迟到帧以验证清理后的隔离。
 const cliReact = { ...rowReact, useState: init => [typeof init === 'function' ? init() : init, () => {}], useRef: init => ({ current: init }), useEffect: () => {} };

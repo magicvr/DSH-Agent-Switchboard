@@ -550,11 +550,12 @@ window.__ModuleLoader__.load({
           type: 'button',
           onClick,
           disabled: opts.disabled === true,
+          ...(opts.expanded === undefined ? {} : { 'aria-expanded': opts.expanded }),
           style: {
             padding: '4px 12px',
             fontSize: '12px',
             cursor: opts.disabled ? 'default' : 'pointer',
-            color: 'var(--dsw-alias-label-primary)',
+            color: opts.danger ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-label-primary)',
             background: opts.primary ? 'var(--dsw-alias-bg-layer-2)' : 'transparent',
             border: '1px solid var(--dsw-alias-border-l2)',
             borderRadius: '4px',
@@ -574,13 +575,13 @@ window.__ModuleLoader__.load({
       );
 
     /**
-     * 一个角色编辑行。
+     * 卡片内的角色字段表单，保留原有 CLI 与包裹路由语义。
      *
      * @param {object} props - 组件属性。
      * @returns {object} React 元素。
      */
     function RoleRow(props) {
-      const { role, index, onChange, onRemove, disabled } = props;
+      const { role, index, onChange, disabled } = props;
       const isCli = role.backend === 'cli';
       const isBuiltin = ['spawn', 'fork'].includes(role.backend ?? 'spawn');
       // 当前驱动由**字段反推**，而不是读 `cliDriver` —— 这样即使用户手工改了参数，
@@ -695,25 +696,9 @@ window.__ModuleLoader__.load({
         },
         h(
           'div',
-          { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' } },
-          h('strong', { style: { fontSize: '12px' } }, role.id || '(未命名)'),
-          h(
-            'span',
-            {
-              style: {
-                fontSize: '11px',
-                color: 'var(--dsw-alias-label-secondary)',
-                flex: '1 1 auto',
-              },
-            },
-            `${BACKEND_LABEL[role.backend] ?? role.backend ?? 'spawn'} · ${role.model || '（未设模型）'}`,
-          ),
-          button('删除', () => onRemove(index), { disabled }),
-        ),
-        h(
-          'div',
           { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' } },
           h('div', { style: { flex: '0 0 130px' } }, field('角色 id', text('id', 'scout'))),
+          h('div', { style: { flex: '1 1 150px' } }, field('角色标题', text('title', '留空使用角色 id'))),
           h(
             'div',
             { style: { flex: '0 0 200px' } },
@@ -825,6 +810,44 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /** 每张卡片保留自己的草稿；切换焦点时通过 key 重新挂载，丢弃未保存内容。 */
+    function RoleCard({ role, index, editing, onEdit, onCancel, onSave, onRemove, problem, disabled, roles }) {
+      const [draftRole, setDraftRole] = useState(() => ({ ...role }));
+      const [confirmDelete, setConfirmDelete] = useState(false);
+      const invalid = validateRoles([role]) ||
+        (roles.filter(r => r.id === role.id).length > 1 ? '角色 id 重复' : null) ||
+        (role.backend === 'cli' && !inferCliDriver(role) ? '需重选预设' : null);
+      const mechanism = role.backend === 'cli'
+        ? '外部 · ' + (inferCliDriver(role) ?? '需重选预设')
+        : '内置 · ' + (role.backend ?? 'spawn');
+      const badge = text => h('span', { className: 'rowTag', style: {
+        fontSize: '10px', padding: '2px 5px', borderRadius: '4px',
+        background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-secondary)',
+      } }, text);
+      return h('li', { className: 'rowCard', 'data-role-id': role.id, style: {
+        listStyle: 'none', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '8px', padding: '10px',
+      } },
+        h('div', { className: 'rowHead', style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+          h('div', { className: 'rowIdentity', style: { display: 'flex', gap: '8px', alignItems: 'center', flex: '1 1 auto', flexWrap: 'wrap' } },
+            h('span', { role: 'img', 'aria-label': invalid ? '配置错误：' + invalid : '配置完整有效',
+              'data-state': invalid ? 'error' : 'success', style: { width: '8px', height: '8px', flex: '0 0 8px', borderRadius: '50%',
+                background: invalid ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-state-success-primary)' } }),
+            h('strong', { className: 'rowName' }, role.title ?? (role.id || '(未命名)')),
+            h('code', { style: { fontSize: '11px' } }, role.id || '(待填写 id)'),
+            badge(mechanism), role.model ? badge(role.model) : null,
+            role.readOnly ? badge('只读') : null, role.allowNestedDispatch ? badge('允许再派发') : null),
+          h('div', { className: 'rowActions', style: { display: 'flex', gap: '6px' } },
+            button(editing ? '收起' : '编辑', editing ? onCancel : onEdit, { disabled, expanded: editing }),
+            index !== 'new' ? button('删除', () => setConfirmDelete(true), { disabled, danger: true }) : null)),
+        confirmDelete ? h('div', { role: 'alert', style: { marginTop: '8px' } },
+          '确认删除这个角色？', button('确认删除', onRemove, { disabled, danger: true }),
+          button('取消', () => setConfirmDelete(false), { disabled })) : null,
+        editing ? h('div', { className: 'rowEditor', style: { marginTop: '10px' } },
+          h(RoleRow, { role: draftRole, index, onChange: (_, next) => setDraftRole(next), disabled }),
+          problem ? h('div', { role: 'alert', style: { color: 'var(--dsw-alias-state-error-primary)' } }, problem) : null,
+          button('保存', () => onSave(draftRole), { disabled, primary: true }), button('取消', onCancel, { disabled })) : null);
+    }
+
     /** 插件级统一路由始终可见，仅影响外部 CLI 的转交代理。 */
     function WrapperSettings({ wrapper, onChange, disabled }) {
       const control = (key, placeholder) => h('input', {
@@ -866,6 +889,8 @@ window.__ModuleLoader__.load({
       //    会拿不到远程命名空间（实测：读得到 configForms、写不到 remote.settings）。
       const store = props.store;
       const [draft, setDraft] = useState(null);
+      const [editingId, setEditingId] = useState(null);
+      const [cardProblem, setCardProblem] = useState(null);
       const [wrapper, setWrapper] = useState({});
       const [status, setStatus] = useState('loading');
       const [notice, setNotice] = useState(null);
@@ -881,6 +906,8 @@ window.__ModuleLoader__.load({
           return;
         }
         setStatus('loading');
+        setEditingId(null);
+        setCardProblem(null);
         void store.read().then((result) => {
           if (!result.ok) {
             // 读取失败必须如实显示：静默当作空会把用户配置「藏起来」。
@@ -915,32 +942,11 @@ window.__ModuleLoader__.load({
         .map((key) => [key, wrapper[key] ?? '']));
       const dirty = rolesDirty || Object.keys(wrapperChanges).length > 0;
 
-      /** 改某一行。 */
-      const changeRole = (index, next) =>
-        setDraft((prev) => {
-          const copy = cloneRoles(prev ?? []);
-          copy[index] = next;
-          return copy;
-        });
-
-      /** 删某一行。 */
-      const removeRole = (index) => setDraft((prev) => (prev ?? []).filter((_, i) => i !== index));
-
-      /** 追加一行空白角色（只改本地草稿，保存时统一写）。 */
-      const addRole = () =>
-        setDraft((prev) => [
-          ...(prev ?? []),
-          {
-            id: '',
-            description: '',
-            instructions: '',
-            backend: 'spawn',
-            model: '',
-            effort: 'medium',
-            readOnly: false,
-            allowNestedDispatch: false,
-          },
-        ]);
+      const beginEdit = id => { setEditingId(id); setCardProblem(null); };
+      const cancelEdit = () => { setEditingId(null); setCardProblem(null); };
+      const newRole = { id: '', description: '', instructions: '', backend: 'spawn', model: '',
+        effort: 'medium', readOnly: false, allowNestedDispatch: false };
+      const addRole = () => beginEdit('new');
 
       /**
        * 校验草稿是否可提交。
@@ -950,31 +956,35 @@ window.__ModuleLoader__.load({
        *
        * @returns {string|null} 错误信息，或 null 表示通过。
        */
-      const validate = () => validateRoles(roles) ||
+      const validate = (nextRoles) => validateRoles(nextRoles) ||
+        (nextRoles.some(r => r.backend === 'cli' && !inferCliDriver(r)) ? '需重选预设：当前配置无法识别为 codex / grok' : null) ||
         (wrapper.wrapperEffort?.trim() && !EFFORTS.includes(wrapper.wrapperEffort.trim())
           ? '包裹子代理思考强度非法' : null);
 
       /** 保存角色列表。 */
-      const save = async () => {
+      const save = async (nextRoles = roles, forceRoles = false) => {
         if (store === undefined || typeof store.write !== 'function' || busy) return;
-        const problem = validate();
+        const problem = validate(nextRoles);
         if (problem) {
           setNotice({ kind: 'error', text: problem });
+          setCardProblem(problem);
           return;
         }
         setBusy(true);
         // 只提交已改草稿，避免包裹编辑把根未提供的 roles 误写成 []；删空仍为 dirty。
-        const result = await store.write(rolesDirty ? roles : undefined, revision, wrapperChanges);
+        const result = await store.write(forceRoles || rolesDirty ? nextRoles : undefined, revision, wrapperChanges);
         setBusy(false);
         if (result.ok) {
-          savedRef.current = JSON.stringify({ roles, wrapper });
+          setDraft(cloneRoles(nextRoles));
+          savedRef.current = JSON.stringify({ roles: nextRoles, wrapper });
           setNotice({
             kind: 'ok',
-            text: `已保存 ${roles.length} 个角色。Switchboard 正在应用配置，无需重启；后续派发使用新配置，应用失败请查看自检。`,
+            text: `已保存 ${nextRoles.length} 个角色。Switchboard 正在应用配置，无需重启；后续派发使用新配置，应用失败请查看自检。`,
           });
           refresh();
         } else {
           setNotice({ kind: 'error', text: `保存失败：${result.message}` });
+          setCardProblem(`保存失败：${result.message}`);
         }
       };
 
@@ -994,8 +1004,7 @@ window.__ModuleLoader__.load({
           },
           '每个角色可独立选择走 DSH 内置子代理，还是走本机外部 CLI。',
         ),
-        button('新增角色', addRole, { disabled: busy || draft === null }),
-        button(dirty ? '保存 *' : '保存', save, { disabled: busy || !dirty, primary: dirty }),
+        button(dirty ? '保存 *' : '保存', () => save(), { disabled: busy || !dirty, primary: dirty }),
         button('放弃改动', refresh, { disabled: busy || !dirty }),
       );
 
@@ -1072,33 +1081,21 @@ window.__ModuleLoader__.load({
           ),
         );
       }
-      if (roles.length === 0) {
-        return wrap(
-          h(
-            'div',
-            { style: { color: 'var(--dsw-alias-label-secondary)' } },
-            status === 'missing'
-              ? '尚未配置任何角色。点「新增角色」开始；每个角色会变成主代理可用的一个委派工具。'
-              : '角色列表为空。点「新增角色」开始。',
-          ),
-        );
-      }
-      return wrap(
-        h(
-          'div',
-          null,
-          roles.map((role, index) =>
-            h(RoleRow, {
-              key: `${role.id || 'new'}-${index}`,
-              role,
-              index,
-              onChange: changeRole,
-              onRemove: removeRole,
-              disabled: busy,
-            }),
-          ),
-        ),
-      );
+      const cardProps = (role, index) => ({
+        key: String(index) + ':' + (editingId === index), role, index, roles,
+        editing: editingId === index, disabled: busy,
+        problem: editingId === index ? cardProblem : null,
+        onEdit: () => beginEdit(index), onCancel: cancelEdit,
+        onSave: next => save(index === 'new' ? [...roles, next] : roles.map((r, i) => i === index ? next : r), true),
+        onRemove: () => save(roles.filter((_, i) => i !== index), true),
+      });
+      return wrap(h('div', null,
+        h('ul', { className: 'rows', style: { margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: '10px' } },
+          roles.map((role, index) => h(RoleCard, cardProps(role, index)))),
+        h('div', { className: 'addBlock', style: { marginTop: '10px' } },
+          editingId === 'new'
+            ? h('ul', { style: { padding: 0 } }, h(RoleCard, cardProps(newRole, 'new')))
+            : button('+ 新增角色', addRole, { disabled: busy || draft === null }))));
     }
 
     // 与官方选择器一致，仅明确的一次性子会话；未知/continuable 不接管。
