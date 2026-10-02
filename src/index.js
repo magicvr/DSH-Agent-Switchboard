@@ -119,7 +119,7 @@ export function readVolatile(resolved) {
  */
 export function readVolatileField(resolved, key) {
   const raw = resolved?.[key];
-  if (raw === null || raw === undefined) return undefined;
+  if (raw === null || raw === undefined) return raw;
   if (typeof raw.get === 'function') {
     try {
       return raw.get();
@@ -892,8 +892,10 @@ function applyInner(ctx, config) {
         diagnostics.configErrors.push(...wrapper.errors);
         for (const error of wrapper.errors) console.error(`[${name}] ${error}`);
       } else {
-        syncRolesToFile({ resolved: updated, roleConfigPath, diagnostics });
-        syncWrapperRouteToFile(updated, roleConfigPath, diagnostics);
+        // 非数组 roles 是非法输入，整次同步不得写盘（包括包裹字段）。
+        if (syncRolesToFile({ resolved: updated, roleConfigPath, diagnostics }) !== false) {
+          syncWrapperRouteToFile(updated, roleConfigPath, diagnostics);
+        }
       }
     };
     // internal/update 的特殊注册不自动进入 effect；显式归属本次激活的释放范围。
@@ -928,9 +930,15 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics }) {
   // `undefined` 表示配置对象没有提供 roles，必须保留文件；数组（包括 []）表示
   // 显式提交，空数组也必须写回，不能把「未提供」误当成「清空」。
   const providedRoles = cordisRoles !== undefined;
-  const rawRoles = providedRoles
-    ? (Array.isArray(cordisRoles) ? cordisRoles : [])
-    : current.ok ? current.value.roles : [];
+  if (providedRoles && !Array.isArray(cordisRoles)) {
+    diagnostics.configuredRoleCount = 0;
+    diagnostics.configuredRoles = [];
+    diagnostics.configErrors = ['roles 必须是数组（undefined 表示未提供）'];
+    diagnostics.roleConfigSync = 'roles 非法，未同步';
+    console.error(`[${name}] ${diagnostics.configErrors[0]}`);
+    return false;
+  }
+  const rawRoles = providedRoles ? cordisRoles : current.ok ? current.value.roles : [];
   diagnostics.configuredRoleCount = rawRoles.length;
   const { roles, errors } = normalizeRoles(rawRoles,
     (current.ok && current.value.provider) || resolved.provider,
@@ -1015,12 +1023,18 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics }) {
   const fromCordis = readVolatileField(resolved, 'roles');
   const cordisRoles = fromCordis;
   diagnostics.roleConfigRead =
-    `${fromFile.detail}；本作用域 Cordis 配置里 roles=${Array.isArray(cordisRoles) ? cordisRoles.length : '未提供'} 个`;
+    `${fromFile.detail}；本作用域 Cordis 配置里 roles=${Array.isArray(cordisRoles) ? cordisRoles.length : cordisRoles === undefined ? '未提供' : '非法'} 个`;
 
+  // 非数组不得静默当空或回落文件；与根同步边界采用同一三分支判据。
+  if (cordisRoles !== undefined && !Array.isArray(cordisRoles)) {
+    diagnostics.configErrors = ['roles 必须是数组（undefined 表示未提供）'];
+    console.error(`[${name}] ${diagnostics.configErrors[0]}`);
+    return;
+  }
   // `undefined` 表示本作用域未提供 roles，才允许回落文件；显式 [] 表示清空，不能复活旧角色。
-  let rawRoles = cordisRoles === undefined
+  const rawRoles = cordisRoles === undefined
     ? fromFile.ok ? fromFile.value.roles : []
-    : Array.isArray(cordisRoles) ? cordisRoles : [];
+    : cordisRoles;
   diagnostics.configuredRoleCount = rawRoles.length;
   const defaults = {
     provider: (fromFile.ok && fromFile.value.provider) || resolved.provider,

@@ -1078,6 +1078,49 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   check('包裹同步完整保留 roles/provider/cwd/maxDepth/formatVersion 与其它顶层字段',
     ['roles', 'provider', 'cwd', 'maxDepth', 'formatVersion', 'custom'].every(key =>
       JSON.stringify(file[key]) === JSON.stringify(originalFile[key])));
+  const explicitlyEmpty = await mount({ roles: [] });
+  check('R2：非空文件 + preset 显式 [] 不挂载旧角色，且保持文件角色',
+    explicitlyEmpty.configs.length === 0 && explicitlyEmpty.result.roleCount === 0 && explicitlyEmpty.result.ok &&
+    JSON.parse(readFileSync(path, 'utf8')).roles[0].id === role.id);
+  for (const [label, configFor] of [
+    ['Config 解引用', (mount) => Config({ mount, roles: null, volatile: { wrapperModel: 'must-not-write' } })],
+    ['普通对象', (mount) => ({ mount, roles: null, volatile: { wrapperModel: 'must-not-write' } })],
+  ]) {
+    for (const mountHere of [false, true]) {
+      const bytes = readFileSync(path);
+      const ctx = makeCtx();
+      apply(ctx, configFor(mountHere));
+      await new Promise(setImmediate);
+      const result = await ctx.tools.get('switchboard_selftest').execute({});
+      check(`M2：${label} roles:null ${mountHere ? 'preset' : '根'} 原文件字节不变`, readFileSync(path).equals(bytes));
+      check(`M2：${label} roles:null ${mountHere ? 'preset' : '根'} 自检不健康且明确诊断`,
+        !result.ok && result.configErrors.includes('roles 必须是数组') && result.roleCount === 0);
+    }
+  }
+  for (const bad of ['not-array', 17, {}]) {
+    for (const ref of [false, true]) {
+      const bytes = readFileSync(path);
+      const ctx = makeCtx();
+      apply(ctx, { roles: ref ? { get: () => bad } : bad, volatile: { wrapperModel: 'must-not-write' } });
+      const result = await ctx.tools.get('switchboard_selftest').execute({});
+      check(`M2：非法 ${JSON.stringify(bad)} ${ref ? '引用' : '普通值'} 拒绝写盘并进入健康门禁`,
+        !result.ok && result.configErrors.includes('roles 必须是数组') && readFileSync(path).equals(bytes));
+    }
+  }
+  const updateCtx = makeCtx();
+  let update;
+  updateCtx.on = (_event, callback) => { update = callback; return () => {}; };
+  updateCtx.effect = callback => callback();
+  const beforeInvalidUpdate = readFileSync(path);
+  apply(updateCtx, Config({ roles: null }));
+  let updateThrew = false;
+  try { update(Config({ roles: null, volatile: { wrapperModel: 'must-not-write' } }), false, () => {}); }
+  catch { updateThrew = true; }
+  check('M2：非法 roles 就地更新仍不写盘、不伪健康', !updateThrew && readFileSync(path).equals(beforeInvalidUpdate) &&
+    !(await updateCtx.tools.get('switchboard_selftest').execute({})).ok);
+  update(Config({ roles: [role], volatile: rootRoute }), false, () => {});
+  check('M2：非法 roles 可经合法数组就地修复，清除诊断并恢复健康',
+    (await updateCtx.tools.get('switchboard_selftest').execute({})).ok);
   const beforeOmittedRoles = JSON.parse(readFileSync(path, 'utf8'));
   apply(makeCtx(), Config({ provider: 'self' }));
   const afterOmittedRoles = JSON.parse(readFileSync(path, 'utf8'));
@@ -1088,6 +1131,7 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   apply(makeCtx(), Config({ provider: 'self', roles: [] }));
   file = JSON.parse(readFileSync(path, 'utf8'));
   check('显式清空 roles 真正清空文件角色', file.roles.length === 0);
+  check('角色写入完成后 volatile 兼容字段仍保留', file.volatile.cliTimeoutSec === 'legacy');
   const cleared = await mount({});
   check('显式清空后新 preset 不再挂载旧角色', cleared.configs.length === 0 && cleared.result.roleCount === 0,
     JSON.stringify(cleared.result));

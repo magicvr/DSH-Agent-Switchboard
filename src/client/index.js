@@ -341,7 +341,7 @@ window.__ModuleLoader__.load({
      * （`SettingsForms.write` 的 `isVolatilePath` 校验，已有回归测试锁定）。
      *
      * @param {object} ctx - Client 插件上下文。
-     * @param {object[]} roles - 角色数组。
+     * @param {object[]|undefined} roles - 已改角色数组（含删空的 []），未改传 undefined。
      * @param {number|undefined} revision - 读取时拿到的 revision，用于并发保护。
      * @returns {Promise<{ok: boolean, message: string}>} 结果。
      */
@@ -416,7 +416,7 @@ window.__ModuleLoader__.load({
      * 但实测出现过「读成功、写失败」，因此 `writeChannel` 会依次尝试多条访问路径。
      *
      * @param {object} ctx - Client 插件上下文。
-     * @param {object[]} roles - 角色数组。
+     * @param {object[]|undefined} roles - 已改角色数组（含删空的 []），未改传 undefined。
      * @param {number|undefined} revision - 读取时拿到的 revision，用于并发保护。
      * @returns {Promise<{ok: boolean, message: string}>} 结果。
      */
@@ -433,8 +433,9 @@ window.__ModuleLoader__.load({
       try {
         const response = await channel.mutate(
           CONFIG_NS,
-          [{ op: 'set', path: ['roles'], value: roles },
+          [...(roles === undefined ? [] : [{ op: 'set', path: ['roles'], value: roles }]),
             ...(wrapper === undefined ? [] : ['wrapperProvider', 'wrapperModel', 'wrapperEffort']
+              .filter((key) => Object.hasOwn(wrapper, key))
               .map((key) => ({ op: 'set', path: ['volatile', key], value: (wrapper[key] ?? '').trim() })))],
           revision,
         );
@@ -902,7 +903,12 @@ window.__ModuleLoader__.load({
       }, [store, refresh]);
 
       const roles = draft ?? [];
-      const dirty = draft !== null && JSON.stringify({ roles, wrapper }) !== savedRef.current;
+      const saved = savedRef.current === null ? {} : JSON.parse(savedRef.current);
+      const rolesDirty = draft !== null && JSON.stringify(roles) !== JSON.stringify(saved.roles);
+      const wrapperChanges = Object.fromEntries(['wrapperProvider', 'wrapperModel', 'wrapperEffort']
+        .filter((key) => (wrapper[key] ?? '') !== (saved.wrapper?.[key] ?? ''))
+        .map((key) => [key, wrapper[key] ?? '']));
+      const dirty = rolesDirty || Object.keys(wrapperChanges).length > 0;
 
       /** 改某一行。 */
       const changeRole = (index, next) =>
@@ -952,8 +958,8 @@ window.__ModuleLoader__.load({
           return;
         }
         setBusy(true);
-        // 角色是变长数组，整体提交语义明确 —— 不必算易错的逐字段 diff。
-        const result = await store.write(roles, revision, wrapper);
+        // 只提交已改草稿，避免包裹编辑把根未提供的 roles 误写成 []；删空仍为 dirty。
+        const result = await store.write(rolesDirty ? roles : undefined, revision, wrapperChanges);
         setBusy(false);
         if (result.ok) {
           savedRef.current = JSON.stringify({ roles, wrapper });
