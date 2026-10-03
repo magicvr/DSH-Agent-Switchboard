@@ -87,11 +87,138 @@ try {
   const home = join(temp, 'wiring'); const profile = join(home, 'profiles', 'desktop');
   mkdirSync(profile, { recursive: true });
   const self = '@magicvr/dsh-agent-switchboard';
+  const repoPreset = parse(readFileSync(new URL('../presets/switchboard.patch.yml', import.meta.url), 'utf8'));
+  const supervisorRules = repoPreset.flatMap(op => op?.insert ?? [])
+    .find(row => row?.id === 'preset-switchboard').config.plugins
+    .find(plugin => plugin?.name === self).config.supervisorRules;
   writeFileSync(join(profile, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: [self] } }, dependencies: { [self]: '*' } }));
-  writeFileSync(join(profile, 'cordis.patch.yml'), `- insert:\n  - id: preset-switchboard\n    config:\n      plugins:\n      - name: "${self}"\n        config:\n          mount: true\n`);
+  const wiringPatch = join(profile, 'cordis.patch.yml');
+  const wiringText = rules => `- insert:\n  - id: preset-switchboard\n    config:\n      plugins:\n      - name: "${self}"\n        config:\n          mount: true\n${rules === undefined ? '' : `          supervisorRules: ${JSON.stringify(rules)}\n`}`;
+  writeFileSync(wiringPatch, wiringText(supervisorRules));
   test('显式目标缺 roles 文件失败', () => { const r = runWiring(['--home', home]); return r.status === 1 && /缺少 roles 文件/.test(r.stderr); });
   mkdirSync(join(home, 'agent-switchboard')); writeFileSync(configPathFor(home), JSON.stringify({ roles: [] }));
-  test('非仓库 cwd 的完整 wiring fixture 跑满九条', () => { const r = runWiring(['--home', home]); return r.status === 0 && /结果：9 通过 \/ 0 失败/.test(r.stdout); });
+  test('非仓库 cwd 的完整 wiring fixture 跑满十一条', () => { const r = runWiring(['--home', home]); return r.status === 0 && /结果：11 通过 \/ 0 失败/.test(r.stdout); });
+  for (const rules of [undefined, '', ' \n\t', 42]) {
+    writeFileSync(wiringPatch, wiringText(rules));
+    test(`无效 supervisorRules ${JSON.stringify(rules)} 必须失败并提示修复`, () => {
+      const r = runWiring(['--home', home]);
+      return r.status === 1 && /FAIL  preset 里本包的 supervisorRules/.test(r.stdout)
+        && /npm run gen:preset && npm run inject:preset，然后重启 DSH/.test(r.stdout);
+    });
+  }
+  writeFileSync(wiringPatch, wiringText(`${supervisorRules}fixture drift`));
+  test('规则漂移必须失败并给出有限差异线索', () => {
+    const r = runWiring(['--home', home]);
+    return r.status === 1 && /FAIL  profile supervisorRules/.test(r.stdout)
+      && /profile 已过期，需重新注入/.test(r.stdout) && /首个不同位置/.test(r.stdout)
+      && /结果：10 通过 \/ 1 失败/.test(r.stdout);
+  });
+
+  const formattedFailure = (result, label) => {
+    const output = result.stdout + result.stderr;
+    return result.status === 1 && output.includes(`FAIL  ${label}`)
+      && /结果：\d+ 通过 \/ [1-9]\d* 失败/.test(output)
+      && !/(?:TypeError|SyntaxError|YAMLParseError|^\s+at )/m.test(output);
+  };
+  test('显式 patch 不存在仍 FAIL 并退出 1', () => {
+    const r = runWiring(['--home', home, '--patch', join(temp, 'missing.patch.yml')]);
+    return r.status === 1 && /FAIL  找不到/.test(r.stderr) && !/^\s+at /m.test(r.stderr);
+  });
+  test('默认 home 无 .dsh 仍零项跳过并退出 0', () => {
+    const script = join(REPO_ROOT, 'scripts', 'check-profile-wiring.mjs');
+    const shim = `
+      import os from 'node:os';
+      import { syncBuiltinESMExports } from 'node:module';
+      delete process.env.DSH_HOME;
+      os.homedir = () => ${JSON.stringify(join(temp, 'absent-default-user'))};
+      syncBuiltinESMExports();
+      process.argv = ${JSON.stringify([process.execPath, script])};
+      await import(${JSON.stringify(pathToFileURL(script).href)});
+    `;
+    const r = captureSync(process.execPath, ['--input-type=module', '--eval', shim], { cwd: temp, env });
+    return r.status === 0 && /结果：0 通过 \/ 0 失败（跳过）/.test(r.stdout)
+      && /\[os.homedir\(\)\]/.test(r.stdout) && !/FAIL/.test(r.stdout + r.stderr);
+  });
+  const validPatch = parse(wiringText(supervisorRules));
+  for (const [label, mutate, failLabel] of [
+    ['顶层为 Object', () => ({ insert: validPatch[0].insert }), '存在 preset-switchboard 声明'],
+    ['insert 为 Object', doc => { doc[0].insert = doc[0].insert[0]; return doc; }, '存在 preset-switchboard 声明'],
+    ['plugins 为 Object', doc => { doc[0].insert[0].config.plugins = doc[0].insert[0].config.plugins[0]; return doc; }, 'preset 的 plugins 里含本包'],
+    ['preset-switchboard 缺失', doc => { doc[0].insert[0].id = 'other-preset'; return doc; }, '存在 preset-switchboard 声明'],
+    ['preset config 缺失', doc => { delete doc[0].insert[0].config; return doc; }, 'preset 的 plugins 里含本包'],
+    ['preset config 非对象', doc => { doc[0].insert[0].config = []; return doc; }, 'preset 的 plugins 里含本包'],
+    ['本包 config 缺失', doc => { delete doc[0].insert[0].config.plugins[0].config; return doc; }, 'preset 里本包不再携带 roles'],
+    ['本包 config 非对象', doc => { doc[0].insert[0].config.plugins[0].config = 'invalid'; return doc; }, 'preset 里本包不再携带 roles'],
+    ['insert 含 null', doc => { doc[0].insert.unshift(null); return doc; }, '存在 preset-switchboard 声明'],
+    ['plugins 含 null', doc => { doc[0].insert[0].config.plugins.unshift(null); return doc; }, 'preset 的 plugins 里含本包'],
+  ]) {
+    writeFileSync(wiringPatch, JSON.stringify(mutate(structuredClone(validPatch))));
+    test(`${label} 必须格式化 FAIL 且无异常栈`, () => {
+      const r = runWiring(['--home', home, '--patch', wiringPatch]);
+      return formattedFailure(r, failLabel)
+        && r.stdout.includes('npm run gen:preset && npm run inject:preset，然后重启 DSH');
+    });
+  }
+  writeFileSync(wiringPatch, '- insert: [');
+  test('profile YAML 损坏必须格式化 FAIL 且无异常栈', () =>
+    formattedFailure(runWiring(['--home', home]), '存在 preset-switchboard 声明'));
+  writeFileSync(wiringPatch, wiringText(supervisorRules));
+  for (const [label, text] of [
+    ['roles 为 Object', '{"roles":{}}'], ['角色文件顶层 null', 'null'], ['角色 JSON 损坏', '{bad'],
+    ['roles 含 null', '{"roles":[null]}'],
+  ]) {
+    writeFileSync(configPathFor(home), text);
+    test(`${label} 必须格式化 FAIL 且无异常栈`, () =>
+      formattedFailure(runWiring(['--home', home]), '配置文件可解析且含 roles 数组'));
+  }
+  writeFileSync(configPathFor(home), JSON.stringify({ roles: [] }));
+  const pkgFile = join(profile, 'package.json');
+  const validPkg = readFileSync(pkgFile, 'utf8');
+  for (const [label, text] of [
+    ['bundles 为 Object', JSON.stringify({ dsh: { profile: { bundles: {} } } })],
+    ['package 顶层 null', 'null'], ['package JSON 损坏', '{bad'],
+  ]) {
+    writeFileSync(pkgFile, text);
+    test(`${label} 必须格式化 FAIL 且无异常栈`, () =>
+      formattedFailure(runWiring(['--home', home]), `dsh.profile.bundles 含 ${self}`));
+  }
+  writeFileSync(pkgFile, validPkg);
+
+  // 仅在子进程拦截仓库文件读取，验证仓库侧结构错误；不改动真实生成物。
+  const runRepoPatch = (relativePath, text) => {
+    const script = join(REPO_ROOT, 'scripts', 'check-profile-wiring.mjs');
+    const shim = `
+      import fs from 'node:fs';
+      import { fileURLToPath } from 'node:url';
+      import { syncBuiltinESMExports } from 'node:module';
+      const originalRead = fs.readFileSync;
+      const target = ${JSON.stringify(join(REPO_ROOT, relativePath))};
+      fs.readFileSync = (...args) => {
+        const path = args[0] instanceof URL ? fileURLToPath(args[0]) : args[0];
+        return path === target ? ${JSON.stringify(text)} : originalRead(...args);
+      };
+      syncBuiltinESMExports();
+      process.argv = ${JSON.stringify([process.execPath, script, '--home', home])};
+      await import(${JSON.stringify(pathToFileURL(script).href)});
+    `;
+    return captureSync(process.execPath, ['--input-type=module', '--eval', shim], { cwd: temp, env });
+  };
+  for (const [label, text] of [
+    ['顶层 Object', '{}'], ['insert Object', `[{"insert":{"name":"${self}"}}]`], ['YAML 损坏', '- insert: ['],
+  ]) test(`bundle patch ${label} 必须格式化 FAIL 且无异常栈`, () =>
+    formattedFailure(runRepoPatch('cordis.patch.yml', text), 'bundle patch 里声明了本包条目'));
+  for (const [label, mutate] of [
+    ['顶层 Object', () => ({})],
+    ['insert Object', doc => { doc[0].insert = doc[0].insert[0]; return doc; }],
+    ['plugins Object', doc => { doc[0].insert[0].config.plugins = {}; return doc; }],
+    ['preset 缺失', () => []],
+    ['config 缺失', doc => { delete doc[0].insert[0].config.plugins[0].config; return doc; }],
+    ['supervisorRules 非字符串', doc => { doc[0].insert[0].config.plugins[0].config.supervisorRules = 42; return doc; }],
+  ]) test(`仓库 preset ${label} 必须格式化 FAIL 且无异常栈`, () => {
+    const r = runRepoPatch('presets/switchboard.patch.yml', JSON.stringify(mutate(structuredClone(validPatch))));
+    return formattedFailure(r, 'profile supervisorRules 与仓库 preset 生成物逐字符一致')
+      && r.stdout.includes('npm run gen:preset && npm run inject:preset，然后重启 DSH');
+  });
 
   console.log('\n=== 角色文件迁移与删源前复读 ===');
   const migration = join(REPO_ROOT, 'scripts', 'ops', 'migrate-roles-to-file.mjs');
