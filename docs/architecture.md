@@ -492,9 +492,11 @@ jobId 由 Jobs 管理，schema、返回值与 render 均不暴露它；客户端
 
 ### 7.1 「调度日志进主代理可见输出」的现状（已实现，含一处固有限制）
 
-**主代理调度规则（D29）：** preset 装载时另注册 `agent-switchboard:scheduling`（order 10510），与角色清单小节共用 `isMainAgentContext` 身份判据。每次组装按可靠的会话头与深度标记动态返回硬编码 `supervisorSchedulingText` 或空串；规则源于对临时素材的适配，正式运行不读取 `raw/AGENTS.md`，不使用 volatile 配置或 UI 控件。只进入主代理，子代理只拿自身 persona，未知身份不输出。内容保留四问路由、最小充分任务包、阻塞派发生命周期、失败路由、上下文卫生、成本纪律与 reviewer 独立性；主代理的小文件/少量代码权限保留但限定为极小局部工作，宽重读取与实现必须委派。
+**主代理调度规则（D29）：** preset 装载时另注册 `agent-switchboard:scheduling`（order 10510），与角色清单小节共用 `isMainAgentContext` 身份判据。每次组装按可靠的会话头与深度标记动态读取本 preset 实例的 `config.supervisorRules`（兼容 getter 与普通字符串）或返回空串；规则源于对临时素材的适配，正式运行不读取 `raw/AGENTS.md`。规则仅由 `scripts/gen-preset.mjs` 的 `selfEntry` 写入 `switchboard-roles.config.supervisorRules`，运行时代码无完整副本；Config 声明字符串、无默认值、非 volatile，根条目不携带，客户端不提供编辑控件。只进入主代理，子代理只拿自身 persona，未知身份不输出。内容保留四问路由、最小充分任务包、阻塞派发生命周期、失败路由、上下文卫生、成本纪律与 reviewer 独立性；主代理的小文件/少量代码权限保留但限定为极小局部工作，宽重读取与实现必须委派。
 
-正式小节取代过去依靠触碰 `raw/*` 偶然获得调度规则的状态，但不拦截官方工作区指令插件的子目录注入：触碰该临时区仍可能把未适配素材带入子代理。R01–R06 通过真实 SystemPrompt 组装与静态断言验证主代理包含、三种子代理标记及未知上下文排除、无过时标识且不可编辑；生产代码变异验证判别力，恢复后校验 SHA-256。离线通过不等于真实会话验收，未调用外部 CLI 或修改用户 DSH 配置。
+生效链路为 `npm run gen:preset` → `npm run inject:preset` → 重启 DSH；profile 内联展开，多 profile 需分别同步。不得手改 YAML，生成器会全量覆盖。缺失、空串或仅空白时不注入、不回退；自检显示“调度规则：未配置（profile 可能未同步 preset：需 gen:preset → inject:preset → 重启）”，`warnings` 非空、`health` 为“可用但告警”，`ok` 仍仅由既有配置/挂载错误决定，不阻断派发。根实例提示在 Switchboard preset 中自检，不因根条目无此字段告警。
+
+正式小节取代过去依靠触碰 `raw/*` 偶然获得调度规则的状态，但不拦截官方工作区指令插件的子目录注入：触碰该临时区仍可能把未适配素材带入子代理。R01–R14 通过真实 SystemPrompt 组装与静态断言验证主代理包含、三种子代理标记及未知上下文排除、无过时标识、preset 载体不可编辑、缺省不注入但告警以及生成逻辑字节幂等；生产代码变异验证判别力，恢复后校验 SHA-256。离线通过不等于真实会话验收，未调用外部 CLI 或修改用户 DSH 配置。
 
 **决策前可见** —— `roleGuidanceText()` 注入系统提示词，每个角色那两行现在带**线路摘要**
 （`routeSummaryFor()`）：

@@ -31,7 +31,6 @@ import {
   normalizeRoles,
   planCliMounts,
   roleGuidanceText,
-  supervisorSchedulingText,
   routeSummaryFor,
   toolConfigFor,
 } from './roles.js';
@@ -317,6 +316,8 @@ export function liveRoleTools(ctx, roles) {
  * 改动后需要重新启用插件。
  */
 export const Config = z.object({
+  // 仅 preset 条目承载，不设默认值、不标 volatile、不开放设置页编辑。
+  supervisorRules: z.string().description('主代理调度规则（由 preset 生成）'),
   // ⚠️ `.volatile()` 是必须调用的，仅把子对象**命名**为 volatile 没有任何效果。
   // 依据 dsh-settings 的 volatileForm：
   //   if (schema.meta.volatile) return plainSchema(schema)
@@ -573,11 +574,16 @@ export function selftestTool(ctx, diagnostics) {
           roleConfigStatus: { type: 'string', required: true },
           configErrors: { type: 'string', required: true },
           fatal: { type: 'string', required: true },
+          scheduling: { type: 'string', required: true },
+          warnings: { type: 'string', required: true },
+          health: { type: 'string', required: true },
         },
       },
       render: (_args, value) => {
         const lines = [
           `Agent Switchboard · ${value.phase}`,
+          `健康：${value.health}`,
+          `调度规则：${value.scheduling}`,
           `已挂载角色工具：${value.roleCount}`,
           `明细（当前挂载状态）：${value.mounted}`,
           // 明细保留首次核验失败的信息；实时恢复后标注「曾延迟注册」，不再判为失败。
@@ -593,6 +599,7 @@ export function selftestTool(ctx, diagnostics) {
           // 「因预设兼容性或执行一致性校验被拦下」。
           `未挂载的角色：${value.blocked}`,
         ];
+        if (value.warnings) lines.push(`告警：${value.warnings}`);
         if (value.configErrors) lines.push(`配置错误：\n${value.configErrors}`);
         if (value.fatal) lines.push(`致命错误：${value.fatal}`);
         return [{ type: 'text', text: lines.join('\n') }];
@@ -623,13 +630,15 @@ export function selftestTool(ctx, diagnostics) {
       const mounted = live;
       const okCount = mounted.filter((m) => m.ok).length;
 
+      const scheduling = !diagnostics.mountHere ? '（根实例不注入；请在 Switchboard preset 中自检）'
+        : diagnostics.readSupervisorRules?.() ? '已配置（仅注入主代理）'
+          : '未配置（profile 可能未同步 preset：需 gen:preset → inject:preset → 重启）';
+      const warnings = diagnostics.mountHere && !diagnostics.readSupervisorRules?.() ? `调度规则：${scheduling}` : '';
+      const ok = diagnostics.fatal === undefined && diagnostics.configErrors.length === 0
+        && !diagnostics.wrapperSyncPending && !mounted.some(m => m.ok === false);
       return {
-        ok:
-          diagnostics.fatal === undefined &&
-          diagnostics.configErrors.length === 0 &&
-          !diagnostics.wrapperSyncPending &&
-          // 不可查询也逐角色返回失败；零角色不要求工具服务可查询。
-          !mounted.some((m) => m.ok === false),
+        scheduling, warnings, health: !ok ? '不健康' : warnings ? '可用但告警' : '健康',
+        ok,
         phase: 'phase-3',
         roleRoutes: diagnostics.mountHere
           ? (diagnostics.roleRoutes ?? []).map(route => `${route.id} (${live.find(item => item.id === route.id)?.ok ? '已挂载' : '未挂载'}): ${route.summary}`).join('\n') || '（无生效角色）'
@@ -828,6 +837,10 @@ function applyInner(ctx, config) {
   // 每个根/preset 激活一份独立记录；preset 常驻，会话只继承它。共享模块级状态
   // 会让后一次激活清空前一次的记录（实测出现自相矛盾的自检输出）。
   const diagnostics = newDiagnostics();
+  diagnostics.readSupervisorRules = () => {
+    const value = readVolatileField(resolved, 'supervisorRules');
+    return typeof value === 'string' && value.trim() ? value : '';
+  };
   noteLegacyTimeout(resolved, diagnostics);
   noteLegacyWrapper(resolved, diagnostics);
 
@@ -1094,7 +1107,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
       delegateToolNames: roles.filter(role => ctx.get('tools').get(role.toolName, scopeOf(ctx))).map(role => role.toolName),
     }); } });
   const disposeScheduling = ctx.get('systemPrompt').section({ name: 'agent-switchboard:scheduling', order: 10510,
-    text: context => isMainAgentContext(context) ? supervisorSchedulingText : '' });
+    text: context => isMainAgentContext(context) ? diagnostics.readSupervisorRules() : '' });
   ctx.effect?.(() => () => { disposeGuidance?.(); disposeScheduling?.(); disposeSelftest?.(); });
 }
 

@@ -15,9 +15,14 @@ import { Context } from '@deepseek-ai/cordis';
 import { ToolRuntime } from '@deepseek-ai/dsh-tools';
 import { applyChildComposition, delegationDepthOf, resolveChildDepth } from '@deepseek-ai/dsh-subagent';
 import { apply, Config, liveRoleTools, selftestTool } from '../src/index.js';
-import { toolConfigFor, supervisorSchedulingText } from '../src/roles.js';
+import { toolConfigFor } from '../src/roles.js';
+import { parse } from 'yaml';
+import { captureSync } from './lib/capture.mjs';
 import { configPathFor, initialConfig, readConfigFile, writeConfigFile } from '../src/config-file.js';
 
+const presetSource = readFileSync(new URL('../presets/switchboard.patch.yml', import.meta.url), 'utf8');
+const presetEntry = parse(presetSource, { customTags: [{ tag: 'tag:yaml.org,2002:js', resolve: value => value }] })[0].insert[0].config.plugins.find(p => p.id === 'switchboard-roles');
+const supervisorRules = presetEntry?.config?.supervisorRules;
 const fixtureHome = mkdtempSync(join(tmpdir(), 'switchboard-check-apply-'));
 const previousDshHome = process.env.DSH_HOME;
 const fixtureRole = { id: 'fixture', description: '离线测试角色', instructions: '只用于测试', model: 'test-model' };
@@ -1657,6 +1662,41 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
       && !cliHealth.executables.includes('无 CLI 角色'));
 }
 
+section('preset 调度规则：缺失告警与生成幂等');
+{
+  for (const [label, value] of [['missing', undefined], ['empty', ''], ['whitespace', ' \n ']]) {
+    const ctx = makeCtx();
+    const sections = [];
+    ctx.systemPrompt.section = section => { sections.push(section); return () => {}; };
+    apply(ctx, Config({ mount: true, provider: 'self', roles: [fixtureRole], supervisorRules: value }));
+    await new Promise(setImmediate);
+    const assembled = { sections: sections.map(section => ({ ...section,
+      text: section.text({ agent: { session: { header: {} }, options: {} } }) })) };
+    check(`R11：规则 ${label} 不注入`, !assembled.sections.some(s => s.name === 'agent-switchboard:scheduling' && s.text));
+    const tool = ctx.tools.get('switchboard_selftest'); const result = await tool.execute({});
+    const warning = '调度规则：未配置（profile 可能未同步 preset：需 gen:preset → inject:preset → 重启）';
+    check(`R12：规则 ${label} 有诊断与可用但告警门禁`, result.ok && result.health === '可用但告警'
+      && result.warnings === warning && tool.output.render({}, result).some(b => b.text.includes(warning)));
+  }
+  // 只替换官方清单输入与输出路径；实际 selfEntry 和全部生成逻辑执行两次。
+  // 夹具不声称已核对本机官方 standard，也不写用户 profile 或仓库产物。
+  const standard = presetSource.replace(/          - id: switchboard-roles[\s\S]*?(?=\n          - )/, '')
+    .replace(/(\s*- id: tool-subagent(?:-fork)?\n)\s*disabled: true\n/g, '$1');
+  const output = join(fixtureHome, 'generated.patch.yml');
+  const generator = readFileSync(new URL('./gen-preset.mjs', import.meta.url), 'utf8')
+    .replace("from './lib/capture.mjs'", `from '${new URL('./lib/capture.mjs', import.meta.url).href}'`)
+    .replace('const standardText = cat(STANDARD_ENTRY);', `const standardText = ${JSON.stringify(standard)};`)
+    .replace("const OUT_FILE = join(ROOT, 'presets', 'switchboard.patch.yml');", `const OUT_FILE = ${JSON.stringify(output)};`);
+  const run = () => captureSync(process.execPath, ['--input-type=module', '-e', generator]);
+  const first = run(); const bytes = existsSync(output) ? readFileSync(output) : Buffer.alloc(0);
+  const second = run();
+  check('R13：真实生成逻辑两次成功且字节幂等', first.status === 0 && second.status === 0
+    && bytes.length > 0 && bytes.equals(readFileSync(output)), first.stderr + second.stderr);
+  const generated = bytes.length ? parse(bytes.toString(), { customTags: [{ tag: 'tag:yaml.org,2002:js', resolve: value => value }] }) : [];
+  check('R14：selfEntry 生成的 preset 确实包含规则', generated[0]?.insert[0].config.plugins
+    .find(p => p.id === 'switchboard-roles')?.config.supervisorRules === supervisorRules);
+}
+
 section('派发级快照：真实 ToolRuntime + 路由预检挂起');
 {
   const { SystemPrompt } = await import('@deepseek-ai/dsh-system-prompt');
@@ -1697,7 +1737,7 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
   register('write'); register('read');
   save(1);
   const owner = ctx.plugin({ inject: ['tools', 'subagents', 'agents', 'systemPrompt', 'subprocess'],
-    apply(actual) { apply(actual, { mount: true, provider: 'self' }); } });
+    apply(actual) { apply(actual, Config({ ...presetEntry.config, provider: 'self' })); } });
   try {
     await owner.await(); await tick(); await tick();
     const parent = { id: 'snapshot-parent', options: { provider: 'self', model: 'parent' },
@@ -1734,8 +1774,8 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
     check('P06：取消后新调用现读且 ALS 不泄漏', coherent(requests.at(-1), 6) && requests.at(-1).toolFilter.deny.includes('edit'));
     const builtin = (await root.systemPrompt.assemble({ agent: parent, scope: parent })).sections;
     check('P07：真实 SystemPrompt 主代理有 switchboard 调度指引', builtin.some(s => s.text.includes('You are the switchboard')));
-    check('R01：主代理实际组装含完整硬编码规则与四问路由', builtin.some(s =>
-      s.name === 'agent-switchboard:scheduling' && s.text === supervisorSchedulingText &&
+    check('R01：主代理实际组装含 preset 规则与四问路由', builtin.some(s =>
+      s.name === 'agent-switchboard:scheduling' && s.text === supervisorRules &&
       ['四问路由', '→ scout', '→ worker', '→ architect', '→ reviewer'].every(marker => s.text.includes(marker))));
     for (const [label, header, options] of [['origin', { origin: 'subagent' }, {}],
       ['persisted-depth', { delegationDepth: 1 }, {}], ['runtime-depth', {}, { subagentDepth: 1 }]]) {
@@ -1759,14 +1799,25 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
       const assembled = await root.systemPrompt.assemble({ scope: preset, ...context });
       check(`R04：未知上下文 ${label} 不输出调度规则`, !assembled.sections.some(s => s.name === 'agent-switchboard:scheduling' && s.text));
     }
-    check('R05：规则文本无过时专有标识', !/\$CODEX_HOME|spawn_agent|sandbox_mode|\.toml|\bTOML\b/.test(supervisorSchedulingText));
+    check('R05：规则文本无过时专有标识', !/\$CODEX_HOME|spawn_agent|sandbox_mode|\.toml|\bTOML\b/.test(supervisorRules));
     const hostSource = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
-    const clientSource = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
-    check('R06：调度规则不承载于配置或 UI',
-      !Object.hasOwn(Config({ volatile: { supervisorSchedulingText: 'override' } }).volatile, 'supervisorSchedulingText') &&
-      !/supervisorSchedulingText\s*:\s*z\./.test(hostSource) &&
-      !/volatile\s*(?:\.supervisorSchedulingText|\[['"]supervisorSchedulingText['"]\])/.test(hostSource) &&
-      !/supervisorSchedulingText|agent-switchboard:scheduling/.test(clientSource));
+    const clientSource = ['index.js', 'logic.js'].map(file =>
+      readFileSync(new URL(`../src/client/${file}`, import.meta.url), 'utf8')).join('\n');
+    const rootEntries = parse(readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')).flatMap(op => op.insert ?? []);
+    check('R06：调度规则来自 preset 条目且不开放 UI 编辑',
+      typeof supervisorRules === 'string' && supervisorRules.includes('四问路由') &&
+      Config.dict.supervisorRules?.type === 'string' && !Config.dict.supervisorRules?.meta.volatile &&
+      !rootEntries.some(row => Object.hasOwn(row.config ?? {}, 'supervisorRules')) &&
+      !/supervisorRules|agent-switchboard:scheduling/.test(clientSource));
+    check('R07：schema 缺省规则无默认值且不报错', Config({}).supervisorRules === undefined
+      && !Object.hasOwn(Config.dict.supervisorRules.meta, 'default'));
+    check('R08：preset 块标量可解析且 schema 原样读取', presetEntry.id === 'switchboard-roles'
+      && Config(presetEntry.config).supervisorRules === supervisorRules && /supervisorRules: \|/.test(presetSource));
+    check('R09：运行时代码不保留完整规则副本', !hostSource.includes('四问路由')
+      && !readFileSync(new URL('../src/roles.js', import.meta.url), 'utf8').includes('四问路由'));
+    const configuredHealth = await root.tools.get('switchboard_selftest', parent).execute({});
+    check('R10：已配置自检无调度告警且健康', configuredHealth.scheduling === '已配置（仅注入主代理）'
+      && configuredHealth.warnings === '' && configuredHealth.health === '健康' && configuredHealth.ok);
     // 同名遮蔽工具不得进入本实例快照 hook；结构变化确保泛拦会让此调用失败。
     const alien = { id: 'alien', options: {}, session: { header: {} } };
     const alienCtx = createScope(ctx, alien, { parent: preset }).ctx;
