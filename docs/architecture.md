@@ -270,8 +270,8 @@
     - `dsh.profile.bundles` **必须含本包**（`dependencies` 里有**不够**）：Loader 只加载
       `bundles` 列出的包。缺失后果是**应用正常启动、但插件完全不存在**，且**没有任何报错**
       （实测踩到：Loader 条目数 187 而非 188，`include:agent-switchboard` 从未创建）。
-    - 根条目**必须启用**，bundle 声明不必携带 `config.roles`；设置页读 `configForms`、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，Host 根实例将角色同步到 `$DSH_HOME/agent-switchboard/roles.json`。标准 preset 中本包只需 `mount: true`，**不得再携带 `roles`**；兼容自定义 preset 的本作用域显式角色数组（含 `[]` 清空），启动和热重载均优先于文件，仅 `undefined` 回落文件。新会话继承现有实例，不重新执行 `apply`；根实例通过 `loader/volatile-update` 写盘；已有 preset 不重挂，执行期读取文件。
-    - `scripts/check-profile-wiring.mjs` 显式断言根条目未禁用、preset 的 `mount: true` 及 `selfRow?.config?.roles === undefined`（找不到默认 profile 时跳过；显式目标缺失则失败）。
+    - 根条目**必须启用**，bundle 声明不必携带 `config.roles`；设置页读 `configForms`、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，Host 根实例将角色同步到 `$DSH_HOME/agent-switchboard/roles.json`。标准 preset 中本包带 `mount: true` 与 `supervisorRules`（D29 修订），**不得再携带 `roles`**；兼容自定义 preset 的本作用域显式角色数组（含 `[]` 清空），启动和热重载均优先于文件，仅 `undefined` 回落文件。新会话继承现有实例，不重新执行 `apply`；根实例通过 `loader/volatile-update` 写盘；已有 preset 不重挂，执行期读取文件。
+    - `scripts/check-profile-wiring.mjs` 显式断言根条目未禁用、preset 的 `mount: true`、`selfRow?.config?.roles === undefined`，以及 `supervisorRules` 为非空字符串并与仓库 preset 生成物逐字符一致（找不到默认 profile 时跳过；显式目标缺失则失败）。
 37. **禁用/启用插件这个操作本身会重写 profile，且只保留它认识的条目。** 实测两次：一次
     web boot 失败后，profile 的 `cordis.patch.yml` 从 41,802 字节被削到 670 字节，
     `dsh.profile.bundles` 里本包也消失。**含义：修 bug 时不要靠「禁用插件」作为试探手段；

@@ -230,7 +230,7 @@ minimal | low | medium | high | xhigh | max
 > **被取代范围：** 运行时 cliTimeoutSec 已由 D17 移除；包裹路由、Jobs 回流与清理生命周期分别见 D18 / D19 / D20。本节表格保留历史，不代表当前字段。
 
 > **历史方案已被后续决策取代：** 下文「第一期角色列表来自 `cordis.patch.yml`」及复杂数组编辑器不可行的取舍，已被 D13 / D14 的自建设置页覆盖；原文保留。
-> 当前角色文件为 `$DSH_HOME/agent-switchboard/roles.json`，设置页仍经根配置桥接并由 Host 同步文件，preset 只携带 `mount: true`、不得携带 `roles`。依据见 D14 的当前实现补记。
+> 当前角色文件为 `$DSH_HOME/agent-switchboard/roles.json`，设置页仍经根配置桥接并由 Host 同步文件，preset 携带 `mount: true` 与 `supervisorRules`（D29 修订）、不得携带 `roles`。依据见 D14 的当前实现补记。
 
 **决策：**
 
@@ -369,10 +369,10 @@ if (rest.length === 0 && op.op === "unset") result.splice(index, 1); // 删除�
 
 > **记录性质与当前实现补记：** 下文保留当时落地路径与事故取证。第 1、6 条关于 profile 根条目必须携带 `config.roles`、文件仅为派生产物的描述，是历史实现路径，已由后续文件存储与配置桥接实现修订；不能据此要求 bundle / preset 再携带角色列表。
 >
-> - 当前角色文件为 `$DSH_HOME/agent-switchboard/roles.json`（`src/config-file.js:63`）。bundle 根条目启用且不携带 config；preset 中本插件只带 `mount: true`（`presets/switchboard.patch.yml:18`），不得带 `roles`（`scripts/check-profile-wiring.mjs:115`）。
+> - 当前角色文件为 `$DSH_HOME/agent-switchboard/roles.json`（`src/config-file.js:63`）。bundle 根条目启用且不携带 config；preset 中本插件带 `mount: true` 与 `supervisorRules`（D29 修订，`presets/switchboard.patch.yml`），不得带 `roles`（`scripts/check-profile-wiring.mjs`）。
 > - **设置页并未直接读写文件。** 它仍读 `configForms` 的根命名空间 `roles`，写 `settings.mutate`；Host 根实例校验、比对并同步显式角色数组（含 [] 清空），仅未提供 roles 时保留已有文件。
 > - 挂载实例兼容本作用域显式 Cordis 角色数组（含 `[]` 清空），启动与热重载均优先于文件；标准 preset 不携带角色，因此走文件。历史上保存不刷新已挂载工具的限制已由 D25 执行期延迟解析取代。
-> - 第 6 条所引 profile 检查的当前断言是 bundles / dependencies、bundle 条目启用、preset `mount:true` 且无 `roles`，以及角色文件可解析；不再断言 profile 根条目必须带 `config.roles`（`scripts/check-profile-wiring.mjs:58`、`:79`、`:96`、`:121`）。
+> - 第 6 条所引 profile 检查的当前断言是 bundles / dependencies、bundle 条目启用、preset `mount:true` 且无 `roles`、`supervisorRules` 为非空字符串并与仓库生成物逐字符一致，以及角色文件可解析；不再断言 profile 根条目必须带 `config.roles`（`scripts/check-profile-wiring.mjs`）。
 
 **为什么要有这一条：** D13 把「自建 Client 设置页 + `configForms` 写回」定为方案，但落地时连续踩到三类失败，最终**推翻了 D13 中关于存储位置与通道的具体判断**。D13 的**目标**不变（机制是角色的属性、要有 UI 配置入口），改的是**做法**。以下是已核实的事实，替代 D13 中相应的推断。
 

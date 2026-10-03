@@ -1,5 +1,7 @@
 # 实施方案
 
+> **记录性质与 D29 当前实现补记：** 本文保留各阶段的历史方案、实测与待验收状态，不把历史记录视为当前验收结论。当前 preset 中本插件条目带 `mount: true` 与 `supervisorRules`，不带 `roles`；角色仍在 `$DSH_HOME/agent-switchboard/roles.json`。调度规则文本由 `scripts/gen-preset.mjs` 生成，字段非 volatile、无默认值、UI 不可编辑；改动后须执行 `npm run gen:preset` → `npm run inject:preset` → 重启 DSH 才生效。规则注入已实现并有离线验证，真机提示词仍待验收（见 D29）。
+
 > 配套阅读：[`decisions.md`](./decisions.md)（为什么这么选）、[`architecture.md`](./architecture.md)（契约与取证）。
 
 ## 目标形态
@@ -34,7 +36,7 @@
 .
 ├── package.json                 契约字段：exports["."] / exports["./client"] / dsh.*
 ├── cordis.patch.yml             启用 bundle 根条目，不携带角色列表
-├── presets/switchboard.patch.yml  preset 声明，本插件只带 mount: true
+├── presets/switchboard.patch.yml  preset 声明，本插件带 mount: true 与 supervisorRules，不带 roles（D29）
 ├── README.md                    用户视角
 ├── AGENTS.md  CONTRIBUTING.md  LICENSE  .gitignore  .gitattributes  .editorconfig
 ├── docs/
@@ -246,7 +248,7 @@
   **当前设置页仍经根条目的 volatile `roles` 桥接**：读走 `configForms.describe()`
   镜像面（`ensure()` → `getSnapshot().view.namespaces`），**写**走
   `remote.settings.mutate(ns, [{op:'set',path:['roles'],value}], revision)`；Host 侧把角色
-  同步到角色文件，并非客户端直接写 JSON。preset 中本插件只带 `mount: true`，不得携带 `roles`
+  同步到角色文件，并非客户端直接写 JSON。preset 中本插件带 `mount: true` 与 `supervisorRules`，不得携带 `roles`（D29 补记）
   （`scripts/check-profile-wiring.mjs`）；启动时加载的常驻 preset 在本作用域 Cordis 角色非空时优先使用它，否则读文件。
   根实例把保存值写入文件后广播专用事件，驱动常驻 preset 代际重挂；新会话仍只继承现有 preset、不重新 apply。既有会话后续派发与下次提示组装无需重启即可取新配置，非法配置或注册失败回滚，旧代在预检/子代理/后台租约归零后释放。已执行任务与历史上下文不改写。离线集成与变异实验已覆盖，真机保存往返及在途 CLI 验收待执行。历史路径与当前机制见 `decisions.md` D14、D22 修正及 D24。
 - 并发与预算上限
@@ -261,7 +263,7 @@
 | R3 | `ctx.subprocess` 在 Windows 上解析 `codex.ps1` 的行为未知 | CLI 后端可能在解析阶段就失败 | 用 `resolveExecutable` 先做独立小实验，再接入 provider |
 | R4 | 本机无 DSH 类型定义 | 无法获得编译期类型保障 | D1 已把风险限制在少数薄适配文件；用 `cordis_inspect_query` 作为类型的唯一权威来源 |
 | R5 | Client 半边崩溃会清空整个 slot | 可能拖垮 GUI 的一块区域 | 第一期只做只读、最小 DOM；严守「不 import Harness Client 包」 |
-| R6 | 角色列表若仅放 patch，用户在 GUI 里改不了 | 与「面板配置角色」的期望有落差 | **已解决（D13 / D14）**：设置页经根配置桥接，Host 同步角色文件；preset 只带 `mount: true`，不带 `roles`；设置页已实测可见可改 |
+| R6 | 角色列表若仅放 patch，用户在 GUI 里改不了 | 与「面板配置角色」的期望有落差 | **已解决（D13 / D14）**：设置页经根配置桥接，Host 同步角色文件；preset 带 `mount: true` 与 `supervisorRules`（D29 补记），不带 `roles`；设置页已实测可见可改 |
 | R7 | 外部 CLI 的额度/登录状态不透明 | 派发失败原因难定位 | 结果里保留原始 stderr 与退出码（D8），不做美化丢弃 |
 | R8 | **link 模式下 Host 半边改动无法热加载** | 每次改动都需重启 dsh 才能真机验证，迭代慢 | 已实测确认（`architecture.md` 第 3.3 节）。缓解：把逻辑尽可能放进可用抽取方式验证的纯函数；Client 半边不受此限（有 HMR）；角色设置由 D24 事件驱动代际重挂，无需重启，Host 源码仍需重启一次装载 |
 | R9 | **`failed to import` 会掩盖真实错误** | 排查方向被误导，可能浪费大量时间（Phase 1 已实际发生） | 已记录取证手法（`architecture.md` 第 3.2 节）：先用落地文件探针判定「模块是否已加载」，再查 `apply` 内部 |
@@ -274,6 +276,6 @@
 | --- | --- |
 | 主代理只统合、不下场 | 主代理侧只增委派工具；写文件权限不授予主代理 |
 | 跨 CLI 可指派 | Phase 3 的 `cli` provider |
-| 角色与派发方式可配置 | 角色文件为 `$DSH_HOME/agent-switchboard/roles.json`；UI 经根配置读写桥接，Host 同步文件；preset 只带 `mount: true`，不得携带 `roles`；机制是每个角色自己的 `backend` 字段（D13 / D14） |
+| 角色与派发方式可配置 | 角色文件为 `$DSH_HOME/agent-switchboard/roles.json`；UI 经根配置读写桥接，Host 同步文件；preset 带 `mount: true` 与 `supervisorRules`（D29 补记），不得携带 `roles`；机制是每个角色自己的 `backend` 字段（D13 / D14） |
 | 模型不得自由拼装 shell 命令 | `src/cli/argv.js` 只做受限占位符替换，`argv` 数组直传 `ctx.subprocess.spawn`，全程无 shell |
 | `raw/` 不入库 | 已在 `.gitignore`，且 `AGENTS.md` 列为硬规则 |
