@@ -1544,9 +1544,10 @@ section('阶段 0：文件 resolver mtime+size 缓存与源码静态契约');
     syncBuiltinESMExports();
     const first = resolver.read(); const same = resolver.read();
     check('F01：mtime+size 未变不重读且复用有效缓存', reads === 1 && !first.cached && same.cached && same.value === first.value);
+    const resolverReads = reads;
     writeConfigFile(path, initialConfig([{ ...fixtureRole, model: 'changed-size-model' }]));
-    // writeConfigFile 现在独立读取磁盘做版本门禁；缓存计数只统计 resolver 的读取。
-    reads--;
+    // 保存的格式门禁及并发复核不属于 resolver 读取计数。
+    reads = resolverReads;
     const changed = resolver.read();
     check('F02：mtime 或 size 改变重读且取得新值', reads === 2 && !changed.cached && changed.value.roles[0].model === 'changed-size-model');
     writeFileSync(path, '{broken');

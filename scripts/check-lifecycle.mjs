@@ -1,5 +1,5 @@
 // 离线检查：只修改 tmpdir fixture，不接触真实 DSH profile 或归档。
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -10,7 +10,7 @@ import { captureSync } from './lib/capture.mjs';
 import { REPO_ROOT, resolvePaths } from './lib/paths.mjs';
 import { collectLifecycle, satisfiesDshRange, evaluateDshPeers } from './lib/lifecycle.mjs';
 import { generatePreset } from './lib/preset-generator.mjs';
-import { readPatch, presetConfig, stripInjectedPreset, isOurBlockLine, assertNoStrayOperations } from './lib/preset-patch.mjs';
+import { readPatch, presetConfig, stripInjectedPreset, isOurBlockLine, assertNoStrayOperations, planInjectedPreset, scanPackageReferences } from './lib/preset-patch.mjs';
 import { runLifecycle } from './ops/plugin-lifecycle.mjs';
 import { CONFIG_FORMAT_VERSION } from '../src/config-file.js';
 
@@ -48,6 +48,7 @@ try {
   mkdirSync(join(home, 'profiles', 'desktop'), { recursive: true });
   mkdirSync(join(repoRoot, 'presets'), { recursive: true });
   put(join(repoRoot, 'package.json'), pkg);
+  put(join(repoRoot, 'cordis.patch.yml'), '[]\n');
   const generated = generatePreset(standard, pkg.name).body;
   put(join(repoRoot, 'presets', 'switchboard.patch.yml'), generated);
   const paths = { ...resolvePaths({ argv: ['--home', home], env: {} }), repoRoot, explicitTarget: false };
@@ -93,6 +94,21 @@ try {
   check('剥离只删除 preset 并保留 cwd', stripInjectedPreset(cleanPatch + generated).includes('cwd: DSH-Agent-Switchboard')
     && !stripInjectedPreset(cleanPatch + generated).includes('id: preset-switchboard'));
   check('剥离后结构断言继续通过', assertNoStrayOperations(stripInjectedPreset(cleanPatch + generated), 'fixture'));
+  for (const [label, original] of [['空序列注入', '[]\n'], ['strip → re-inject', planInjectedPreset(generated, '', { remove: true })]]) {
+    let parsed, error;
+    try { parsed = parse(planInjectedPreset(original, generated)); } catch (e) { error = e.message; }
+    check(`${label} 可解析且 preset 存在`, parsed?.[0]?.insert?.[0]?.id === 'preset-switchboard', error);
+  }
+  const userComment = '# 用户注释：必须逐字保留\n';
+  check('相邻用户注释剥离后逐字保留', stripInjectedPreset(generated + userComment + cleanPatch).includes(userComment)
+    && planInjectedPreset(generated + userComment, '', { remove: true }).includes(userComment));
+  check('缩进的尾随用户注释也逐字保留', stripInjectedPreset(generated + '  ' + userComment + cleanPatch).includes('  ' + userComment));
+  const rootReference = `- insert:\n    - id: agent-switchboard\n      name: ${JSON.stringify(pkg.name)}\n`;
+  check('全深度引用扫描列出根条目与嵌套 preset', scanPackageReferences(rootReference + generated, pkg.name).length === 2
+    && scanPackageReferences(rootReference + generated, pkg.name)[0].id === 'agent-switchboard'
+    && scanPackageReferences(rootReference + generated, pkg.name)[0].line === 3);
+  const aliasReferences = scanPackageReferences(`- insert:\n    - id: alias-owner\n      module: &pkg ${JSON.stringify(pkg.name)}\n    - id: alias-user\n      package: *pkg\n`, pkg.name);
+  check('等价字段与 alias 引用保留 id 和行', aliasReferences.length === 2 && aliasReferences[1].id === 'alias-user' && aliasReferences[1].line === 5);
   put(paths.patch, patchWith({ ...config, supervisorRules: config.supervisorRules + 'x' })); s = collect();
   check('supervisorRules 一字节漂移精确报告', s.preset.rules.status === 'drifted' && /首个不同位置/.test(s.preset.rules.reason));
   check('status 漂移仍退出 0', invoke('status').exitCode === 0);
@@ -120,6 +136,10 @@ try {
   check('退出成功但归档内容不可解析仍是 unknown 且有原因', s.preset.generatedDrift.status === 'unknown'
     && s.preset.generatedDrift.reason.includes('plugins:') && s.compatibility.runtime.status === 'unknown'
     && s.compatibility.runtime.reason.startsWith('未验证：') && !Object.hasOwn(s.compatibility.runtime, 'version'));
+  s = collectLifecycle({ ...options, readArchive: entry => entry === 'dsh/package.json' ? '{"version":"01.2.3"}' : archive(entry) });
+  check('畸形运行时版本 unknown、有原因且不进入 verdict', s.compatibility.runtime.status === 'unknown'
+    && /SemVer/.test(s.compatibility.runtime.reason) && !Object.hasOwn(s.compatibility.runtime, 'version')
+    && s.compatibility.peers.status === 'unknown' && !s.compatibility.peers.ranges && s.compatibility.runtimeExempt === null);
 
   section('临时 ASAR 与真实子进程读取');
   // 按 dsh-cat 的归档格式生成最小 fixture，覆盖非注入的 captureSync 路径。
@@ -252,6 +272,196 @@ try {
     } }
     visit(root); return JSON.stringify(values);
   }
+  section('并发与卸载引用回归');
+  const dangling = fixture({ patch: rootReference + generated });
+  const danglingResult = dangling.run('uninstall', ['--apply']);
+  check('双引用卸载拒绝移包指令且保留用户根条目', danglingResult.exitCode === 1
+    && danglingResult.output.includes(`${dangling.p.patch}:3 id=agent-switchboard`)
+    && /profile 配置中仍有包引用/.test(danglingResult.output) && /刻意不删除用户编写的内容/.test(danglingResult.output)
+    && /请自行解决或移除下列条目后重新运行/.test(danglingResult.output)
+    && /悬空引用/.test(danglingResult.output) && !/人工包移除步骤/.test(danglingResult.output)
+    && readFileSync(dangling.p.patch, 'utf8').includes(rootReference) && !readPatch(dangling.p.patch).entries.some(row => row.id === 'preset-switchboard'), danglingResult.output);
+  console.log(`  双引用卸载 exit=${danglingResult.exitCode}\n${danglingResult.events.join('\n')}`);
+  const danglingPurge = fixture({ registration: 'none', patch: rootReference + generated });
+  const danglingRoles = readFileSync(danglingPurge.p.roles);
+  const danglingPurgeResult = danglingPurge.run('uninstall', ['--apply', '--purge-roles']);
+  check('profile 残留引用拒绝 purge 和移包，角色及用户条目字节保留', danglingPurgeResult.exitCode === 1
+    && danglingPurgeResult.output.includes(`${danglingPurge.p.patch}:3 id=agent-switchboard`)
+    && /拒绝移除指令及 --purge-roles/.test(danglingPurgeResult.output)
+    && /请自行解决或移除下列条目后重新运行/.test(danglingPurgeResult.output)
+    && !/人工包移除步骤/.test(danglingPurgeResult.output) && danglingRoles.equals(readFileSync(danglingPurge.p.roles))
+    && readFileSync(danglingPurge.p.patch, 'utf8') === stripInjectedPreset(rootReference + generated), danglingPurgeResult.output);
+  put(join(repoRoot, 'cordis.patch.yml'), rootReference);
+  const reachable = fixture();
+  const reachableRoles = readFileSync(reachable.p.roles);
+  const reachableResult = reachable.run('uninstall', ['--apply']);
+  check('仅注入 preset 引用的 uninstall 可达 exit=3，包内 bundle 自引用不阻塞', reachableResult.exitCode === 3
+    && /PASS  preset 剥离后复读验证/.test(reachableResult.output) && /人工包移除步骤/.test(reachableResult.output)
+    && scanPackageReferences(readFileSync(reachable.p.patch, 'utf8'), pkg.name).length === 0
+    && reachableRoles.equals(readFileSync(reachable.p.roles))
+    && readFileSync(join(repoRoot, 'cordis.patch.yml'), 'utf8') === rootReference, reachableResult.output);
+  console.log(`  uninstall 可达 exit=${reachableResult.exitCode}\n${reachableResult.events.join('\n')}`);
+  put(join(repoRoot, 'cordis.patch.yml'), '[]\n');
+  for (const purge of [false, true]) {
+    const f = fixture({ registration: purge ? 'none' : 'complete' });
+    const profileConfig = join(f.p.profile, 'cordis.yml');
+    put(profileConfig, `plugins:\n  - id: profile-switchboard\n    name: ${JSON.stringify(pkg.name)}\n`);
+    const rolesBefore = readFileSync(f.p.roles);
+    const r = f.run('uninstall', ['--apply', ...(purge ? ['--purge-roles'] : [])]);
+    check(`profile cordis.yml 残留引用拒绝${purge ? ' purge' : '移包'}且保留用户内容`, r.exitCode === 1
+      && r.output.includes(`${profileConfig}:3 id=profile-switchboard`)
+      && /请自行解决或移除下列条目后重新运行/.test(r.output) && !/人工包移除步骤/.test(r.output)
+      && scanPackageReferences(readFileSync(profileConfig, 'utf8'), pkg.name).length === 1
+      && rolesBefore.equals(readFileSync(f.p.roles)), r.output);
+  }
+  const cleanConfig = fixture();
+  put(join(cleanConfig.p.profile, 'cordis.yml'), 'plugins: []\n');
+  check('存在无包引用的 profile cordis.yml 仍允许人工移包', cleanConfig.run('uninstall', ['--apply']).exitCode === 3);
+  for (const command of ['install', 'upgrade', 'uninstall']) {
+    const f = fixture({ patch: command === 'uninstall' ? cleanPatch + generated : cleanPatch });
+    const changed = readFileSync(f.p.patch, 'utf8') + '# 并发编辑\n';
+    let edited = false;
+    const r = f.run(command, ['--apply'], { log: line => {
+      if (!edited && line.startsWith('apply：')) { edited = true; put(f.p.patch, changed); }
+    } });
+    check(`${command} 规划到写入并发改变拒绝、无备份且保留并发字节`, r.exitCode === 1
+      && r.events.some(line => /规划后已改变.*重新运行/.test(line)) && readFileSync(f.p.patch, 'utf8') === changed
+      && !readdirSync(f.p.profile).some(name => name.includes('.bak-lifecycle-')), r.events.join('\n'));
+  }
+  for (const mode of ['dependencies', 'bundles', 'unreadable']) {
+    const f = fixture({ registration: 'none' });
+    const beforeRoles = readFileSync(f.p.roles);
+    const r = f.run('uninstall', ['--apply', '--purge-roles'], { log: line => {
+      if (line.startsWith('备份：') && line.includes('roles.json')) {
+        put(join(f.p.profile, 'package.json'), mode === 'unreadable' ? '{invalid' : mode === 'dependencies'
+          ? { dependencies: { [pkg.name]: '*' } } : { dsh: { profile: { bundles: [pkg.name] } } });
+      }
+    } });
+    check(`purge 前 ${mode} 登记变化拒绝且数据保留`, r.exitCode === 1 && beforeRoles.equals(readFileSync(f.p.roles)), r.events.join('\n'));
+  }
+  for (const mode of ['seed', 'migrate']) {
+    const f = fixture({ roles: mode === 'seed' ? null : { roles: [], user: true } });
+    const concurrentRoles = JSON.stringify({ formatVersion: 1, roles: [], concurrent: true });
+    const r = f.run('install', ['--apply'], { log: line => {
+      if (line.startsWith('apply：')) {
+        mkdirSync(join(f.p.roles, '..'), { recursive: true }); put(f.p.roles, concurrentRoles);
+      }
+    } });
+    check(`${mode} 角色规划快照变化拒绝且保留并发内容`, r.exitCode === 1
+      && readFileSync(f.p.roles, 'utf8') === concurrentRoles && r.events.some(line => /规划后已改变/.test(line)), r.events.join('\n'));
+  }
+  section('生成物再生成屏障（真实生成器，仅 tmpdir）');
+  const regenerationRepo = join(temp, 'regeneration-repo');
+  mkdirSync(join(regenerationRepo, 'scripts', 'lib'), { recursive: true });
+  mkdirSync(join(regenerationRepo, 'presets'), { recursive: true });
+  put(join(regenerationRepo, 'package.json'), pkg);
+  put(join(regenerationRepo, 'cordis.patch.yml'), '[]\n');
+  for (const name of ['gen-preset.mjs', 'dsh-cat.mjs', 'lib/paths.mjs', 'lib/capture.mjs', 'lib/preset-generator.mjs'])
+    cpSync(join(REPO_ROOT, 'scripts', name), join(regenerationRepo, 'scripts', name));
+  cpSync(join(REPO_ROOT, 'src'), join(regenerationRepo, 'src'), { recursive: true });
+  cpSync(join(REPO_ROOT, 'node_modules', 'yaml'), join(regenerationRepo, 'node_modules', 'yaml'), { recursive: true });
+  const regenerationFile = join(regenerationRepo, 'presets', 'switchboard.patch.yml');
+  const staleGenerated = generated.replace('主代理调度规则', '旧主代理调度规则');
+  const regenerationOptions = { repoRoot: regenerationRepo, readArchive: archive };
+  const regenerationFixture = () => {
+    const f = fixture({ patch: cleanPatch + staleGenerated });
+    f.p.repoRoot = regenerationRepo;
+    put(regenerationFile, staleGenerated);
+    const run = (command, args = [], extra = {}) => f.run(command, args,
+      { env: archiveEnv, collectOptions: regenerationOptions, ...extra });
+    return { ...f, run };
+  };
+  for (const command of ['install', 'upgrade']) {
+    const f = regenerationFixture(), before = fingerprint(temp);
+    const status = f.run('status');
+    check(`${command} 漂移 status 只报告且全树零写入`, status.exitCode === 0 && fingerprint(temp) === before
+      && /仓库生成物：drifted/.test(status.output));
+    const dry = f.run(command);
+    check(`${command} 再生成 dry-run 待 --apply，全树零写入`, dry.exitCode === 1 && fingerprint(temp) === before
+      && /再生成待 --apply/.test(dry.output), dry.output);
+    const applied = f.run(command, ['--apply']);
+    check(`${command} 真实生成器再生成并复读 current`, applied.exitCode === 0
+      && readFileSync(regenerationFile, 'utf8') === generated
+      && /已写入/.test(applied.output) && /PASS  preset 再生成后复读验证/.test(applied.output), applied.output);
+    check(`${command} 再生成后重新注入并写后验证`, applied.snapshot.preset.rules.status === 'current'
+      && !readFileSync(f.p.patch, 'utf8').includes('旧主代理调度规则') && /PASS  写后复读验证/.test(applied.output), applied.output);
+    const secondBefore = fingerprint(temp), second = f.run(command, ['--apply']);
+    check(`${command} 再生成后第二次 no-op`, second.exitCode === 0 && fingerprint(temp) === secondBefore
+      && !/再生成：/.test(second.output), second.output);
+    console.log(`  ${command} 证据 dry=${dry.exitCode}, apply=${applied.exitCode}, second=${second.exitCode}\n${applied.events.join('\n')}`);
+  }
+  const failureFixture = regenerationFixture(), failureBefore = bytesTree(failureFixture.home);
+  const fixtureCat = join(regenerationRepo, 'scripts', 'dsh-cat.mjs'), catOriginal = readFileSync(fixtureCat);
+  put(fixtureCat, "console.error('fixture archive read failure'); process.exit(7);\n");
+  const generationFailure = failureFixture.run('upgrade', ['--apply']);
+  check('生成器非零失败 exit=1 保留真实原因，不注入、不改 profile', generationFailure.exitCode === 1
+    && /退出码 1/.test(generationFailure.output) && /fixture archive read failure/.test(generationFailure.output)
+    && bytesTree(failureFixture.home) === failureBefore && readFileSync(regenerationFile, 'utf8') === staleGenerated,
+  generationFailure.output);
+  console.log(`  生成器失败证据 exit=${generationFailure.exitCode}\n${generationFailure.events.join('\n')}`);
+  writeFileSync(fixtureCat, catOriginal);
+  const generatorFile = join(regenerationRepo, 'scripts', 'gen-preset.mjs'), generatorOriginal = readFileSync(generatorFile);
+  const concurrentGeneration = regenerationFixture();
+  const concurrentPatch = readFileSync(concurrentGeneration.p.patch, 'utf8') + '# 再生成期间并发编辑\n';
+  put(generatorFile, `import { writeFileSync as concurrentWrite } from 'node:fs';\nconcurrentWrite(${JSON.stringify(concurrentGeneration.p.patch)}, ${JSON.stringify(concurrentPatch)});\n` + generatorOriginal.toString('utf8'));
+  const concurrentResult = concurrentGeneration.run('upgrade', ['--apply']);
+  check('再生成窗口内 profile 改变拒绝覆盖', concurrentResult.exitCode === 1
+    && /规划后已改变/.test(concurrentResult.output) && readFileSync(concurrentGeneration.p.patch, 'utf8') === concurrentPatch, concurrentResult.output);
+  writeFileSync(generatorFile, generatorOriginal);
+  put(regenerationFile, staleGenerated);
+  const generatedRace = regenerationFixture();
+  const externalGenerated = staleGenerated + '# 用户并发生成物编辑\n';
+  const generatedRaceResult = generatedRace.run('upgrade', ['--apply'], { log: line => {
+    if (line.startsWith('再生成：')) put(regenerationFile, externalGenerated);
+  } });
+  check('生成器启动前规划快照不同拒绝、保留并发生成物', generatedRaceResult.exitCode === 1
+    && generatedRaceResult.events.some(line => /规划后已改变/.test(line))
+    && readFileSync(regenerationFile, 'utf8') === externalGenerated, generatedRaceResult.events.join('\n'));
+  const generatorRenameRace = regenerationFixture();
+  put(generatorFile, `import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
+const originalWrite = fs.writeFileSync;
+fs.writeFileSync = (...args) => {
+  const result = originalWrite(...args);
+  if (String(args[0]).endsWith('.tmp')) originalWrite('presets/switchboard.patch.yml', ${JSON.stringify(externalGenerated)});
+  return result;
+}; syncBuiltinESMExports();\n` + generatorOriginal.toString('utf8'));
+  const generatorRenameResult = generatorRenameRace.run('upgrade', ['--apply']);
+  check('生成器 rename 前并发改变拒绝、保留生成物并清理 temp', generatorRenameResult.exitCode === 1
+    && /规划后已改变/.test(generatorRenameResult.output) && readFileSync(regenerationFile, 'utf8') === externalGenerated
+    && !readdirSync(join(regenerationRepo, 'presets')).some(name => name.endsWith('.tmp')), generatorRenameResult.output);
+  writeFileSync(generatorFile, generatorOriginal);
+  put(regenerationFile, staleGenerated);
+  put(generatorFile, "console.log('fixture pretend success');\n");
+  const skippedGeneration = failureFixture.run('upgrade', ['--apply']);
+  check('生成器假成功未写文件必须被复读屏障拒绝，不注入', skippedGeneration.exitCode === 1
+    && /再生成后复读验证失败：文件字节未改变/.test(skippedGeneration.output)
+    && bytesTree(failureFixture.home) === failureBefore, skippedGeneration.output);
+  writeFileSync(generatorFile, generatorOriginal);
+  const wrongFile = regenerationFixture(), wrongBefore = bytesTree(wrongFile.home);
+  put(generatorFile, "import { appendFileSync } from 'node:fs'; appendFileSync('presets/switchboard.patch.yml', '\\n');\n");
+  const wrongGeneration = wrongFile.run('upgrade', ['--apply']);
+  check('生成器改变字节但未达到 current 必须拒绝，不注入', wrongGeneration.exitCode === 1
+    && /再生成后复读验证失败/.test(wrongGeneration.output) && bytesTree(wrongFile.home) === wrongBefore, wrongGeneration.output);
+  writeFileSync(generatorFile, generatorOriginal);
+  for (const readArchive of [null, () => { throw new Error('fixture unavailable'); }]) {
+    const f = regenerationFixture(), beforeRepo = fingerprint(regenerationRepo);
+    put(f.p.patch, cleanPatch);
+    const degraded = f.run('upgrade', ['--apply'], { collectOptions: { repoRoot: regenerationRepo, readArchive } });
+    check('归档不可用明确未验证与手工回退，继续同步已知制品', degraded.exitCode === 0
+      && /漂移未验证/.test(degraded.output) && /npm run gen:preset/.test(degraded.output)
+      && degraded.snapshot.preset.generatedDrift.status === 'unknown' && fingerprint(regenerationRepo) === beforeRepo
+      && /PASS  写后复读验证/.test(degraded.output), degraded.output);
+  }
+  section('帮助入口');
+  const lifecycleHelp = captureSync(process.execPath, [script, '--help'], { env });
+  const versionHelp = captureSync(process.execPath, [join(REPO_ROOT, 'scripts', 'ops', 'plugin-version.mjs'), '--help'], { env });
+  check('lifecycle --help 五个命令、全部参数、dry-run 和完整退出码', lifecycleHelp.status === 0
+    && ['status', 'verify', 'install', 'upgrade', 'uninstall', '--apply', '--purge-roles', '--json',
+      '--home', '--profile', '--patch', '--roles-file', '--cwd', '没有 --dry-run', '0 =', '1 =', '3 =']
+      .every(token => lifecycleHelp.stdout.includes(token)), lifecycleHelp.stdout + lifecycleHelp.stderr);
+  check('version --help 命令、参数、互斥与无备份/commit/tag', versionHelp.status === 0
+    && ['show', 'bump', 'major|minor|patch|X.Y.Z', '--pre <tag>', '--finalize', '--apply', '互斥', '显式版本', '.bak', 'commit', 'tag']
+      .every(token => versionHelp.stdout.includes(token)), versionHelp.stdout + versionHelp.stderr);
   for (const kind of ['desktop', 'server']) for (const registration of ['none', 'trap']) {
     const f = fixture({ kind, registration, roles: null, patch: cleanPatch });
     const before = fingerprint(f.home);
@@ -374,10 +584,21 @@ try {
     && JSON.parse(jsonLogs[0]).operation.events.some(line => /写后复读验证/.test(line))
     && JSON.parse(jsonLogs[0]).operation.exitCode === 0);
   section('B4 真实命令入口，仅合成 profile');
+  cpSync(join(REPO_ROOT, 'scripts', 'lib'), join(regenerationRepo, 'scripts', 'lib'), { recursive: true });
+  mkdirSync(join(regenerationRepo, 'scripts', 'ops'), { recursive: true });
+  const isolatedScript = join(regenerationRepo, 'scripts', 'ops', 'plugin-lifecycle.mjs');
+  cpSync(script, isolatedScript);
+  put(regenerationFile, generated);
+  const cliDangling = fixture({ patch: rootReference + generated });
+  const cliDanglingResult = captureSync(process.execPath, [isolatedScript, 'uninstall', '--home', cliDangling.home, '--profile', cliDangling.p.profile, '--apply'], { env, cwd: temp });
+  check('双引用真实 CLI exit=1、报告剩余 id/行且不发移包指令', cliDanglingResult.status === 1
+    && /cordis.patch.yml:3 id=agent-switchboard/.test(cliDanglingResult.stdout)
+    && !/人工包移除步骤/.test(cliDanglingResult.stdout), cliDanglingResult.stdout + cliDanglingResult.stderr);
+  console.log(`  双引用 CLI exit=${cliDanglingResult.status}；${cliDanglingResult.stdout.split('\n').filter(line => /悬空引用|id=/.test(line)).join('；')}`);
   for (const command of ['install', 'upgrade', 'uninstall']) {
     const f = fixture({ patch: command === 'uninstall' ? cleanPatch + generated : cleanPatch });
     const before = fingerprint(f.home), patchBefore = readFileSync(f.p.patch);
-    const args = [script, command, '--home', f.home, '--profile', f.p.profile];
+    const args = [isolatedScript, command, '--home', f.home, '--profile', f.p.profile];
     const dry = captureSync(process.execPath, args, { env, cwd: temp });
     check(`${command} CLI dry-run exit=1 全树零写入`, dry.status === 1 && fingerprint(f.home) === before, dry.stdout + dry.stderr);
     const applied = captureSync(process.execPath, [...args, '--apply'], { env, cwd: temp });

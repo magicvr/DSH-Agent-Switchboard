@@ -2,17 +2,20 @@
 import { pathToFileURL } from 'node:url';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync, accessSync, constants } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { resolvePaths, printPaths } from '../lib/paths.mjs';
 import { collectLifecycle } from '../lib/lifecycle.mjs';
-import { planInjectedPreset, readPatch, presetConfig, pluginsWithoutName } from '../lib/preset-patch.mjs';
+import { captureSync } from '../lib/capture.mjs';
+import { planInjectedPreset, readPatch, presetConfig, pluginsWithoutName, scanPackageReferences } from '../lib/preset-patch.mjs';
 import { initialConfig, migrateConfigFileOnDisk, readConfigFileDetailed } from '../../src/config-file.js';
 
 const HELP = `用法：node scripts/ops/plugin-lifecycle.mjs <status|verify|install|upgrade|uninstall> [路径参数] [--json]
-写入操作默认 dry-run；只有 --apply 才写盘。uninstall 可加 --purge-roles（仅包已移除后）。
+status：只读报告；verify：只读验证；install：安装后收敛；upgrade：升级收敛；uninstall：安全剥离后提示移除包。
+写入操作默认 dry-run（省略 --apply；没有 --dry-run flag）；只有 --apply 才写盘，包括漂移的仓库 preset 再生成。
+--purge-roles：uninstall 仅包已移除后删除角色文件。--json：输出单份 JSON 快照及操作事件。
 本工具不安装依赖、不执行 pnpm、不修改包登记。
-退出码：0 = 状态完全一致（或原已一致）；1 = 真正失败或尚未修复的漂移（含 dry-run 待写入）；3 = 人工包安装/移除或兼容豁免步骤待完成。
-路径参数：--home / --profile / --patch / --roles-file / --cwd。
+退出码：0 = 收敛目标一致（status 正常采集、verify 跳过未安装插件或默认缺失 profile 也为 0）；1 = 失败或未修复的漂移（含 dry-run 待写入）；3 = 人工包安装/更新/移除或兼容豁免步骤待完成。
+路径参数：--home <path> / --profile <path> / --patch <path> / --roles-file <path> / --cwd <path>。
 代码升级必须完全退出并重启 DSH；reload 无法生效。`;
 
 const quote = value => process.platform === 'win32' ? `'${String(value).replaceAll("'", "''")}'`
@@ -39,19 +42,25 @@ function writableParent(path) {
   if (existsSync(path)) accessSync(path, constants.W_OK);
 }
 
-function backedChange(path, next, log) {
-  const exists = existsSync(path);
-  const original = exists ? readFileSync(path) : null;
+const snapshotBytes = path => existsSync(path) ? readFileSync(path) : null;
+function assertUnchanged(path, original) {
+  const current = snapshotBytes(path);
+  if (original === null ? current !== null : current === null || !original.equals(current))
+    throw new Error(`文件在规划后已改变，拒绝写入，请重新运行：${path}`);
+}
+
+function backedChange(path, next, log, original, beforeReplace = () => {}) {
+  assertUnchanged(path, original);
+  const exists = original !== null;
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const suffix = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomBytes(6).toString('hex')}`;
   const backup = `${path}.bak-lifecycle-${suffix}`;
   writeFileSync(backup, original ?? '原文件不存在；恢复时删除新建目标文件。\n', { flag: 'wx', mode: 0o600 });
   log(`备份：${backup}${exists ? '' : '（原文件不存在记录）'}`);
-  if (original ? !original.equals(readFileSync(path)) : existsSync(path)) throw new Error('备份期间目标改变，拒绝写入');
-  if (next === null) unlinkSync(path);
+  if (next === null) { beforeReplace(); assertUnchanged(path, original); unlinkSync(path); }
   else {
     const temp = `${path}.${suffix}.tmp`;
-    try { writeFileSync(temp, next, { flag: 'wx', mode: 0o600 }); renameSync(temp, path); }
+    try { writeFileSync(temp, next, { flag: 'wx', mode: 0o600 }); beforeReplace(); assertUnchanged(path, original); renameSync(temp, path); }
     finally { if (existsSync(temp)) unlinkSync(temp); }
   }
   const verified = next === null ? !existsSync(path) : Buffer.from(next).equals(readFileSync(path));
@@ -59,7 +68,7 @@ function backedChange(path, next, log) {
   log(`PASS  写后复读验证：${path}`);
 }
 
-function converge(command, s, { apply, purge, collect, log }) {
+function converge(command, s, { apply, purge, collect, env, log }) {
   if (!s.profile.exists || !s.profile.packageExists || s.profile.error)
     throw new Error(`profile 不存在或无效，拒绝写入：${s.profile.error ?? s.paths.profile}`);
   const registered = s.registration.dependencyPresent || s.registration.inBundles;
@@ -75,43 +84,94 @@ function converge(command, s, { apply, purge, collect, log }) {
       : `manifestVersion：${s.registration.resolvedManifestVersion} → ${s.repo.manifestVersion}${s.registration.resolvedManifestVersion === s.repo.manifestVersion ? '（未变）' : '（变化）'}`);
     log(`DSH peers：${s.compatibility.peers.status}；${s.compatibility.peers.reason ?? '范围接受当前运行时'}`);
   }
-  const original = readFileSync(s.paths.patch, 'utf8');
-  const block = command === 'uninstall' ? '' : readFileSync(join(s.paths.repoRoot, 'presets', 'switchboard.patch.yml'), 'utf8');
+  const patchOriginal = readFileSync(s.paths.patch);
+  const original = patchOriginal.toString('utf8');
+  const rolesOriginal = snapshotBytes(s.paths.roles);
+  const generatedPath = join(s.paths.repoRoot, 'presets', 'switchboard.patch.yml');
+  const generatedOriginal = command === 'uninstall' ? null : readFileSync(generatedPath);
+  let block = generatedOriginal?.toString('utf8') ?? '';
   if (command !== 'uninstall') {
     const generated = presetConfig(readPatch(join(s.paths.repoRoot, 'presets', 'switchboard.patch.yml')), s.repo.name);
     if (generated.error || generated.config?.mount !== true || Object.hasOwn(generated.config ?? {}, 'roles')
       || typeof generated.config?.supervisorRules !== 'string' || !generated.config.supervisorRules.trim()
       || pluginsWithoutName(generated.preset.config.plugins).length) throw new Error('仓库 preset 无效，拒绝同步');
-    if (s.preset.generatedDrift.status === 'drifted') throw new Error('仓库生成物漂移，先重新生成 preset');
     if (s.roles.exists && !s.roles.ok) throw new Error(`roles.json 不可安全迁移：${s.roles.error}`);
   }
-  const next = planInjectedPreset(original, block, { remove: command === 'uninstall' });
+  let next = planInjectedPreset(original, block, { remove: command === 'uninstall' });
+  if (command !== 'uninstall') {
+    if (s.preset.generatedDrift.status === 'unknown')
+      log(`仓库生成物漂移未验证；无法自动再生成：${s.preset.generatedDrift.reason}；手工回退：npm run gen:preset；继续收敛可验证制品。`);
+    if (s.preset.generatedDrift.status === 'drifted') {
+      log('仓库生成物漂移：待再生成 presets/switchboard.patch.yml（git 跟踪文件）。');
+      if (!apply) log('未写盘：preset 再生成待 --apply；随后重新注入并验证。');
+      else {
+        // 在生成器写入前完成现有目标的结构、格式和权限预检。
+        writableParent(generatedPath);
+        writableParent(s.paths.patch);
+        if (!s.roles.exists || s.roles.verdict === 'migrated') writableParent(s.paths.roles);
+        assertUnchanged(s.paths.patch, patchOriginal);
+        assertUnchanged(s.paths.roles, rolesOriginal);
+        assertUnchanged(generatedPath, generatedOriginal);
+        log('再生成：node scripts/gen-preset.mjs（shell: false，文件描述符 captureSync）。');
+        const result = captureSync(process.execPath, [join(s.paths.repoRoot, 'scripts', 'gen-preset.mjs')],
+          { cwd: s.paths.repoRoot, env: { ...env, DSH_PRESET_EXPECTED_SHA256: createHash('sha256').update(generatedOriginal).digest('hex') }, timeout: 60000, maxBuffer: 64 * 1024 * 1024 });
+        for (const output of [result.stdout, result.stderr]) if (output?.trim()) log(output.trim());
+        if (result.error || result.status !== 0)
+          throw new Error(`preset 再生成失败：${result.error?.message ?? `退出码 ${result.status}，信号 ${result.signal ?? '-'}；${result.stderr.trim() || result.stdout.trim()}`}`);
+        const regenerated = readFileSync(generatedPath, 'utf8');
+        assertUnchanged(s.paths.patch, patchOriginal);
+        assertUnchanged(s.paths.roles, rolesOriginal);
+        const afterGeneration = collect();
+        if (regenerated === block || afterGeneration.preset.generatedDrift.status !== 'current')
+          throw new Error(`preset 再生成后复读验证失败：${regenerated === block ? '文件字节未改变' : afterGeneration.preset.generatedDrift.reason ?? '产物未达到 current'}`);
+        log('PASS  preset 再生成后复读验证：字节已改变，生成物 current。');
+        s = afterGeneration;
+        block = regenerated;
+        next = planInjectedPreset(original, block);
+      }
+    }
+  }
   const patchChanged = original !== next;
   const seed = command !== 'uninstall' && !s.roles.exists;
   const migrate = command !== 'uninstall' && s.roles.verdict === 'migrated';
   const purgeRoles = command === 'uninstall' && purge && s.roles.exists;
   // 所有结构/格式/权限预检先于任何备份、目录创建或写入。
   if (apply) {
+    assertUnchanged(s.paths.patch, patchOriginal);
+    assertUnchanged(s.paths.roles, rolesOriginal);
     if (patchChanged) writableParent(s.paths.patch);
     if (seed || migrate || purgeRoles) writableParent(s.paths.roles);
   }
   log(`${apply ? 'apply' : 'dry-run'}：preset ${patchChanged ? command === 'uninstall' ? '将剥离' : '将同步' : '无需改动'}；roles ${seed ? '将播种空角色列表' : migrate ? '将迁移格式' : purgeRoles ? '将删除' : '保留原始字节'}。`);
-  if (patchChanged && apply) backedChange(s.paths.patch, next, log);
+  if (patchChanged && apply) backedChange(s.paths.patch, next, log, patchOriginal);
   if (command === 'uninstall') {
     // 强制屏障：复读确认引用已消失，才能输出包移除指令。
     if (apply || !patchChanged) {
       const patch = readPatch(s.paths.patch);
       if (patch.error || patch.entries.some(row => row.id === 'preset-switchboard')) throw new Error('卸载剥离后验证失败！不得移除包');
-      log('PASS  preset 剥离后复读验证；包自身 bundle patch 保留，安全中间状态。');
+      const remaining = [];
+      // 只扫描移包后仍保留的 profile 配置；仓库 bundle patch 随包分发、随包移除，不会悬空。
+      const profileConfig = join(s.paths.profile, 'cordis.yml');
+      for (const path of [s.paths.patch, ...(existsSync(profileConfig) ? [profileConfig] : [])]) {
+        for (const ref of scanPackageReferences(readFileSync(path, 'utf8'), s.repo.name))
+          remaining.push(`${path}:${ref.line} id=${ref.id}`);
+      }
+      if (remaining.length) throw new Error(`profile 配置中仍有包引用，移除包将留下悬空引用；拒绝移除指令及 --purge-roles。工具刻意不删除用户编写的内容；请自行解决或移除下列条目后重新运行：\n${remaining.join('\n')}`);
+      log('PASS  preset 剥离后复读验证；profile patch 与 cordis.yml（若存在）均无剩余包引用。');
     } else { log('未写盘：必须先 --apply 剥离并验证 preset，之后才可移除包。'); return { snapshot: s, exitCode: 1 }; }
     if (registered) { log(`人工包移除步骤：${packageInstruction(s, true)}`); return { snapshot: collect(), exitCode: 3 }; }
-    if (purgeRoles && apply) backedChange(s.paths.roles, null, log);
+    if (purgeRoles && apply) backedChange(s.paths.roles, null, log, rolesOriginal, () => {
+      const current = JSON.parse(readFileSync(join(s.paths.profile, 'package.json'), 'utf8'));
+      if (!current || typeof current !== 'object' || Array.isArray(current)
+        || Object.hasOwn(current.dependencies ?? {}, s.repo.name) || current.dsh?.profile?.bundles?.includes(s.repo.name))
+        throw new Error('--purge-roles 被拒绝：包重新登记或登记文件无效，请重新运行');
+    });
     log(s.restart.reason);
     return { snapshot: collect(), exitCode: !apply && purgeRoles ? 1 : 0 };
   }
-  if (seed && apply) backedChange(s.paths.roles, `${JSON.stringify(initialConfig(), null, 2)}\n`, log);
+  if (seed && apply) backedChange(s.paths.roles, `${JSON.stringify(initialConfig(), null, 2)}\n`, log, rolesOriginal);
   if (migrate) {
-    const result = migrateConfigFileOnDisk(s.paths.roles, { apply });
+    const result = migrateConfigFileOnDisk(s.paths.roles, { apply, expected: rolesOriginal });
     if (!result.ok) throw new Error(result.error);
     if (result.backup) log(`备份：${result.backup}`);
     log(apply ? 'PASS  roles 格式迁移后复读验证' : `未写盘：roles 格式迁移 ${JSON.stringify(result.applied)}`);
@@ -154,7 +214,7 @@ export function runLifecycle({ argv = process.argv.slice(2), env = process.env, 
     const events = [];
     if (!json) printPaths(paths, log);
     let result;
-    try { result = converge(command, snapshot, { apply, purge,
+    try { result = converge(command, snapshot, { apply, purge, env,
       collect: () => collectLifecycle({ ...collectOptions, paths, env }), log: line => { events.push(line); if (!json) log(line); } }); }
     catch (error) { events.push(`FAIL  ${error.message}`); if (!json) log(events.at(-1)); result = { snapshot, exitCode: 1 }; }
     if (json) log(JSON.stringify({ ...result.snapshot, operation: { command, apply, events, exitCode: result.exitCode } }, null, 2));

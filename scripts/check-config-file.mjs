@@ -310,6 +310,28 @@ section('迁移竞态与备份唯一性');
 }
 
 
+section('H · rename 前并发替换');
+for (const original of [JSON.stringify(initialConfig()), JSON.stringify({ roles: [] }), '{broken']) {
+  const path = join(tmp, 'concurrent.json');
+  writeFileSync(path, original);
+  const external = '{"formatVersion":999,"roles":[],"concurrent":true}\n';
+  const write = fs.writeFileSync;
+  let replaced = false, result;
+  try {
+    fs.writeFileSync = (...args) => {
+      const value = write(...args);
+      if (String(args[0]).startsWith(path + '.') && String(args[0]).endsWith('.tmp')) {
+        replaced = true; write(path, external);
+      }
+      return value;
+    };
+    syncBuiltinESMExports(); result = writeConfigFile(path, initialConfig());
+  } finally { fs.writeFileSync = write; syncBuiltinESMExports(); }
+  check('H：检查到 rename 并发替换拒绝、外部内容保留、temp 清理', replaced && !result.ok
+    && /并发改变/.test(result.error) && readFileSync(path, 'utf8') === external
+    && !readdirSync(tmp).some(name => name.startsWith('concurrent.json.') && name.endsWith('.tmp')), JSON.stringify(result));
+}
+
 rmSync(tmp, { recursive: true, force: true });
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

@@ -12,7 +12,8 @@
 // 用法：
 //   node scripts/gen-preset.mjs            写入 presets/switchboard.patch.yml
 //   node scripts/gen-preset.mjs --check     只比对漂移，不写盘
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, unlinkSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { generatePreset } from './lib/preset-generator.mjs';
 import { captureSync } from './lib/capture.mjs';
@@ -26,6 +27,12 @@ const PRESET_ID = 'preset-switchboard';
 const PRESET_KEY = 'switchboard';
 const SELF_PACKAGE = '@magicvr/dsh-agent-switchboard';
 const OUT_FILE = join(ROOT, 'presets', 'switchboard.patch.yml');
+const original = existsSync(OUT_FILE) ? readFileSync(OUT_FILE) : null;
+const expectedHash = process.env.DSH_PRESET_EXPECTED_SHA256;
+if (expectedHash && (!original || createHash('sha256').update(original).digest('hex') !== expectedHash)) {
+  console.error('FAIL  preset 文件在规划后已改变，请重新运行');
+  process.exit(1);
+}
 
 /**
  * 读取归档内某个文件的文本（复用只读探针 dsh-cat.mjs）。
@@ -121,5 +128,12 @@ if (process.argv.includes('--check')) {
 }
 
 mkdirSync(dirname(OUT_FILE), { recursive: true });
-writeFileSync(OUT_FILE, body, 'utf8');
+const temp = `${OUT_FILE}.${randomBytes(6).toString('hex')}.tmp`;
+try {
+  writeFileSync(temp, body, { encoding: 'utf8', flag: 'wx' });
+  const current = existsSync(OUT_FILE) ? readFileSync(OUT_FILE) : null;
+  if (original === null ? current !== null : current === null || !original.equals(current))
+    throw new Error('preset 文件在规划后已改变，拒绝写入，请重新运行');
+  renameSync(temp, OUT_FILE);
+} finally { if (existsSync(temp)) unlinkSync(temp); }
 console.log(`\n已写入 ${OUT_FILE}`);

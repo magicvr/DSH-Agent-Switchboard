@@ -230,7 +230,7 @@ export function writeConfigFile(path, value) {
           error: `配置在自动迁移期间已改变，拒绝写入；备份保留：${backup}` };
       }
     }
-    const written = atomicWriteConfigFile(path, value);
+    const written = atomicWriteConfigFile(path, value, original);
     if (!written.ok) return { ...written, ...(backup ? { backup } : {}) };
     if (!backup) return written;
     const verified = readConfigFileDetailed(path);
@@ -258,7 +258,7 @@ function createMigrationBackup(path, original, kind) {
  * 显式磁盘格式迁移：默认只报告步骤；apply 备份读取快照，检查并发修改，再原子写入与复读。
  * changed 表示是否已写盘；status='changed' 表示并发修改导致拒绝（changed=false）。
  */
-export function migrateConfigFileOnDisk(path, { apply = false } = {}) {
+export function migrateConfigFileOnDisk(path, { apply = false, expected } = {}) {
   let backup;
   let status = 'unreadable';
   let applied;
@@ -270,6 +270,7 @@ export function migrateConfigFileOnDisk(path, { apply = false } = {}) {
       if (error?.code === 'ENOENT') return { ok: true, status: 'missing', changed: false };
       throw error;
     }
+    if (expected !== undefined && !original.equals(expected)) throw new Error('配置在规划后已改变，请重新运行');
     const read = parseConfigFileDetailed(original.toString('utf8'));
     status = read.format?.status ?? 'unreadable';
     if (!read.ok) return { ok: false, status, changed: false, error: read.error };
@@ -279,7 +280,7 @@ export function migrateConfigFileOnDisk(path, { apply = false } = {}) {
     // 写入前最后一次复核原始字节；备份创建期间的外部编辑不能被迁移覆盖。
     if (!original.equals(readFileSync(path))) return { ok: false, status: 'changed', applied, changed: false, backup,
       error: `配置在迁移期间已改变，拒绝写入；未写配置，原始快照备份保留：${backup}` };
-    const written = atomicWriteConfigFile(path, read.config);
+    const written = atomicWriteConfigFile(path, read.config, original);
     if (!written.ok) return { ...written, status, applied, changed: false, backup };
     changed = true;
     const verified = readConfigFileDetailed(path);
@@ -296,7 +297,7 @@ export function migrateConfigFileOnDisk(path, { apply = false } = {}) {
 }
 
 /** 共享原子写入；格式门禁由调用入口负责。 */
-function atomicWriteConfigFile(path, value) {
+function atomicWriteConfigFile(path, value, original) {
   let temp;
   try {
     temp = `${path}.${randomBytes(6).toString('hex')}.tmp`;
@@ -306,6 +307,9 @@ function atomicWriteConfigFile(path, value) {
     let delay = RENAME_RETRY_INITIAL_MS;
     for (let attempt = 0; ; attempt++) {
       try {
+        const current = existsSync(path) ? readFileSync(path) : undefined;
+        if (original === undefined ? current !== undefined : current === undefined || !Buffer.from(original).equals(current))
+          throw new Error('配置在检查后发生并发改变，拒绝写入，请重新运行');
         renameSync(temp, path);
         return { ok: true };
       } catch (error) {

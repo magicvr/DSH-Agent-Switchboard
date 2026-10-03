@@ -8,6 +8,16 @@ import { REPO_ROOT } from '../lib/paths.mjs';
 import { CONFIG_FORMAT_VERSION } from '../../src/config-file.js';
 import { bumpVersion, validateExplicitVersion, compareVersions, rewriteChangelog, latestReleasedVersion } from '../lib/version.mjs';
 
+const HELP = `用法：node scripts/ops/plugin-version.mjs show
+      node scripts/ops/plugin-version.mjs bump <major|minor|patch|X.Y.Z> [--pre <tag>|--finalize] [--apply]
+show：只读显示并检查版本一致性。
+bump：major/minor/patch 递增版本，或指定严格高于当前版本的合法 SemVer X.Y.Z。
+--pre <tag>：生成或递增预发布版本。--finalize：将当前预发布版收为正式版。
+--pre 与 --finalize 互斥，均不能与显式版本组合。
+默认 dry-run（省略 --apply）；--apply 写入 package.json、package-lock.json、CHANGELOG.md 并复读校验。
+bump 对 git 跟踪文件永不创建 .bak，永不自动 commit 或 tag。
+退出码：0 = show 一致或 bump 计划/写入成功；1 = 失败。`;
+
 function argumentsFor(argv) {
   const command = argv[0] ?? 'show';
   if (!['show', 'bump'].includes(command)) throw new Error(`未知子命令：${command}`);
@@ -41,6 +51,7 @@ function atomicWrite(path, text) {
 }
 
 function main() {
+  if (process.argv.slice(2).includes('--help')) { console.log(HELP); return 0; }
   const options = argumentsFor(process.argv.slice(2));
   const files = ['package.json', 'package-lock.json', 'CHANGELOG.md'];
   const paths = files.map(name => join(REPO_ROOT, name));

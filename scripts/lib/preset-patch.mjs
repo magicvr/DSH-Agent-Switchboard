@@ -1,5 +1,5 @@
 // preset 块的唯一剥离与结构校验实现；严格保留行首 guard。
-import { parse } from 'yaml';
+import { parse, parseDocument, LineCounter, isMap, isSeq, isScalar, isAlias } from 'yaml';
 import { readFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 
@@ -26,16 +26,18 @@ export function planInjectedPreset(original, block, { remove = false } = {}) {
       throw new Error('preset 标记未对应唯一独立操作，拒绝写入');
   }
   const cleaned = stripInjectedPreset(original);
-  const remaining = cleaned.trim() ? parse(cleaned) : [];
+  const remaining = cleaned.trim() ? parse(cleaned) ?? [] : [];
   if (!valid(remaining) || !isDeepStrictEqual(remaining, doc.filter(op => !hits.includes(op))))
     throw new Error('preset 剥离会改变其它操作或留下残留，拒绝写入');
-  if (remove) return hits.length ? (cleaned.trim() ? cleaned : '[]\n') : original;
+  if (remove) return hits.length ? (remaining.length ? cleaned : `${cleaned.replace(/\n*$/, '')}\n[]\n`) : original;
   const generated = parse(block);
   if (!valid(generated) || generated.length !== 1 || generated[0].insert?.length !== 1
     || generated[0].insert[0].id !== 'preset-switchboard') throw new Error('仓库 preset 结构无效');
   // 已同步时保留所有原始字节，第二次运行不再改动换行或备份。
   if (hits.length && isDeepStrictEqual(hits[0], generated[0])) return original;
-  const next = `${cleaned.replace(/\n*$/, '\n')}\n${block.replace(/\r\n/g, '\n').replace(/\n*$/, '\n')}`;
+  // 空序列不能和块式序列拼接；只移除 [] 本身，保留用户注释。
+  const base = remaining.length === 0 ? cleaned.replace(/^\s*\[\]\s*(?=#|$)/m, '') : cleaned;
+  const next = `${base.replace(/\n*$/, '\n')}\n${block.replace(/\r\n/g, '\n').replace(/\n*$/, '\n')}`;
   if (!valid(parse(next))) throw new Error('注入产物结构无效');
   return next;
 }
@@ -53,6 +55,32 @@ export function findPresetDeclaration(doc, presetId = 'preset-switchboard') {
 
 export function pluginsWithoutName(plugins) {
   return plugins.filter(plugin => typeof plugin.name !== 'string' || plugin.name.length === 0);
+}
+
+/** 扫描所有深度的包名值（含等价字段和 YAML alias），返回条目 id 与来源行。 */
+export function scanPackageReferences(text, packageName) {
+  const lineCounter = new LineCounter();
+  const doc = parseDocument(text, { lineCounter });
+  if (doc.errors.length) throw new Error(`patch 引用扫描无法解析：${doc.errors[0].message}`);
+  const references = [];
+  function walk(node, id = '(无 id)', aliasLine, ancestors = new Set()) {
+    if (!node || ancestors.has(node)) return;
+    const seen = new Set(ancestors).add(node);
+    const line = aliasLine ?? lineCounter.linePos(node.range?.[0] ?? 0).line;
+    if (isAlias(node)) return walk(node.resolve(doc), id, line, seen);
+    if (isScalar(node)) {
+      if (node.value === packageName) references.push({ id, line });
+    } else if (isMap(node)) {
+      const ownId = node.get('id');
+      if (typeof ownId === 'string') id = ownId;
+      for (const pair of node.items) {
+        walk(pair.key, id, aliasLine, seen);
+        walk(pair.value, id, aliasLine, seen);
+      }
+    } else if (isSeq(node)) for (const item of node.items) walk(item, id, aliasLine, seen);
+  }
+  walk(doc.contents);
+  return references;
 }
 
 // 按 wiring 的解析后字符串比较；不 trim、不归一化规则内容。
@@ -156,8 +184,24 @@ export function stripInjectedPreset(text) {
   for (let start = 0; start < lines.length; start++) {
     if (!isOurBlockLine(lines[start])) continue;
     while (start > 0 && lines[start - 1].trimStart().startsWith('# Switchboard')) start--;
+    const offset = lines.slice(0, start).reduce((size, line) => size + line.length + 1, 0);
+    const document = parseDocument(text);
+    if (!document.errors.length && isSeq(document.contents)) {
+      const operation = document.contents.items.find(node => {
+        const value = node?.toJSON();
+        return Array.isArray(value?.insert) && value.insert.some(row => row?.id === 'preset-switchboard')
+          && node.range[1] > offset;
+      });
+      // range[1] 结束于 YAML 内容；range[2] 还包含尾随注释，不能用于删除。
+      if (operation) return stripInjectedPreset(text.slice(0, offset) + text.slice(operation.range[1]));
+    }
     let end = start + 1;
-    while (end < lines.length && !isTopLevel(lines[end])) end++;
+    // 标记后允许本操作的顶层 insert；操作内容只包含缩进的续行。
+    if (lines[start].trimStart().startsWith('# Switchboard')) {
+      while (end < lines.length && lines[end].trimStart().startsWith('# Switchboard')) end++;
+      if (/^- insert:\s*$/.test(lines[end] ?? '')) end++;
+    }
+    while (end < lines.length && (/^\s+\S/.test(lines[end]) || !lines[end].trim())) end++;
     const stripped = [...lines.slice(0, start), ...lines.slice(end)].join('\n');
     return stripInjectedPreset(stripped);
   }
@@ -175,7 +219,8 @@ export function stripInjectedPreset(text) {
       // 连同其前面的空白行一起删，避免留下连续空行。
       let from = start;
       while (from > 0 && lines[from - 1].trim() === '') from--;
-      const next = [...lines.slice(0, from), ...lines.slice(end)].join('\n');
+      // 空操作后面的用户注释也不属于操作。
+      const next = [...lines.slice(0, from), ...lines.slice(start + 1)].join('\n');
       return stripInjectedPreset(next);
     }
   }

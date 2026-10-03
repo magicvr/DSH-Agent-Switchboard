@@ -104,7 +104,7 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
     try {
       // Electron 归档中实际启动的 dsh 包版本，不使用机器上另装的 CLI 版本。
       const runtimePackage = JSON.parse(readArchive('dsh/package.json'));
-      if (typeof runtimePackage.version !== 'string' || !/^\d+\.\d+\.\d+(?:[-+].+)?$/.test(runtimePackage.version)) throw new Error('dsh/package.json 无有效版本');
+      if (!parseVersion(runtimePackage.version)) throw new Error('dsh/package.json 无有效严格 SemVer 版本');
       runtime = { status: 'known', version: runtimePackage.version, source: 'Electron app.asar 内 dsh/package.json（安装运行时；未确认当前运行进程）' };
     } catch (error) { runtime = unknown(error.message); }
   }
