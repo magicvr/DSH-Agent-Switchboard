@@ -29,9 +29,13 @@
 
 选用本插件 preset 时，动态系统提示小节向主代理注入 preset 内部条目 `switchboard-roles.config.supervisorRules` 承载的调度规则：四问路由（事实→scout、执行→worker、方向→architect、正确性→reviewer）、任务包、生命周期、上下文与成本纪律及独立审查。只进入可靠识别的主代理；子代理只拿自身 persona，不继承这套主代理规则；身份未知时不输出。字段由 `scripts/gen-preset.mjs` 的 `selfEntry` 生成，Config 仅声明字符串，无默认值、非 volatile，不在根条目，不开放 UI 编辑，模型与强度仍由角色配置和派发适配层决定。
 
-生效需要执行 `npm run gen:preset` → `npm run inject:preset` → 重启 DSH：profile 内联展开 preset，不会自动同步。不要手改生成的 YAML，下次生成会覆盖。字段缺失、空串或仅空白时不注入、不回退代码副本；`switchboard_selftest` 明确告警并标为“可用但告警”，不阻断派发。
+支持的更新路径是先运行 `npm run plugin:upgrade` 预演，审阅后运行 `npm run plugin:upgrade -- --apply` 收敛，再完全退出并重启 DSH：profile 内联展开 preset，不会自动同步。DSH 归档可读且仓库 preset 判定为漂移时，`install` / `upgrade --apply` 自动调用既有生成器再同步，无需先手工生成；归档不可用时明确报告未验证，并提示 `npm run gen:preset` 手工回退。自动再生成已有离线验证，真实写入仍未验证；预演的真机证据与待验收项见 [`docs/lifecycle.md`](./docs/lifecycle.md)。不要手改生成的 YAML，下次生成会覆盖。字段缺失、空串或仅空白时不注入、不回退代码副本；`switchboard_selftest` 明确告警并标为“可用但告警”，不阻断派发。
 
 这取代了此前依靠 `raw/AGENTS.md` 在触碰临时文件时偶然注入的状态：现在正式来源是受版本控制的适配文本，不读取临时草稿。官方工作区指令插件对子目录文件的动态注入仍可能把 `raw/AGENTS.md` 带入触碰 `raw/*` 的子代理；本插件未改动该机制。实现与离线验证见 [D29](./docs/decisions.md#d29--主代理调度规则硬编码并按-preset-动态注入)，真机提示词待验收。
+
+### 插件生命周期与版本管理
+
+`plugin:status` / `plugin:verify` 只读检测登记、preset、角色文件与兼容性；`plugin:install` / `plugin:upgrade` / `plugin:uninstall` 默认预演，显式 `--apply` 才收敛派生制品。工具不安装包、不修改依赖登记、不执行 pnpm，人工包步骤由 DSH 官方通道完成。`version:show` 检查版本，`version:bump` 默认展示计划，显式 `--apply` 才同步版本与 CHANGELOG，永不自动 commit 或 tag。命令参数、退出码、安装 / 升级 / 安全卸载顺序及验证边界见 [`docs/lifecycle.md`](./docs/lifecycle.md)；新增运行时版本字段与格式门禁仍待完整重启后真机验收。
 
 ## 核心设计
 
@@ -172,6 +176,16 @@ Host 根实例将配置同步到文件。根条目保持启用，但只在 `moun
 - [x] **Phase 4 已落地部分** — 角色与派发设置页已实现并真机验收，CLI 调度信息进入主代理可见的回传结果
 - [ ] **Phase 4 剩余项** — 并发与预算上限、统一调度记录及用法文档继续完善；内置后端返回日志的限制见 [`docs/architecture.md`](./docs/architecture.md#7-可观测性)
 
+## 文档地图
+
+| 文件 | 内容 |
+| --- | --- |
+| [`docs/architecture.md`](./docs/architecture.md) | 当前实现、DSH 契约与历史取证 |
+| [`docs/decisions.md`](./docs/decisions.md) | 技术决策与后续修订 |
+| [`docs/plan.md`](./docs/plan.md) | 分阶段方案、验收证据与风险 |
+| [`docs/cli-backends.md`](./docs/cli-backends.md) | CLI 后端实测参数与验证边界 |
+| [`docs/lifecycle.md`](./docs/lifecycle.md) | 插件安装、升级、安全卸载与版本管理 |
+
 ## 仓库布局
 
 ```
@@ -179,6 +193,7 @@ Host 根实例将配置同步到文件。根条目保持启用，但只在 `moun
 ├── docs/
 │   ├── architecture.md   已核实的 DSH 插件契约与取证
 │   ├── decisions.md      技术决策记录（含历史方案与后续修订）
+│   ├── lifecycle.md      插件安装、升级、卸载与版本管理运维手册
 │   └── plan.md           目录结构、分期实施方案、验收标准、风险登记
 ├── src/                  Host、Client、角色模型、CLI provider 与配置存储
 ├── presets/              Switchboard preset 声明

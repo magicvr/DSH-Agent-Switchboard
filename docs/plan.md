@@ -2,7 +2,7 @@
 
 > **记录性质与 D29 当前实现补记：** 本文保留各阶段的历史方案、实测与待验收状态，不把历史记录视为当前验收结论。当前 preset 中本插件条目带 `mount: true` 与 `supervisorRules`，不带 `roles`；角色仍在 `$DSH_HOME/agent-switchboard/roles.json`。调度规则文本由 `scripts/gen-preset.mjs` 生成，字段非 volatile、无默认值、UI 不可编辑；改动后须执行 `npm run gen:preset` → `npm run inject:preset` → 重启 DSH 才生效。规则注入已实现并有离线验证；生成器新增提交纪律，提交由主代理统一执行，worker 不自行提交。新增规则的生成与检查、profile 同步及真机提示词验收须分别确认，不将源码更新视为生效（见 D29）。
 
-> 配套阅读：[`decisions.md`](./decisions.md)（为什么这么选）、[`architecture.md`](./architecture.md)（契约与取证）。
+> 配套阅读：[`decisions.md`](./decisions.md)（为什么这么选）、[`architecture.md`](./architecture.md)（契约与取证）。生命周期当前支持路径与验证边界见 [`lifecycle.md`](./lifecycle.md) 及本文末尾 D31 补记；上面的底层生成 / 注入步骤保留为历史记录。
 
 ## 目标形态
 
@@ -390,3 +390,28 @@
 **主代理核验（不依赖子代理结论）**：`npm run check` 全链退出码 0；用真实 `$DSH_HOME/agent-switchboard/roles.json` 跑 `normalizeRoles` + `planCliMounts`，4 个角色零错误、3 个 CLI 角色全部 active 无 blocked，`scout`（只读）的 `deny` 已含 `bash` 与 `plugin_manager`，codex 的 `{npmRoot}` 在 Windows 上解析为真实反斜杠路径 —— 修复未破坏线上配置。
 
 **仍未验收（如实记录）**：真实 Web GUI 的鼠标交互与设置往返（尤其「读取失败 → 保存被禁用 → 重试」与两步删除的焦点行为）；非 Windows 物理机上的 `bash` 拦截与 codex `{npmRoot}` 解析（仅有模拟平台参数的离线用例）；`plugin_manager` 进入 deny 后对只读角色的实际影响。Host 源码改动仍需重启一次装载。
+
+## 附：插件生命周期与版本管理实施结果（2026-10-03）
+
+**状态：D31 各批次已实现并通过离线检查；desktop 只读与预演已真机验证，新增运行时行为仍待完整重启验收。** 运维步骤见 [`lifecycle.md`](./lifecycle.md)。
+
+### 执行批次
+
+| 批次 | 已实现内容 |
+| --- | --- |
+| B1 | 无依赖 SemVer 版本逻辑、`version:show`、默认 dry-run 的 `version:bump`、显式 `--apply` 版本与 CHANGELOG 收口；不自动 commit / tag |
+| B2 | `0 → 1` 配置格式纯函数迁移链与写入门禁；`migrated` 写入时备份、迁移和复读，`future` / `unsupported` 硬拒绝且不备份 |
+| B3 | `plugin:status` / `plugin:verify` 只读状态采集，分别报告依赖、bundles、包体；检测 preset 漂移、角色格式、精确版本豁免与 DSH peers，归档不可用明确标未验证 |
+| B4 | `plugin:install` / `plugin:upgrade` / `plugin:uninstall` 幂等收敛、默认预演、备份与写后复验；卸载先剥离并验证 preset 再提示移包，默认保留用户角色文件 |
+
+包依赖与 bundle 登记仍由 DSH 官方通道完成，本仓库不执行 pnpm、不改 `dependencies`、不自动创建兼容豁免。DSH 归档可读且仓库 preset 判定为漂移时，`install` / `upgrade --apply` 自动调用既有生成器再同步；预演不写盘，归档不可用时报告未验证并提示手工生成回退。自动再生成已有离线验证，真实写入仍未验证。范围判断仅支持精确版本、`~`、`^`，其它语法报告 `unsupported-range`。插件版本、manifest 版本与配置格式版本独立演进。
+
+### 验收证据
+
+- 本轮实际执行 `node scripts/check-lifecycle.mjs`：**127 通过 / 0 失败**；`node scripts/check-version.mjs`：**107 通过 / 0 失败**；`npm run check` 全链退出 **0**。合成 profile 覆盖零写入预演、真实脚本入口收敛、重复运行幂等、格式预检与卸载屏障。
+- 实施阶段 desktop 真机验收：`status` / `verify` / install 预演 / upgrade 预演退出 **0**，uninstall 预演退出 **1**；profile `cordis.patch.yml` 前后 SHA-256 完全相同，新增备份 **0**。预演是省略 `--apply`，工具没有 `--dry-run` 参数；本轮文档工作未重复操作真实 `$DSH_HOME`。
+- 实施阶段直接调用已确认 desktop 被 CLI 硬拒绝、CLI 必须带 profile，以及 `dsh plugin --profile <name> --help` 会继续初始化 profile，不能当只读探针。CLI `add` / `remove` 形式依据 CLI 自述与源码，**未实测**。
+
+### 仍未验收与限制
+
+`src/` 新增 `switchboard_selftest` 版本字段与格式门禁尚未在完整重启后的 DSH 上验收，不能将离线通过视为当前进程生效。真实生命周期写入、版本写入、CLI 包安装 / 移除与 GUI 按钮确切文案未在本轮验证。模块或版本改动必须完整重启，reload 无效。`future` / `unsupported` 被 Host 拒写时，diagnostics 和自检报告不健康，但 GUI 仍可能提示保存已接受；客户端错误展示尚未接入。

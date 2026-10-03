@@ -931,6 +931,6 @@ CLI 自身工具与受控委派白名单、只读 deny、`allow: []` 拒绝继�
 
 **代价与缓解：** desktop profile 上安装、卸载必然包含一步人工 GUI 操作，工具只能检测、给指令并复验，无法全自动。缓解是让命令幂等收敛，重复运行总是把状态推向目标，并明确报告「已同步」与「需重启才生效」的区别。仓库内受版本控制的 `package.json`、`package-lock.json`、`CHANGELOG.md` 在 bump 时不写 `.bak` 备份，因为 git 就是它们的备份；改用原子写 + 写后复读校验。这是对本仓库 `scripts/ops/` 通用备份惯例的有意偏离；原子替换按文件执行，中途失败仍可能留下跨文件版本不一致，由复验明确报错。配置写入仅对较新或未知（`future`）、无法迁移（`unsupported`）的磁盘格式硬拒绝；较旧但可迁移（`migrated`）的文件在写入时自动迁移，先生成带时间戳的备份，再写盘并复读验证，避免拒绝写入而静默丢弃用户的设置修改。仍有客户端限制：对 `future` / `unsupported` 的硬拒绝，GUI 设置页可能仍报告保存已接受，实际文件未写入；Host 通过 diagnostics 报告并将插件标为不健康，客户端尚未接入该错误的展示。
 
-**分阶段边界：** B1 已落地版本管理半边：无依赖 SemVer 2.0.0 纯逻辑、只读 show、默认 dry-run 的 bump、显式 `--apply` 写入与 CHANGELOG 收口、离线版本检查。配置格式迁移链也已实现：`src/config-migrations.js` 的 `0 → 1` 步骤、`inspectConfigFormat`、`migrateConfig` 与 `migrateConfigFileOnDisk` 提供格式检查、内存迁移及带备份和复读验证的磁盘迁移；离线检查不等同于真机验收。生命周期命令 `status` / `install` / `upgrade` / `uninstall` 仍未实现，由后续批次落地，其真机行为尚未验证，不得写成已具备的工具能力。版本 bump 不执行 DSH 安装、不修改 profile、不自动重启。
+**分阶段边界：** B1 已落地版本管理半边：无依赖 SemVer 2.0.0 纯逻辑、只读 show、默认 dry-run 的 bump、显式 `--apply` 写入与 CHANGELOG 收口、离线版本检查。配置格式迁移链也已实现：`src/config-migrations.js` 的 `0 → 1` 步骤、`inspectConfigFormat`、`migrateConfig` 与 `migrateConfigFileOnDisk` 提供格式检查、内存迁移及带备份和复读验证的磁盘迁移；离线检查不等同于真机验收。后续批次已落地只读 `status` / `verify` 及幂等收敛 `install` / `upgrade` / `uninstall`，合成 profile 检查通过；desktop 真机只读与预演已验证零写入，真实写入和新增运行时行为仍待完整重启后验收，详见 [`lifecycle.md`](./lifecycle.md)。非 desktop 的 `dsh plugin --profile <name> add <spec>` / `remove <name>` 依据 CLI 自述与源码，未实测。版本 bump 不执行 DSH 安装、不修改 profile、不自动重启。
 
 ---
