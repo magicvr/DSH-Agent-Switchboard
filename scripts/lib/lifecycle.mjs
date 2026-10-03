@@ -6,6 +6,35 @@ import { resolvePaths, resolveAsar, REPO_ROOT } from './paths.mjs';
 import { readPatch, presetConfig, compareRules } from './preset-patch.mjs';
 import { generatePreset } from './preset-generator.mjs';
 import { CONFIG_FORMAT_VERSION, readConfigFileDetailed } from '../../src/config-file.js';
+import { parseVersion, compareVersions } from './version.mjs';
+
+// 有界范围判断，匹配 DSH includePrerelease:true；未知语法绝不猜测。
+export function satisfiesDshRange(version, range) {
+  const runtime = parseVersion(version);
+  if (!runtime) return { status: 'unknown', reason: 'invalid-runtime-version' };
+  if (typeof range !== 'string') return { status: 'unknown', reason: 'unsupported-range' };
+  const operator = /^[~^]/.test(range) ? range[0] : '';
+  const base = parseVersion(operator ? range.slice(1) : range);
+  if (!base) return { status: 'unknown', reason: 'unsupported-range' };
+  let accepts = compareVersions(runtime, base) === 0;
+  if (operator) {
+    const major = BigInt(base.major), minor = BigInt(base.minor), patch = BigInt(base.patch);
+    const upper = operator === '~' ? `${major}.${minor + 1n}.0-0`
+      : major > 0n ? `${major + 1n}.0.0-0`
+        : minor > 0n ? `0.${minor + 1n}.0-0` : `0.0.${patch + 1n}-0`;
+    accepts = compareVersions(runtime, base) >= 0 && compareVersions(runtime, upper) < 0;
+  }
+  return { status: accepts ? 'compatible' : 'incompatible', accepts };
+}
+
+export function evaluateDshPeers(version, peers) {
+  const ranges = Object.entries(peers).filter(([name]) => name === '@deepseek-ai/dsh' || name.startsWith('@deepseek-ai/dsh-'))
+    .map(([name, range]) => ({ name, range, ...satisfiesDshRange(version, range) }));
+  const status = ranges.some(row => row.status === 'incompatible') ? 'incompatible'
+    : ranges.some(row => row.status === 'unknown') ? 'unknown' : 'compatible';
+  return { status, ranges, reason: ranges.filter(row => row.status !== 'compatible')
+    .map(row => `${row.name}: ${row.reason ?? `${version} 不满足 ${row.range}`}`).join('; ') || null };
+}
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 function readJson(path) {
@@ -37,7 +66,7 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
   if (!pkg.value?.name || !pkg.value.version) throw new Error(`仓库 package.json 无效：${pkg.error ?? '缺少 name/version'}`);
   const name = pkg.value.name;
   const repo = { name, version: pkg.value.version, manifestVersion: pkg.value.dsh?.manifestVersion ?? null,
-    peerDependencies: Object.fromEntries(Object.entries(pkg.value.peerDependencies ?? {}).filter(([key]) => key.startsWith('@deepseek-ai/dsh'))),
+    peerDependencies: Object.fromEntries(Object.entries(pkg.value.peerDependencies ?? {}).filter(([key]) => key === '@deepseek-ai/dsh' || key.startsWith('@deepseek-ai/dsh-'))),
     configFormatVersion: CONFIG_FORMAT_VERSION };
   const profilePackage = readJson(join(paths.profile, 'package.json'));
   // DSH 以 profile 目录 basename desktop 拒绝 CLI 管理；不从路径其他片段猜测。
@@ -51,7 +80,7 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
   const resolved = readJson(join(paths.profile, 'node_modules', name, 'package.json'));
   const registration = { dependencyPresent, dependencySpec: dependencyPresent ? dependencies[name] : null, inBundles,
     resolved: Boolean(resolved.value?.name === name && typeof resolved.value.version === 'string'),
-    resolvedVersion: resolved.value?.version ?? null, resolutionError: resolved.error ?? null,
+    resolvedVersion: resolved.value?.version ?? null, resolvedManifestVersion: resolved.value?.dsh?.manifestVersion ?? null, resolutionError: resolved.error ?? null,
     silentFailureTrap: dependencyPresent && !inBundles };
   const generated = presetConfig(readPatch(join(repoRoot, 'presets', 'switchboard.patch.yml')), name);
   const actual = presetConfig(readPatch(paths.patch), name);
@@ -97,7 +126,8 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
   const compatibility = { runtime, fileExists: compat.exists, error: compat.exists ? compat.error ?? null : null,
     key, exemptionPresent, values, olderKeys,
     exemption: exemptionPresent ? (Array.isArray(values) && values.every(v => typeof v === 'string') ? 'exempt' : 'invalid') : olderKeys.length ? 'expired' : 'absent',
-    runtimeExempt: runtime.status === 'known' && Array.isArray(values) ? values.includes(runtime.version) : null };
+    runtimeExempt: runtime.status === 'known' ? (exemptionPresent && !Array.isArray(values) ? null : Array.isArray(values) && values.includes(runtime.version)) : null,
+    peers: runtime.status === 'known' ? evaluateDshPeers(runtime.version, repo.peerDependencies) : { status: 'unknown', reason: runtime.reason } };
   const snapshot = { paths, archive, repo, profile, registration, preset, roles, compatibility,
     restart: { requiredForModuleChange: true, reason: '插件模块改动必须完全退出并重启 DSH 进程；Node 模块缓存不能驱逐，reload 不能应用代码升级。' } };
   snapshot.verification = verifyLifecycle(snapshot);
@@ -131,7 +161,8 @@ export function verifyLifecycle(s) {
   if (s.compatibility.exemption === 'invalid') add('compatibility.exemption', '当前豁免值必须是运行时版本字符串数组');
   if (s.compatibility.exemption === 'expired') add('compatibility.expired', `精确版本豁免已失效：只有 ${s.compatibility.olderKeys.join(', ')}，缺少 ${s.compatibility.key}`);
   if (s.compatibility.exemptionPresent && s.compatibility.runtimeExempt === false) add('compatibility.runtime', '当前运行时版本不在当前插件版本豁免值中');
-  // 无豁免不是不兼容的证据；peer 范围是否接受运行时由 DSH 官方装载器裁决。
+  if (s.compatibility.peers.status === 'incompatible' && s.compatibility.runtimeExempt !== true)
+    add('compatibility.peers', s.compatibility.peers.reason);
   return { status: issues.length ? 'inconsistent' : 'consistent', issues };
 }
 

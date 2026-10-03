@@ -1,6 +1,44 @@
 // preset 块的唯一剥离与结构校验实现；严格保留行首 guard。
 import { parse } from 'yaml';
 import { readFileSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
+
+// 生命周期只接受独立且带生成器标记的块；剥离仍唯一委托给历史 guard。
+// 同时比较解析后的其它操作，防止剥离误吞相邻用户配置。
+export function planInjectedPreset(original, block, { remove = false } = {}) {
+  const doc = parse(original);
+  const valid = operations => Array.isArray(operations) && operations.every(op => op && typeof op === 'object'
+    && !Array.isArray(op) && Object.keys(op).length > 0
+    && (!Object.hasOwn(op, 'insert') || (Array.isArray(op.insert) && op.insert.length > 0
+      && op.insert.every(row => row && typeof row === 'object' && !Array.isArray(row)))));
+  if (!valid(doc)) throw new Error('profile patch 结构无效，拒绝写入');
+  const hits = doc.filter(op => op.id === 'preset-switchboard'
+    || op.insert?.some(row => row.id === 'preset-switchboard'));
+  if (hits.length > 1 || (hits.length && (Object.keys(hits[0]).length !== 1
+    || hits[0].insert?.length !== 1 || !/^# Switchboard/m.test(original))))
+    throw new Error('preset 块未标记或有歧义，拒绝写入');
+  if (hits.length) {
+    const markers = [...original.matchAll(/^# Switchboard.*$/gm)];
+    const tail = original.slice(markers[0].index);
+    const boundaries = [...tail.matchAll(/^- /gm)];
+    const marked = parse(tail.slice(0, boundaries[1]?.index ?? tail.length));
+    if (markers.length !== 1 || !isDeepStrictEqual(marked, hits))
+      throw new Error('preset 标记未对应唯一独立操作，拒绝写入');
+  }
+  const cleaned = stripInjectedPreset(original);
+  const remaining = cleaned.trim() ? parse(cleaned) : [];
+  if (!valid(remaining) || !isDeepStrictEqual(remaining, doc.filter(op => !hits.includes(op))))
+    throw new Error('preset 剥离会改变其它操作或留下残留，拒绝写入');
+  if (remove) return hits.length ? (cleaned.trim() ? cleaned : '[]\n') : original;
+  const generated = parse(block);
+  if (!valid(generated) || generated.length !== 1 || generated[0].insert?.length !== 1
+    || generated[0].insert[0].id !== 'preset-switchboard') throw new Error('仓库 preset 结构无效');
+  // 已同步时保留所有原始字节，第二次运行不再改动换行或备份。
+  if (hits.length && isDeepStrictEqual(hits[0], generated[0])) return original;
+  const next = `${cleaned.replace(/\n*$/, '\n')}\n${block.replace(/\r\n/g, '\n').replace(/\n*$/, '\n')}`;
+  if (!valid(parse(next))) throw new Error('注入产物结构无效');
+  return next;
+}
 
 // probe-preset 历史语义：仅接受 insert 数组，重复声明时取最后命中的条目。
 export function findPresetDeclaration(doc, presetId = 'preset-switchboard') {
