@@ -49,7 +49,7 @@
     "yaml": "^2.6.0"
   },
   "scripts": {
-    "check": "node scripts/check-roles.mjs && node scripts/check-drivers.mjs && node scripts/check-cli.mjs && node scripts/check-cli-provider.mjs && node scripts/check-config-schema.mjs && node scripts/check-config-volatile.mjs && node scripts/check-config-file.mjs && node scripts/check-apply.mjs && node scripts/check-validation-parity.mjs && node scripts/check-client.mjs && node scripts/check-profile-wiring.mjs && node scripts/check-script-portability.mjs",
+    "check": "node scripts/check-roles.mjs && node scripts/check-drivers.mjs && node scripts/check-cli.mjs && node scripts/check-cli-provider.mjs && node scripts/check-config-schema.mjs && node scripts/check-config-volatile.mjs && node scripts/check-config-file.mjs && node scripts/check-apply.mjs && node scripts/check-validation-parity.mjs && node scripts/check-client.mjs && node scripts/check-profile-wiring.mjs && node scripts/check-version.mjs && node scripts/check-script-portability.mjs",
     "check:roles": "node scripts/check-roles.mjs",
     "check:parity": "node scripts/check-validation-parity.mjs",
     "check:drivers": "node scripts/check-drivers.mjs",
@@ -61,6 +61,9 @@
     "check:apply": "node scripts/check-apply.mjs",
     "check:client": "node scripts/check-client.mjs",
     "check:wiring": "node scripts/check-profile-wiring.mjs",
+    "check:version": "node scripts/check-version.mjs",
+    "version:show": "node scripts/ops/plugin-version.mjs show",
+    "version:bump": "node scripts/ops/plugin-version.mjs bump",
     "migrate:roles": "node scripts/ops/migrate-roles-to-file.mjs",
     "check:live": "node scripts/probes/check-cli-live.mjs",
     "check:preset": "node scripts/gen-preset.mjs --check",
