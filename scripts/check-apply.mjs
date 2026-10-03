@@ -1774,9 +1774,12 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
     check('P06：取消后新调用现读且 ALS 不泄漏', coherent(requests.at(-1), 6) && requests.at(-1).toolFilter.deny.includes('edit'));
     const builtin = (await root.systemPrompt.assemble({ agent: parent, scope: parent })).sections;
     check('P07：真实 SystemPrompt 主代理有 switchboard 调度指引', builtin.some(s => s.text.includes('You are the switchboard')));
-    check('R01：主代理实际组装含 preset 规则与四问路由', builtin.some(s =>
+    check('R01：主代理实际组装含 preset 规则、四问路由与提交纪律护栏', builtin.some(s =>
       s.name === 'agent-switchboard:scheduling' && s.text === supervisorRules &&
-      ['四问路由', '→ scout', '→ worker', '→ architect', '→ reviewer'].every(marker => s.text.includes(marker))));
+      ['四问路由', '→ scout', '→ worker', '→ architect', '→ reviewer', '提交纪律',
+        '避免改动失去追溯', '不要自行提交', '通过目标仓库要求的检查与测试后再提交',
+        '绝不提交临时区、忽略目录、密钥令牌、本机绝对路径或构建产物',
+        '不擅自推送或改写既有历史'].every(marker => s.text.includes(marker))));
     for (const [label, header, options] of [['origin', { origin: 'subagent' }, {}],
       ['persisted-depth', { delegationDepth: 1 }, {}], ['runtime-depth', {}, { subagentDepth: 1 }]]) {
       const child = { id: label, session: { header }, options };
@@ -1786,18 +1789,20 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
         !assembled.sections.some(s => s.name === 'agent-switchboard:roles' && s.text));
       check(`R02：子代理 ${label} 不含调度规则`, !assembled.sections.some(s =>
         s.name === 'agent-switchboard:scheduling' && s.text) &&
-        !assembled.sections.some(s => s.text.includes('四问路由')));
+        !assembled.sections.some(s => /四问路由|提交纪律/.test(s.text)));
     }
     const unknown = await root.systemPrompt.assemble({ scope: preset });
     check('P09：缺少可靠代理上下文不猜测主代理身份', !unknown.sections.some(s => s.name === 'agent-switchboard:roles' && s.text));
-    check('R03：上下文不可靠不输出调度规则', !unknown.sections.some(s => s.name === 'agent-switchboard:scheduling' && s.text));
+    check('R03：上下文不可靠不输出调度规则', !unknown.sections.some(s =>
+      (s.name === 'agent-switchboard:scheduling' && s.text) || /四问路由|提交纪律/.test(s.text)));
     for (const [label, context] of [['empty', {}], ['null', { agent: null }],
       ['missing-header', { agent: { session: {} } }],
       ['invalid-header', { agent: { session: { header: 'unreliable' } } }],
       ['array-header', { agent: { session: { header: [] } } }]]) {
       // 固定 preset scope，确保这些负例确实看得到已注册小节，而非在空作用域里空通过。
       const assembled = await root.systemPrompt.assemble({ scope: preset, ...context });
-      check(`R04：未知上下文 ${label} 不输出调度规则`, !assembled.sections.some(s => s.name === 'agent-switchboard:scheduling' && s.text));
+      check(`R04：未知上下文 ${label} 不输出调度规则`, !assembled.sections.some(s =>
+        (s.name === 'agent-switchboard:scheduling' && s.text) || /四问路由|提交纪律/.test(s.text)));
     }
     check('R05：规则文本无过时专有标识', !/\$CODEX_HOME|spawn_agent|sandbox_mode|\.toml|\bTOML\b/.test(supervisorRules));
     const hostSource = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
