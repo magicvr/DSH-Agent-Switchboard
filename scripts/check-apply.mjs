@@ -7,7 +7,7 @@
 // 不是真实 spawn 集成，未验证 preset 继承与完整上下文隔离，见 D21。
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createScope, scopeChainOf, scopeOf } from '@deepseek-ai/dsh-scope';
@@ -224,6 +224,141 @@ section('夹具保真：未 inject 抛错、服务按私有 scope 绑定、初�
   await new Promise(setImmediate);
   const failed = await broken.tools.get('switchboard_selftest').execute({});
   check('初始角色注册异常使健康门禁失败且显式记录原因', !failed.ok && failed.roleCount === 0 && failed.mounted.includes('fixture-tools-unavailable'), JSON.stringify(failed));
+}
+
+section('配置格式门禁：settings 保存与运行时自检');
+{
+  const path = configPathFor(fixtureHome);
+  for (const [label, value, status] of [
+    ['未来', { formatVersion: 999, roles: [fixtureRole], custom: { keep: true } }, 'future'],
+    ['旧版', { roles: [fixtureRole], custom: { keep: true } }, 'migrated'],
+    ['当前', initialConfig([fixtureRole], { custom: { keep: true } }), 'current'],
+  ]) {
+    writeFileSync(path, JSON.stringify(value));
+    const before = readFileSync(path);
+    const backupsBefore = readdirSync(dirname(path));
+    const root = makeCtx();
+    apply(root, Config({ roles: [], volatile: { wrapperModel: 'gate-write' } }));
+    const rootHealth = await root.tools.get('switchboard_selftest').execute({});
+    check(`${label} settings 保存判据`, rootHealth.configFormatStatus === (status === 'migrated' ? 'current' : status));
+    if (status === 'current' || status === 'migrated') {
+      const after = JSON.parse(readFileSync(path, 'utf8'));
+      check('当前文件可写且保留未知字段与版本', after.roles.length === 0 && after.custom.keep
+        && after.formatVersion === 1 && after.volatile.wrapperModel === 'gate-write');
+      if (status === 'migrated') {
+        const backup = readdirSync(dirname(path)).find(file => file.includes('.bak-automigrate-') && !backupsBefore.includes(file));
+        check('G1：settings 保存旧版文件持久化编辑并自动备份', rootHealth.ok && after.roles.length === 0
+          && after.formatVersion === 1 && backup && before.equals(readFileSync(join(dirname(path), backup))), JSON.stringify(rootHealth));
+        console.log('  settings 磁盘 BEFORE=' + before.toString());
+        console.log('  settings 磁盘 AFTER=' + readFileSync(path, 'utf8'));
+      }
+    } else {
+      const written = writeConfigFile(path, initialConfig([]));
+      check(`${label}写入返回拒绝且磁盘字节不变`, !written.ok && /拒绝写入/.test(written.error)
+        && before.equals(readFileSync(path)) && !rootHealth.ok
+        && JSON.stringify(backupsBefore) === JSON.stringify(readdirSync(dirname(path))));
+      check(`${label} apply 同步失败被报告且没有异常传播`, rootHealth.configErrors.includes('拒绝写入')
+        && before.equals(readFileSync(path)) && root.tools.get('switchboard_selftest').output.render({}, rootHealth)
+          .some(block => block.text.includes('同步失败：拒绝写入')), JSON.stringify(rootHealth));
+      console.log('  future 磁盘字节保持=' + readFileSync(path, 'utf8') + '；新增备份=0');
+      const preset = makeCtx();
+      apply(preset, Config({ mount: true, supervisorRules, provider: 'self' }));
+      await import('@deepseek-ai/dsh-tool-subagent');
+      await new Promise(setImmediate);
+      const health = await preset.tools.get('switchboard_selftest').execute({});
+      check(`${label}运行时健康门禁`, status === 'future'
+        ? !health.ok && health.configErrors.includes('999') && health.configErrors.includes('支持版本 1')
+        : health.ok && health.warnings.includes('磁盘迁移待完成'));
+      check('自检报告插件版本且宿主版本明确未核实', typeof health.pluginVersion === 'string'
+        && health.manifestVersion === 1 && health.configFormatVersion === 1
+        && health.dshRuntimeVersion === null && health.dshRuntimeVersionReason.includes('未核实'));
+    }
+  }
+  const futureText = JSON.stringify({ formatVersion: 999, roles: [fixtureRole] });
+  writeFileSync(path, futureText);
+  const wrapper = makeCtx();
+  apply(wrapper, { volatile: { wrapperModel: 'gate-write' } });
+  const wrapperHealth = await wrapper.tools.get('switchboard_selftest').execute({});
+  check('future 包裹路由同步读取拒绝被报告且 apply 不抛错', !wrapperHealth.ok
+    && wrapperHealth.configErrors.includes('包裹路由同步失败') && wrapperHealth.configErrors.includes('999')
+    && readFileSync(path, 'utf8') === futureText, JSON.stringify(wrapperHealth));
+  // 模拟读取与写入门禁之间磁盘升级：包裹桥接的 written.ok 分支也必须报告失败。
+  const racedWrapper = makeCtx();
+  const originalRead = fs.readFileSync;
+  let reads = 0;
+  try {
+    fs.readFileSync = (...args) => {
+      if (args[0] === path && args[1] === 'utf8' && ++reads === 2) {
+        return JSON.stringify(initialConfig([fixtureRole]));
+      }
+      return originalRead(...args);
+    };
+    syncBuiltinESMExports();
+    apply(racedWrapper, { volatile: { wrapperModel: 'gate-write' } });
+  } finally {
+    fs.readFileSync = originalRead;
+    syncBuiltinESMExports();
+  }
+  const racedHealth = await racedWrapper.tools.get('switchboard_selftest').execute({});
+  check('future 包裹写入门禁返回拒绝被报告且磁盘不变', reads >= 3 && !racedHealth.ok
+    && racedHealth.configErrors.includes('包裹路由同步失败：拒绝写入')
+    && readFileSync(path, 'utf8') === futureText, JSON.stringify(racedHealth));
+  writeFileSync(path, JSON.stringify(initialConfig([fixtureRole], { provider: 'self' })));
+}
+
+section('旧版文件通过真实 Volatile 保存事件持久化');
+{
+  const path = configPathFor(fixtureHome);
+  const previousBytes = readFileSync(path);
+  const ctx = makeCtx();
+  let update;
+  ctx.on = (name, listener) => { if (name === 'loader/volatile-update') update = listener; };
+  const config = Config({ roles: [fixtureRole], provider: 'self' });
+  apply(ctx, config);
+  const legacy = JSON.stringify({ roles: [fixtureRole], custom: { keep: true } });
+  writeFileSync(path, legacy);
+  const beforeNames = readdirSync(dirname(path));
+  const edited = { ...fixtureRole, model: 'saved-model', instructions: 'saved-instructions' };
+  commitVolatile(config.roles, [edited]);
+  update([['roles']]);
+  const after = readFileSync(path, 'utf8');
+  const backup = readdirSync(dirname(path)).find(file => file.includes('.bak-automigrate-') && !beforeNames.includes(file));
+  const health = await ctx.tools.get('switchboard_selftest').execute({});
+  check('G1：真实保存事件返回前编辑已落盘且旧字节已备份', health.ok && backup
+    && JSON.parse(after).formatVersion === 1 && JSON.parse(after).roles[0].model === 'saved-model'
+    && JSON.parse(after).roles[0].instructions === 'saved-instructions'
+    && readFileSync(join(dirname(path), backup), 'utf8') === legacy, JSON.stringify(health));
+  console.log('  保存事件 BEFORE=' + legacy);
+  console.log('  保存事件 AFTER=' + after);
+  writeFileSync(path, previousBytes);
+}
+
+section('包元数据读取容错');
+{
+  const originalRead = fs.readFileSync;
+  for (const [label, substitute] of [['读取失败', () => { throw new Error('fixture-package-unreadable'); }],
+    ['解析失败', () => '{bad'], ['缺失 dsh', () => '{"version":"fixture"}']]) {
+    let imported;
+    let error;
+    try {
+      fs.readFileSync = (target, ...args) => {
+        if (target instanceof URL && target.href === new URL('../package.json', import.meta.url).href) return substitute();
+        return originalRead(target, ...args);
+      };
+      syncBuiltinESMExports();
+      imported = await import('../src/index.js?metadata-test=' + encodeURIComponent(label));
+    } catch (caught) { error = caught; }
+    finally { fs.readFileSync = originalRead; syncBuiltinESMExports(); }
+    let result;
+    if (imported) {
+      const ctx = makeCtx(); imported.apply(ctx, Config({}));
+      result = await ctx.tools.get('switchboard_selftest').execute({});
+    }
+    check('G5：' + label + ' 不阻断加载，自检保持类型并报告未知', !error && result
+      && result.pluginVersion === (label === '缺失 dsh' ? 'fixture' : '未知') && result.manifestVersion === 0
+      && result.warnings.includes('元数据') && result.dshRuntimeVersion === null
+      && result.dshRuntimeVersionReason === '未核实可靠的宿主版本接口或可解析的宿主包版本；不以 DSH 组件版本推测运行时版本', error?.message ?? JSON.stringify(result));
+  }
 }
 
 section('Config：mount 字段与内置 roles 字段是否冲突');
@@ -1155,7 +1290,7 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   const path = configPathFor(fixtureHome);
   const originalFile = initialConfig([role], { provider: 'self', cwd: 'C:/preserved', maxDepth: 7,
     volatile: { cliTimeoutSec: 'legacy' } });
-  originalFile.formatVersion = 9;
+  originalFile.formatVersion = 1;
   originalFile.custom = { keep: true };
   writeConfigFile(path, originalFile);
   const mount = async (config) => {
@@ -1241,7 +1376,7 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   apply(makeCtx(), Config({ volatile: { wrapperModel: 'continuous-model', wrapperEffort: 'medium' } }));
   file = JSON.parse(readFileSync(path, 'utf8'));
   check('角色同步与包裹路由连续执行互不破坏',
-    file.roles[0].id === role.id && file.custom.keep === true && file.formatVersion === 9 &&
+    file.roles[0].id === role.id && file.custom.keep === true && file.formatVersion === 1 &&
       file.volatile.wrapperModel === 'continuous-model' && file.volatile.wrapperEffort === 'medium' &&
       JSON.parse(beforeContinuous).roles[0].id === file.roles[0].id);
   apply(makeCtx(), Config({ provider: 'self', roles: [role], volatile: rootRoute }));
@@ -1313,11 +1448,11 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   check('R1：桥接后就地清空保留空 roles 并写三空值', JSON.stringify(file.roles) === '[]' &&
     ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile[key] === ''));
 
-  writeConfigFile(path, initialConfig([], { formatVersion: 9, custom: { keep: true }, volatile: { other: 'keep' } }));
+  writeConfigFile(path, initialConfig([], { formatVersion: 1, custom: { keep: true }, volatile: { other: 'keep' } }));
   apply(makeCtx(), Config({ volatile: rootRoute }));
   file = JSON.parse(readFileSync(path, 'utf8'));
   check('R1：已有空 roles 更新 wrapper 且保留其它字段与版本', JSON.stringify(file.roles) === '[]' &&
-    file.formatVersion === 9 && file.custom.keep === true && file.volatile.other === 'keep' &&
+    file.formatVersion === 1 && file.custom.keep === true && file.volatile.other === 'keep' &&
     file.volatile.wrapperProvider === 'root-route' && file.volatile.wrapperModel === 'root-model' && file.volatile.wrapperEffort === 'high');
 
   rmSync(path);
@@ -1410,6 +1545,8 @@ section('阶段 0：文件 resolver mtime+size 缓存与源码静态契约');
     const first = resolver.read(); const same = resolver.read();
     check('F01：mtime+size 未变不重读且复用有效缓存', reads === 1 && !first.cached && same.cached && same.value === first.value);
     writeConfigFile(path, initialConfig([{ ...fixtureRole, model: 'changed-size-model' }]));
+    // writeConfigFile 现在独立读取磁盘做版本门禁；缓存计数只统计 resolver 的读取。
+    reads--;
     const changed = resolver.read();
     check('F02：mtime 或 size 改变重读且取得新值', reads === 2 && !changed.cached && changed.value.roles[0].model === 'changed-size-model');
     writeFileSync(path, '{broken');
@@ -1530,6 +1667,17 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
     const depthValue = readConfigFile(path).value; depthValue.maxDepth = 7; writeConfigFile(path, depthValue);
     await delegate.execute({ prompt: 'T', description: 'depth' }, exec);
     check('S04：maxDepth 文件变更下一次派发使用新上限且不重挂', requests.at(-1).maxDepth === 8 && ctx.registered.length === count);
+    const currentBytes = readFileSync(path);
+    const beforeFuture = requests.length;
+    writeFileSync(path, JSON.stringify({ ...depthValue, formatVersion: 999 }));
+    let futureError = '';
+    try { await delegate.execute({ prompt: 'REFUSE', description: 'future-format' }, exec); }
+    catch (error) { futureError = error.message; }
+    check('格式升级后已有工具拒绝派发，不能使用正常版本缓存', requests.length === beforeFuture
+      && futureError.includes('999') && !(await health()).ok && (await health()).configFormatStatus === 'future');
+    writeFileSync(path, currentBytes);
+    await delegate.execute({ prompt: 'RECOVER', description: 'current-format' }, exec);
+    check('恢复 current 后既有工具继续正常派发', requests.length === beforeFuture + 1 && (await health()).ok);
     hold = true;
     const task = delegate.execute({ prompt: 'OLD-TASK', description: 'snapshot' }, exec); await tick();
     const snapshot = requests.at(-1);

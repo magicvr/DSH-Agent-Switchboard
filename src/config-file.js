@@ -44,15 +44,15 @@
 import { mkdirSync, readFileSync, existsSync, statSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
+import { CONFIG_FORMAT_VERSION, inspectConfigFormat, migrateConfig } from './config-migrations.js';
+export { CONFIG_FORMAT_VERSION } from './config-migrations.js';
 
 /** 插件在 `$DSH_HOME` 下的私有目录名。 */
 export const CONFIG_DIR_NAME = 'agent-switchboard';
 
 /** 配置文件名。 */
 export const CONFIG_FILE_NAME = 'roles.json';
-
-/** 配置文件的当前格式版本。将来改结构时用来做迁移判据。 */
-export const CONFIG_FORMAT_VERSION = 1;
 
 /**
  * 解析配置文件路径。
@@ -85,26 +85,42 @@ export const DIR_MODE = 0o700;
  * @returns {{ok: boolean, value?: object, missing?: boolean, error?: string}} 读取结果。
  */
 export function readConfigFile(path) {
-  if (!existsSync(path)) return { ok: true, value: undefined, missing: true };
+  const { config, format, ...result } = readConfigFileDetailed(path);
+  return { ...result, ...(result.ok ? { value: config } : {}) };
+}
+
+/** 详细读取：config 为内存升级值；format 是磁盘判据（缺失/不可解析时为 null）。
+ * ok/missing/error 沿用读取结果语义；格式 current 仍须通过 roles 数组形状校验。
+ */
+export function readConfigFileDetailed(path) {
+  if (!existsSync(path)) return { ok: true, config: undefined, missing: true, format: null };
   let text;
   try {
     text = readFileSync(path, 'utf8');
   } catch (error) {
-    return { ok: false, error: `读取失败：${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, config: undefined, format: null,
+      error: `读取失败：${error instanceof Error ? error.message : String(error)}` };
   }
+  return parseConfigFileDetailed(text);
+}
+
+/** 从同一份读取快照解析，迁移与备份不会混用不同版本的字节。 */
+function parseConfigFileDetailed(text) {
   let parsed;
   try {
     parsed = JSON.parse(text);
   } catch (error) {
-    return { ok: false, error: `JSON 解析失败：${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, config: undefined, format: null,
+      error: `JSON 解析失败：${error instanceof Error ? error.message : String(error)}` };
   }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return { ok: false, error: '配置文件的顶层必须是一个对象' };
+  const format = inspectConfigFormat(parsed);
+  if (format.status === 'future' || format.status === 'unsupported') {
+    return { ok: false, config: undefined, format, error: format.reason };
   }
   if (!Array.isArray(parsed.roles)) {
-    return { ok: false, error: '配置文件缺少 roles 数组' };
+    return { ok: false, config: undefined, format, error: '配置文件缺少 roles 数组' };
   }
-  return { ok: true, value: parsed };
+  return { ok: true, config: migrateConfig(parsed), format };
 }
 
 /**
@@ -115,30 +131,43 @@ export function createConfigFileResolver(path) {
   let fingerprint;
   let cached;
   let lastError;
+  let format = null;
+  let blocked = false;
   return {
     read() {
       let stat;
       try {
         stat = statSync(path);
       } catch (error) {
+        if (blocked) return { ok: false, format, error: lastError, source: 'file', stale: true, cached: false };
         if (error?.code === 'ENOENT') return { ok: true, missing: true, value: undefined, source: 'file', stale: false, cached: false };
         lastError = `配置文件状态读取失败：${error instanceof Error ? error.message : String(error)}`;
-        return cached ? { ok: true, value: cached, source: 'file', stale: true, cached: true, error: lastError }
-          : { ok: false, error: lastError, source: 'file', stale: true, cached: false };
+        return cached ? { ok: true, value: cached, format, source: 'file', stale: true, cached: true, error: lastError }
+          : { ok: false, format, error: lastError, source: 'file', stale: true, cached: false };
       }
       const next = `${stat.mtimeMs}:${stat.size}`;
-      if (next === fingerprint && cached) return { ok: true, value: cached, source: 'file', stale: Boolean(lastError), cached: true };
-      const result = readConfigFile(path);
+      if (next === fingerprint && blocked) return { ok: false, format, error: lastError, source: 'file', stale: true, cached: false };
+      if (next === fingerprint && cached) return { ok: true, value: cached, format, source: 'file', stale: Boolean(lastError), cached: true };
+      const detailed = readConfigFileDetailed(path);
+      const result = { ...detailed, value: detailed.config };
+      format = detailed.format;
+      // 拒绝状态锁存；只有成功读取且格式明确受支持才能解除。
+      if (result.ok && ['current', 'migrated'].includes(format?.status)) blocked = false;
+      else if (format && !['current', 'migrated'].includes(format.status)) blocked = true;
       fingerprint = next;
+      if (blocked) {
+        lastError = result.error ?? lastError;
+        return { ok: false, format, error: lastError, source: 'file', stale: true, cached: false };
+      }
       if (result.ok && !result.missing) {
         cached = result.value;
         lastError = undefined;
-        return { ok: true, value: cached, source: 'file', stale: false, cached: false };
+        return { ok: true, value: cached, format, source: 'file', stale: false, cached: false };
       }
       if (result.missing) return { ok: true, missing: true, value: undefined, source: 'file', stale: false, cached: false };
       lastError = result.error;
-      return cached ? { ok: true, value: cached, source: 'file', stale: true, cached: true, error: lastError }
-        : { ok: false, error: lastError, source: 'file', stale: true, cached: false };
+      return cached ? { ok: true, value: cached, format, source: 'file', stale: true, cached: true, error: lastError }
+        : { ok: false, format, error: lastError, source: 'file', stale: true, cached: false };
     },
     get cache() { return cached; },
   };
@@ -174,12 +203,104 @@ const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),
  *
  * @param {string} path - 目标绝对路径。
  * @param {object} value - 要写入的对象。
- * @returns {{ok: boolean, error?: string}} 结果。
+ * @returns {{ok: boolean, error?: string, backup?: string, migrated?: {from: number, to: number, applied: object[], backup: string}}} 结果。
  */
 export function writeConfigFile(path, value) {
-  const text = `${JSON.stringify(value, null, 2)}\n`;
-  const temp = `${path}.${randomBytes(6).toString('hex')}.tmp`;
+  let backup;
   try {
+    let format;
+    let original;
+    if (existsSync(path)) {
+      original = readFileSync(path, 'utf8');
+      let raw;
+      try { raw = JSON.parse(original); }
+      catch (error) {
+        // 仅保留已有 JSON 损坏文件的显式修复语义；无法读取时不能证明版本安全。
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+      if (raw !== undefined) {
+        format = inspectConfigFormat(raw);
+        if (format.status === 'future' || format.status === 'unsupported') {
+          return { ok: false, error: `拒绝写入配置：${format.reason}` };
+        }
+      }
+      if (format?.status === 'migrated') {
+        backup = createMigrationBackup(path, original, 'automigrate');
+        if (readFileSync(path, 'utf8') !== original) return { ok: false, backup,
+          error: `配置在自动迁移期间已改变，拒绝写入；备份保留：${backup}` };
+      }
+    }
+    const written = atomicWriteConfigFile(path, value);
+    if (!written.ok) return { ...written, ...(backup ? { backup } : {}) };
+    if (!backup) return written;
+    const verified = readConfigFileDetailed(path);
+    if (!verified.ok || verified.format?.status !== 'current' || !isDeepStrictEqual(verified.config, JSON.parse(JSON.stringify(value)))) {
+      return { ok: false, backup,
+        error: `自动迁移后复读验证失败！保存未确认，请检查文件并从备份恢复：${backup}；${verified.error ?? '产物不匹配'}` };
+    }
+    return { ok: true, migrated: { from: format.onDiskVersion, to: format.currentVersion,
+      applied: format.applied, backup } };
+  } catch (error) {
+    return { ok: false, ...(backup ? { backup } : {}),
+      error: `无法安全保存，拒绝写入配置：${error.message ?? error}` };
+  }
+}
+
+/** 独占创建带随机后缀的原始快照备份，保持运维可识别的名称。 */
+function createMigrationBackup(path, original, kind) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-') + '-' + randomBytes(6).toString('hex');
+  const backup = `${path}.bak-${kind}-${stamp}`;
+  writeFileSync(backup, original, { mode: FILE_MODE, flag: 'wx' });
+  return backup;
+}
+
+/**
+ * 显式磁盘格式迁移：默认只报告步骤；apply 备份读取快照，检查并发修改，再原子写入与复读。
+ * changed 表示是否已写盘；status='changed' 表示并发修改导致拒绝（changed=false）。
+ */
+export function migrateConfigFileOnDisk(path, { apply = false } = {}) {
+  let backup;
+  let status = 'unreadable';
+  let applied;
+  let changed = false;
+  try {
+    let original;
+    try { original = readFileSync(path); }
+    catch (error) {
+      if (error?.code === 'ENOENT') return { ok: true, status: 'missing', changed: false };
+      throw error;
+    }
+    const read = parseConfigFileDetailed(original.toString('utf8'));
+    status = read.format?.status ?? 'unreadable';
+    if (!read.ok) return { ok: false, status, changed: false, error: read.error };
+    applied = read.format.applied;
+    if (status === 'current' || !apply) return { ok: true, status, applied, changed: false };
+    backup = createMigrationBackup(path, original, 'migrate-format');
+    // 写入前最后一次复核原始字节；备份创建期间的外部编辑不能被迁移覆盖。
+    if (!original.equals(readFileSync(path))) return { ok: false, status: 'changed', applied, changed: false, backup,
+      error: `配置在迁移期间已改变，拒绝写入；未写配置，原始快照备份保留：${backup}` };
+    const written = atomicWriteConfigFile(path, read.config);
+    if (!written.ok) return { ...written, status, applied, changed: false, backup };
+    changed = true;
+    const verified = readConfigFileDetailed(path);
+    if (!verified.ok || verified.format?.status !== 'current'
+      || !isDeepStrictEqual(verified.config, read.config)) {
+      return { ok: false, status, applied, changed, backup,
+        error: `迁移后复读验证失败！版本或内容不一致，请从备份恢复：${backup}；${verified.error ?? '产物不匹配'}` };
+    }
+    return { ok: true, status, applied, changed, backup };
+  } catch (error) {
+    return { ok: false, status, applied, changed, ...(backup ? { backup } : {}),
+      error: `迁移失败，${changed ? '已写配置但未确认验证' : '未写配置'}${backup ? '，备份保留：' + backup : ''}：${error.message ?? error}` };
+  }
+}
+
+/** 共享原子写入；格式门禁由调用入口负责。 */
+function atomicWriteConfigFile(path, value) {
+  let temp;
+  try {
+    temp = `${path}.${randomBytes(6).toString('hex')}.tmp`;
+    const text = `${JSON.stringify(value, null, 2)}\n`;
     mkdirSync(dirname(path), { recursive: true, mode: DIR_MODE });
     writeFileSync(temp, text, { encoding: 'utf8', mode: FILE_MODE, flag: 'wx' });
     let delay = RENAME_RETRY_INITIAL_MS;
@@ -197,7 +318,7 @@ export function writeConfigFile(path, value) {
   } catch (error) {
     // 清理临时文件；清理本身失败不应掩盖原始错误。
     try {
-      rmSync(temp, { force: true });
+      if (temp) rmSync(temp, { force: true });
     } catch {
       /* 尽力而为 */
     }

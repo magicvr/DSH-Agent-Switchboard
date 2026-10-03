@@ -24,10 +24,12 @@
 //   node scripts/ops/fix-cli-models.mjs --check
 //   node scripts/ops/fix-cli-models.mjs --apply
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { parse } from 'yaml';
 // 用**驱动表本身**产出参数模板，而不是在这里再写一份 ——
 // 界面「一键填好」用的也是这个函数，因此脚本改出来的值与界面一致（有漂移断言锁定）。
 import { cliFieldsFor } from '../../src/cli/drivers.js';
+import { readConfigFileDetailed, writeConfigFile } from '../../src/config-file.js';
 import { parsePathArgs, resolvePaths, printPaths } from '../lib/paths.mjs';
 
 const pathArgv = process.argv.slice(2).filter(a => !['--apply', '--check'].includes(a));
@@ -40,6 +42,15 @@ if (Object.hasOwn(options, 'roles-file') && !existsSync(ROLES_FILE)) {
   throw new Error(`找不到显式 roles 文件：${ROLES_FILE}`);
 }
 const mode = process.argv.includes('--apply') ? 'apply' : 'check';
+const fileRead = readConfigFileDetailed(ROLES_FILE);
+if (!fileRead.ok) {
+  const format = fileRead.format;
+  console.error(format?.status === 'future' || format?.status === 'unsupported'
+    ? `FAIL  磁盘配置版本 ${JSON.stringify(format.onDiskVersion)}，支持版本 ${format.currentVersion}；拒绝修正，所有文件保持原状。${fileRead.error}`
+    : `FAIL  无法读取 roles 配置，所有文件保持原状：${fileRead.error}`);
+  process.exit(1);
+}
+const backupSuffix = () => `${Date.now()}-${randomBytes(4).toString('hex')}`;
 
 /**
  * 期望的「角色 → 字段修正」。只列需要改的；`worker` 的模型已实测可用故不动。
@@ -297,13 +308,13 @@ if (fail > 0) {
 }
 
 // --- 写盘 --------------------------------------------------------------------
-copyFileSync(PATCH, `${PATCH}.bak-fix-cli-models-${Date.now()}`);
+copyFileSync(PATCH, `${PATCH}.bak-fix-cli-models-${backupSuffix()}`);
 writeFileSync(PATCH, out, 'utf8');
 console.log(`\n已写入 ${PATCH}`);
 
 // 同步到插件文件（preset 会话从那里回落 cwd / 默认值）。
 if (existsSync(ROLES_FILE)) {
-  const fileCfg = JSON.parse(readFileSync(ROLES_FILE, 'utf8'));
+  const fileCfg = fileRead.config;
   const fileRoles = Array.isArray(fileCfg.roles) ? fileCfg.roles : [];
   fileCfg.roles = fileRoles.map((r) => {
     const want = WANTED[r.id];
@@ -317,8 +328,12 @@ if (existsSync(ROLES_FILE)) {
     };
   });
   if (Object.hasOwn(options, 'cwd') || typeof fileCfg.cwd !== 'string' || fileCfg.cwd.length === 0) fileCfg.cwd = CWD_VALUE;
-  copyFileSync(ROLES_FILE, `${ROLES_FILE}.bak-fix-cli-models`);
-  writeFileSync(ROLES_FILE, `${JSON.stringify(fileCfg, null, 2)}\n`, 'utf8');
+  copyFileSync(ROLES_FILE, `${ROLES_FILE}.bak-fix-cli-models-${backupSuffix()}`);
+  const written = writeConfigFile(ROLES_FILE, fileCfg);
+  if (!written.ok) {
+    console.error(`FAIL  同步 roles 配置失败：${written.error}`);
+    process.exit(1);
+  }
   console.log(`已同步到 ${ROLES_FILE}（cwd=${fileCfg.cwd}）`);
 }
 

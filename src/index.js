@@ -23,6 +23,7 @@ import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { scopeOf } from '@deepseek-ai/dsh-scope';
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   CLI_BACKEND,
@@ -35,7 +36,7 @@ import {
   toolConfigFor,
 } from './roles.js';
 import { createCliTool } from './cli/provider.js';
-import { configPathFor, readConfigFile, createConfigFileResolver, writeConfigFile, initialConfig } from './config-file.js';
+import { CONFIG_FORMAT_VERSION, configPathFor, readConfigFileDetailed, createConfigFileResolver, writeConfigFile, initialConfig } from './config-file.js';
 
 /**
  * 从插件自己的配置文件读取角色。
@@ -49,16 +50,36 @@ function readRoleConfigFile(path) {
   if (path === undefined) {
     return { ok: false, detail: '无法定位角色配置文件（ctx.profileContext 不可用）' };
   }
-  const read = readConfigFile(path);
+  const detailed = readConfigFileDetailed(path);
+  const read = { ...detailed, value: detailed.config };
   if (!read.ok) {
-    return { ok: false, detail: `角色配置文件无法读取（${path}）：${read.error}` };
+    return { ok: false, format: read.format, detail: `角色配置文件无法读取（${path}）：${read.error}` };
   }
   if (read.missing) {
     // 「文件不存在」不是错误：用户还没配过角色。如实说明，不冒充成功。
     return { ok: true, missing: true, value: { roles: [] }, detail: `尚未创建角色配置文件（${path}）` };
   }
-  return { ok: true, value: read.value, detail: `已从 ${path} 读取 ${read.value.roles.length} 个角色` };
+  return { ok: true, format: read.format, value: read.value, detail: `已从 ${path} 读取 ${read.value.roles.length} 个角色${read.format.reason ? `；${read.format.reason}` : ''}` };
 }
+
+let pluginPackage;
+let packageWarning = '';
+try {
+  pluginPackage = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+} catch (error) {
+  packageWarning = `插件包元数据读取失败，版本未知（manifest=0 表示未知）：${error.message ?? error}`;
+  console.error(`[agent-switchboard] ${packageWarning}`);
+}
+const pluginVersion = typeof pluginPackage?.version === 'string' ? pluginPackage.version : '未知';
+// 保持自检 number 契约；0 是未知哨兵，告警明确说明缺失。
+const manifestVersion = Number.isSafeInteger(pluginPackage?.dsh?.manifestVersion)
+  ? pluginPackage.dsh.manifestVersion : 0;
+if (!packageWarning && (pluginVersion === '未知' || manifestVersion === 0)) {
+  packageWarning = '插件包元数据不完整，插件版本或 manifestVersion 未知（manifest=0 表示未知）';
+  console.error(`[agent-switchboard] ${packageWarning}`);
+}
+// 未核实公开宿主版本 accessor；不能以组件版本推测宿主版本。
+const dshRuntimeVersionReason = '未核实可靠的宿主版本接口或可解析的宿主包版本；不以 DSH 组件版本推测运行时版本';
 
 /** Loader 条目名，与 package.json 的 `name` 保持一致。 */
 export const name = 'agent-switchboard';
@@ -199,7 +220,7 @@ function syncWrapperRouteToFile(resolved, roleConfigPath, diagnostics) {
   const existing = current.ok ? current.value : {};
   if (!fields.some((key) => Object.hasOwn(root, key) || Object.hasOwn(existing.volatile ?? {}, key))) return;
   if (!current.ok) {
-    fail(current.detail);
+    fail(`拒绝写入包裹路由配置；${current.detail}`);
     return;
   }
   // 仅包裹设置也必须建立桥接文件；空 roles 仍可由迁移脚本后续播种。
@@ -559,6 +580,12 @@ export function selftestTool(ctx, diagnostics) {
         type: 'object',
         additionalProperties: false,
         properties: {
+          pluginVersion: { type: 'string', required: true },
+          manifestVersion: { type: 'number', required: true },
+          configFormatVersion: { type: 'number', required: true },
+          configFormatStatus: { type: 'string', required: true },
+          dshRuntimeVersion: { type: 'null', required: true },
+          dshRuntimeVersionReason: { type: 'string', required: true },
           ok: { type: 'boolean', required: true },
           phase: { type: 'string', required: true },
           roleCount: { type: 'number', required: true },
@@ -582,6 +609,7 @@ export function selftestTool(ctx, diagnostics) {
       render: (_args, value) => {
         const lines = [
           `Agent Switchboard · ${value.phase}`,
+          `版本：插件=${value.pluginVersion} manifest=${value.manifestVersion} 配置=${value.configFormatVersion} (${value.configFormatStatus}) DSH=${value.dshRuntimeVersion ?? value.dshRuntimeVersionReason}`,
           `健康：${value.health}`,
           `调度规则：${value.scheduling}`,
           `已挂载角色工具：${value.roleCount}`,
@@ -633,10 +661,19 @@ export function selftestTool(ctx, diagnostics) {
       const scheduling = !diagnostics.mountHere ? '（根实例不注入；请在 Switchboard preset 中自检）'
         : diagnostics.readSupervisorRules?.() ? '已配置（仅注入主代理）'
           : '未配置（profile 可能未同步 preset：需 gen:preset → inject:preset → 重启）';
-      const warnings = diagnostics.mountHere && !diagnostics.readSupervisorRules?.() ? `调度规则：${scheduling}` : '';
+      const format = diagnostics.roleConfigPath ? readConfigFileDetailed(diagnostics.roleConfigPath).format : null;
+      const warnings = [packageWarning, diagnostics.mountHere && !diagnostics.readSupervisorRules?.() ? `调度规则：${scheduling}` : '',
+        format?.status === 'migrated' ? format.reason : ''].filter(Boolean).join('；');
       const ok = diagnostics.fatal === undefined && diagnostics.configErrors.length === 0
+        && format?.status !== 'future' && format?.status !== 'unsupported'
         && !diagnostics.wrapperSyncPending && !mounted.some(m => m.ok === false);
       return {
+        pluginVersion,
+        manifestVersion,
+        configFormatVersion: CONFIG_FORMAT_VERSION,
+        configFormatStatus: format?.status ?? 'unavailable',
+        dshRuntimeVersion: null,
+        dshRuntimeVersionReason,
         scheduling, warnings, health: !ok ? '不健康' : warnings ? '可用但告警' : '健康',
         ok,
         phase: 'phase-3',
@@ -689,6 +726,7 @@ export function selftestTool(ctx, diagnostics) {
         settingsNamespaces: settingsNamespacesText(ctx),
         roleConfigStatus: [
           `路径=${diagnostics.roleConfigPath ?? '未解析'}`,
+          ...(format?.reason ? [`格式=${format.reason}`] : []),
           `读取=${diagnostics.roleConfigRead ?? '（本作用域未读取）'}`,
           `同步=${diagnostics.roleConfigSync ?? '（本作用域未同步）'}`,
           ...(diagnostics.wrapperSyncPending ? ['包裹路由=根设置尚未桥接（文件创建未成功，不能宣称已生效）'] : []),

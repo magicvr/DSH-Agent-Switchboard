@@ -1,8 +1,9 @@
 // 离线：仅写临时 fixture，不运行外部 CLI、不改变真实 USERPROFILE。
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { pathToFileURL } from 'node:url';
-import { parse } from 'yaml';
+import { parse, stringify } from 'yaml';
+import { cliFieldsFor } from '../src/cli/drivers.js';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { captureSync } from './lib/capture.mjs';
@@ -13,9 +14,12 @@ import { loadCliConfig, validateCliConfig, cliInvocation } from './lib/cli-confi
 
 let pass = 0;
 let fail = 0;
-function check(label, condition) {
-  console.log(`  ${condition ? 'PASS' : 'FAIL'}  ${label}`);
+function check(label, condition, detail = '') {
+  console.log(`  ${condition ? 'PASS' : 'FAIL'}  ${label}${!condition && detail ? ` — ${detail}` : ''}`);
   if (condition) pass++; else fail++;
+}
+function section(title) {
+  console.log(`\n=== ${title} ===`);
 }
 function test(label, fn) {
   try { check(label, Boolean(fn())); } catch { check(label, false); }
@@ -220,7 +224,7 @@ try {
       && r.stdout.includes('npm run gen:preset && npm run inject:preset，然后重启 DSH');
   });
 
-  console.log('\n=== 角色文件迁移与删源前复读 ===');
+  section('角色文件迁移与删源前复读');
   const migration = join(REPO_ROOT, 'scripts', 'ops', 'migrate-roles-to-file.mjs');
   const seedRoles = [{ id: 'migration-fixture', title: 'Fixture', prompt: 'offline fixture', backend: 'spawn' }];
   const migrationText = `- insert:\n  - id: preset-switchboard\n    config:\n      plugins:\n      - id: switchboard-roles\n        name: "${self}"\n        config:\n          mount: true\n          provider: seed-provider\n          cwd: seed-cwd\n          maxDepth: 2\n          roles: ${JSON.stringify(seedRoles)}\n`;
@@ -279,11 +283,11 @@ try {
   const profileConfig = f => parse(readFileSync(f.patch, 'utf8'))[0].insert[0].config.plugins[0].config;
   const readRoles = f => existsSync(f.roles) ? JSON.parse(readFileSync(f.roles, 'utf8')) : undefined;
   const wrapperOnly = {
-    formatVersion: 7, roles: [], provider: 'existing-provider', cwd: 'existing-cwd', maxDepth: 4,
+    formatVersion: 1, roles: [], provider: 'existing-provider', cwd: 'existing-cwd', maxDepth: 4,
     volatile: { wrapperProvider: 'wrapper-route', wrapperModel: 'wrapper-model', wrapperEffort: 'high', cliTimeoutSec: 45 },
     custom: { retained: true },
   };
-  for (const [label, value] of [['缺文件', undefined], ['空 roles 文件', { roles: [] }], ['wrapper-only 文件', wrapperOnly]]) {
+  for (const [label, value] of [['缺文件', undefined], ['无版本文件', { roles: [] }], ['空 roles 文件', { formatVersion: 1, roles: [] }], ['wrapper-only 文件', wrapperOnly]]) {
     const f = fixture(`migration-success-${label}`, value);
     const result = runMigration(f);
     const after = readRoles(f);
@@ -292,6 +296,35 @@ try {
     check(`${label}源 config 只剩 mount:true`, isDeepStrictEqual(profileConfig(f), { mount: true }));
     check(`${label}保留已有字段并补齐默认值`, isDeepStrictEqual(after,
       { formatVersion: 1, provider: 'seed-provider', cwd: 'seed-cwd', maxDepth: 2, ...value, roles: seedRoles }));
+  }
+  const stale = fixture('migration-stale-dry-run', { roles: seedRoles, custom: true });
+  const staleBytes = readFileSync(stale.roles);
+  const dryRun = captureSync(process.execPath, [migration, '--home', stale.home],
+    { cwd: temp, env: { ...env, DSH_HOME: stale.home } });
+  check('旧格式脚本默认 dry-run 报告步骤且两文件不变', dryRun.status === 0
+    && /格式迁移待完成/.test(dryRun.stdout) && staleBytes.equals(readFileSync(stale.roles))
+    && readFileSync(stale.patch, 'utf8') === migrationText
+    && readdirSync(join(stale.home, 'agent-switchboard')).length === 1);
+  const staleApply = runMigration(stale);
+  const formatBackups = readdirSync(join(stale.home, 'agent-switchboard'))
+    .filter(name => name.startsWith('roles.json.bak-migrate-format-'));
+  check('旧格式 --apply 完成备份与复读验证并保留已有 roles', staleApply.status === 0
+    && /格式迁移完成并复读验证通过/.test(staleApply.stdout) && formatBackups.length === 1
+    && staleBytes.equals(readFileSync(join(stale.home, 'agent-switchboard', formatBackups[0])))
+    && isDeepStrictEqual(readRoles(stale), { roles: seedRoles, custom: true, formatVersion: 1 }));
+  for (const [label, version] of [['未来版本 999', 999], ['非法版本', '1']]) {
+    const f = fixture(`migration-refusal-${label}`, { formatVersion: version, roles: [] });
+    const rolesBefore = readFileSync(f.roles);
+    const patchBefore = readFileSync(f.patch);
+    const result = runMigration(f);
+    const output = result.stdout + result.stderr;
+    check(`${label}迁移干净拒绝无堆栈`, result.status === 1 && /FAIL.*磁盘配置版本/.test(output)
+      && output.includes(String(version)) && /支持版本 1/.test(output) && /保持原状/.test(output)
+      && !/\n\s+at |file:\/\//.test(output), output);
+    check(`${label} roles 文件字节不变`, rolesBefore.equals(readFileSync(f.roles)));
+    check(`${label} profile 字节不变且未备份`, patchBefore.equals(readFileSync(f.patch))
+      && readdirSync(join(f.home, 'agent-switchboard')).length === 1
+      && readdirSync(join(f.home, 'profiles', 'desktop')).length === 1);
   }
   const existingRoles = [{ id: 'existing-role', custom: true }];
   const populated = fixture('migration-existing-roles', { ...wrapperOnly, roles: existingRoles });
@@ -310,6 +343,50 @@ try {
       : /PASS  已播种配置文件/.test(output) && /删除 profile 角色前复读/.test(output)
         && isDeepStrictEqual(readRoles(f)?.roles, seedRoles));
   }
+
+  section('CLI 修正格式门禁与备份');
+  const fixHome = join(temp, 'fix-cli');
+  mkdirSync(fixHome);
+  const fixPatch = join(fixHome, 'patch.yml');
+  const fixRoles = join(fixHome, 'roles.json');
+  const fixSeed = [
+    { id: 'scout', backend: 'cli', cliDriver: 'grok', model: 'grok-4.7', effort: 'high', ...cliFieldsFor('grok', false) },
+    { id: 'worker', backend: 'cli', cliDriver: 'codex', model: 'gpt-6.1-sol', effort: 'high', ...cliFieldsFor('codex', false) },
+    { id: 'architect', backend: 'spawn', model: 'gpt-6-astra' },
+  ].map(role => ({ ...role, description: 'fixture', instructions: 'fixture' }));
+  const fixText = stringify([{ id: 'agent-switchboard', config: { mount: false, provider: 'fixture', roles: fixSeed } }]);
+  const runFix = apply => captureSync(process.execPath,
+    [join(REPO_ROOT, 'scripts', 'ops', 'fix-cli-models.mjs'), '--home', fixHome,
+      '--patch', fixPatch, '--roles-file', fixRoles, ...(apply ? ['--apply'] : [])],
+    { cwd: temp, env: { ...env, DSH_HOME: fixHome } });
+  for (const version of [99, '1']) {
+    writeFileSync(fixPatch, fixText);
+    const bytes = JSON.stringify({ formatVersion: version, roles: { futureRole: 'must keep' }, futureOnly: 'keep' });
+    writeFileSync(fixRoles, bytes);
+    const result = runFix(true);
+    const output = result.stdout + result.stderr;
+    check(`CLI 修正拒绝版本 ${JSON.stringify(version)} 且两文件不变无备份无堆栈`, result.status === 1
+      && output.includes(`磁盘配置版本 ${JSON.stringify(version)}，支持版本 1`)
+      && /保持原状/.test(output) && !/\n\s+at |file:\/\//.test(output)
+      && readFileSync(fixRoles, 'utf8') === bytes && readFileSync(fixPatch, 'utf8') === fixText
+      && readdirSync(fixHome).length === 2, output);
+  }
+  const fixValue = { formatVersion: 1, roles: fixSeed, futureOnly: 'keep' };
+  writeFileSync(fixRoles, JSON.stringify(fixValue));
+  const fixDry = runFix(false);
+  check('CLI 修正默认 dry-run 不写盘', fixDry.status === 0 && /未写盘/.test(fixDry.stdout)
+    && readFileSync(fixRoles, 'utf8') === JSON.stringify(fixValue)
+    && readFileSync(fixPatch, 'utf8') === fixText && readdirSync(fixHome).length === 2);
+  const firstFix = runFix(true);
+  const firstBackups = readdirSync(fixHome).filter(name => name.startsWith('roles.json.bak-fix-cli-models-'));
+  const secondFix = runFix(true);
+  const secondBackups = readdirSync(fixHome).filter(name => name.startsWith('roles.json.bak-fix-cli-models-'));
+  check('CLI 修正当前格式写入成功并保留未知字段', firstFix.status === 0 && secondFix.status === 0
+    && /结果：15 通过 \/ 0 失败/.test(firstFix.stdout)
+    && readRoles({ roles: fixRoles }).futureOnly === 'keep', firstFix.stdout + firstFix.stderr + secondFix.stderr);
+  check('CLI 修正连续运行保留独立的原字节备份', firstBackups.length === 1
+    && secondBackups.length === 2 && secondBackups.includes(firstBackups[0])
+    && readFileSync(join(fixHome, firstBackups[0]), 'utf8') === JSON.stringify(fixValue));
 
   console.log('\n=== ASAR 定位 ===');
   const asar = extra => resolveAsar({ env: {}, cwd: temp, homedir: base.homedir, platform: 'win32', isFile: () => true, ...extra });

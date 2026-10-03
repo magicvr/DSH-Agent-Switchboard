@@ -914,3 +914,23 @@ CLI 自身工具与受控委派白名单、只读 deny、`allow: []` 拒绝继�
 **代价：** 依赖「空值自动抹掉该元素」来省略参数的自定义模板会从「静默错位」变成「显式报错」。这是必要的安全收紧；线上 `roles.json` 的 4 个角色均带 `effort`，零影响。`scripts/check-cli.mjs` 中原先把该行为断言为预期的用例（「缺省值替换为空串并丢弃该元素」）必须改写为断言抛错语义 —— 该断言正是这条缺陷长期未被发现的原因。
 
 **边界：** 本决策（F3）不改 argv 的替换位置语义（始终在单个 argv 元素内部替换、全程无 shell）、不改驱动模板本身、不为缺省强度的 CLI 角色静默注入默认值（避免遮蔽用户的配置意图）。Codex `prefixArgs` 驱动模板的平台化调整属于 F8，另见 [`plan.md`](./plan.md) 的修复计划。
+
+---
+
+## D31 · 插件生命周期与版本管理（分阶段收敛 + 配置格式迁移）
+
+**决策：** 本插件的安装、卸载、升级不再另造一个安装器，而是「检测 + 指令 + 收敛派生制品 + 验证」。包依赖与 bundle 登记一律走 DSH 官方通道：Electron GUI 的 Plugins 页，或非 desktop profile 的 `dsh plugin --profile <name> add <spec>`；本仓库工具不碰 `dependencies`、不自行执行 pnpm。`package.json.version` 是插件版本唯一事实来源；`plugin-version` 工具负责 bump 与 CHANGELOG 收口，且**永不自动 commit 或 tag**。`roles.json` 的 `formatVersion` 从「只写不读」改为显式有序的纯函数迁移链；插件版本、manifest 版本与配置格式版本分别演进，不混为一个版本号。
+
+**依据（已核实）：** 以下为本次方向所依据的逐条取证结论：
+
+- `dsh plugin --profile desktop ...` 被 `rejectElectronProfile` 无条件拒绝，且无 flag、env、别名或路径绕道（`dsh/lib/bin.js`）。
+- `desktop` 只能由 Electron 应用管理；本地目录安装的唯一受支持 GUI 入口是 `plugin_manager.installBundle` → `pnpm add <spec>`，cwd 为 profile 目录。
+- bundle 必须同时出现在 profile `package.json` 的 `dependencies` 与 `dsh.profile.bundles`；只进 `dependencies` 会静默不加载。
+- `compatibility.json` 永不自动创建，豁免键是精确的 `package@version`，版本一变即静默失效。
+- 任何 JavaScript 模块改动（含 `link:` 本地源码）都必须重启进程才能生效。
+
+**代价与缓解：** desktop profile 上安装、卸载必然包含一步人工 GUI 操作，工具只能检测、给指令并复验，无法全自动。缓解是让命令幂等收敛，重复运行总是把状态推向目标，并明确报告「已同步」与「需重启才生效」的区别。仓库内受版本控制的 `package.json`、`package-lock.json`、`CHANGELOG.md` 在 bump 时不写 `.bak` 备份，因为 git 就是它们的备份；改用原子写 + 写后复读校验。这是对本仓库 `scripts/ops/` 通用备份惯例的有意偏离；原子替换按文件执行，中途失败仍可能留下跨文件版本不一致，由复验明确报错。配置写入仅对较新或未知（`future`）、无法迁移（`unsupported`）的磁盘格式硬拒绝；较旧但可迁移（`migrated`）的文件在写入时自动迁移，先生成带时间戳的备份，再写盘并复读验证，避免拒绝写入而静默丢弃用户的设置修改。仍有客户端限制：对 `future` / `unsupported` 的硬拒绝，GUI 设置页可能仍报告保存已接受，实际文件未写入；Host 通过 diagnostics 报告并将插件标为不健康，客户端尚未接入该错误的展示。
+
+**分阶段边界：** B1 已落地版本管理半边：无依赖 SemVer 2.0.0 纯逻辑、只读 show、默认 dry-run 的 bump、显式 `--apply` 写入与 CHANGELOG 收口、离线版本检查。配置格式迁移链也已实现：`src/config-migrations.js` 的 `0 → 1` 步骤、`inspectConfigFormat`、`migrateConfig` 与 `migrateConfigFileOnDisk` 提供格式检查、内存迁移及带备份和复读验证的磁盘迁移；离线检查不等同于真机验收。生命周期命令 `status` / `install` / `upgrade` / `uninstall` 仍未实现，由后续批次落地，其真机行为尚未验证，不得写成已具备的工具能力。版本 bump 不执行 DSH 安装、不修改 profile、不自动重启。
+
+---

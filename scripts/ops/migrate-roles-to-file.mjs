@@ -25,7 +25,7 @@
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { parse } from 'yaml';
-import { readConfigFile, writeConfigFile, initialConfig } from '../../src/config-file.js';
+import { readConfigFile, readConfigFileDetailed, migrateConfigFileOnDisk, writeConfigFile, initialConfig } from '../../src/config-file.js';
 import { join } from 'node:path';
 import { parsePathArgs, pathValue, resolvePaths, printPaths } from '../lib/paths.mjs';
 
@@ -107,7 +107,13 @@ console.log(`角色：${seedRoles.length} 个 —— ${seedRoles.map((r) => r.id
 console.log(`默认值：${JSON.stringify(seedExtra)}`);
 
 // --- 2) 现有配置文件状态 -------------------------------------------------------
-const existing = readConfigFile(configPath);
+const detailed = readConfigFileDetailed(configPath);
+if (['future', 'unsupported'].includes(detailed.format?.status)) {
+  console.error(`FAIL  磁盘配置版本 ${JSON.stringify(detailed.format.onDiskVersion)}，支持版本 ${detailed.format.currentVersion}，拒绝写入：${detailed.error}`);
+  console.error('      配置文件与 profile 均保持原状，未改动。');
+  process.exit(1);
+}
+const existing = { ...detailed, value: detailed.config };
 if (!existing.ok) {
   console.error(`FAIL  现有配置文件损坏，拒绝覆盖：${existing.error}`);
   console.error('      请先修好或删除它，再重跑本脚本。');
@@ -142,6 +148,10 @@ const hasRolesInProfile = Array.isArray(selfRow.config?.roles) && selfRow.config
 console.log(`profile 里是否还有 roles：${hasRolesInProfile}`);
 
 console.log('\n将要做的改动：');
+if (detailed.format?.status === 'migrated') {
+  const pending = migrateConfigFileOnDisk(configPath);
+  console.log(`  格式迁移待完成：${JSON.stringify(pending.applied)}（--apply 才写盘）`);
+}
 if (needsSeed && seedRoles.length > 0) console.log(`  1. 播种配置文件（${seedRoles.length} 个角色）→ ${configPath}`);
 else console.log('  1. 不改动配置文件');
 console.log(
@@ -156,6 +166,15 @@ if (mode === 'check') {
 }
 
 // --- 4) 先播种文件（顺序关键：先文件、后 profile）-------------------------------
+if (detailed.format?.status === 'migrated') {
+  const migrated = migrateConfigFileOnDisk(configPath, { apply: true });
+  if (!migrated.ok) {
+    console.error(`FAIL  配置格式迁移失败：${migrated.error}`);
+    console.error('      未改动 profile —— 保持原状。');
+    process.exit(1);
+  }
+  console.log(`PASS  配置格式迁移完成并复读验证通过；备份：${migrated.backup}`);
+}
 if (needsSeed && seedRoles.length > 0) {
   const written = writeConfigFile(configPath, initialConfig(seedRoles, { ...seedExtra, ...existing.value, roles: seedRoles }));
   if (!written.ok) {
