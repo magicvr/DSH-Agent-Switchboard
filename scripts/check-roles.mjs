@@ -527,7 +527,7 @@ section('出站权限与三种提示使用同一有效结果');
   for (const backend of ['cli', 'spawn', 'fork']) {
     for (const allowNestedDispatch of [false, true]) {
       const role = normalizeRole({ id: 'self', backend, instructions: 'i', description: 'd', model: 'm', allowNestedDispatch,
-        ...(backend === 'cli' ? { cliDriver: 'grok', cliCwd: 'C:/w', ...cliFieldsFor('grok', false) } : {}) }, 0, 'p').role;
+        ...(backend === 'cli' ? { cliDriver: 'grok', effort: 'medium', cliCwd: 'C:/w', ...cliFieldsFor('grok', false) } : {}) }, 0, 'p').role;
       const options = { maxDepth: 3, delegateToolNames, availableToolNames };
       const permissions = dispatchPermissionsFor(role, options);
       const config = toolConfigFor(role, options);
@@ -606,7 +606,7 @@ section('planCliMounts：有效 CLI 预设挂载（无全局闸门）');
   const { cliFieldsFor } = await import('../src/cli/drivers.js');
   const mk = (id, backend) => normalizeRole({
     id, backend, description: 'd', instructions: 'i', model: 'm', provider: 'p',
-    readOnly: true, cliDriver: 'grok', ...cliFieldsFor('grok', true), cliCwd: 'C:/w',
+    readOnly: true, effort: 'medium', cliDriver: 'grok', ...cliFieldsFor('grok', true), cliCwd: 'C:/w',
   }, 0).role;
   const roles = [mk('a', 'spawn'), mk('b', 'cli'), mk('c', 'cli'), mk('d', 'fork')];
 
@@ -649,6 +649,25 @@ section('planCliMounts：有效 CLI 预设挂载（无全局闸门）');
     ![...blockedIds].some((id) => id.startsWith('s')),
     [...blockedIds].join(','),
   );
+}
+
+
+section('F2 / F3 回归');
+{
+  const ro = { id: 'ro', backend: 'spawn', readOnly: true };
+  check('只读拒绝 bash 与 plugin_manager',
+    JSON.stringify(dispatchPermissionsFor(ro, { availableToolNames: ['bash', 'plugin_manager'] }).toolFilter.deny) === '["bash","plugin_manager"]');
+  check('Windows 清单不添加未知 bash', !dispatchPermissionsFor(ro, { availableToolNames: ['pwsh'] }).toolFilter.deny.includes('bash'));
+  for (const driver of ['codex', 'grok']) {
+    const base = { id: driver, description: 'd', instructions: 'i', backend: 'cli', model: 'm', cliCwd: 'C:/w', cliDriver: driver, ...cliFieldsFor(driver, true), readOnly: true };
+    const missing = normalizeRole(base, 0);
+    check(`${driver} 缺强度在装载期报错`, missing.errors.some(e => e.includes('模板使用了 {effort}')));
+    check(`${driver} 显式合法强度通过`, normalizeRole({ ...base, effort: 'medium' }, 0).errors.length === 0);
+    const custom = { ...base, cliDriver: undefined, cliPromptDelivery: 'stdin', cliArgs: ['exec', '-'] };
+    check('未引用 effort 的自定义模板可省略', normalizeRole(custom, 0).errors.length === 0);
+    const cwd = normalizeRole({ ...custom, cliCwd: undefined, cliArgs: ['exec', '{cwd}'] }, 0);
+    check('引用 cwd 却不可得在装载期报错', cwd.errors.some(e => e.includes('{cwd}')));
+  }
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

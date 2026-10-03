@@ -809,7 +809,7 @@ section('CLI 逐角色阻塞：未知配置不注册工具、不解析命令、�
     if (section.name === 'agent-switchboard:roles') guidance = section.text;
     return { dispose() {} };
   };
-  const base = { description: 'd', instructions: 'i', backend: 'cli', model: 'external-model', readOnly: true, cliCwd: 'C:/w' };
+  const base = { description: 'd', instructions: 'i', backend: 'cli', model: 'external-model', effort: 'medium', readOnly: true, cliCwd: 'C:/w' };
   const legacy = { ...base, id: 'legacy', cliDriver: 'custom', ...cliFieldsFor('codex', true), cliCommand: 'unknown-executable' };
   const valid = { ...base, id: 'valid', cliDriver: 'custom', ...cliFieldsFor('grok', true) };
   const before = JSON.stringify([legacy, valid]);
@@ -830,7 +830,7 @@ section('CLI 逐角色阻塞：未知配置不注册工具、不解析命令、�
 section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失不可冒充健康');
 {
   const { cliFieldsFor } = await import('../src/cli/drivers.js');
-  const role = { id: 'cli-worker', description: 'd', instructions: 'i', backend: 'cli', model: 'external-model',
+  const role = { id: 'cli-worker', description: 'd', instructions: 'i', backend: 'cli', model: 'external-model', effort: 'medium',
     cliDriver: 'grok', cliCwd: 'C:/w', ...cliFieldsFor('grok', false) };
   for (const mode of ['success', 'throw', 'missing', 'delegate-missing']) {
     const scope = {};
@@ -966,7 +966,7 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
   ctx.tools.register({ name: 'read' });
   ctx.tools.register({ name: 'workflow' });
   ctx.tools.register({ name: 'subagent' });
-  const cli = { description: 'd', instructions: 'i', backend: 'cli', model: 'external', cliDriver: 'grok',
+  const cli = { description: 'd', instructions: 'i', backend: 'cli', model: 'external', effort: 'medium', cliDriver: 'grok',
     cliCwd: 'C:/w', ...cliFieldsFor('grok', false) };
   apply(ctx, { mount: true, maxDepth: 1, provider: 'self', roles: [
     { ...cli, id: 'organizer', allowNestedDispatch: true },
@@ -1433,7 +1433,7 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
   const { cliFieldsFor } = await import('../src/cli/drivers.js');
   const path = configPathFor(fixtureHome);
   const builtin = { ...fixtureRole, id: 'hot', effort: 'low', readOnly: false };
-  const cli = { ...fixtureRole, id: 'hot-cli', backend: 'cli', cliDriver: 'codex',
+  const cli = { ...fixtureRole, id: 'hot-cli', backend: 'cli', effort: 'medium', cliDriver: 'codex',
     cliCwd: 'C:/fixture', ...cliFieldsFor('codex', false) };
   writeConfigFile(path, initialConfig([builtin, cli], { provider: 'self', maxDepth: 3 }));
   const root = new Context();
@@ -1826,7 +1826,7 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
     const foreign = await run('foreign', undefined, alien);
     check('P10：真实 ToolRuntime 本 preset 同名他方工具不被快照 hook 拦截', !foreign.isError && foreign.value === 'delegate_to_snapshot');
     save(7);
-    const cliRole = { ...fixtureRole, backend: 'cli', cliDriver: 'codex', ...cliFieldsFor('codex', false),
+    const cliRole = { ...fixtureRole, backend: 'cli', effort: 'medium', cliDriver: 'codex', ...cliFieldsFor('codex', false),
       cliCwd: 'fixture', cliTimeoutMs: 1234 };
     const normalized = normalizeRoles([cliRole]);
     check('P11：cliTimeoutMs 不解析也不透传到规范化 cli', normalized.roles.length === 1
@@ -1870,6 +1870,15 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
 }
 
 // 动态契约替代旧私有代际/租约测试；固定工具骨架不再测试旧内部生命周期。
+
+section('F5 校验失败不追加 toolName 漂移');
+{
+  const ctx = makeCtx();
+  apply(ctx, { mount: true, provider: 'self', roles: [{ ...fixtureRole, model: '', toolName: 'delegate_to_fixture' }] });
+  const result = await ctx.tools.get('switchboard_selftest').execute({});
+  check('仅真实 model 错误，无虚假 toolName 错误', /model.*必填/.test(result.configErrors) && !result.configErrors.includes('toolName'), result.configErrors);
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 } finally {
   if (previousDshHome === undefined) delete process.env.DSH_HOME;

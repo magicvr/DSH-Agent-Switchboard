@@ -576,6 +576,6 @@ DSH GUI 的完整按钮链与 codex/grok 进程树清理仍需真机验收，本
 
 客户端使用手写 `h()` 模仿官方 `@deepseek-ai/dsh-client-ui-settings-models/lib/client.js` 的 `rows / rowCard / rowHead / rowIdentity / rowActions / addBlock` 结构。每角色折叠卡片头显示标题与 id、内置 spawn/fork 或外部 codex/grok 的机制徽标、模型/只读/允许再派发徽标；8×8 实心状态圆点使用 `--dsw-alias-state-success-primary` / `--dsw-alias-state-error-primary`，并用 aria-label 说明配置有效或错误原因。它判断配置完整性、重复 id 与 CLI 预设识别，不判断本机 CLI 是否可运行。
 
-`SwitchboardSettings` 持有唯一 `editingId` 和读取 revision，`RoleCard` 持有本卡片 `draftRole` 与删除确认状态，`RoleRow` 保留原字段控件及 readOnly 切换的原子预设同步。卡片 key 随展开状态变化，取消、收起或切换焦点会重新挂载并丢弃旧草稿；保存构造完整角色候选数组，调用原有 validateRoles 与预设识别校验，失败在卡片内显示红色 alert。成功经原 `makeRoleStore` 写入通道一次 mutate，携带 revision；远端失败保留编辑器及草稿。新增位于列表底部，显式保存才入列；删除先原位确认，第二步才提交。包裹小节始终位于列表前，仍逐字段 dirty 提交，wrapper-only 不写 roles。
+`SwitchboardSettings` 持有唯一 `editingId`、读取 revision 和删除确认状态 `confirmingIndex`，`RoleCard` 仅持有本卡片 `draftRole`，`RoleRow` 保留原字段控件及 readOnly 切换的原子预设同步。删除确认状态上移到父组件并在删除、重读或切换编辑时清空，避免删除中间行后下标前移，使位移上来的卡片继承确认态而误删。卡片 key 随展开状态变化，取消、收起或切换焦点会重新挂载并丢弃旧草稿；保存构造完整角色候选数组，调用原有 validateRoles 与预设识别校验，失败在卡片内显示红色 alert。成功经原 `makeRoleStore` 写入通道一次 mutate，携带 revision；远端失败保留编辑器及草稿。新增位于列表底部，显式保存才入列；删除先原位确认，第二步才提交。包裹小节始终位于列表前，仍逐字段 dirty 提交，wrapper-only 不写 roles。
 
 官方也是自绘：平台自动表单只支持标量字段，configForms.describe 仅作为只读镜像。外部客户端插件禁止引入 Harness Client 包（包括官方 UI primitives 的 Modal/Button），以免版本变化或包缺失让 slot 白屏；本页不 import 官方 UI 包，不引入依赖或定时器，采用原生 button（type=button、aria-expanded）和卡片内两步确认替代 Modal。该改版已完成离线渲染取树、真实回调与变异验证；真实 GUI 观感、焦点体验与设置往返仍待真机验收，不改变 Host、权限、任务生命周期或延迟解析架构。

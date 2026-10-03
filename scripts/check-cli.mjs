@@ -82,8 +82,19 @@ section('占位符替换：基本行为');
   const inline = buildArgs(['--prompt={prompt}'], { prompt: 'XYZ' });
   check('同一元素内混合字面量与占位符', inline[0] === '--prompt=XYZ', inline[0]);
 
-  const missing = buildArgs(['exec', '--effort', '{effort}', '-'], { prompt: 'P' });
-  check('缺省值替换为空串并丢弃该元素', missing.includes('--effort') && !missing.includes(''), JSON.stringify(missing));
+  const missing = throws(() => buildArgs(['exec', '--effort', '{effort}', '-'], { prompt: 'P' }));
+  check('缺省 effort 抛错并指名 {effort}', missing?.includes('{effort}'), String(missing));
+  const embedded = throws(() => buildArgs(['model_reasoning_effort={effort}'], {}));
+  check('嵌入式缺值也抛错', embedded?.includes('{effort}'), String(embedded));
+  for (const effort of ['', '   ']) {
+    const error = throws(() => buildArgs(['--effort', '{effort}'], { effort }));
+    check(`空强度 ${JSON.stringify(effort)} 被拒绝`, error?.includes('{effort}'), String(error));
+  }
+  check('合法强度保留完整 argv', JSON.stringify(buildArgs(['--effort', '{effort}'], { effort: 'high' })) === '["--effort","high"]');
+  check('模板不引用 effort 可省略强度', JSON.stringify(buildArgs(['exec', '-'], {})) === '["exec","-"]');
+  check('固定空元素不隐式丢弃', JSON.stringify(buildArgs(['exec', ''], {})) === '["exec",""]');
+  for (const name of ['model', 'cwd', 'prompt']) check(`缺省 {${name}} 抛错`,
+    throws(() => buildArgs([`{${name}}`], {}))?.includes(`{${name}}`));
 }
 
 section('替换的安全性：元素边界');
@@ -255,6 +266,18 @@ section('专属 CLI 工具命名一致性（跨模块）');
     JSON.stringify(cfg.toolFilter.allow) === JSON.stringify([tool.name]));
   check('工具名包含与 delegate 相同的角色后缀', tool.name === 'switchboard_cli_run_codex_scout');
   check('CLI 委派后端是 spawn', cfg.provider === 'spawn');
+}
+
+
+section('F3 运行期错误被专属工具包装');
+{
+  let spawned = false;
+  const role = { id: 'missing-effort', model: 'm', instructions: 'i', backend: 'cli',
+    cli: { command: 'grok', prefixArgs: [], args: ['--effort', '{effort}'], promptDelivery: 'stdin', cwd: 'C:/w' } };
+  const tool = createCliTool({ role, spawn: () => { spawned = true; throw new Error('不应启动'); } });
+  const result = await tool.execute({ prompt: 'P' }, { agent: { id: 'a', session: { header: { origin: 'subagent' } } } });
+  check('缺强度返回正常 start-failed 结果，无 rejection', result.status === 'start-failed' && result.stderr.includes('{effort}'));
+  check('模板失败不调用 spawn', !spawned);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

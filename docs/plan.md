@@ -279,3 +279,113 @@
 | 角色与派发方式可配置 | 角色文件为 `$DSH_HOME/agent-switchboard/roles.json`；UI 经根配置读写桥接，Host 同步文件；preset 带 `mount: true` 与 `supervisorRules`（D29 补记），不得携带 `roles`；机制是每个角色自己的 `backend` 字段（D13 / D14） |
 | 模型不得自由拼装 shell 命令 | `src/cli/argv.js` 只做受限占位符替换，`argv` 数组直传 `ctx.subprocess.spawn`，全程无 shell |
 | `raw/` 不入库 | 已在 `.gitignore`，且 `AGENTS.md` 列为硬规则 |
+
+## 附：整体审视缺陷修复计划（2026-10-03）
+
+> **来源与口径：** 针对当前 HEAD（`d96118a`）的一次整体缺陷审视。取证方式为 4 路只读取证（Host 核心 / CLI 层 / Client 面板 / 生命周期与派发快照）+ 2 路独立复核 + 主代理定点核实宿主契约（`dsh-settings` 的 `mutate` 并发语义、真实 `roles.json`、`bash` 工具注册名）。
+> **基线：** `npm run check` 全绿（129 项 / 0 失败）。**绿不等于干净** —— F3 的缺陷当前正被 `check-cli.mjs:86` 断言成预期行为。
+> **结论：** 确认缺陷 9 项（F1–F9）；已核实误报 4 项与 NOTE 级 3 项列在「明确不修」。安全核心面（无 shell、占位符白名单、临时提示词文件清理、取消路径清理、D27 并发快照隔离）本轮未发现缺陷。
+
+### 缺陷清单
+
+| # | 严重度 | 缺陷 | 位置 | 触发条件 |
+| --- | --- | --- | --- | --- |
+| F1 | 高（数据丢失） | 读取配置失败后「保存」仍高亮可点，一次点击把 `roles.json` 清空 | `src/client/index.js:911-916`、`939`、`1007` | `store.read()` 失败（镜像未就绪 / `ensure()` 抛错 / 暂时找不到 ns 行） |
+| F2 | 高（条件） | `WRITE_TOOLS` 漏 `bash`（并漏 `plugin_manager`），非 Windows 下只读角色可执行 shell | `src/roles.js:34-42` | 非 Windows：preset 启用 `dsh-tool-bash`（`presets/switchboard.patch.yml:54-59`） |
+| F3 | 高（潜伏） | 模板引用的占位符取不到值时留下悬空 flag，参数错位 / 非法空值 | `src/cli/argv.js:134-171`、`src/roles.js:168` | CLI 角色缺省 `effort` 且模板含 `{effort}` |
+| F4 | 中 | 角色卡片用数组下标当 key，「确认删除」状态被位移后的下一行继承 → 误删 | `src/client/index.js:1085`、`815-816` | 列表中间行进入两步确认后删除 |
+| F5 | 中 | 角色校验失败时追加虚假的「toolName 改动」错误，污染诊断 | `src/index.js:1133-1136` | 配置因常规原因校验失败且条目带 `toolName` |
+| F6 | 中 | 手写/迁移的 `roles.json` 省略 `cliPrefixArgs` 时角色被静默 blocked | `src/roles.js:178` + `src/cli/drivers.js:293` | 文件条目省略该字段（GUI 与生成器都会写，故仅手写/旧文件） |
+| F7 | 低 | `whichNode` 不剥离 PATH 项外层引号，误回退到 Electron 本体 | `src/cli/drivers.js:106-112` | Windows PATH 项被成对双引号包裹 |
+| F8 | 低 | Codex 预设 `{npmRoot}` 硬编码 Windows `APPDATA`，非 Windows 必然失败 | `src/cli/drivers.js:81`、`132` | 非 Windows 使用 codex 预设 |
+| F9 | 低 | 标题清空后不回退显示 id，与控件承诺不符 | `src/client/index.js:836` | 清空标题输入框并保存 |
+
+### 修复设计
+
+**F1 · 读取失败必须禁止写入**
+新增「本次读取是否成功」状态；读取失败时 `savedRef` 写入与成功同形的快照（`{ roles: [], wrapper: {} }`），使 `dirty` 不再恒真；**同时**加硬闸门：读取未成功时保存按钮 `disabled`、`save()` 早退并给出「读取失败，不能写入」提示，「放弃改动」保持可用以重试。
+验收：读取失败时按钮不可点、`dirty === false`；任何路径触发的保存都被拒绝；不得再出现 `roles: []` 提交（`revision: undefined` 在宿主侧会**跳过**并发保护 —— `dsh-settings` 的判定是 `expected !== void 0 && descriptor.revision !== expected`）。
+
+**F2 · 补全只读角色的写入工具黑名单**
+`WRITE_TOOLS` 补入真实注册名 `bash` 与 `plugin_manager`（后者安装/卸载插件 = 写配置能力）。保留「只列 `availableToolNames` 命中的名字」的 fail-open 语义不变，并在注释里如实标注该边界（现注释已承认「采集后新增的危险工具会缺失于 deny」）。
+验收：断言可用工具集含 `bash` 时 `deny` 含 `bash`；Windows 工具集（不含 `bash`）下不得报未知名。
+
+**F3 · 占位符空值：装载期条件必填 + 运行期严格兜底（新决策 D30）**
+- 装载期：模板**引用**了某占位符时，其取值必须可得且非空 —— `{effort}` → 角色必须显式给出合法强度；`{cwd}` → 必须能解析出工作目录；`{model}` 已有必填。模板未引用则不强制（避免对所有 CLI 角色一刀切）。
+- 运行期：`buildArgs` 对「被引用但取不到非空值」的占位符**抛错并指名占位符**，不再退化为空串或静默丢弃元素；该抛错必须被 CLI 工具包装成正常失败结果，不得成为未处理 rejection。
+- 客户端镜像：`validateRoles`（`src/client/logic.js` 与 `src/client/index.js` 内联副本）实现同一规则，`check-validation-parity.mjs` 补正反例。客户端无法知道插件级 `cwd` 默认值，因此有意不校验 `{cwd}` 的可得性，由 Host 侧校验。
+- GUI：思考强度下拉增加「（未指定）」空选项；选空时**必须从草稿对象删除该键**，不能写空串（`src/roles.js:169` 会把空串判为非法枚举）。
+- 检查链：`check-cli.mjs:86` 由「断言 `--effort` 残留」改为「断言抛出含 `{effort}` 的错误」，并补嵌入式缺值、空串、合法值、模板未引用四类用例。
+验收：Grok/Codex 两个模板在缺 `effort` 时装载期报错、运行期抛错，绝不生成错位或 `model_reasoning_effort=` 的命令行；模板不含 `{effort}` 的自定义角色仍可省略强度。
+
+**F4 · 删除确认状态上移**
+把两步确认状态从 `RoleCard` 上移到 `SwitchboardSettings`（`confirmingIndex`），并在 `refresh()` / `beginEdit` / `cancelEdit` 时清空。消除「删中间行后位移上来的行继承确认态」。
+验收：离线渲染桩断言「删除中间行后，位移上来的卡片不处于确认态」。
+
+**F5 · 诊断不再叠加虚假错误**
+`toolName` 漂移比对仅在 `normalized.errors.length === 0`（角色已成功规范化）时进行。
+验收：构造「校验失败 + 显式 `toolName`」的配置，错误列表只有真实原因，无 `toolName` 条目。
+
+**F6 · 缺省 `cliPrefixArgs` 不再误判预设冲突**
+`matchesList` 把 `null`/`undefined` 视为空数组（仅在 expected 为空时匹配）。codex 的 prefixArgs 非空，缺省仍应报冲突，但文案要指明缺的是哪个字段。
+验收：省略 `cliPrefixArgs` 的 Grok 角色可正常挂载；省略的 Codex 角色报出可读的字段级原因。
+
+**F7 · `whichNode` 剥离 PATH 引号**
+遍历前剥离 PATH 项的首尾空白与成对双引号。
+验收：断言含引号的 PATH 项能被正确命中。
+
+**F8 · `{npmRoot}` 跨平台**
+按平台解析全局 npm 根（Windows 保持 `%APPDATA%\npm\node_modules`；POSIX 用 `npm_config_prefix` / 常见全局根探测），路径分隔符随平台；**解析不出时不得返回伪造路径**，交由 F3 的装载期校验报错。客户端 `CLI_DRIVER_OPTIONS` 的 codex `prefixArgs` 同步。
+验收：断言非 Windows 下不再产出 `\npm\node_modules\...` 这类非法路径；解析失败时是可读的配置错误而非 spawn 失败。
+
+**F9 · 标题回退**
+改为 `(role.title?.trim() || role.id || '(未命名)')`。
+
+### 执行批次
+
+| 批次 | 范围 | 涉及文件 |
+| --- | --- | --- |
+| 1（Host 侧） | F2、F3（Host 与 argv）、F5、F6、F7、F8 | `src/roles.js`、`src/cli/argv.js`、`src/cli/drivers.js`、`src/index.js`、`scripts/check-cli.mjs`、`scripts/check-roles.mjs`、`scripts/check-drivers.mjs` |
+| 2（Client 侧） | F1、F3（客户端镜像与下拉）、F4、F9 | `src/client/index.js`、`src/client/logic.js`、`scripts/check-client.mjs`、`scripts/check-validation-parity.mjs` |
+| 3（独立验证） | 逐条复核修复是否真的成立、有无回归 | 只读复核 + 全链回归 |
+
+批次 1 与批次 2 顺序执行（`check-validation-parity.mjs` 与角色校验规则跨两侧，避免并发写入冲突）。
+
+### 验收标准
+
+1. `npm run check` 全绿，且 F1–F9 每条都有新增断言；**不得保留把缺陷固化成预期的断言**（点名 `scripts/check-cli.mjs:86`）。
+2. 每条缺陷的原始复现路径由「产生错误结果」变为「被拒绝或产生正确结果」，并在提交说明中给出命令与输出。
+3. 文档同步：本计划、`decisions.md` D30（占位符策略）、`architecture.md` 的占位符契约段与 D26 段（删除确认状态归属变化）、`cli-backends.md`（若 F8 触及驱动参数）。
+4. 如实标注边界：Client 侧改动只有离线渲染断言，真实 GUI 往返与真机保存仍需单独验收；Host 源码改动仍需重启一次装载。
+
+### 明确不修（含理由）
+
+- **已核实误报**：`syncRolesToFile` 校验失败仍写盘（设计如此，`check-apply.mjs` 有断言且客户端已前置校验）；`stderrTailBytes` 传 0 时全量输出（唯一调用方不传该参数，不可达）；`save()` 缺 `try/finally`（`saveRoles` 内部已 `try/catch`，`write()` 不会 reject）；`maxDepth` 未标 `.volatile()`（设计如此，深度由文件驱动，`check-apply.mjs` 的 S04 明确断言）。
+- **NOTE 级不修**：重复 `apply` 无幂等防卫（正常 Cordis 生命周期会先卸载旧 Fiber）、`import('@deepseek-ai/dsh-tool-subagent')` 浮动 Promise 无取消（仅在极端快速销毁时留下诊断噪声）、根同步分两次写盘（两次均为原子 rename，窗口为微秒级）。改动面大于收益。
+
+### 风险
+
+| # | 风险 | 应对 |
+| --- | --- | --- |
+| F3-R1 | 收紧后，依赖「空值自动抹掉该 argv 元素」来省略参数的自定义模板会从「静默错位」变成「显式报错」 | 这是必要的安全收紧；线上 4 个角色均带 `effort`，零影响；报错文案必须指明该删哪个 flag 或补哪个字段 |
+| F3-R2 | 客户端与 Host 校验若不同步，会出现「界面放行、保存后被 Host 拒掉」 | 以 `check-validation-parity.mjs` 的正反例为准，两侧同批改 |
+| F1-R1 | 读取失败时禁用保存会挡住「镜像坏了但确实想改配置」的用户 | 失败文案已给出「放弃改动可重试」；宁可挡住写入，也不允许在未读到当前配置时覆盖它 |
+
+### 实施结果（2026-10-03）
+
+**状态：F1–F9 已全部实现并通过离线验收；真实 GUI 往返与真机验收仍未执行。**
+
+| 批次 | 内容 | 结果 |
+| --- | --- | --- |
+| 1（Host 侧） | F2、F3（Host 与 argv + 客户端校验镜像）、F5、F6、F7、F8 | 已实现；`check-cli` 原固化断言已改写为抛错语义 |
+| 2（Client 侧） | F1、F3（思考强度下拉）、F4、F9 | 已实现；`check-client` 278 → 293 |
+| 2b（收口） | F1 的并发交错漏闸 + 文档同步 | 已实现；`check-client` 293 → 297 |
+| 3（独立验收） | 逐条复核 + 变异验证 | 8 条裁定成立；F1 由「部分成立」经 2b 收口 |
+
+**独立验收（只读复核 + 变异验证）**：F3 回退 `buildArgs` 抛错、F1 去掉 `readSucceeded` 闸门、F4 把确认状态改回卡片本地、F2 从 `WRITE_TOOLS` 移除 `bash`/`plugin_manager` —— 四种变异均使对应断言 **FAIL**，断言具备可证伪性。F5/F6/F7/F8/F9 逐条复现通过。
+
+**收口的那一条**：审查员发现 F1 的 `refresh()` 缺请求序号隔离 —— 连点「放弃改动」可让两次读取交错返回，旧响应覆盖新状态后会出现「显示为错误态但 `readSucceeded` 仍为真」的组合：重试按钮被禁用（卡死），或 `draft` 已被清空而 `revision` 为 `undefined`，此时新增角色保存会跳过宿主并发保护 —— 与 F1 同族的数据丢失路径。已加请求序号（过期响应直接丢弃）并在失败分支显式复位闸门，附并发交错断言与变异验证。
+
+**主代理核验（不依赖子代理结论）**：`npm run check` 全链退出码 0；用真实 `$DSH_HOME/agent-switchboard/roles.json` 跑 `normalizeRoles` + `planCliMounts`，4 个角色零错误、3 个 CLI 角色全部 active 无 blocked，`scout`（只读）的 `deny` 已含 `bash` 与 `plugin_manager`，codex 的 `{npmRoot}` 在 Windows 上解析为真实反斜杠路径 —— 修复未破坏线上配置。
+
+**仍未验收（如实记录）**：真实 Web GUI 的鼠标交互与设置往返（尤其「读取失败 → 保存被禁用 → 重试」与两步删除的焦点行为）；非 Windows 物理机上的 `bash` 拦截与 codex `{npmRoot}` 解析（仅有模拟平台参数的离线用例）；`plugin_manager` 进入 deny 后对只读角色的实际影响。Host 源码改动仍需重启一次装载。

@@ -9,6 +9,7 @@
 // 输入分别喂给两边，断言判定一致** —— 任何一侧单方面变严都会立刻失败。
 //
 // 用法：node scripts/check-validation-parity.mjs
+import { cliFieldsFor } from '../src/cli/drivers.js';
 import { normalizeRoles } from '../src/roles.js';
 import { validateRoles } from '../src/client/logic.js';
 
@@ -60,7 +61,9 @@ const cli = {
   cliDriver: 'codex',
   cliCommand: '{node}',
   cliPrefixArgs: ['{npmRoot}\\@openai\\codex\\bin\\codex.js'],
-  cliArgs: ['exec', '-s', 'read-only', '-m', '{model}', '-'],
+  ...cliFieldsFor('codex', true),
+  readOnly: true,
+  effort: 'medium',
   cliPromptDelivery: 'stdin',
   cliCwd: DEFAULT_CWD,
 };
@@ -101,6 +104,17 @@ parity('id 重复', [{ ...builtin }, { ...builtin }]);
 parity('非法 backend', [{ ...builtin, backend: 'nope' }]);
 parity('两个角色（一内置一 CLI）', [{ ...builtin }, { ...cli }]);
 parity('空数组', []);
+
+for (const driver of ['codex', 'grok']) {
+  for (const effort of [undefined, '', '   ', 'turbo', 42, 'low', 'high']) {
+    const r = parity(`${driver} effort=${JSON.stringify(effort)}`, [{ ...cli, ...cliFieldsFor(driver, true), effort }]);
+    const valid = ['low', 'high'].includes(effort);
+    check('强度条件必填结果正确', r.hostOk === valid && r.clientOk === valid);
+  }
+}
+const custom = { ...cli, cliDriver: undefined, cliArgs: ['exec', '-'], effort: undefined };
+const noEffort = parity('模板未引用 effort', [custom]);
+check('未引用强度时仍可省略', noEffort.hostOk && noEffort.clientOk);
 
 section('重点回归：内置角色留空 provider 必须两边都接受');
 {

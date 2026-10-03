@@ -121,9 +121,8 @@ export function validateTemplate(template, { promptDelivery = 'stdin' } = {}) {
  *
  * 替换规则：
  *   - 只在单个元素内部替换，元素之间永不合并；
- *   - 值缺失（undefined）时把该占位符替换为空串；
- *   - **替换后为空串的元素被丢弃**，这样 `['-p', '{prompt}']` 在提示词走 stdin
- *     而 prompt 为空时不会留下一个多余的 `-p`；
+ *   - 被引用的值缺失或为空时抛错并指名占位符；
+ *   - 保留模板元素，不推断或隐式省略前置 flag；
  *   - 值含换行 / NUL 时抛错。
  *
  * @param {readonly string[]} template - 已校验的参数模板。
@@ -143,9 +142,14 @@ export function buildArgs(template, values) {
 
   const out = [];
   for (const element of template) {
-    const replaced = element.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name) => values[name] ?? '');
-    // 空的 argv 元素没有意义，而且部分 CLI 会把空串当作一个真实参数处理。
-    if (replaced.length > 0) out.push(replaced);
+    const replaced = element.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name) => {
+      const value = values[name];
+      if (typeof value !== 'string' || value.trim().length === 0) {
+        throw new Error(`占位符 {${name}} 缺少非空值；请补充配置或从模板移除对应参数`);
+      }
+      return value;
+    });
+    out.push(replaced);
   }
   return out;
 }

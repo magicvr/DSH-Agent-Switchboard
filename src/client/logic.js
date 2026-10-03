@@ -68,6 +68,11 @@ export function validateRoles(roles) {
     if (r.backend === 'cli') {
       if (!r.cliCommand) return `${at}：CLI 后端需要「命令」`;
       if (!Array.isArray(r.cliArgs) || r.cliArgs.length === 0) return `${at}：CLI 后端需要参数模板`;
+      if (r.cliArgs.some(arg => typeof arg === 'string' && arg.includes('{effort}')) &&
+        !EFFORTS.includes(typeof r.effort === 'string' ? r.effort.trim() : undefined)) {
+        return `${at}：模板使用了 {effort}，必须显式选择思考强度`;
+      }
+      // 客户端无法知道插件级 cwd 默认值，有意不校验 {cwd} 的可得性。
       // ⚠️ **不校验 `cliPromptDelivery`**：Host 侧是 `read('cliPromptDelivery') ?? 'stdin'`，
       //    留空即取默认值 `stdin`。客户端若要求必填，就是把 Host 接受的配置拒掉。
     }

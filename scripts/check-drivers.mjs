@@ -17,6 +17,8 @@ import {
   validateCliPreset,
   resolveDriverPlaceholders,
   DRIVER_PLACEHOLDERS,
+  whichNode,
+  resolveNpmRoot,
 } from '../src/cli/drivers.js';
 import { normalizeRoles, planCliMounts, roleGuidanceText } from '../src/roles.js';
 import { validateTemplate, buildInvocation, PROMPT_DELIVERY } from '../src/cli/argv.js';
@@ -161,7 +163,7 @@ section('占位符解析：{node} / {npmRoot} 必须变成真实路径，且不�
   // codex 的可用入口形态：`node <codex.js>`，因此 prefixArgs 解析后必须是一个绝对路径。
   const codex = CLI_DRIVERS.find((d) => d.id === 'codex');
   const resolved = codex.prefixArgs.map(resolveDriverPlaceholders);
-  check('codex 前缀参数解析后是绝对路径', resolved.every((p) => /^[A-Za-z]:\\/.test(p)), JSON.stringify(resolved));
+  check('codex 前缀参数解析后是绝对路径', resolved.every((p) => process.platform === 'win32' ? /^[A-Za-z]:\\/.test(p) : p.startsWith('/')), JSON.stringify(resolved));
   check(
     'codex 前缀参数指向 codex.js（而非 .ps1 / .cmd）',
     resolved.some((p) => p.endsWith('codex.js')),
@@ -229,7 +231,7 @@ section('inferCliDriver：反推必须与选择一致，自定义不得被误认
 section('Host 预设一致性与旧配置逐角色阻塞');
 {
   const mk = (id, driver, readOnly = true) => ({
-    id, backend: 'cli', description: 'd', instructions: 'i', model: 'external-model',
+    id, backend: 'cli', description: 'd', instructions: 'i', model: 'external-model', effort: 'medium',
     readOnly, cliCwd: 'C:/w', cliDriver: driver, ...cliFieldsFor(driver, readOnly),
   });
   for (const driver of ['codex', 'grok']) {
@@ -333,6 +335,48 @@ section('端到端拼装：驱动产出的字段经 buildInvocation 得到正确
   check('grok：提示词在 argv 里（该 CLI 只接受参数形式）', gArgv.includes('P'), JSON.stringify(gArgv));
   check('grok：非只读用 acceptEdits', gArgv.includes('acceptEdits'), JSON.stringify(gArgv));
   check('grok：模型已填充', gArgv.includes('grok-4.7'), JSON.stringify(gArgv));
+}
+
+
+section('F6 / F7 / F8 回归');
+{
+  for (const cliPrefixArgs of [undefined, null]) {
+    const base = { id: 'g', backend: 'cli', description: 'd', instructions: 'i', model: 'm', effort: 'medium', readOnly: true, cliCwd: 'C:/w' };
+    const grok = normalizeRoles([{ ...base, cliDriver: 'grok', ...cliFieldsFor('grok', true), cliPrefixArgs }]);
+    check('Grok 缺省 prefixArgs 可挂载', grok.errors.length === 0 && planCliMounts(grok.roles).active.length === 1);
+    const codex = validateCliPreset({ ...base, cliDriver: 'codex', ...cliFieldsFor('codex', true), cliPrefixArgs });
+    check('Codex 缺省 prefixArgs 指明字段', codex.errors.some(e => e.includes('cliPrefixArgs')));
+  }
+  const oldPath = process.env.PATH;
+  const { dirname } = await import('node:path');
+  try {
+    process.env.PATH = `  "${dirname(process.execPath)}"  `;
+    check('PATH 空白与成对双引号剥离后命中 node', whichNode()?.toLowerCase() === process.execPath.toLowerCase());
+  } finally { if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath; }
+  check('POSIX prefix 产出平台路径', resolveNpmRoot({ platform: 'linux', env: { npm_config_prefix: '/opt/npm' } }) === '/opt/npm/lib/node_modules');
+  check('POSIX 常见全局根探测', resolveNpmRoot({ platform: 'darwin', env: {}, exists: p => p === '/opt/homebrew/lib/node_modules' }) === '/opt/homebrew/lib/node_modules');
+  check('POSIX 解析失败不伪造路径', resolveNpmRoot({ platform: 'linux', env: {}, exists: () => false }) === undefined);
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  const oldPrefix = process.env.npm_config_prefix;
+  try {
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    process.env.npm_config_prefix = '/opt/npm';
+    check('POSIX 完整 Codex 前缀无 Windows 分隔符',
+      resolveDriverPlaceholders(cliFieldsFor('codex', true).cliPrefixArgs[0]) === '/opt/npm/lib/node_modules/@openai/codex/bin/codex.js');
+  } finally {
+    Object.defineProperty(process, 'platform', platformDescriptor);
+    if (oldPrefix === undefined) delete process.env.npm_config_prefix; else process.env.npm_config_prefix = oldPrefix;
+  }
+  const legacy = { ...cliFieldsFor('codex', true), cliPrefixArgs: ['{npmRoot}\\@openai\\codex\\bin\\codex.js'], readOnly: true, cliDriver: 'codex' };
+  check('旧 Windows Codex 模板继续匹配', validateCliPreset(legacy).errors.length === 0);
+
+  const oldRoot = DRIVER_PLACEHOLDERS.npmRoot;
+  try {
+    DRIVER_PLACEHOLDERS.npmRoot = () => undefined;
+    const raw = { id: 'c', backend: 'cli', description: 'd', instructions: 'i', model: 'm', effort: 'medium', readOnly: true, cliCwd: 'C:/w', cliDriver: 'codex', ...cliFieldsFor('codex', true) };
+    const result = normalizeRoles([raw]);
+    check('npmRoot 不可得在装载期报告字段与占位符', result.errors.some(e => e.includes('cliPrefixArgs[0]') && e.includes('{npmRoot}')));
+  } finally { DRIVER_PLACEHOLDERS.npmRoot = oldRoot; }
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

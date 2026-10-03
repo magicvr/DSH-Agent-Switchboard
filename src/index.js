@@ -1130,7 +1130,7 @@ function createRoleResolver(roleConfigPath, resolved) {
     const defaults = { provider: value.provider || resolved.provider, cwd: value.cwd || resolved.cwd };
     const normalized = raw !== undefined && !Array.isArray(raw)
       ? { roles: [], errors: ['roles 必须是数组'] } : normalizeRoles(raw, defaults.provider, defaults.cwd);
-    if (Array.isArray(raw) && raw.some(item => item?.toolName !== undefined &&
+    if (normalized.errors.length === 0 && Array.isArray(raw) && raw.some(item => item?.toolName !== undefined &&
       item.toolName !== normalized.roles.find(role => role.id === item.id)?.toolName)) {
       normalized.errors.push('toolName 改动会改变角色工具集；阶段 3 未实现，请使用由 id 派生的工具名');
     }

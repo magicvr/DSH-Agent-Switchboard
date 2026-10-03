@@ -89,7 +89,7 @@ const CLI_DRIVER_OPTIONS = [
     label: 'Codex CLI',
     description: 'OpenAI Codex。非交互走 `codex exec`，提示词走 stdin。只读由 `-s read-only` 实现。',
     command: '{node}',
-    prefixArgs: ['{npmRoot}\\@openai\\codex\\bin\\codex.js'],
+    prefixArgs: ['{npmRoot}/@openai/codex/bin/codex.js'],
     promptDelivery: 'stdin',
     modelPlaceholder: 'gpt-6-luna',
     args: (readOnly) => [
@@ -220,6 +220,11 @@ function validateRoles(roles) {
     if (r.backend === 'cli') {
       if (!r.cliCommand) return `${at}：CLI 后端需要「命令」`;
       if (!Array.isArray(r.cliArgs) || r.cliArgs.length === 0) return `${at}：CLI 后端需要参数模板`;
+      if (r.cliArgs.some(arg => typeof arg === 'string' && arg.includes('{effort}')) &&
+        !EFFORTS.includes(typeof r.effort === 'string' ? r.effort.trim() : undefined)) {
+        return `${at}：模板使用了 {effort}，必须显式选择思考强度`;
+      }
+      // 客户端无法知道插件级 cwd 默认值，有意不校验 {cwd} 的可得性。
       // ⚠️ **不校验 `cliPromptDelivery`**：Host 侧是 `read('cliPromptDelivery') ?? 'stdin'`，
       //    留空即取默认值 `stdin`。客户端若要求必填，就是把 Host 接受的配置拒掉。
     }
@@ -625,15 +630,22 @@ window.__ModuleLoader__.load({
         });
 
       /** 统一样式的下拉。 */
-      const select = (key, options, labels) =>
+      const select = (key, options, labels, allowUnset = false) =>
         h(
           'select',
           {
-            value: role[key] ?? options[0],
+            value: role[key] ?? (allowUnset ? '' : options[0]),
             disabled,
-            onChange: (e) => set(key, e.target.value),
+            onChange: (e) => {
+              if (allowUnset && e.target.value === '') {
+                const next = { ...role };
+                delete next[key];
+                onChange(index, next);
+              } else set(key, e.target.value);
+            },
             style: selectStyle(),
           },
+          allowUnset ? h('option', { value: '' }, '（未指定）') : null,
           options.map((o) => h('option', { key: o, value: o }, labels ? labels[o] ?? o : o)),
         );
 
@@ -720,7 +732,7 @@ window.__ModuleLoader__.load({
             ? h('div', { style: { flex: '1 1 150px' } }, field('Provider', text('provider', '留空使用默认 provider', true)))
             : null,
           h('div', { style: { flex: '1 1 150px' } }, field(isCli ? '外部 CLI 模型' : '模型', text('model', 'gpt-6-luna'))),
-          h('div', { style: { flex: '0 0 100px' } }, field('思考强度', select('effort', EFFORTS))),
+          h('div', { style: { flex: '0 0 100px' } }, field('思考强度', select('effort', EFFORTS, undefined, true))),
         ),
         h(
           'div',
@@ -811,9 +823,8 @@ window.__ModuleLoader__.load({
     }
 
     /** 每张卡片保留自己的草稿；切换焦点时通过 key 重新挂载，丢弃未保存内容。 */
-    function RoleCard({ role, index, editing, onEdit, onCancel, onSave, onRemove, problem, disabled, roles }) {
+    function RoleCard({ role, index, editing, onEdit, onCancel, onSave, onRemove, confirmDelete, onConfirmDelete, onCancelDelete, problem, disabled, roles }) {
       const [draftRole, setDraftRole] = useState(() => ({ ...role }));
-      const [confirmDelete, setConfirmDelete] = useState(false);
       const invalid = validateRoles([role]) ||
         (roles.filter(r => r.id === role.id).length > 1 ? '角色 id 重复' : null) ||
         (role.backend === 'cli' && !inferCliDriver(role) ? '需重选预设' : null);
@@ -832,16 +843,16 @@ window.__ModuleLoader__.load({
             h('span', { role: 'img', 'aria-label': invalid ? '配置错误：' + invalid : '配置完整有效',
               'data-state': invalid ? 'error' : 'success', style: { width: '8px', height: '8px', flex: '0 0 8px', borderRadius: '50%',
                 background: invalid ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-state-success-primary)' } }),
-            h('strong', { className: 'rowName' }, role.title ?? (role.id || '(未命名)')),
+            h('strong', { className: 'rowName' }, role.title?.trim() || role.id || '(未命名)'),
             h('code', { style: { fontSize: '11px' } }, role.id || '(待填写 id)'),
             badge(mechanism), role.model ? badge(role.model) : null,
             role.readOnly ? badge('只读') : null, role.allowNestedDispatch ? badge('允许再派发') : null),
           h('div', { className: 'rowActions', style: { display: 'flex', gap: '6px' } },
             button(editing ? '收起' : '编辑', editing ? onCancel : onEdit, { disabled, expanded: editing }),
-            index !== 'new' ? button('删除', () => setConfirmDelete(true), { disabled, danger: true }) : null)),
+            index !== 'new' ? button('删除', onConfirmDelete, { disabled, danger: true }) : null)),
         confirmDelete ? h('div', { role: 'alert', style: { marginTop: '8px' } },
           '确认删除这个角色？', button('确认删除', onRemove, { disabled, danger: true }),
-          button('取消', () => setConfirmDelete(false), { disabled })) : null,
+          button('取消', onCancelDelete, { disabled })) : null,
         editing ? h('div', { className: 'rowEditor', style: { marginTop: '10px' } },
           h(RoleRow, { role: draftRole, index, onChange: (_, next) => setDraftRole(next), disabled }),
           problem ? h('div', { role: 'alert', style: { color: 'var(--dsw-alias-state-error-primary)' } }, problem) : null,
@@ -890,6 +901,8 @@ window.__ModuleLoader__.load({
       const store = props.store;
       const [draft, setDraft] = useState(null);
       const [editingId, setEditingId] = useState(null);
+      const [confirmingIndex, setConfirmingIndex] = useState(null);
+      const [readSucceeded, setReadSucceeded] = useState(false);
       const [cardProblem, setCardProblem] = useState(null);
       const [wrapper, setWrapper] = useState({});
       const [status, setStatus] = useState('loading');
@@ -898,9 +911,13 @@ window.__ModuleLoader__.load({
       // 读取时拿到的 revision 必须留到写回时使用，否则并发保护无从谈起。
       const [revision, setRevision] = useState(undefined);
       const savedRef = useRef(null);
+      const readSequenceRef = useRef(0);
 
       /** 重新读取本插件的配置。 */
       const refresh = useCallback(() => {
+        const readSequence = ++readSequenceRef.current;
+        setReadSucceeded(false);
+        setConfirmingIndex(null);
         if (store === undefined || typeof store.read !== 'function') {
           setStatus('error:未取到插件操作回调（插件的 apply 未注入 store）');
           return;
@@ -909,10 +926,14 @@ window.__ModuleLoader__.load({
         setEditingId(null);
         setCardProblem(null);
         void store.read().then((result) => {
+          // 连续重读可能交错返回；旧响应不得覆盖最新请求的状态与 revision。
+          if (readSequence !== readSequenceRef.current) return;
           if (!result.ok) {
+            setReadSucceeded(false);
             // 读取失败必须如实显示：静默当作空会把用户配置「藏起来」。
             setDraft([]);
-            savedRef.current = JSON.stringify([]);
+            setWrapper({});
+            savedRef.current = JSON.stringify({ roles: [], wrapper: {} });
             setRevision(undefined);
             setStatus(`error:${result.error}`);
             return;
@@ -922,6 +943,7 @@ window.__ModuleLoader__.load({
           savedRef.current = JSON.stringify({ roles: result.roles, wrapper: result.wrapper ?? {} });
           // revision 用于并发保护：写回时必须带上读取时的那一个。
           setRevision(result.revision);
+          setReadSucceeded(true);
           setStatus(result.roles.length > 0 ? 'ready' : result.missing === true ? 'missing' : 'empty');
         });
       }, [store]);
@@ -942,8 +964,8 @@ window.__ModuleLoader__.load({
         .map((key) => [key, wrapper[key] ?? '']));
       const dirty = rolesDirty || Object.keys(wrapperChanges).length > 0;
 
-      const beginEdit = id => { setEditingId(id); setCardProblem(null); };
-      const cancelEdit = () => { setEditingId(null); setCardProblem(null); };
+      const beginEdit = id => { setConfirmingIndex(null); setEditingId(id); setCardProblem(null); };
+      const cancelEdit = () => { setConfirmingIndex(null); setEditingId(null); setCardProblem(null); };
       const newRole = { id: '', description: '', instructions: '', backend: 'spawn', model: '',
         effort: 'medium', readOnly: false, allowNestedDispatch: false };
       const addRole = () => beginEdit('new');
@@ -963,6 +985,10 @@ window.__ModuleLoader__.load({
 
       /** 保存角色列表。 */
       const save = async (nextRoles = roles, forceRoles = false) => {
+        if (!readSucceeded) {
+          setNotice({ kind: 'error', text: '读取失败，不能写入。点「放弃改动」可重试。' });
+          return;
+        }
         if (store === undefined || typeof store.write !== 'function' || busy) return;
         const problem = validate(nextRoles);
         if (problem) {
@@ -1004,8 +1030,8 @@ window.__ModuleLoader__.load({
           },
           '每个角色可独立选择走 DSH 内置子代理，还是走本机外部 CLI。',
         ),
-        button(dirty ? '保存 *' : '保存', () => save(), { disabled: busy || !dirty, primary: dirty }),
-        button('放弃改动', refresh, { disabled: busy || !dirty }),
+        button(dirty ? '保存 *' : '保存', () => save(), { disabled: busy || !readSucceeded || !dirty, primary: dirty }),
+        button('放弃改动', refresh, { disabled: busy || (readSucceeded && !dirty) }),
       );
 
       // 说明性的页脚。原先这里是一个 `allowCrossCli` 总开关，现已移除：
@@ -1084,10 +1110,12 @@ window.__ModuleLoader__.load({
       const cardProps = (role, index) => ({
         key: String(index) + ':' + (editingId === index), role, index, roles,
         editing: editingId === index, disabled: busy,
+        confirmDelete: confirmingIndex === index,
+        onConfirmDelete: () => setConfirmingIndex(index), onCancelDelete: () => setConfirmingIndex(null),
         problem: editingId === index ? cardProblem : null,
         onEdit: () => beginEdit(index), onCancel: cancelEdit,
         onSave: next => save(index === 'new' ? [...roles, next] : roles.map((r, i) => i === index ? next : r), true),
-        onRemove: () => save(roles.filter((_, i) => i !== index), true),
+        onRemove: () => { setConfirmingIndex(null); return save(roles.filter((_, i) => i !== index), true); },
       });
       return wrap(h('div', null,
         h('ul', { className: 'rows', style: { margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: '10px' } },

@@ -36,9 +36,10 @@
 // 用占位符而不是硬编码绝对路径：`{node}` 与 `{npmRoot}` 在装载期解析，
 // 这样预设不必把本机用户名写进仓库（`AGENTS.md` 硬规则 5）。
 //
-// ⚠️ 本模块只依赖 `node:fs`，**不 import 任何 DSH 运行时**：
+// ⚠️ 本模块只依赖 `node:fs` / `node:path`，**不 import 任何 DSH 运行时**：
 // 它会被 `roles.js`（纯函数模块）与 Client 半边镜像引用，必须能在 Node 里直接单测。
 import { existsSync } from 'node:fs';
+import { posix, win32 } from 'node:path';
 
 /**
  * 提示词传递方式。
@@ -78,8 +79,21 @@ export const DRIVER_PLACEHOLDERS = {
    */
   node: () => resolveNodeExecutable(),
   /** npm 全局包根目录。 */
-  npmRoot: () => `${process.env.APPDATA ?? ''}\\npm\\node_modules`,
+  npmRoot: () => resolveNpmRoot(),
 };
+
+/** npm 全局根解析；环境参数供离线平台用例注入，不执行 shell。 */
+export function resolveNpmRoot({ platform = process.platform, env = process.env, exists = existsSync } = {}) {
+  if (platform === 'win32') {
+    return env.APPDATA?.trim() ? win32.join(env.APPDATA.trim(), 'npm', 'node_modules') : undefined;
+  }
+  const prefix = env.npm_config_prefix?.trim();
+  if (prefix && posix.isAbsolute(prefix)) return posix.join(prefix, 'lib', 'node_modules');
+  for (const root of ['/usr/local/lib/node_modules', '/usr/lib/node_modules', '/opt/homebrew/lib/node_modules']) {
+    try { if (exists(root)) return root; } catch { /* 无权限：尝试下一个 */ }
+  }
+  return undefined;
+}
 
 /**
  * 找一个「能被 spawn 的真实 node」。
@@ -99,12 +113,13 @@ function resolveNodeExecutable() {
  *
  * @returns {string|undefined} 绝对路径，或 undefined 表示未找到。
  */
-function whichNode() {
+export function whichNode() {
   const pathValue = process.env.PATH ?? process.env.Path ?? '';
   const separator = process.platform === 'win32' ? ';' : ':';
   const exts = process.platform === 'win32' ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';') : [''];
-  for (const dir of pathValue.split(separator)) {
-    if (dir.trim().length === 0) continue;
+  for (const entry of pathValue.split(separator)) {
+    const dir = entry.trim().replace(/^"(.*)"$/, '$1').trim();
+    if (dir.length === 0) continue;
     for (const ext of exts) {
       const candidate = `${dir.replace(/[\\/]+$/, '')}${process.platform === 'win32' ? '\\' : '/'}node${ext}`;
       try {
@@ -129,7 +144,7 @@ export const CLI_DRIVERS = [
     description: 'OpenAI Codex。非交互走 `codex exec`，提示词走 stdin。只读由 `-s read-only` 实现。',
     // ⚠️ 必须是 `node <codex.js>`：`codex.ps1` 与 `codex.cmd` 都无法在 shell:false 下 spawn。
     command: '{node}',
-    prefixArgs: ['{npmRoot}\\@openai\\codex\\bin\\codex.js'],
+    prefixArgs: ['{npmRoot}/@openai/codex/bin/codex.js'],
     promptDelivery: 'stdin',
     modelPlaceholder: 'gpt-6-luna',
     // 实测：codex 的强度参数在 --help 里完全未出现，取值随模型变化（D12）。
@@ -262,7 +277,12 @@ export function validateCliPreset(role) {
   const d = cliDriverFor(driver);
   if (!d) return { driver: undefined, errors: ['CLI 配置待迁移：需重选 codex / grok 预设（无法无损识别或预设未知）'] };
   if (inferred !== driver) {
-    return { driver, errors: [`CLI 预设 ${driver} 与实际 command / prefixArgs / args / delivery 不一致，需重选预设`] };
+    const fields = [];
+    if (!matchesCommandText(role?.cliCommand, d.command)) fields.push('cliCommand');
+    if (!matchesList(role?.cliPrefixArgs, d.prefixArgs)) fields.push('cliPrefixArgs');
+    if (![true, false].some(readOnly => JSON.stringify(role?.cliArgs) === JSON.stringify(d.args(readOnly)))) fields.push('cliArgs');
+    if (role?.cliPromptDelivery !== d.promptDelivery) fields.push('cliPromptDelivery');
+    return { driver, errors: [`CLI 预设 ${driver} 的 ${fields.join(' / ')} 缺失或与预设不一致，需重选预设`] };
   }
   if (JSON.stringify(role.cliArgs) !== JSON.stringify(d.args(role.readOnly === true))) {
     return { driver, errors: [`CLI 预设 ${driver} 的 readOnly 与沙箱参数不一致，需重选预设`] };
@@ -279,7 +299,9 @@ export function validateCliPreset(role) {
  */
 function matchesCommandText(actual, expected) {
   if (typeof actual !== 'string') return false;
-  return actual === expected || actual === resolveDriverPlaceholders(expected);
+  // 兼容旧 Windows 预设模板；解析后路径仍由平台决定。
+  const canonical = value => value.startsWith('{npmRoot}') ? value.replace(/\\/g, '/') : value;
+  return canonical(actual) === canonical(expected) || actual === resolveDriverPlaceholders(expected);
 }
 
 /**
@@ -290,6 +312,7 @@ function matchesCommandText(actual, expected) {
  * @returns {boolean} 是否匹配。
  */
 function matchesList(actual, expected) {
+  if (actual == null) return expected.length === 0;
   if (!Array.isArray(actual) || actual.length !== expected.length) return false;
   return actual.every((v, i) => matchesCommandText(v, expected[i]));
 }
@@ -308,7 +331,12 @@ export function resolveDriverPlaceholders(text) {
   if (typeof text !== 'string') return '';
   let out = text;
   for (const [key, fn] of Object.entries(DRIVER_PLACEHOLDERS)) {
-    out = out.split(`{${key}}`).join(fn());
+    if (!out.includes(`{${key}}`)) continue;
+    const value = fn();
+    // 保留无法解析的标记，让装载期报告配置错误，禁止伪造路径。
+    if (!value) continue;
+    out = out.split(`{${key}}`).join(value);
+    if (key === 'npmRoot') out = out.replace(/[\\/]/g, process.platform === 'win32' ? '\\' : '/');
   }
   return out;
 }

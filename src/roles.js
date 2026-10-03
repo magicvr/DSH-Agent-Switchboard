@@ -35,6 +35,8 @@ export const WRITE_TOOLS = Object.freeze([
   'write',
   'edit',
   'pwsh',
+  'bash',
+  'plugin_manager',
   'workflow',
   'todo_write',
   'create_goal',
@@ -191,12 +193,17 @@ export function normalizeRole(raw, index, defaultProvider, defaultCwd) {
     }
 
     const cliPrefixArgs = raw.cliPrefixArgs;
-    if (cliPrefixArgs !== undefined && !Array.isArray(cliPrefixArgs)) {
+    if (cliPrefixArgs != null && !Array.isArray(cliPrefixArgs)) {
       cliErrors.push(`${at}.cliPrefixArgs 必须是字符串数组`);
     }
 
     const cliPromptDelivery = read('cliPromptDelivery') ?? 'stdin';
-    const cliCwd = read('cliCwd') ?? defaultCwd;
+    const cliCwd = read('cliCwd') || (typeof defaultCwd === 'string' ? defaultCwd.trim() : undefined);
+    const uses = name => Array.isArray(cliArgs) && cliArgs.some(arg => typeof arg === 'string' && arg.includes(`{${name}}`));
+    if (uses('effort') && !EFFORT_VALUES.includes(effort)) {
+      cliErrors.push(`${at}.effort：模板使用了 {effort}，必须显式选择思考强度（${EFFORT_VALUES.join(' / ')}）`);
+    }
+    if (uses('cwd') && !cliCwd) cliErrors.push(`${at}.cliCwd：模板使用了 {cwd}，必须配置可得的工作目录`);
 
     if (Array.isArray(cliArgs) && cliCommand) {
       // 模板校验放到这里（而不是只在运行时）：配置错误应在装载期就报出来，
@@ -232,6 +239,10 @@ export function normalizeRole(raw, index, defaultProvider, defaultCwd) {
       maxOutputBytes: Number.isSafeInteger(raw.cliMaxOutputBytes) ? raw.cliMaxOutputBytes : 1_000_000,
       maxErrorBytes: Number.isSafeInteger(raw.cliMaxErrorBytes) ? raw.cliMaxErrorBytes : 100_000,
     };
+
+    for (const [field, value] of [['cliCommand', cli.command], ...cli.prefixArgs.map((value, i) => [`cliPrefixArgs[${i}]`, value])]) {
+      if (/\{(?:node|npmRoot)\}/.test(value)) cliErrors.push(`${at}.${field}：无法解析 ${value.match(/\{(?:node|npmRoot)\}/)[0]}，请配置有效的 Node / npm 全局根目录`);
+    }
 
     // CLI 后端不承载 DSH 的 provider/model route，因此上面没有强制它们。
     if (!cliCwd) cliErrors.push(`${at}.cliCwd 未设置，且全局 cwd 也未设置`);
