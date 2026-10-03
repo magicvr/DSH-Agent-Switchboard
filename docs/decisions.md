@@ -843,6 +843,8 @@ CLI 自身工具与受控委派白名单、只读 deny、`allow: []` 拒绝继�
 
 ---
 
+**后续补注：** 上述待决窗口已由 D27 的公开 tools/execute hook + ALS 派发级快照解决；历史问题记录保留。冻结范围及 CLI 两个生命周期的边界以 D27 为准。
+
 ## D26 · 角色设置采用官方模型页的卡片式交互
 
 **决策：** 每角色一张折叠卡片，头部展示标题/id、机制徽标、带 aria-label 的配置状态圆点及模型/权限徽标；根组件单卡片聚焦编辑，卡片保留本地草稿，保存先校验再沿原 settings 通道带 revision 提交，取消或切换焦点丢弃草稿。新增在列表底部原位展开，删除采用卡片内两步确认；包裹小节与逐字段 dirty 提交语义保持不变。
@@ -850,3 +852,39 @@ CLI 自身工具与受控委派白名单、只读 deny、`allow: []` 拒绝继�
 **依据与取舍：** 复刻已核实的官方模型页交互结构而不导入其组件。官方也自绘，因为平台自动表单只支持标量字段；外部客户端插件禁止引入 Harness Client 包，故用零构建、无新增依赖的手写 h() 与主题 token 替代官方 UI primitives。原生按钮及内联确认无法完全复用官方 Modal 的视觉与焦点行为，但保留显式提交和确认语义。
 
 **验证边界：** 离线组件回调、取树断言与生产代码变异实验验证编辑/取消/校验/revision/增删和既有语义；真实 GUI 观感与设置往返待验收。本决策不改变 Host 行为、权限模型、CLI 生命周期或延迟解析。
+
+---
+
+## D27 · 在公开 tools/execute 入口捕获派发级快照
+
+**决策：** 保留 D25 的固定工具骨架、getter 延迟解析、loader/volatile-update 与 mtime+size 文件缓存。preset 实例注册公开 around-dispatch hook；实际角色工具注册时收集定义对象身份，执行时按调用代理 scope 解析工具并与本实例 WeakSet 精确比对，不能按工具名前缀泛拦。入口同步 resolver 与权限清单捕获，AsyncLocalStorage.run(snapshot, next) 隔离并发；getter 优先读调用快照，缺省回落现读。官方 apply 必须保留原 liveConfig，Cordis Config 校验产物会物化 getter，不能将它用于动态读取。
+
+**依据：** 官方 delegate 在 await LLM 路由预检前读取 agentOptions，之后读取 persona/toolFilter/maxDepth；独立 getter 会在保存时混用两版。包装 subagents.start 太晚，getter 时间缓存不能隔离并发。注册身份捕获在角色插件自身的服务视图中完成，不修改共享 tools 服务，覆盖 provider 延迟注册与重新注册。
+
+**如实边界：** 冻结点是 tools/execute 入口（预检之前），不包含模型生成工具调用的时刻。CLI 委派阶段的包裹请求同快照；真正 CLI execute 另行捕获当前角色，不能宣称“委派 → 包裹 LLM → CLI 进程”跨两个生命周期绝对同配置。裸 .execute() 跳过 hook。保留 mtime+size 检测限制，不改运行期限、任务 owner、清理或权限模型。
+
+**验证：** check-apply 的 P01–P06 经真实 Cordis + ToolRuntime + 官方工具插件，在 resolveCallConfig 挂起期间写角色文件，验证完整版本、并发逆序完成、权限清单冻结、预检异常、取消及后续现读；P10 验证同名他方工具绕过；P12–P13 验证 CLI 包裹阶段快照与后续更新；P14–P15 验证 provider 移除与重新注册的身份捕获。关键生产分支的变异分别触发 FAIL，恢复 raw 备份后校验 SHA-256 字节一致。LLM、subagents.start 与进程服务为桩，不调用真实模型或外部 CLI，不等同真机验收。
+
+---
+
+## D28 · preset 调度指引仅进入主代理
+
+**决策：** systemPrompt.section 的 text provider 使用正式组装上下文 agent（缺省 scope）及会话头 origin/delegationDepth、运行时 options.subagentDepth 识别顶层代理。只有可靠代理上下文且无子代理标记时输出 roleGuidanceText；子代理与未知上下文输出空串。子代理继续使用自身 persona，不新增角色清单提示，不改变派发权限。
+
+**依据：** 本地 dsh-agent 的 assembleContextFor 传入 agent 与 scope，dsh-system-prompt 直接将 assembly context 传给 text provider；SessionHeader 声明 origin=subagent 和持久化 delegationDepth，顶层深度缺省为零。子代理继承 preset 不意味着承担主代理调度身份。
+
+**验证边界：** P07–P09 经真实 SystemPrompt 组装分别验证主代理有指引、origin/持久化深度/运行时深度子代理无指引、未知上下文无指引；修改既有 guidance 夹具以提供主代理上下文，保留全部既有断言。无可用 cordis_inspect_query，本次以已安装包源码为接口依据，真机提示词仍待验收。
+
+---
+
+## D29 · 主代理调度规则硬编码并按 preset 动态注入
+
+**决策：** 将适配后的 Supervisor / Role-based Subagent 调度规则硬编码在 `src/roles.js`，preset 注册动态 `systemPrompt.section`（`agent-switchboard:scheduling`）。与 D28 的角色指引共用身份判据；只向可靠识别的主代理输出，origin=subagent、持久化或运行时深度非零、身份未知均为空串。子代理只拿自身 persona，不复制主代理规则。规则受版本控制和检查覆盖，**不开放 UI 编辑、不设置 volatile 配置键**。
+
+**理由与取舍：** 用户已裁决“只进主代理、硬编码、不开 UI 编辑”。这是插件的调度行为契约，编辑入口会引入规则漂移、重复配置与验证成本；角色 persona、模型与强度继续由既有角色配置承担。系统提示压缩重复叙述与例子，保留全部决策性内容，不新增服务、配置代际或派发机制。原素材第 204–207 行的主代理自主处理小文件/少量代码**保留但限定**：仅已知位置、极小局部、成本明显低于派发的工作；宽而重的读取与实现必须委派。
+
+**素材适配：** `raw/AGENTS.md` 原样不可用，仅是用户指定的历史素材，不是正式项目决策或运行时来源。第 22、32–41、76、337–340 行的本机角色文件路径、TOML 和手工传模型/强度方案删除，改为插件配置解析角色、`delegate_to_*` 派发、适配层决定模型/强度，主代理不得覆盖；第 22 行的 sandbox_mode 改为 readOnly 工具层权限过滤并保留 CLI 权限边界。第 322–325 行的 spawn_agent/wait_agent/send_input/close_agent 生命周期改为阻塞等待、不重复派发、不为催进度打断，取消后检查部分副作用并按失败性质路由。第 354–371 行的临时提高 reasoning effort 删除，改为先检查角色是否选错、再考虑更高角色。四问路由、任务包、一次性专业单元、核心文档理解、按支持能力并行、上下文卫生、结果验证、reviewer 独立性、失败路由与成本纪律保留并合并重复叙述。
+
+**替代与边界：** 正式主代理小节取代过去靠触碰 `raw/*` 偶然注入规则的状态，不在运行时读临时素材。官方工作区指令插件的子目录注入未改变；触碰临时区仍可能给子代理泄漏未适配的 `raw/AGENTS.md`，本决策不另加拦截机制。
+
+**验证：** check-apply 的 R01–R06 覆盖真实 SystemPrompt 主代理完整文本与四问路由、三类子代理标记、未知上下文、无过时标识与无配置/UI 编辑入口；保留既有断言，仅将旧夹具改为按角色小节名称捕获。关键生产分支变异应触发对应 FAIL，逐次用 raw 备份恢复并校验 SHA-256 字节一致。未触碰用户 DSH 配置、未调用真实外部 CLI；真实提示词验收待按主代理包含四问、子代理不含及文本无过时专有名词进行。

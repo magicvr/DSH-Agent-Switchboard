@@ -15,7 +15,7 @@ import { Context } from '@deepseek-ai/cordis';
 import { ToolRuntime } from '@deepseek-ai/dsh-tools';
 import { applyChildComposition, delegationDepthOf, resolveChildDepth } from '@deepseek-ai/dsh-subagent';
 import { apply, Config, liveRoleTools, selftestTool } from '../src/index.js';
-import { toolConfigFor } from '../src/roles.js';
+import { toolConfigFor, supervisorSchedulingText } from '../src/roles.js';
 import { configPathFor, initialConfig, readConfigFile, writeConfigFile } from '../src/config-file.js';
 
 const fixtureHome = mkdtempSync(join(tmpdir(), 'switchboard-check-apply-'));
@@ -800,7 +800,10 @@ section('CLI 逐角色阻塞：未知配置不注册工具、不解析命令、�
   ctx.subagents.registerProvider = (provider) => { providers.push(provider); return { dispose() {} }; };
   ctx.subprocess.resolveExecutable = (command) => { resolved.push(command); return Promise.resolve('C:/fake/grok.exe'); };
   ctx.subprocess.spawn = () => { spawned++; throw new Error('离线测试禁止启动 CLI'); };
-  ctx.systemPrompt.section = (section) => { guidance = section.text; return { dispose() {} }; };
+  ctx.systemPrompt.section = (section) => {
+    if (section.name === 'agent-switchboard:roles') guidance = section.text;
+    return { dispose() {} };
+  };
   const base = { description: 'd', instructions: 'i', backend: 'cli', model: 'external-model', readOnly: true, cliCwd: 'C:/w' };
   const legacy = { ...base, id: 'legacy', cliDriver: 'custom', ...cliFieldsFor('codex', true), cliCommand: 'unknown-executable' };
   const valid = { ...base, id: 'valid', cliDriver: 'custom', ...cliFieldsFor('grok', true) };
@@ -815,7 +818,7 @@ section('CLI 逐角色阻塞：未知配置不注册工具、不解析命令、�
     !ctx.registered.includes('delegate_to_legacy') && ctx.registered.includes('delegate_to_valid') && ctx.registered.includes('delegate_to_builtin'));
   const result = await ctx.tools.get('switchboard_selftest').execute({});
   check('自检与主代理指引都显示旧配置待迁移',
-    result.blocked.includes('legacy') && result.blocked.includes('待迁移') && guidance().includes('不得派发'));
+    result.blocked.includes('legacy') && result.blocked.includes('待迁移') && guidance({ agent: { session: { header: {} }, options: {} } }).includes('不得派发'));
   check('装载后旧 custom 原始配置保持不变', JSON.stringify([legacy, valid]) === before);
 }
 
@@ -989,8 +992,8 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
       && !first.toolFilter.allow.includes('switchboard_cli_run_leaf'));
   check('真实插件 persona 使用同一有效清单，保留预算提示', first.persona.includes('delegate_to_leaf')
     && first.persona.includes('剩余深度预算') && !first.persona.includes('不要调用其他角色的工具'));
-  check('guidance 用实际挂载清单生成有效出站提示', guidance().includes('may delegate further')
-    && guidance().includes('cannot delegate further'));
+  check('guidance 用实际挂载清单生成有效出站提示', guidance({ agent: { session: { header: {} }, options: {} } }).includes('may delegate further')
+    && guidance({ agent: { session: { header: {} }, options: {} } }).includes('cannot delegate further'));
   const beforeLeaf = requests.length;
   let leafResult, leafError;
   try { leafResult = await ctx.tools.get('delegate_to_leaf', scope).execute({ prompt: 'T', description: 'fixture' }, exec); }
@@ -1097,7 +1100,7 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
   await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
   for (const refresh of events.get('tools/change') ?? []) refresh();
   check('全部 delegate 卸载后 persona、guidance 不再宣称可继续派发',
-    requests.at(-1).persona.includes('不可继续派发') && !guidance().includes('may delegate further'));
+    requests.at(-1).persona.includes('不可继续派发') && !guidance({ agent: { session: { header: {} }, options: {} } }).includes('may delegate further'));
 }
 
 section('隔离 DSH_HOME：残留运行期限不影响配置加载或健康状态');
@@ -1652,6 +1655,167 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
     cliHealth.ok && cliHealth.roleCount === 3 && resolveCount === 0 && cliHealth.roleRoutes.includes('source=preset stale=false')
       && [0, 1, 2].every(index => cliHealth.executables.includes(`diagnostic-${index}:`))
       && !cliHealth.executables.includes('无 CLI 角色'));
+}
+
+section('派发级快照：真实 ToolRuntime + 路由预检挂起');
+{
+  const { SystemPrompt } = await import('@deepseek-ai/dsh-system-prompt');
+  const { normalizeRoles } = await import('../src/roles.js');
+  const { cliFieldsFor } = await import('../src/cli/drivers.js');
+  const root = new Context();
+  new SystemPrompt(root, {});
+  new ToolRuntime(root);
+  const path = configPathFor(fixtureHome);
+  const tick = () => new Promise(setImmediate);
+  const gates = [], requests = [];
+  let pause = true;
+  const provider = { name: 'spawn', inheritsParentContext: false,
+    capabilities: { depthLimit: true, agentOptions: true, persona: true, toolFilter: true } };
+  root.provide('subagents', { getProvider: name => name === 'spawn' ? provider : undefined,
+    resolveMaxDepth: depth => depth,
+    async start(_name, request) {
+      requests.push(request);
+      return { id: 'snapshot-run', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose() {} };
+    } });
+  root.provide('agents', {});
+  root.provide('sessionProjections', { register() {} });
+  root.provide('subprocess', { spawn() { throw new Error('不得启动 CLI'); } });
+  root.provide('profileContext', { home: fixtureHome });
+  root.provide('llm', { async resolveCallConfig(value) {
+    if (pause) await new Promise((resolve, reject) => gates.push({ resolve, reject }));
+    return value;
+  } });
+  const preset = {};
+  const ctx = createScope(root, preset).ctx;
+  const version = n => initialConfig([{ ...fixtureRole, id: 'snapshot', model: `model-${n}`,
+    instructions: `persona-${n}-${'x'.repeat(n * 10)}`, effort: n % 2 ? 'low' : 'high', readOnly: n % 2 === 0 }],
+    { provider: 'self', maxDepth: n });
+  const save = n => writeConfigFile(path, version(n));
+  const register = (name, target = root) => target.tools.register({ name,
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'string' }, render: () => [] }, execute: async () => name });
+  register('write'); register('read');
+  save(1);
+  const owner = ctx.plugin({ inject: ['tools', 'subagents', 'agents', 'systemPrompt', 'subprocess'],
+    apply(actual) { apply(actual, { mount: true, provider: 'self' }); } });
+  try {
+    await owner.await(); await tick(); await tick();
+    const parent = { id: 'snapshot-parent', options: { provider: 'self', model: 'parent' },
+      session: { header: {}, requestHeader: () => undefined } };
+    const childCtx = createScope(ctx, parent, { parent: preset }).ctx;
+    const run = (label, signal = new AbortController().signal, agent = parent) => root.tools.execute({
+      name: 'delegate_to_snapshot', arguments: { prompt: label, description: label }, agent, signal });
+    const waitGate = async index => { for (let n = 0; n < 50 && !gates[index]; n++) await tick();
+      if (!gates[index]) throw new Error(`预检未挂起 ${index}`); };
+    const coherent = (request, n) => request?.agentOptions.model === `model-${n}`
+      && request.agentOptions.reasoningEffort === (n % 2 ? 'low' : 'high')
+      && request.persona === `persona-${n}-${'x'.repeat(n * 10)}` && request.maxDepth === n + 1
+      && request.toolFilter.deny.includes('write') === (n % 2 === 0);
+    const first = run('first'); await waitGate(0); save(2);
+    gates[0].resolve(); const firstResult = await first;
+    check('P01：真实 ToolRuntime 预检期间保存，model/persona/filter/depth 严格同版本',
+      !firstResult.isError && coherent(requests.at(-1), 1));
+    const a = run('concurrent-a'); await waitGate(1); register('edit'); save(3);
+    const b = run('concurrent-b'); await waitGate(2); save(4);
+    gates[2].resolve(); const rb = await b; gates[1].resolve(); const ra = await a;
+    check('P02：真实 ToolRuntime 并发逆序完成，两个派发各自同版本', !ra.isError && !rb.isError
+      && requests.at(-2).label === 'concurrent-b' && coherent(requests.at(-2), 3)
+      && requests.at(-1).label === 'concurrent-a' && coherent(requests.at(-1), 2)
+      && !requests.at(-1).toolFilter.deny.includes('edit'), JSON.stringify({ ra, rb, requests }));
+    const failed = run('exception'); await waitGate(3); save(5); gates[3].reject(new Error('fixture-preflight-error'));
+    check('P03：真实 ToolRuntime 预检异常被如实报告', (await failed).isError);
+    pause = false; const afterException = await run('after-exception');
+    check('P04：异常后新调用现读且 ALS 不泄漏', coherent(requests.at(-1), 5), JSON.stringify({ afterException, request: requests.at(-1) }));
+    pause = true;
+    const controller = new AbortController(); const cancelled = run('cancelled', controller.signal);
+    await waitGate(4); controller.abort(); save(6); gates[4].resolve();
+    check('P05：真实 ToolRuntime 取消后不启动子代理', (await cancelled).isError && requests.at(-1).label === 'after-exception');
+    pause = false; await run('after-cancel');
+    check('P06：取消后新调用现读且 ALS 不泄漏', coherent(requests.at(-1), 6) && requests.at(-1).toolFilter.deny.includes('edit'));
+    const builtin = (await root.systemPrompt.assemble({ agent: parent, scope: parent })).sections;
+    check('P07：真实 SystemPrompt 主代理有 switchboard 调度指引', builtin.some(s => s.text.includes('You are the switchboard')));
+    check('R01：主代理实际组装含完整硬编码规则与四问路由', builtin.some(s =>
+      s.name === 'agent-switchboard:scheduling' && s.text === supervisorSchedulingText &&
+      ['四问路由', '→ scout', '→ worker', '→ architect', '→ reviewer'].every(marker => s.text.includes(marker))));
+    for (const [label, header, options] of [['origin', { origin: 'subagent' }, {}],
+      ['persisted-depth', { delegationDepth: 1 }, {}], ['runtime-depth', {}, { subagentDepth: 1 }]]) {
+      const child = { id: label, session: { header }, options };
+      createScope(childCtx, child, { parent });
+      const assembled = await root.systemPrompt.assemble({ agent: child, scope: child });
+      check(`P08：真实 SystemPrompt 子代理 ${label} 不含主代理指引`,
+        !assembled.sections.some(s => s.name === 'agent-switchboard:roles' && s.text));
+      check(`R02：子代理 ${label} 不含调度规则`, !assembled.sections.some(s =>
+        s.name === 'agent-switchboard:scheduling' && s.text) &&
+        !assembled.sections.some(s => s.text.includes('四问路由')));
+    }
+    const unknown = await root.systemPrompt.assemble({ scope: preset });
+    check('P09：缺少可靠代理上下文不猜测主代理身份', !unknown.sections.some(s => s.name === 'agent-switchboard:roles' && s.text));
+    check('R03：上下文不可靠不输出调度规则', !unknown.sections.some(s => s.name === 'agent-switchboard:scheduling' && s.text));
+    for (const [label, context] of [['empty', {}], ['null', { agent: null }],
+      ['missing-header', { agent: { session: {} } }],
+      ['invalid-header', { agent: { session: { header: 'unreliable' } } }],
+      ['array-header', { agent: { session: { header: [] } } }]]) {
+      // 固定 preset scope，确保这些负例确实看得到已注册小节，而非在空作用域里空通过。
+      const assembled = await root.systemPrompt.assemble({ scope: preset, ...context });
+      check(`R04：未知上下文 ${label} 不输出调度规则`, !assembled.sections.some(s => s.name === 'agent-switchboard:scheduling' && s.text));
+    }
+    check('R05：规则文本无过时专有标识', !/\$CODEX_HOME|spawn_agent|sandbox_mode|\.toml|\bTOML\b/.test(supervisorSchedulingText));
+    const hostSource = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+    const clientSource = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
+    check('R06：调度规则不承载于配置或 UI',
+      !Object.hasOwn(Config({ volatile: { supervisorSchedulingText: 'override' } }).volatile, 'supervisorSchedulingText') &&
+      !/supervisorSchedulingText\s*:\s*z\./.test(hostSource) &&
+      !/volatile\s*(?:\.supervisorSchedulingText|\[['"]supervisorSchedulingText['"]\])/.test(hostSource) &&
+      !/supervisorSchedulingText|agent-switchboard:scheduling/.test(clientSource));
+    // 同名遮蔽工具不得进入本实例快照 hook；结构变化确保泛拦会让此调用失败。
+    const alien = { id: 'alien', options: {}, session: { header: {} } };
+    const alienCtx = createScope(ctx, alien, { parent: preset }).ctx;
+    register('delegate_to_snapshot', alienCtx);
+    writeConfigFile(path, initialConfig([]));
+    const foreign = await run('foreign', undefined, alien);
+    check('P10：真实 ToolRuntime 本 preset 同名他方工具不被快照 hook 拦截', !foreign.isError && foreign.value === 'delegate_to_snapshot');
+    save(7);
+    const cliRole = { ...fixtureRole, backend: 'cli', cliDriver: 'codex', ...cliFieldsFor('codex', false),
+      cliCwd: 'fixture', cliTimeoutMs: 1234 };
+    const normalized = normalizeRoles([cliRole]);
+    check('P11：cliTimeoutMs 不解析也不透传到规范化 cli', normalized.roles.length === 1
+      && !Object.hasOwn(normalized.roles[0].cli, 'timeoutMs') && !Object.hasOwn(normalized.roles[0], 'cliTimeoutMs'));
+    save(8);
+    root.emit('subagent/provider-removed', 'spawn');
+    check('P14：真实 provider 移除释放旧注册定义', !root.tools.get('delegate_to_snapshot', parent));
+    root.emit('subagent/provider-added', provider);
+    pause = true;
+    const remounted = run('provider-readded'); await waitGate(5); save(9);
+    gates[5].resolve(); const remountedResult = await remounted;
+    check('P15：provider 重注册的新定义仍被本实例快照 hook 精确识别', !remountedResult.isError && coherent(requests.at(-1), 8));
+    const cliVersion = n => initialConfig([{ ...cliRole, id: 'snapshot-cli', allowNestedDispatch: n === 2 }],
+      { provider: 'self', maxDepth: n, volatile: { wrapperModel: `wrapper-${n}`, wrapperEffort: n === 1 ? 'low' : 'high' } });
+    writeConfigFile(path, cliVersion(1));
+    const cliPreset = {};
+    const cliCtx = createScope(root, cliPreset).ctx;
+    const cliOwner = cliCtx.plugin({ inject: ['tools', 'subagents', 'agents', 'systemPrompt', 'subprocess'],
+      apply(actual) { apply(actual, { mount: true, provider: 'self' }); } });
+    try {
+      await cliOwner.await(); await tick(); await tick();
+      const cliParent = { ...parent, id: 'cli-parent' };
+      createScope(cliCtx, cliParent, { parent: cliPreset });
+      pause = true;
+      const call = root.tools.execute({ name: 'delegate_to_snapshot_cli', agent: cliParent,
+        arguments: { prompt: 'CLI wrapper', description: 'CLI wrapper' }, signal: new AbortController().signal });
+      await waitGate(6); writeConfigFile(path, cliVersion(2));
+      gates[6].resolve(); const result = await call; const request = requests.at(-1);
+      check('P12：真实 ToolRuntime CLI 包裹路由/persona/filter/depth 同入口版本', !result.isError
+        && request.agentOptions.model === 'wrapper-1' && request.agentOptions.reasoningEffort === 'low'
+        && request.maxDepth === 2 && request.persona.includes('不可继续派发')
+        && JSON.stringify(request.toolFilter.allow) === '["switchboard_cli_run_snapshot_cli"]');
+      pause = false;
+      await root.tools.execute({ name: 'delegate_to_snapshot_cli', agent: cliParent,
+        arguments: { prompt: 'CLI next', description: 'CLI next' }, signal: new AbortController().signal });
+      check('P13：真实 ToolRuntime CLI 后续包裹派发现读新配置', requests.at(-1).agentOptions.model === 'wrapper-2'
+        && requests.at(-1).agentOptions.reasoningEffort === 'high' && requests.at(-1).maxDepth === 3
+        && requests.at(-1).persona.includes('可按任务需要') && requests.at(-1).toolFilter.allow.includes('delegate_to_snapshot_cli'));
+    } finally { await cliOwner.dispose(); }
+  } finally { await owner.dispose(); }
 }
 
 // 动态契约替代旧私有代际/租约测试；固定工具骨架不再测试旧内部生命周期。

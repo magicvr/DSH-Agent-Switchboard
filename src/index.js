@@ -23,6 +23,7 @@ import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { scopeOf } from '@deepseek-ai/dsh-scope';
 import { join } from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   CLI_BACKEND,
   EFFORT_VALUES,
@@ -30,6 +31,7 @@ import {
   normalizeRoles,
   planCliMounts,
   roleGuidanceText,
+  supervisorSchedulingText,
   routeSummaryFor,
   toolConfigFor,
 } from './roles.js';
@@ -726,7 +728,6 @@ export function selftestTool(ctx, diagnostics) {
  * @returns {Promise<{ok: boolean, detail: string}>} 挂载结果。
  */
 function mountedRoleOptions(ctx, roles, maxDepth) {
-  ctx = ctx[publicContextKey] ?? ctx;
   const tools = ctx.get('tools');
   const scope = scopeOf(ctx);
   return {
@@ -736,25 +737,37 @@ function mountedRoleOptions(ctx, roles, maxDepth) {
   };
 }
 
-async function mountRoleTool(ctx, role, toolModule, resolver, roles, maxDepth, wrapperRoute) {
+async function mountRoleTool(ctx, role, toolModule, resolver, roles, maxDepth, wrapperRoute, dispatch) {
   if (typeof ctx.plugin !== 'function') return { ok: false, detail: 'ctx.plugin 不可用' };
   try {
     const liveRole = () => {
-      const current = resolver().roles.find(item => item.id === role.id);
+      const current = (dispatch.storage.getStore() ?? resolver()).roles.find(item => item.id === role.id);
       if (current?.cliBlockReason) throw new Error(current.cliBlockReason);
       return current;
     };
     const liveConfig = toolConfigFor(role, {
       getRole: liveRole,
-      getMaxDepth: () => resolver().maxDepth,
-      getWrapperRoute: () => resolver().wrapperRoute,
+      getMaxDepth: () => (dispatch.storage.getStore() ?? resolver()).maxDepth,
+      getWrapperRoute: () => (dispatch.storage.getStore() ?? resolver()).wrapperRoute,
       maxDepth, wrapperRoute,
       availableToolNames: ctx.get('tools').schemas(scopeOf(ctx)).map(tool => tool.name),
       delegateToolNames: roles.map(item => item.toolName),
-      getAvailableToolNames: () => ctx.get('tools').schemas(scopeOf(ctx)).map(tool => tool.name),
-      getDelegateToolNames: () => roles.filter(item => ctx.get('tools').get(item.toolName, scopeOf(ctx))).map(item => item.toolName),
+      getAvailableToolNames: () => dispatch.storage.getStore()?.availableToolNames ?? ctx.get('tools').schemas(scopeOf(ctx)).map(tool => tool.name),
+      getDelegateToolNames: () => dispatch.storage.getStore()?.delegateToolNames ?? roles.filter(item => ctx.get('tools').get(item.toolName, scopeOf(ctx))).map(item => item.toolName),
     });
-    const fiber = ctx.plugin({ ...toolModule, apply: (toolCtx, config) => toolModule.apply(toolCtx, config) }, liveConfig);
+    const fiber = ctx.plugin({ ...toolModule, apply: (toolCtx) => {
+      const tools = toolCtx.get('tools');
+      // 仅此角色插件的工具服务视图记录注册身份，不修改共享服务。
+      // 捕获实际 register 的定义，亦覆盖 provider 延迟出现或移除后重新注册。
+      const ownedTools = Object.create(tools, { register: { value(definition) {
+        const dispose = tools.register(definition);
+        if (definition.name === role.toolName) dispatch.tools.add(definition);
+        return dispose;
+      } } });
+      // Cordis Config 校验产物会物化 getter；官方 apply 必须持有原 liveConfig 才能延迟解析。
+      toolModule.apply(toolCtx.extend({ tools: ownedTools, subagents: toolCtx.subagents,
+        systemPrompt: toolCtx.systemPrompt, sessionProjections: toolCtx.sessionProjections }), liveConfig);
+    } }, liveConfig);
     if (typeof fiber?.await === 'function') await fiber.await();
   } catch (error) { return { ok: false, detail: error instanceof Error ? error.message : String(error) }; }
   await Promise.resolve(); await Promise.resolve();
@@ -1025,6 +1038,17 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     return;
   }
   const { active: activeCliRoles, blocked: blockedCliRoles } = planCliMounts(roles);
+  const dispatch = { storage: new AsyncLocalStorage(), tools: new WeakSet() };
+  // 冻结点是 tools/execute 入口（路由预检之前），不包含模型生成工具调用的时刻。
+  // CLI 这里只保证包裹委派请求同快照；底层 CLI 工具在另一个生命周期另行现读角色。
+  ctx.on?.('tools/execute', (exec, next) => {
+    const tool = ctx.get('tools').get(exec.name, exec.agent);
+    if (!tool || !dispatch.tools.has(tool)) return next();
+    // resolver 与权限清单均同步捕获，跨 await 与并发调用由 ALS 隔离。
+    const current = resolver();
+    const snapshot = { ...current, ...mountedRoleOptions(ctx, current.roles, current.maxDepth) };
+    return dispatch.storage.run(snapshot, next);
+  });
   diagnostics.blocked = blockedCliRoles;
   for (const role of activeCliRoles) {
     try {
@@ -1058,16 +1082,29 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     for (const role of roles) {
       const blocked = diagnostics.blocked.find(item => item.id === role.id);
       if (blocked) { diagnostics.mounts.push({ id: role.id, ok: false, detail: blocked.reason }); continue; }
-      const outcome = await mountRoleTool(ctx, role, toolModule, resolver, roles, initial.maxDepth, initial.wrapperRoute);
+      const outcome = await mountRoleTool(ctx, role, toolModule, resolver, roles, initial.maxDepth, initial.wrapperRoute, dispatch);
       diagnostics.mounts.push({ id: role.id, ok: outcome.ok, detail: outcome.detail });
     }
   }).catch(error => { diagnostics.fatal = `无法 import @deepseek-ai/dsh-tool-subagent：${error.message ?? error}`; });
   const disposeGuidance = ctx.get('systemPrompt').section({ name: 'agent-switchboard:roles', order: 10500,
-    text: () => { let current; try { current = resolver(); } catch { return '角色配置不可派发；请检查 switchboard_selftest。'; } return roleGuidanceText(current.roles, {
+    text: (context) => {
+      if (!isMainAgentContext(context)) return '';
+      let current; try { current = resolver(); } catch { return '角色配置不可派发；请检查 switchboard_selftest。'; } return roleGuidanceText(current.roles, {
       availableToolNames: ctx.get('tools').schemas(scopeOf(ctx)).map(tool => tool.name),
       delegateToolNames: roles.filter(role => ctx.get('tools').get(role.toolName, scopeOf(ctx))).map(role => role.toolName),
     }); } });
-  ctx.effect?.(() => () => { disposeGuidance?.(); disposeSelftest?.(); });
+  const disposeScheduling = ctx.get('systemPrompt').section({ name: 'agent-switchboard:scheduling', order: 10510,
+    text: context => isMainAgentContext(context) ? supervisorSchedulingText : '' });
+  ctx.effect?.(() => () => { disposeGuidance?.(); disposeScheduling?.(); disposeSelftest?.(); });
+}
+
+// DSH assembleContextFor 传入 agent 与 scope；未知上下文不猜测主代理身份。
+function isMainAgentContext(context) {
+  const agent = context?.agent ?? context?.scope;
+  const header = agent?.session?.header;
+  return !!header && typeof header === 'object' && !Array.isArray(header) &&
+    header.origin !== 'subagent' && (header.delegationDepth ?? 0) === 0 &&
+    (agent.options?.subagentDepth ?? 0) === 0;
 }
 
 function createRoleResolver(roleConfigPath, resolved) {

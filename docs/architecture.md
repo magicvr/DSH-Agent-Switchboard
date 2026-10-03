@@ -355,7 +355,7 @@ provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliT
 包裹路由取插件级 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`（D22）。
 根实例通过既有 `$DSH_HOME/agent-switchboard/roles.json` 的 `volatile` 同步三字段；不新增服务、文件类型或路径。
 根实例在 apply 时同步初值，直接监听 owning Fiber 的 `loader/volatile-update` 同步保存值。载荷是路径数组的数组；Loader 先提交 Volatile 再普通 emit，通过发送侧 `Context.filter` 只投递 owning Fiber。监听器不使用 next、prepend 或 receiver 过滤，也无需额外 effect 包装。
-工具骨架只注册一次，官方 `dsh-tool-subagent` 在 execute 内读取 getter；每次派发现读 model/effort/instructions/readOnly/maxDepth、权限清单与包裹路由。提示组装也现读角色与可见工具。
+工具骨架只注册一次，官方 `dsh-tool-subagent` 在 execute 内读取 getter；每次派发入口现读 model/effort/instructions/readOnly/maxDepth、权限清单与包裹路由，同次执行的 getter 优先读取派发级快照。提示组装也现读角色与可见工具。
 文件 resolver 用 mtimeMs+size 缓存：未变不重读，改变重读；损坏保留上一有效快照并标 stale，无有效缓存拒绝挂载/派发且自检不健康。显式 preset roles（含 []）优先，undefined 才回落文件，source 区分 preset/file。
 CLI 工具每次执行先复验当前角色的 driver、模板与 readOnly 兼容性，再复制执行快照；命令通过 `ctx.get('subprocess').resolveExecutable` 执行期解析，spawn 使用 argv 数组与 shell:false。装载自检标记“待执行时解析（尚未验证）”，执行后报告解析结果或本次解析失败，不冒充无 CLI 角色。runner 原有解析失败回落字面命令的行为保留，失败会进入可执行文件诊断。
 已开始的内置请求和 CLI 执行保留起始快照；工具返回、Jobs 结算、客户端读取分离，owner 仍为子会话，无主动 remove 或运行期限。实例卸载使用官方插件生命周期，不再管理私有代际或租约。
@@ -492,6 +492,10 @@ jobId 由 Jobs 管理，schema、返回值与 render 均不暴露它；客户端
 
 ### 7.1 「调度日志进主代理可见输出」的现状（已实现，含一处固有限制）
 
+**主代理调度规则（D29）：** preset 装载时另注册 `agent-switchboard:scheduling`（order 10510），与角色清单小节共用 `isMainAgentContext` 身份判据。每次组装按可靠的会话头与深度标记动态返回硬编码 `supervisorSchedulingText` 或空串；规则源于对临时素材的适配，正式运行不读取 `raw/AGENTS.md`，不使用 volatile 配置或 UI 控件。只进入主代理，子代理只拿自身 persona，未知身份不输出。内容保留四问路由、最小充分任务包、阻塞派发生命周期、失败路由、上下文卫生、成本纪律与 reviewer 独立性；主代理的小文件/少量代码权限保留但限定为极小局部工作，宽重读取与实现必须委派。
+
+正式小节取代过去依靠触碰 `raw/*` 偶然获得调度规则的状态，但不拦截官方工作区指令插件的子目录注入：触碰该临时区仍可能把未适配素材带入子代理。R01–R06 通过真实 SystemPrompt 组装与静态断言验证主代理包含、三种子代理标记及未知上下文排除、无过时标识且不可编辑；生产代码变异验证判别力，恢复后校验 SHA-256。离线通过不等于真实会话验收，未调用外部 CLI 或修改用户 DSH 配置。
+
 **决策前可见** —— `roleGuidanceText()` 注入系统提示词，每个角色那两行现在带**线路摘要**
 （`routeSummaryFor()`）：
 
@@ -559,7 +563,11 @@ DSH GUI 的完整按钮链与 codex/grok 进程树清理仍需真机验收，本
 
 现行数据流是：根条目提交 Volatile -> owning Fiber 收到 `loader/volatile-update` -> 原子写入 `roles.json` -> 静态工具在下一次执行时通过 mtime/size resolver 读取。`internal/update`、generation、租约、影子服务、跨作用域广播和 `ctx.root.fiber` 归属均为历史失败路径，不是当前机制。Host 源码改动仍需重启一次加载。
 
-**已确认的边界：** 在途快照保证目前从内置 subagents.start 请求组装完成及 CLI execute 起始快照算起。官方工具在 LLM 路由预检 await 前读取 agentOptions、之后读取 persona/toolFilter/maxDepth；该等待期间保存配置可能混用旧模型和新指令，独立离线探针已复现。若要求从 delegate execute 入口原子冻结整次配置，独立 getter 方案需要新增调用级快照边界；此项 BLOCKED BY DESIGN，待架构决策，不能宣称已解决。
+**派发级快照（D27）：** preset 作用域注册公开 `tools/execute` around-dispatch hook；角色插件独立的 tools 服务视图在实际 register 时收集定义对象，hook 用调用代理 scope 下实际可见的定义对象与本实例 WeakSet 比对，仅拦本实例角色委派工具，包括 provider 延迟出现或重注册。同名的其他工具和底层 CLI 执行工具不拦截。进入 hook 时同步调用 resolver，并捕获完整角色、maxDepth、wrapperRoute 与可见/受控委派工具清单，以 `AsyncLocalStorage.run(snapshot, next)` 包裹主体。getter 优先读 ALS，取不到时回落现读；并发执行各有上下文。Cordis Config 校验会物化 getter，因此官方 apply 保留原 liveConfig，而不是使用校验产物的启动快照。
+
+**如实边界：** 冻结点是 `tools/execute` 入口（路由预检之前），不包含模型生成工具调用的时刻。CLI 角色只保证委派阶段的包裹请求同快照；真正执行在 `src/cli/provider.js` 的 execute 中另行捕获当前角色，不能保证整个“委派 → 包裹 LLM → CLI 进程”跨两个生命周期绝对同配置。直接调用裸工具 `.execute()` 会跳过 runtime hook；离线派发快照判据必须经真实 ToolRuntime。文件仍按 mtime+size 缓存，未加强相同时间戳和大小的外部写入检测，也不改权限模型或 CLI 无运行时间上限语义。
+
+**调度指引仅主代理（D28）：** 已安装包的 `assembleContextFor` 传入 `{ agent, scope: agent }`，section text provider 接收原 assembly context。仅在可靠代理上下文存在、会话头 origin 不是 subagent、持久化 delegationDepth 与运行时 options.subagentDepth 都为零（缺省为零）时输出调度指引。子代理与身份未知的组装返回空串，子代理保留自身 persona；继承 preset 不会再被告知“You are the switchboard”。依据为本地包源码与真实 SystemPrompt 组装测试；本轮无可用 cordis_inspect_query，未宣称实时接口查询或真机验收。
 
 
 ### 角色设置页的卡片交互（D26）
