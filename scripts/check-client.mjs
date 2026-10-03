@@ -17,6 +17,17 @@ import { apply, Config } from '../src/index.js';
 import { configPathFor, initialConfig, readConfigFile, writeConfigFile } from '../src/config-file.js';
 import { CLI_ROUTE_FACT_KEYS, parseCliRouteFacts, parseJsonArray, splitCliChannels, validateRoles } from '../src/client/logic.js';
 import { parseRouteFacts, ROUTE_FACT_KEYS } from '../src/cli/output.js';
+
+/**
+ * 真机 codex 头部（codex v0.159.2，本机实测，形态见 `docs/cli-backends.md` §2.2）。
+ *
+ * 只保留**结构**：`workdir` 与会话 id 换成占位值，避免把本机绝对路径写进仓库（AGENTS.md 硬规则 5）。
+ * 它比合成样本多两行（`reasoning summaries` / `session id`）与尾部 `--------`，
+ * 因此能证明抽取器不会被「形如事实的额外行」带偏。
+ */
+const CODEX_ROUTE_HEADER = 'OpenAI Codex v0.159.2\n--------\nworkdir: <cwd>\nmodel: gpt-6.1-sol\n' +
+  'provider: openai\napproval: never\nsandbox: read-only\nreasoning effort: low\n' +
+  'reasoning summaries: none\nsession id: 00000000-0000-4000-8000-000000000000\n--------\n';
 import { normalizeRoles } from '../src/roles.js';
 
 let pass = 0;
@@ -359,8 +370,7 @@ section('CLI 路由事实与通道拆分：Client 镜像必须与 Host 一致');
   // Client 半边无法 import Host 的 `src/cli/output.js`，只能内联一份事实键表与抽取函数。
   // 漂移的后果很具体：界面会把「CLI 究竟接受了哪些参数」显示错、或干脆显示不出来，
   // 而这条证据正是本项目「配置真的生效」的验收依据。
-  const codexHeader = 'OpenAI Codex v0.159.2\n--------\nworkdir: C:\\repo\nmodel: gpt-6-luna\n' +
-    'provider: openai\napproval: never\nsandbox: read-only\nreasoning effort: high\n\n正文第一行';
+  const codexHeader = `${CODEX_ROUTE_HEADER}\n正文第一行`;
   const noise = 'model: 只是正文里的一行\nnot a fact: 1\n\n';
   // 超出扫描窗口（25 行）的事实不能被采信 —— 窗口本身就是「别把正文误当事实」的防线。
   const beyond = `${Array.from({ length: 30 }, (_, i) => `line ${i}`).join('\n')}\nmodel: too-late\n`;
@@ -371,9 +381,15 @@ section('CLI 路由事实与通道拆分：Client 镜像必须与 Host 一致');
     const mine = JSON.stringify(parseCliRouteFacts(input)), host = JSON.stringify(parseRouteFacts(input));
     check(`抽取行为与 Host 一致（${name}）`, mine === host, `Client=${mine} Host=${host}`);
   }
-  check('codex 头部确实抽到关键事实', parseCliRouteFacts(codexHeader).model === 'gpt-6-luna'
+  check('真机头部确实抽到关键事实', parseCliRouteFacts(codexHeader).model === 'gpt-6.1-sol'
     && parseCliRouteFacts(codexHeader).sandbox === 'read-only'
+    && parseCliRouteFacts(codexHeader)['reasoning effort'] === 'low'
     && parseCliRouteFacts(beyond).model === undefined);
+  check('真机头部：形如事实的额外行不被误采信',
+    parseCliRouteFacts(CODEX_ROUTE_HEADER)['reasoning summaries'] === undefined
+      && parseCliRouteFacts(CODEX_ROUTE_HEADER)['session id'] === undefined
+      && Object.keys(parseCliRouteFacts(CODEX_ROUTE_HEADER)).join(',')
+        === 'workdir,model,provider,approval,sandbox,reasoning effort');
   const channels = splitCliChannels([
     { channel: 'stderr', text: 'model: gpt-6-luna\n' },
     { channel: 'stdout', text: '最终回答' },
@@ -1139,8 +1155,7 @@ section('CLI composer：one-shot 选择、官方只读占位与无 turn 输出')
   }
   // 「工具调用等消息混进正文」正是本次要修的问题：codex 的过程/工具轨迹在 stderr 上，
   // 因此判据是**通道**，而不是去猜哪一行像工具调用。
-  const codexStderr = 'OpenAI Codex v0.159.2\n--------\nworkdir: C:\\repo\nmodel: gpt-6-luna\n' +
-    'provider: openai\napproval: never\nsandbox: read-only\nreasoning effort: high\n';
+  const codexStderr = `${CODEX_ROUTE_HEADER}`;
   const liveTree = CliJobOutput({ job: cliRow('live', 's', { chunks: [
     { channel: 'stdout', text: '最终回答' },
     { channel: 'stderr', text: `${codexStderr}exec: npm test\n` },
@@ -1152,8 +1167,8 @@ section('CLI composer：one-shot 选择、官方只读占位与无 turn 输出')
     channelText(liveTree, 'stderr').includes('exec: npm test')
       && detailsWith(liveTree, '过程与诊断')[0]?.props.open === false);
   check('CLI 渲染：路由事实不随诊断折叠而隐藏',
-    cliText(liveTree).includes('路由事实：workdir=C:\\repo · model=gpt-6-luna')
-      && cliText(liveTree).includes('sandbox=read-only · reasoning effort=high'));
+    cliText(liveTree).includes('路由事实：workdir=<cwd> · model=gpt-6.1-sol')
+      && cliText(liveTree).includes('sandbox=read-only · reasoning effort=low'));
   const deadTree = CliJobOutput({ job: cliRow('dead', 's', { status: 'failed',
     chunks: [{ channel: 'stderr', text: codexStderr }] }) });
   check('CLI 渲染：失败态诊断自动展开并改用错误色',
