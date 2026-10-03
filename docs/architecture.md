@@ -464,6 +464,9 @@ jobId 由 Jobs 管理，schema、返回值与 render 均不暴露它；客户端
 | `conversation.composer.dock` | 被一次性子会话的只读 composer chain 隐藏，注入 dock 不会显示。 |
 | `conversation.content` / `sidebar.chat.conversation` | 前者是 Component Factory 不是 list；后者是 single，替换整个侧边栏内容区过于侵入。 |
 | transcript 外追加 / 工具进度 | `Session.append` 强制校验且只允许五类标准事件；没有 `tool/progress`，`ToolRunContext` 仅有 `deferContext` / `concludeTurn`，不伪造历史记录或逐块工具结果。 |
+| `tool.call.toolview` | 该 slot 确实存在（由 `dsh-client-ui-tool` 按 wire 工具名 key 分发），但**运行中 `output` 为 `undefined`，只有终态才有结果文本**，且默认折叠；它只针对**已存在的真实工具调用**，无法为外部 CLI 的条目凭空生成卡片。 |
+
+**DSH 原生信息流的可复用边界（本次取证）：** 内置 Web Client **不消费** `presentCall` / `presentResult`（官方文档明确它们只供 Host 本地消费方），工具卡片由客户端从原始调用参数与结果派生；父会话也**不显示子代理的工具调用**，只有一行 `subagent` 工具调用，要看过程须打开子会话面板。因此「把外部 CLI 的结构化条目注入原生信息流」**没有公开写入口**，能模仿的是**词汇与层级**（正文可见 / 过程折叠 / 状态与耗时），而不是接入原生流。
 
 **chain 的取舍：** `conversation.composer` 不能并列追加观察者，只能由更低 priority 的贡献取代官方静态占位。因此使用独立 id，不复用官方 id；替代视图必须保留官方文案与只读语义，不恢复输入能力。代价是需要维护占位文案及宿主 chain 兼容性，不能将离线检查通过等同于真实侧边栏视觉验收。
 
@@ -472,6 +475,8 @@ jobId 由 Jobs 管理，schema、返回值与 render 均不暴露它；客户端
 **订阅与降级：** 设置页与只读席位保持父插件原有依赖；`ctx.inject(['remote', 'remote.job'], ...)` 在独立子作用域提前捕获 gateway/job face，避免异步重连在 React 调用栈重新解析命名空间。服务缺失只显示「CLI 实时输出暂不可用」，不阻断父插件；服务恢复/撤销驱动观察重启/释放。list/follow 采用 `$stream`，接受 rows/opened 锚点，游标仅原样保存 Host 的 from/next；carrier 中断显式提示，已接受锚点后的意外 EOF 使用公开 restart 立即重订阅，不导入 Harness Client 包；此 EOF 分支不含退避，真实 carrier 异常仍由 `$stream` 原有重试机制处理。订阅终端错误必须显式呈现，不能当成无任务。
 
 **有界呈现：** 最多观察 8 个任务（运行中优先，其次最新结算），每个任务保留 32 Ki UTF-16 字符、256 个通道片段；正文使用文本节点，不解析 HTML/ANSI。运行中默认展开，结算后仍可展开尾部。输出默认自动滚到底；用户上滚后暂停，回到底部或点击「滚动到最下」恢复；每个任务独立维护状态。Host lossy、chunk gapBefore、已有历史缺口与客户端裁切均明确提示；超出任务数也有提示。没有刷新定时器或 CLI 运行时长限制，也没有取消按钮。
+
+**通道分区呈现：** 早先面板把 `job.chunks` 在**同一个 `<pre>` 里顺序拼接**成 `[stdout] …` / `[stderr] …`，于是外部 CLI 的**过程与工具轨迹被当作正文**一起平铺 —— 用户要观察的是 CLI 的结论，不是它的工具调用流水。真因不在数据源，而在**通道未被区分**：codex 非 `--json` 模式下 stdout 只有最终消息，路由事实头与过程/工具轨迹都在 stderr（`docs/cli-backends.md` §2.4 的对照组实测；同节用例 8 证明 `--json` 会把事件流改到 stdout 并让 stderr 变空，从而牺牲可读路由事实）。因此修法是**按通道分区**，而不是猜 stderr 里哪一行像工具调用：正文区只显示 stdout（流式、贴底，运行中默认展开）；stderr 归入独立 `<details>`「过程与诊断」，**默认折叠**，失败（`failed` / `killed`）时自动展开并改用错误色；从 stderr 头部按 `ROUTE_FACT_KEYS` 抽出的路由事实以单独一行显示在折叠区**之外**，保证「CLI 真的接受了本次模型/沙箱/强度参数」这条证据不随折叠隐藏。折叠只是展示层：chunks 原样保留，有界与 gap 语义不变，因此「不美化、不丢弃」（D8）未被削弱。客户端无法 import Host 的抽取实现，故镜像一份（`logic.js` 为权威，内联进 `src/client/index.js`），由 `scripts/check-client.mjs` 断言键表与抽取行为与 Host 一致。**未真机验收**：真实 CLI 的 stderr 形状、折叠交互与失败自动展开仍需重启后人工查看。
 
 调用外部 CLI 至少要考虑：
 

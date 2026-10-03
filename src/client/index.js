@@ -282,6 +282,61 @@ function validateRoles(roles) {
   return null;
 }
 
+/**
+ * 外部 CLI 自报路由事实的键；与 `src/client/logic.js` 的同名常量**逐项相同**。
+ *
+ * ⚠️ 值也必须与 Host 的 `src/cli/output.js` 的 `ROUTE_FACT_KEYS` 一致：
+ * Host 用同一张表从 stderr 抽取「配置真的被 CLI 接受」的证据，Client 用它把证据
+ * 显示在折叠区之外。`scripts/check-client.mjs` 对键表与抽取行为都有漂移断言。
+ */
+const CLI_ROUTE_FACT_KEYS = [
+  'workdir',
+  'model',
+  'provider',
+  'approval',
+  'sandbox',
+  'reasoning effort',
+  'reasoning summary',
+];
+
+/**
+ * 从 CLI 的 stderr 里抽取路由事实行；与 `src/client/logic.js` 的
+ * `parseCliRouteFacts` **必须逐字相同**（见上）。
+ *
+ * @param {string} stderr - 完整 stderr。
+ * @param {number} [scanLines] - 扫描的行数上限。
+ * @returns {Record<string, string>} 抽到的事实键值；无则空对象。
+ */
+function parseCliRouteFacts(stderr, scanLines = 25) {
+  const facts = {};
+  if (typeof stderr !== 'string' || stderr.length === 0) return facts;
+  const keys = CLI_ROUTE_FACT_KEYS.join('|');
+  const pattern = new RegExp(`^(${keys})\\s*:\\s*(.+)$`);
+  for (const line of stderr.split('\n').slice(0, scanLines)) {
+    const match = pattern.exec(line.trim());
+    if (match) facts[match[1]] = match[2].trim();
+  }
+  return facts;
+}
+
+/**
+ * 按通道把 CLI 任务的输出片段拆成「正文」与「过程/诊断」；与 `src/client/logic.js`
+ * 的 `splitCliChannels` **必须逐字相同**（见上）。
+ *
+ * @param {object[]} chunks - 任务输出片段（`{ text, channel }`）。
+ * @returns {{stdout: string, stderr: string}} 两个通道各自的正文。
+ */
+function splitCliChannels(chunks) {
+  const out = { stdout: '', stderr: '' };
+  for (const chunk of Array.isArray(chunks) ? chunks : []) {
+    const text = typeof chunk?.text === 'string' ? chunk.text : '';
+    if (text.length === 0) continue;
+    if (chunk.channel === 'stderr') out.stderr += text;
+    else out.stdout += text;
+  }
+  return out;
+}
+
 /** 滚动位置在底部容差内时视为粘底。 */
 function isAtScrollBottom(scrollTop, scrollHeight, clientHeight, tolerance = 8) {
   return scrollHeight - clientHeight - scrollTop <= tolerance;
@@ -1351,10 +1406,40 @@ window.__ModuleLoader__.load({
       };
     }
 
+    /**
+     * 一个 CLI 任务的观察席（D23 的展示层）。
+     *
+     * ## 为什么要按通道分区，而不是把输出平铺
+     *
+     * 早先这里把 `job.chunks` 在**同一个 `<pre>` 里顺序拼接**成 `[stdout] …` / `[stderr] …`。
+     * 而 codex 非 `--json` 模式下 stdout 只有最终消息，**路由事实头与过程/工具轨迹都在
+     * stderr**（`docs/cli-backends.md` §2.4 有对照组实测）。于是用户看到的「外部 CLI 回流」
+     * 里混进了大量工具调用噪音 —— 那些信息是给排障用的，不是给观察用的。
+     *
+     * 修法不是去猜 stderr 里哪一行像工具调用（措辞会随 CLI 版本漂移），而是**按通道分区**：
+     *   - 正文区（stdout）：只有 CLI 的最终消息，流式追加、默认可见；
+     *   - 过程与诊断（stderr）：默认折叠，一键可查，失败时自动展开；
+     *   - 路由事实条：从 stderr 抽出的「CLI 真接受了本次参数」证据，**不随折叠隐藏**。
+     *
+     * 折叠只是展示层：chunks 仍原样保存在 store 里，有界与 gap 语义不变，
+     * 因此「不美化、不丢弃」的证据要求没有被削弱。
+     */
     function CliJobOutput({ job }) {
       const [expanded, setExpanded] = useState(() => cliLive(job));
       const [pinned, setPinned] = useState(true);
+      const failed = job.status === 'failed' || job.status === 'killed';
+      // 用户手动开合优先（null = 尚未干预）；未干预时跟随状态：失败展开、运行中折叠。
+      // 这样「运行中 → 失败」的实时转变也会自动展开 —— 初值只在挂载时算一次，够不到这个转变。
+      const [diagnosticsOpen, setDiagnosticsOpen] = useState(() => null);
+      const expandedDiagnostics = diagnosticsOpen ?? failed;
       const outputRef = useRef(null);
+      const { stdout, stderr } = splitCliChannels(job.chunks);
+      const routeFacts = parseCliRouteFacts(stderr);
+      const routeLine = CLI_ROUTE_FACT_KEYS.filter((key) => routeFacts[key] !== undefined)
+        .map((key) => `${key}=${routeFacts[key]}`).join(' · ');
+      const diagnosticsColor = failed
+        ? 'var(--dsw-alias-label-error, var(--dsw-alias-label-secondary))'
+        : 'var(--dsw-alias-label-secondary)';
       useEffect(() => {
         if (!pinned || !expanded) return;
         const node = outputRef.current;
@@ -1373,11 +1458,23 @@ window.__ModuleLoader__.load({
         h('summary', { style: { cursor: 'pointer' } }, `${String(job.label).slice(0, 200)} · ${status}`),
         job.error ? h('div', { role: 'alert' }, `CLI 输出订阅失败：${job.error}`) : null,
         job.gap ? h('div', { role: 'status' }, '输出已截断或存在 gap（丢失片段）；仅显示有界尾部。') : null,
+        routeLine.length > 0 ? h('div', { 'data-role': 'cli-route-facts',
+          style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)', margin: '4px 0', overflowWrap: 'anywhere' } },
+          `路由事实：${routeLine}`) : null,
         !pinned ? h('button', { type: 'button', onClick: scrollToBottom, 'aria-label': '滚动到最下' }, '滚动到最下') : null,
-        h('pre', { ref: outputRef, onScroll, style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 240, overflow: 'auto', margin: '8px 0' } },
-          (job.chunks ?? []).map((chunk, index) => h('span', { key: index, 'data-channel': chunk.channel,
-            style: chunk.channel === 'stderr' ? { color: 'var(--dsw-alias-label-error)' } : undefined,
-          }, `[${chunk.channel}] ${chunk.text}`))),
+        h('pre', { ref: outputRef, onScroll, 'data-channel': 'stdout',
+          style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 240, overflow: 'auto', margin: '8px 0' } },
+          stdout.length > 0 ? stdout : (cliLive(job) ? '（等待正文输出…）' : '（CLI 未产生标准输出）')),
+        stderr.length > 0 || failed
+          ? h('details', { open: expandedDiagnostics,
+            onToggle: (event) => setDiagnosticsOpen(event.currentTarget.open) },
+            h('summary', { style: { cursor: 'pointer', color: diagnosticsColor } },
+              `过程与诊断（stderr，${stderr.length} 字符）`),
+            h('pre', { 'data-channel': 'stderr',
+              style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 200, overflow: 'auto',
+                margin: '4px 0', color: diagnosticsColor } },
+              stderr.length > 0 ? stderr : '（无 stderr 输出）'))
+          : null,
       );
     }
 

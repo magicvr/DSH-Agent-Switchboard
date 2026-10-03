@@ -27,8 +27,11 @@
  *
  * 这是**可当场读取的生效证据**：把 `model` 从 A 换成 B，这一行会跟着变。
  * 因此它既是诊断信息，也是验收依据。
+ *
+ * 导出是为了让 `scripts/check-client.mjs` 能把 Client 半边那份镜像（它无法 import
+ * 本模块）与本表逐项比对：两份一旦漂移，界面会把「CLI 到底接受了哪些参数」显示错。
  */
-const ROUTE_FACT_KEYS = [
+export const ROUTE_FACT_KEYS = [
   'workdir',
   'model',
   'provider',

@@ -15,7 +15,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply, Config } from '../src/index.js';
 import { configPathFor, initialConfig, readConfigFile, writeConfigFile } from '../src/config-file.js';
-import { parseJsonArray, validateRoles } from '../src/client/logic.js';
+import { CLI_ROUTE_FACT_KEYS, parseCliRouteFacts, parseJsonArray, splitCliChannels, validateRoles } from '../src/client/logic.js';
+import { parseRouteFacts, ROUTE_FACT_KEYS } from '../src/cli/output.js';
 import { normalizeRoles } from '../src/roles.js';
 
 let pass = 0;
@@ -345,12 +346,44 @@ section('防漂移：Client 内联的纯逻辑与 logic.js 必须逐字相同');
   }
 
   const logicSrc = readFileSync(new URL('../src/client/logic.js', import.meta.url), 'utf8');
-  for (const name of ['parseJsonArray', 'validateRoles']) {
+  for (const name of ['parseJsonArray', 'validateRoles', 'parseCliRouteFacts', 'splitCliChannels']) {
     const a = extractFunction(logicSrc, name);
     const b = extractFunction(CLIENT_SRC, name);
     check(`${name} 在两处都存在`, a !== undefined && b !== undefined);
     check(`${name} 两处实现逐字相同`, a !== undefined && a === b, a === b ? '' : '存在漂移');
   }
+}
+
+section('CLI 路由事实与通道拆分：Client 镜像必须与 Host 一致');
+{
+  // Client 半边无法 import Host 的 `src/cli/output.js`，只能内联一份事实键表与抽取函数。
+  // 漂移的后果很具体：界面会把「CLI 究竟接受了哪些参数」显示错、或干脆显示不出来，
+  // 而这条证据正是本项目「配置真的生效」的验收依据。
+  const codexHeader = 'OpenAI Codex v0.159.2\n--------\nworkdir: C:\\repo\nmodel: gpt-6-luna\n' +
+    'provider: openai\napproval: never\nsandbox: read-only\nreasoning effort: high\n\n正文第一行';
+  const noise = 'model: 只是正文里的一行\nnot a fact: 1\n\n';
+  // 超出扫描窗口（25 行）的事实不能被采信 —— 窗口本身就是「别把正文误当事实」的防线。
+  const beyond = `${Array.from({ length: 30 }, (_, i) => `line ${i}`).join('\n')}\nmodel: too-late\n`;
+  check('路由事实键表与 Host 逐项一致',
+    JSON.stringify(CLI_ROUTE_FACT_KEYS) === JSON.stringify(ROUTE_FACT_KEYS),
+    `Client=${JSON.stringify(CLI_ROUTE_FACT_KEYS)} Host=${JSON.stringify(ROUTE_FACT_KEYS)}`);
+  for (const [name, input] of Object.entries({ codexHeader, noise, beyond, empty: '' })) {
+    const mine = JSON.stringify(parseCliRouteFacts(input)), host = JSON.stringify(parseRouteFacts(input));
+    check(`抽取行为与 Host 一致（${name}）`, mine === host, `Client=${mine} Host=${host}`);
+  }
+  check('codex 头部确实抽到关键事实', parseCliRouteFacts(codexHeader).model === 'gpt-6-luna'
+    && parseCliRouteFacts(codexHeader).sandbox === 'read-only'
+    && parseCliRouteFacts(beyond).model === undefined);
+  const channels = splitCliChannels([
+    { channel: 'stderr', text: 'model: gpt-6-luna\n' },
+    { channel: 'stdout', text: '最终回答' },
+    { text: '缺通道按 stdout' },
+    { channel: 'stderr', text: '' },
+    { channel: 'stdout', text: '' },
+  ]);
+  check('通道拆分：stdout 只收正文，缺通道归 stdout', channels.stdout === '最终回答缺通道按 stdout', channels.stdout);
+  check('通道拆分：stderr 独立保留且空片段不入账', channels.stderr === 'model: gpt-6-luna\n', channels.stderr);
+  check('通道拆分：空输入安全', JSON.stringify(splitCliChannels(undefined)) === '{"stdout":"","stderr":""}');
 }
 
 section('CLI 驱动表：Client 镜像必须与 Host 权威一致');
@@ -1018,6 +1051,13 @@ function cliNodes(tree) {
   return nodes;
 }
 const cliText = tree => cliNodes(tree).flatMap(node => node.children.filter(child => typeof child === 'string')).join('\n');
+/** 取某个通道容器的文本：正文区 `data-channel="stdout"`，过程与诊断区 `data-channel="stderr"`。 */
+const channelText = (tree, channel) => cliNodes(tree).filter(node => node.props?.['data-channel'] === channel)
+  .flatMap(node => node.children.filter(child => typeof child === 'string')).join('\n');
+/** 找出 summary 文本含指定串的 `<details>`（一个任务节点里有「根节点」与「过程与诊断」两层）。 */
+const detailsWith = (tree, text) => cliNodes(tree).filter(node => node.type === 'details'
+  && node.children.some(child => child?.type === 'summary'
+    && (child.children ?? []).some(item => typeof item === 'string' && item.includes(text))));
 function fakeCliRemote() {
   const streams = [], calls = [], counters = { kill: 0, model: 0, readAt: 0 };
   const remote = {
@@ -1097,6 +1137,41 @@ section('CLI composer：one-shot 选择、官方只读占位与无 turn 输出')
     const result = CliJobOutput({ job: cliRow(status, 's', { status, gap: true, error: 'follow offline' }) });
     check(`CLI 渲染：${status} 状态、gap 和订阅错误可见`, cliText(result).includes(label) && cliText(result).includes('gap') && cliText(result).includes('follow offline') && !result.props.open);
   }
+  // 「工具调用等消息混进正文」正是本次要修的问题：codex 的过程/工具轨迹在 stderr 上，
+  // 因此判据是**通道**，而不是去猜哪一行像工具调用。
+  const codexStderr = 'OpenAI Codex v0.159.2\n--------\nworkdir: C:\\repo\nmodel: gpt-6-luna\n' +
+    'provider: openai\napproval: never\nsandbox: read-only\nreasoning effort: high\n';
+  const liveTree = CliJobOutput({ job: cliRow('live', 's', { chunks: [
+    { channel: 'stdout', text: '最终回答' },
+    { channel: 'stderr', text: `${codexStderr}exec: npm test\n` },
+  ] }) });
+  check('CLI 渲染：正文区只有 stdout，过程轨迹不进正文',
+    channelText(liveTree, 'stdout') === '最终回答' && !cliText(liveTree).includes('[stdout]')
+      && !channelText(liveTree, 'stdout').includes('exec: npm test'));
+  check('CLI 渲染：stderr 独立成默认折叠的诊断区',
+    channelText(liveTree, 'stderr').includes('exec: npm test')
+      && detailsWith(liveTree, '过程与诊断')[0]?.props.open === false);
+  check('CLI 渲染：路由事实不随诊断折叠而隐藏',
+    cliText(liveTree).includes('路由事实：workdir=C:\\repo · model=gpt-6-luna')
+      && cliText(liveTree).includes('sandbox=read-only · reasoning effort=high'));
+  const deadTree = CliJobOutput({ job: cliRow('dead', 's', { status: 'failed',
+    chunks: [{ channel: 'stderr', text: codexStderr }] }) });
+  check('CLI 渲染：失败态诊断自动展开并改用错误色',
+    detailsWith(deadTree, '过程与诊断')[0]?.props.open === true
+      && cliNodes(deadTree).some(node => node.props?.['data-channel'] === 'stderr'
+        && node.props.style.color === 'var(--dsw-alias-label-error, var(--dsw-alias-label-secondary))'));
+  check('CLI 渲染：终态无 stdout 给出占位而非空白',
+    channelText(CliJobOutput({ job: cliRow('quiet', 's', { status: 'completed' }) }), 'stdout')
+      === '（CLI 未产生标准输出）'
+      && channelText(CliJobOutput({ job: cliRow('busy', 's') }), 'stdout') === '（等待正文输出…）');
+  // 实时转变也要照顾：状态初值只在挂载时算一次，因此折叠态必须由「状态 + 用户是否干预」推导。
+  const runningTree = CliJobOutput({ job: cliRow('turn', 's',
+    { chunks: [{ channel: 'stderr', text: 'boom\n' }] }) });
+  const turnedTree = CliJobOutput({ job: cliRow('turn', 's',
+    { status: 'failed', chunks: [{ channel: 'stderr', text: 'boom\n' }] }) });
+  check('CLI 渲染：运行中 → 失败的实时转变会自动展开诊断',
+    detailsWith(runningTree, '过程与诊断')[0]?.props.open === false
+      && detailsWith(turnedTree, '过程与诊断')[0]?.props.open === true);
 }
 
 section('CLI apply：可选子注入、作用域捕获与服务重绑');
@@ -1379,8 +1454,8 @@ section('CLI composer 生命周期：首帧隔离、会话切换与卸载');
   const noTurnSession = sessions.get('session-A');
   fake.streams[1].push(outputCli([{ channel: 'stderr', text: 'diagnostic without turn/end' }], 71)); await settleCli();
   const noTurnTree = render('session-A'), noTurnNodes = cliNodes(noTurnTree);
-  check('CLI 渲染：真实挂载 session 无 turn/end，rows/output 实时渲染 stdout/stderr', !('turn' in noTurnSession) && !('end' in noTurnSession) && cliText(noTurnTree).includes('[stdout] OLD PRIVATE OUTPUT') && cliText(noTurnTree).includes('[stderr] diagnostic without turn/end'));
-  check('CLI 渲染：真实订阅 stderr 通道样式与 running 默认展开', noTurnNodes.some(node => node.props?.['data-channel'] === 'stderr' && node.props.style.color === 'var(--dsw-alias-label-error)') && noTurnNodes.some(node => node.type === 'details' && node.props.open));
+  check('CLI 渲染：真实挂载 session 无 turn/end，stdout 进正文、stderr 进折叠诊断', !('turn' in noTurnSession) && !('end' in noTurnSession) && channelText(noTurnTree, 'stdout') === 'OLD PRIVATE OUTPUT' && channelText(noTurnTree, 'stderr') === 'diagnostic without turn/end' && !cliText(noTurnTree).includes('[stdout]') && !cliText(noTurnTree).includes('[stderr]'));
+  check('CLI 渲染：真实订阅 running 根节点展开、诊断默认折叠且用次要色', detailsWith(noTurnTree, '运行中')[0]?.props.open === true && detailsWith(noTurnTree, '过程与诊断')[0]?.props.open === false && noTurnNodes.some(node => node.props?.['data-channel'] === 'stderr' && node.props.style.color === 'var(--dsw-alias-label-secondary)'));
   check('CLI 渲染：实时输出也绝对 readonly，不出现输入/发送/continuation 控件', !noTurnNodes.some(node => ['input', 'textarea', 'button', 'form'].includes(node.type)) && cliText(noTurnTree).includes('一次性任务不支持后续消息，可在这里查看完整执行记录。'));
   const firstNewTree = render('session-B');
   check('CLI 生命周期：新会话 commit 前首帧 mask 旧 state', !cliText(firstNewTree).includes('OLD PRIVATE OUTPUT') && firstNewTree.children[0].props.snapshot.sessionId === 'session-B' && firstNewTree.children[0].props.snapshot.jobs.length === 0);

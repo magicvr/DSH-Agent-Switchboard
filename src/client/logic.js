@@ -86,3 +86,66 @@ export function validateRoles(roles) {
   }
   return null;
 }
+
+/**
+ * 外部 CLI 自报路由事实的键。
+ *
+ * ⚠️ 必须与 Host 的 `src/cli/output.js` 的 `ROUTE_FACT_KEYS` **逐项一致**。
+ * 这份镜像的唯一用途：把 stderr 折叠成「过程与诊断」之后，仍能把
+ * 「CLI 真的接受了本次模型/沙箱/强度参数」这一行证据**始终**显示在折叠区之外。
+ * `scripts/check-client.mjs` 有键表与行为两重漂移断言锁定它。
+ */
+export const CLI_ROUTE_FACT_KEYS = [
+  'workdir',
+  'model',
+  'provider',
+  'approval',
+  'sandbox',
+  'reasoning effort',
+  'reasoning summary',
+];
+
+/**
+ * 从 CLI 的 stderr 里抽取路由事实行（Host `parseRouteFacts` 的镜像）。
+ *
+ * 只在头部有限行数内匹配，避免把正常输出里恰好形如 `model: xxx` 的行误当成事实。
+ *
+ * @param {string} stderr - 完整 stderr。
+ * @param {number} [scanLines] - 扫描的行数上限。
+ * @returns {Record<string, string>} 抽到的事实键值；无则空对象。
+ */
+export function parseCliRouteFacts(stderr, scanLines = 25) {
+  const facts = {};
+  if (typeof stderr !== 'string' || stderr.length === 0) return facts;
+  const keys = CLI_ROUTE_FACT_KEYS.join('|');
+  const pattern = new RegExp(`^(${keys})\\s*:\\s*(.+)$`);
+  for (const line of stderr.split('\n').slice(0, scanLines)) {
+    const match = pattern.exec(line.trim());
+    if (match) facts[match[1]] = match[2].trim();
+  }
+  return facts;
+}
+
+/**
+ * 按通道把 CLI 任务的输出片段拆成「正文」与「过程/诊断」。
+ *
+ * 为什么按**通道**而不是按文本内容判定：codex 非 `--json` 模式下 stdout 只有最终消息，
+ * 路由事实与过程/工具轨迹都在 stderr（`docs/cli-backends.md` §2.4 有对照组实测）。
+ * 因此「哪些是工具调用噪音」无需猜文本 —— 通道本身就是权威判据，也不会因为某个 CLI
+ * 改了措辞而失效。
+ *
+ * `channel` 缺失按 `stdout` 处理，与 `makeCliStore` 的规范化一致。
+ *
+ * @param {object[]} chunks - 任务输出片段（`{ text, channel }`）。
+ * @returns {{stdout: string, stderr: string}} 两个通道各自的正文。
+ */
+export function splitCliChannels(chunks) {
+  const out = { stdout: '', stderr: '' };
+  for (const chunk of Array.isArray(chunks) ? chunks : []) {
+    const text = typeof chunk?.text === 'string' ? chunk.text : '';
+    if (text.length === 0) continue;
+    if (chunk.channel === 'stderr') out.stderr += text;
+    else out.stdout += text;
+  }
+  return out;
+}
