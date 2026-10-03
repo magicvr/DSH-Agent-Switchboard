@@ -1074,6 +1074,25 @@ const channelText = (tree, channel) => cliNodes(tree).filter(node => node.props?
 const detailsWith = (tree, text) => cliNodes(tree).filter(node => node.type === 'details'
   && node.children.some(child => child?.type === 'summary'
     && (child.children ?? []).some(item => typeof item === 'string' && item.includes(text))));
+/**
+ * 收集满足判据的节点及其**祖先链**。
+ *
+ * 用途：只断言「文本出现在整棵树里」是证伪不了「证据条其实被塞进折叠区」的
+ * —— `cliText` 不看 `<details open>`，藏进去也照样能读到。要证明它在折叠区之外，
+ * 只能比祖先关系。
+ */
+const ancestorsOf = (tree, predicate) => {
+  const found = [];
+  const walk = (node, chain) => {
+    if (Array.isArray(node)) return node.forEach(child => walk(child, chain));
+    if (!node || typeof node !== 'object') return;
+    if (typeof node.type === 'function') return walk(cliApi[node.type.name](node.props), chain);
+    if (predicate(node)) found.push(chain);
+    node.children?.forEach(child => walk(child, [...chain, node]));
+  };
+  walk(tree, []);
+  return found;
+};
 function fakeCliRemote() {
   const streams = [], calls = [], counters = { kill: 0, model: 0, readAt: 0 };
   const remote = {
@@ -1169,6 +1188,10 @@ section('CLI composer：one-shot 选择、官方只读占位与无 turn 输出')
   check('CLI 渲染：路由事实不随诊断折叠而隐藏',
     cliText(liveTree).includes('路由事实：workdir=<cwd> · model=gpt-6.1-sol')
       && cliText(liveTree).includes('sandbox=read-only · reasoning effort=low'));
+  const routeFactsPlacement = ancestorsOf(liveTree, node => node.props?.['data-role'] === 'cli-route-facts');
+  check('CLI 渲染：路由事实条确实在「过程与诊断」之外（否则折叠即丢证据）',
+    routeFactsPlacement.length === 1
+      && !routeFactsPlacement[0].includes(detailsWith(liveTree, '过程与诊断')[0]));
   const deadTree = CliJobOutput({ job: cliRow('dead', 's', { status: 'failed',
     chunks: [{ channel: 'stderr', text: codexStderr }] }) });
   check('CLI 渲染：失败态诊断自动展开并改用错误色',
@@ -1452,8 +1475,10 @@ section('CLI composer 生命周期：首帧隔离、会话切换与卸载');
     useState: initial => { const at = index++; if (!(at in states)) states[at] = typeof initial === 'function' ? initial() : initial;
       return [states[at], value => { states[at] = typeof value === 'function' ? value(states[at]) : value; }]; },
     useEffect: (effect, deps) => { effects.push({ effect, deps }); },
+    // CliJobOutput 直接以本段的 react 渲染时也要能跑（它用的是 useRef 抓滚动容器）。
+    useRef: initial => ({ current: initial }),
   };
-  const { CliReadOnlyComposer } = clientWindow.spec.factory(() => react);
+  const { CliReadOnlyComposer, CliJobOutput: StatefulJobOutput } = clientWindow.spec.factory(() => react);
   const fake = fakeCliRemote(), realStore = makeBoundCliStore(fake.remote), callbacks = [];
   const store = { watch: (id, notify) => { callbacks.push(notify); return realStore.watch(id, notify); } };
   let cleanup, priorDeps;
@@ -1488,6 +1513,17 @@ section('CLI composer 生命周期：首帧隔离、会话切换与卸载');
   check('CLI 生命周期：旧流迟到回调不串新会话', states[0] === beforeLate && cliText(render('session-B')).includes('NEW OUTPUT') && !cliText(render('session-B')).includes('LATE OLD OUTPUT') && fake.calls.filter(call => call.request.jobId === 'late-job').length === 0);
   callbacks[0]({ sessionId: 'session-A', error: 'OLD ERROR', jobs: [cliRow('stale', 'session-A', { chunks: [{ text: 'STALE', channel: 'stdout' }] })] });
   check('CLI 生命周期：旧 notify 快照也被 sessionId mask', !cliText(render('session-B')).includes('STALE') && !cliText(render('session-B')).includes('OLD ERROR'));
+  // 折叠态的推导要**保留 hook 状态**才验得动：无状态桩各渲染一次时，「用初值 failed 决定
+  // open」的错误实现也能通过（独立复核指出）。本段 harness 的 states 按槽位保留，因此改用
+  // 同一个组件的连续渲染，并覆盖「用户手动干预后不再强制展开」。
+  const renderStatefulJob = status => { index = 0; return StatefulJobOutput({ job: cliRow('stateful', 'session-B',
+    { status, chunks: [{ channel: 'stdout', text: 'answer' },
+      { channel: 'stderr', text: CODEX_ROUTE_HEADER }] }) }); };
+  const diagnosticsOpen = tree => detailsWith(tree, '过程与诊断')[0]?.props.open;
+  check('CLI 折叠：未干预时 running 默认折叠', diagnosticsOpen(renderStatefulJob('running')) === false);
+  check('CLI 折叠：保留状态时 running → failed 自动展开', diagnosticsOpen(renderStatefulJob('failed')) === true);
+  detailsWith(renderStatefulJob('failed'), '过程与诊断')[0].props.onToggle({ currentTarget: { open: false } });
+  check('CLI 折叠：用户手动折叠后 killed 不再强制展开', diagnosticsOpen(renderStatefulJob('killed')) === false);
   cleanup(); const afterUnmount = states[0];
   newList.push({ type: 'rows', jobs: [cliRow('after-unmount', 'session-B')] }); await settleCli();
   check('CLI 生命周期：卸载仅 dispose 流，无新回调且 kill/model/readAt=0', fake.streams.every(stream => stream.disposed === 1) && states[0] === afterUnmount && Object.values(fake.counters).every(value => value === 0));
