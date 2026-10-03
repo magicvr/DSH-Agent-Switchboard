@@ -1833,6 +1833,7 @@ section('preset 调度规则：缺失告警与生成幂等');
   const output = join(fixtureHome, 'generated.patch.yml');
   const generator = readFileSync(new URL('./gen-preset.mjs', import.meta.url), 'utf8')
     .replace("from './lib/capture.mjs'", `from '${new URL('./lib/capture.mjs', import.meta.url).href}'`)
+    .replace("from './lib/preset-generator.mjs'", `from '${new URL('./lib/preset-generator.mjs', import.meta.url).href}'`)
     .replace('const standardText = cat(STANDARD_ENTRY);', `const standardText = ${JSON.stringify(standard)};`)
     .replace("const OUT_FILE = join(ROOT, 'presets', 'switchboard.patch.yml');", `const OUT_FILE = ${JSON.stringify(output)};`);
   const run = () => captureSync(process.execPath, ['--input-type=module', '-e', generator]);
