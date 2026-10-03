@@ -572,6 +572,17 @@ npm 入口、文档及脚本用法与运行时命令同步更新。离线 `check
 全部 `cli*` schema、已有隐藏值与工作目录回落语义保留；包裹字段可保存，路由应用仍留后续批次。
 本批次仅离线验证源码结构与桩化回调，控件显示、设置保存往返及旧配置提示仍需重启 DSH 后真机验收。
 
+**后续修正（客户端镜像必须与 Host 判定一致）：** `{npmRoot}` 前缀模板的分隔符归一
+（Host 的 `canonical()`）与 `matchesList` 的「`null` / `undefined` 即空数组」语义，此前只落在
+Host 一侧，设置面板的驱动反推仍是严格比较。后果是「Host 接受、界面判未知」：旧 Windows 形态
+（`{npmRoot}\@openai\codex\bin\codex.js`）的 codex 角色在面板里显示「需重选预设」，而保存闸门
+检查的是**整份角色列表**，于是只要还有一个这样的角色，任何一次保存都被拦下（真机实测：三个
+CLI 角色全部反推 `undefined`，Host 对应全部 `codex`、`validateCliPreset` 零错误）。现由
+`src/client/index.js` 的 `matchesDriverText` / `matchesDriverList` 对齐，并新增
+`check-client.mjs` 的「同一批 fixture 两边结论必须一致」断言（含旧模板与 grok 缺省
+`cliPrefixArgs` 两个回归点，修复前该断言 FAIL）。真正未知的形态仍不猜测：浏览器没有占位符
+解析器，已解析的绝对路径不在客户端匹配范围内（Host 额外接受它）。
+
 ---
 
 ## D17 · CLI 无运行期限与独立取消分类

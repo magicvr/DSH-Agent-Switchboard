@@ -508,6 +508,54 @@ section('RoleRow 真实事件回调：预设与只读切换原子更新');
     builtinWrites.length === 1 && builtinWrites[0].value.readOnly === true && !('cliArgs' in builtinWrites[0].value));
 }
 
+section('预设反推：客户端镜像与 Host 必须对同一批配置给出同一结论');
+{
+  // ⚠️ 这条断言对应一次真机故障：codex 的 `cliPrefixArgs` 模板从旧 Windows 形态
+  //    `{npmRoot}\@openai\codex\bin\codex.js` 改成 `/` 分隔时，**只有 Host 一侧**加了
+  //    `canonical()` 归一化，客户端镜像仍是严格比较。后果是「Host 接受、界面判未知」：
+  //    卡片显示「需重选预设」，而保存闸门检查的是整份角色列表，于是任何一次保存都被拦下
+  //    （实测：三个 CLI 角色全部反推为 undefined，Host 对应全部 codex、零错误）。
+  //
+  //    这里不再逐条复刻规则，而是**同一批 fixture 喂两边**：任何一侧单方面变严/变松都会失败。
+  const { cliFieldsFor, inferCliDriver: hostInfer, validateCliPreset } = await import('../src/cli/drivers.js');
+  const base = { id: 'r', backend: 'cli', model: 'm', cliCwd: 'C:/w' };
+  /** 同一批输入两边判定的对照。 */
+  const parity = (label, role, expected) => {
+    const host = hostInfer(role);
+    const client = clientData.inferCliDriver(role);
+    check(`${label}：两边一致且为 ${String(expected)}`,
+      host === expected && client === expected, `Host=${String(host)} / 客户端=${String(client)}`);
+  };
+  for (const driver of ['codex', 'grok']) {
+    for (const readOnly of [true, false]) {
+      const fields = cliFieldsFor(driver, readOnly);
+      parity(`${driver}/readOnly=${readOnly} 当前模板`, { ...base, ...fields, readOnly }, driver);
+    }
+  }
+  // 旧 Windows 形态：分隔符是 `\`。fixture 必须**真的含反斜杠**，否则这条断言恒真。
+  const legacyFields = cliFieldsFor('codex', true);
+  const legacy = {
+    ...base, ...legacyFields, readOnly: true,
+    cliPrefixArgs: legacyFields.cliPrefixArgs.map((arg) => arg.replace(/\//g, '\\')),
+  };
+  check('旧 Windows 模板 fixture 确实含反斜杠（断言非恒真）',
+    legacy.cliPrefixArgs.some((arg) => arg.includes('\\')));
+  check('旧 Windows 模板：Host 仍然接受（兼容的前提）', validateCliPreset(legacy).errors.length === 0);
+  parity('旧 Windows 模板（Host 接受，界面曾判未知）', legacy, 'codex');
+  // 缺省 `cliPrefixArgs`：Host 的 `matchesList` 把 `null`/`undefined` 当作空数组，
+  // 因此 grok（prefixArgs 为空）缺省是合法的；镜像曾用 JSON.stringify 比较而判未知。
+  parity('grok 缺省 cliPrefixArgs（空数组语义）', { ...base, ...cliFieldsFor('grok', true), cliPrefixArgs: undefined }, 'grok');
+  const writes = [];
+  const legacyElements = rowElements(legacy, writes);
+  check('旧 Windows 模板在卡片里不再显示「需重选预设」',
+    legacyElements.some((n) => n.type === 'select' && n.props.value === 'codex') &&
+    !legacyElements.some((n) => n.children.includes('需重选预设：当前配置无法识别为 codex / grok')));
+  // 真正未知的形态仍然必须拒绝：不得为了兼容而猜测。
+  parity('参数被改过', { ...base, ...legacyFields, readOnly: true, cliArgs: ['exec', '-'] }, undefined);
+  parity('命令被改过', { ...base, ...legacyFields, readOnly: true, cliCommand: 'some-other-cli' }, undefined);
+  parity('提示词传递方式被改过', { ...base, ...legacyFields, readOnly: true, cliPromptDelivery: 'argv' }, undefined);
+}
+
 section('面板字段：源码结构与桩化 RoleRow（不替代真机验收）');
 {
   const rowSource = CLIENT_SRC.slice(CLIENT_SRC.indexOf('    function RoleRow('), CLIENT_SRC.indexOf('    function WrapperSettings('));

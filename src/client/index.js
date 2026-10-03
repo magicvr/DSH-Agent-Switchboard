@@ -152,20 +152,63 @@ function cliFieldsFor(id, readOnly) {
  * 若用户手工改过 `cli*` 字段导致与任何驱动都不一致，返回 undefined ——
  * 避免界面把用户的自定义配置**显示**成某个预设（那会误导）。
  *
+ * ⚠️ **判据必须与 Host 逐条对齐**（`src/cli/drivers.js` 的 `matchesCommandText` /
+ * `matchesList`），否则会出现「Host 接受、界面判未知」这类最困惑的失败：
+ *
+ *   - Host 把 `{npmRoot}` 前缀模板的两种分隔符归一后比对，因此旧 Windows 形态
+ *     `{npmRoot}\@openai\codex\bin\codex.js` 仍然匹配。镜像一度只做严格比较，
+ *     结果**旧配置在界面里反推不出驱动**：卡片显示「需重选预设」，而保存闸门检查
+ *     的是整份角色列表，于是任何一次保存都被拦下（实测：三个 CLI 角色全部
+ *     undefined，Host 对应全部 codex、零错误）。
+ *   - Host 的 `matchesList` 把 `null` / `undefined` 当成空数组，因此 prefixArgs 为空的
+ *     grok 允许缺省该字段。
+ *
+ * 浏览器没有本机路径解析器，因此只做**分隔符归一**与空数组等价，不解析
+ * `{node}` / `{npmRoot}`，也不按文件名猜测（见 `RoleRow` 里 `currentDriver` 的说明）。
+ * 已知残余差异：Host 还额外接受**已解析的绝对路径**（它在本机跑得动解析器），
+ * 浏览器无从构造那个值，因此不猜测 —— 设置镜像里存的是模板，不是解析值。
+ *
  * @param {object} role - 角色。
  * @returns {string|undefined} 驱动 id。
  */
 function inferCliDriver(role) {
   for (const d of CLI_DRIVER_OPTIONS) {
-    if (role?.cliCommand !== d.command) continue;
-    if (JSON.stringify(role.cliPrefixArgs) !== JSON.stringify(d.prefixArgs)) continue;
-    if (role.cliPromptDelivery !== d.promptDelivery) continue;
-    const args = role.cliArgs ?? [];
+    if (!matchesDriverText(role?.cliCommand, d.command)) continue;
+    if (!matchesDriverList(role?.cliPrefixArgs, d.prefixArgs)) continue;
+    if (role?.cliPromptDelivery !== d.promptDelivery) continue;
+    const args = role?.cliArgs ?? [];
     for (const readOnly of [true, false]) {
       if (JSON.stringify(args) === JSON.stringify(d.args(readOnly))) return d.id;
     }
   }
   return undefined;
+}
+
+/**
+ * 单条命令文本是否匹配（模板形态，分隔符归一后比对）。
+ *
+ * @param {unknown} actual - 角色里的值。
+ * @param {string} expected - 驱动定义里的模板。
+ * @returns {boolean} 是否匹配。
+ */
+function matchesDriverText(actual, expected) {
+  if (typeof actual !== 'string') return false;
+  // 与 Host 的 `canonical()` 相同：只对 `{npmRoot}` 前缀的值归一分隔符。
+  const canonical = (value) => (value.startsWith('{npmRoot}') ? value.replace(/\\/g, '/') : value);
+  return canonical(actual) === canonical(expected);
+}
+
+/**
+ * 字符串数组是否匹配（逐项比对；`null` / `undefined` 等价于空数组，同 Host）。
+ *
+ * @param {unknown} actual - 角色里的数组。
+ * @param {string[]} expected - 驱动定义里的模板数组。
+ * @returns {boolean} 是否匹配。
+ */
+function matchesDriverList(actual, expected) {
+  if (actual == null) return expected.length === 0;
+  if (!Array.isArray(actual) || actual.length !== expected.length) return false;
+  return actual.every((value, index) => matchesDriverText(value, expected[index]));
 }
 
 /**

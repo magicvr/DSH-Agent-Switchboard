@@ -167,7 +167,7 @@ reasoning effort: ...
   effort: medium
   cliDriver: codex
   cliCommand: "{node}"
-  cliPrefixArgs: ["{npmRoot}\\@openai\\codex\\bin\\codex.js"]
+  cliPrefixArgs: ["{npmRoot}/@openai/codex/bin/codex.js"]
   cliArgs: ["exec", "-s", "read-only", "--skip-git-repo-check",
             "-m", "{model}", "-c", "model_reasoning_effort={effort}", "-"]
   cliPromptDelivery: stdin
@@ -177,6 +177,11 @@ reasoning effort: ...
 **只需要一步**：把角色的 `backend` 改为 `cli` 并填上面那些 `cli*` 字段。
 （在设置面板里更简单：`派发机制` 选「外部 CLI」，再从 CLI 下拉框选 `Codex CLI` / `Grok CLI`，
 参数模板会自动填好。）
+
+> `cliPrefixArgs` 写成 `/` 分隔即可。**旧 Windows 形态**（`{npmRoot}\@openai\codex\bin\codex.js`）
+> Host 仍然识别：`matchesCommandText` 对 `{npmRoot}` 前缀的值归一分隔符后比对；设置面板
+> 的驱动反推使用同一套判据（`src/client/index.js` 的 `matchesDriverText`），不会把它显示成
+> 「需重选预设」。真正未知的形态仍然拒绝，不按文件名猜测。
 
 **当前仅支持 codex / grok 预设。** Host 在挂载前核对 command / prefixArgs / args / delivery
 完整形态，并独立核对 `readOnly` 与沙箱参数。切换只读会原子更新预设参数。

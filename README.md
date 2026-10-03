@@ -112,7 +112,7 @@ Host 根实例将配置同步到文件。根条目保持启用，但只在 `moun
       "model": "gpt-6-luna",
       "effort": "max",
       "cliCommand": "{node}",
-      "cliPrefixArgs": ["{npmRoot}\\@openai\\codex\\bin\\codex.js"],
+      "cliPrefixArgs": ["{npmRoot}/@openai/codex/bin/codex.js"],
       // 参数模板：只允许 {prompt} / {cwd} / {model} / {effort} 四个受限占位符。
       "cliArgs": [
         "exec", "-s", "read-only", "--skip-git-repo-check",
