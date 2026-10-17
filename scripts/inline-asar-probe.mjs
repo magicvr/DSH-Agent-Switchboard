@@ -4,32 +4,16 @@
 //   ls <dir>               列出目录
 //   grep <regex>           在文本文件中搜索，输出 文件:行号:内容
 // 注意：--eval 下 process.argv 会多一个占位 argv[1]，因此从 argv[2] 起取参数。
-import { readFileSync } from 'node:fs';
+import { openAsar } from './lib/asar.mjs';
 
 const argv = process.argv.slice(2);
 const archivePath = argv[0];
 const mode = argv[1];
 const arg = argv[2];
 
-const fd = readFileSync(archivePath);
-const headerSize = fd.readUInt32LE(4);
-const jsonSize = fd.readUInt32LE(12);
-const header = JSON.parse(fd.subarray(16, 16 + jsonSize).toString('utf8'));
-const dataStart = 8 + headerSize;
-
-const entries = [];
-(function walk(node, prefix) {
-  for (const [name, child] of Object.entries(node.files ?? {})) {
-    const p = prefix ? `${prefix}/${name}` : name;
-    if (child.files) walk(child, p);
-    else entries.push({ path: p, offset: Number(child.offset ?? 0), size: child.size ?? 0 });
-  }
-})(header, '');
-
-function readEntry(e) {
-  const start = dataStart + e.offset;
-  return fd.subarray(start, start + e.size);
-}
+const archive = openAsar(archivePath);
+const entries = archive.entries;
+const readEntry = (entry) => archive.read(entry.path);
 
 switch (mode) {
   case 'list-registry': {

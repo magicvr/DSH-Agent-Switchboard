@@ -108,13 +108,15 @@
 **DSH 升级后的固定仪式（每次都照做，不要跳步）：**
 
 1. `node scripts/ops/plugin-lifecycle.mjs verify` —— 看裁决。`DSH peers：incompatible` 就是被门禁拒载了（症状：设置页静默消失，只写 stderr）。
-2. **拉两版做逐包代码比对，判断是「只改版本坐标」还是「接口真的变了」。** 只有前者才可以直接重 pin；后者必须先按差异改代码。`0.2.1-rc.1 → rc.2` 实测结论是前者：所有相关包除 `package.json` 外**代码树逐字节相同**，上游 `standard.patch.yml` 也相同，因此零代码改动。判断方法（本轮用过）：`npm pack @deepseek-ai/<pkg>@<旧版>` 与新版分别解包，对每个包的**非 `package.json` 文件**做 SHA-256 聚合比对；完全相同即只改坐标。
+2. **判断是「只改版本坐标」还是「接口真的变了」：`npm run dsh:delta`。** 它把 pin 的版本与本机运行时版本都从 registry 取下来，对**契约面 12 个包**逐文件做 sha256 比对（代码与资产/配置分开判定），并单独报告上游 `presets/standard.patch.yml` 是否变化。退出码：`0` = 只改版本坐标，可以放心重 pin；`1` = 有接口/实现文件变化，必须先进代码核对；`2` = **无法判定**（归档不可用、registry 取不到、或某包在该版本尚未发布）——`2` **不等于安全**，只是没比对上。命令只读，不改任何仓库文件；它刻意不替你改 pin。
+   - 手动等价做法（命令不可用时）：用 `npm pack @deepseek-ai/<pkg>@<旧版>` 与本机运行时版本分别取包，对每个包的非 `package.json` 文件做哈希比对。
+   - 已实测：`0.2.1-rc.1 → rc.2` 报 `0`（12 个包除版本坐标外逐字节相同；唯一差异是 `dsh-web-app` 的 `cordis.patch.yml` 这个本插件不消费的资产文件），而 `0.2.0-rc.2 → rc.2` 报 `1` 并列出真实变化的代码文件。
 3. 改 `package.json` 的四个 dsh peer pin（`cordis` / `schemastery` 若归档里也变了则一并改），然后 `npm install` 重生成 lock 与 `node_modules`。
 4. `npm run check` 全链；`node scripts/check-profile-wiring.mjs` 会断言仓库 peers 满足归档运行时、且 `node_modules` 每个 `@deepseek-ai/dsh*` 与运行时同版本。
 5. `node scripts/ops/plugin-lifecycle.mjs verify` 应回到 `consistent`。**preset 正文没变就不需要重新注入**；若上游 `standard.patch.yml` 变了，`check:preset` 会报漂移，先 `npm run gen:preset` 再 `upgrade --apply`。
 6. 完全退出并重启 DSH，再跑 `plugin:verify` 与 `switchboard_selftest`。
 
-> **刻意不提供「按运行时版本自动改写 pin」的命令**：那种命令会在没有核对接口差异的前提下让插件加载到可能已破坏 API 的运行时上，正是本项目一直在防的静默失效。摩擦要靠上面的固定仪式降下来，不能靠放宽范围或自动改写。
+> **刻意不提供「按运行时版本自动改写 pin」的命令**：那种命令会在没有核对接口差异的前提下让插件加载到可能已破坏 API 的运行时上，正是本项目一直在防的静默失效。`npm run dsh:delta` 只做**判定**（只读、可自动化），改 pin 仍由人看过结论后手动改——摩擦降在判定上，不降在把关强度上。
 
 `compatibility.json` 豁免按精确 `package@version` 查找，值为允许的 DSH 版本字符串数组。插件版本改变后旧键在 DSH 中静默失效，工具会报告 `expired`；当前运行时不在数组中也会失败。工具只提示人工处理，GUI 豁免按钮和流程、CLI 豁免子命令均未验证。
 

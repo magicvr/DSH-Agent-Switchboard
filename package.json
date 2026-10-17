@@ -68,6 +68,7 @@
     "plugin:install": "node scripts/ops/plugin-lifecycle.mjs install",
     "plugin:upgrade": "node scripts/ops/plugin-lifecycle.mjs upgrade",
     "plugin:uninstall": "node scripts/ops/plugin-lifecycle.mjs uninstall",
+    "dsh:delta": "node scripts/ops/dsh-delta.mjs",
     "version:show": "node scripts/ops/plugin-version.mjs show",
     "version:bump": "node scripts/ops/plugin-version.mjs bump",
     "migrate:roles": "node scripts/ops/migrate-roles-to-file.mjs",

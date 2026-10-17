@@ -37,7 +37,7 @@
 
 ### 插件生命周期与版本管理
 
-`plugin:status` / `plugin:verify` 只读检测登记、preset、角色文件与兼容性；`plugin:install` / `plugin:upgrade` / `plugin:uninstall` 默认预演，显式 `--apply` 才收敛派生制品。工具不安装包、不修改依赖登记、不执行 pnpm，人工包步骤由 DSH 官方通道完成。`version:show` 检查版本，`version:bump` 默认展示计划，显式 `--apply` 才同步版本与 CHANGELOG，永不自动 commit 或 tag。命令参数、退出码、安装 / 升级 / 安全卸载顺序及验证边界见 [`docs/lifecycle.md`](./docs/lifecycle.md)；新增运行时版本字段与格式门禁仍待完整重启后真机验收。
+`plugin:status` / `plugin:verify` 只读检测登记、preset、角色文件与兼容性；`plugin:install` / `plugin:upgrade` / `plugin:uninstall` 默认预演，显式 `--apply` 才收敛派生制品。工具不安装包、不修改依赖登记、不执行 pnpm，人工包步骤由 DSH 官方通道完成。`version:show` 检查版本，`version:bump` 默认展示计划，显式 `--apply` 才同步版本与 CHANGELOG，永不自动 commit 或 tag。**DSH 升级后先用 `npm run dsh:delta` 判定**：它只读地比对「仓库 pin 的版本」与本机运行时版本在契约面 12 个包上的逐文件差异，回答「只改版本坐标（可放心重 pin）」还是「接口真的变了（必须先改代码）」，并顺带报告上游 preset 是否变化；退出码 `2` 表示无法判定，**不等于安全**。命令参数、退出码、升级仪式、安装 / 升级 / 安全卸载顺序及验证边界见 [`docs/lifecycle.md`](./docs/lifecycle.md)。
 
 ## 核心设计
 
