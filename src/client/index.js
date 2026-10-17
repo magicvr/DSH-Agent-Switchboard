@@ -51,8 +51,8 @@
  */
 const CONFIG_NS = 'agent-switchboard';
 
-/** 已知的后端取值（必须与 Host 的 `z.union(['spawn','fork','cli'])` 一致）。 */
-const BACKENDS = ['spawn', 'fork', 'cli'];
+/** 已知的后端取值（必须与 Host 的 `z.union(['spawn','cli'])` 一致）。 */
+const BACKENDS = ['spawn', 'cli'];
 
 /** 已知的思考强度取值（必须与 Host 的 `EFFORT_VALUES` 一致）。 */
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -68,7 +68,6 @@ const DEFAULT_CLI_DRIVER = 'codex';
 /** 后端的中文说明（仅用于展示）。 */
 const BACKEND_LABEL = {
   spawn: '内置 · spawn（独立上下文）',
-  fork: '内置 · fork（继承上下文）',
   cli: '外部 CLI（本机命令）',
 };
 
@@ -426,7 +425,10 @@ window.__ModuleLoader__.load({
           wrapper: Object.fromEntries(['wrapperProvider', 'wrapperModel', 'wrapperEffort']
             .map((key) => [key, row.value?.volatile?.[key] ?? ''])),
           revision: row.revision,
-          writable: row.writable,
+          // ⚠️ `writable` 在 0.2.1-rc.1 里属于**视图根**而不是每个 namespace 行：
+          // `describe()` 返回 `{writable, hasDocument, namespaces:[...]}`，而
+          // `namespaceView()` 的行里没有这个字段（实测）。读行的结果是恒 undefined。
+          writable: view.writable ?? row.writable,
           missing: roles.length === 0,
         };
       } catch (error) {
@@ -500,7 +502,12 @@ window.__ModuleLoader__.load({
         }
         if (typeof value.mutate === 'function') {
           tried.push(`${label}=有 mutate`);
-          return { channel: value, tried };
+          // ⚠️ 两个通道的 `mutate` **签名不同**，不能按同一种方式调用：
+          //   - `remote.settings.mutate(ns, ops, expectedRevision)` → 返回 `{ok,...}` 信封；
+          //   - `configForms.get(ns).mutate(ops, expectedRevision)` → 返回布尔。
+          // 实测（DSH 0.2.1-rc.1）后者就是官方 `ConfigForm` 使用的两参形式。
+          // 混用会让兜底路径**静默写失败却报成功**，因此这里显式区分。
+          return { channel: value, tried, form: label.startsWith('ctx.configForms') ? 'form' : 'namespace' };
         }
         tried.push(`${label}=无 mutate(方法:[${Object.keys(value).join(',')}])`);
       }
@@ -529,7 +536,7 @@ window.__ModuleLoader__.load({
      * @returns {Promise<{ok: boolean, message: string}>} 结果。
      */
     async function saveRoles(ctx, roles, revision, wrapper) {
-      const { channel, tried } = writeChannel(ctx, CONFIG_NS);
+      const { channel, tried, form } = writeChannel(ctx, CONFIG_NS);
       if (channel === undefined) {
         return {
           ok: false,
@@ -538,15 +545,19 @@ window.__ModuleLoader__.load({
             `诊断：${tried.join(' | ')}。`,
         };
       }
+      const ops = [...(roles === undefined ? [] : [{ op: 'set', path: ['roles'], value: roles }]),
+        ...(wrapper === undefined ? [] : ['wrapperProvider', 'wrapperModel', 'wrapperEffort']
+          .filter((key) => Object.hasOwn(wrapper, key))
+          .map((key) => ({ op: 'set', path: ['volatile', key], value: (wrapper[key] ?? '').trim() })))];
       try {
-        const response = await channel.mutate(
-          CONFIG_NS,
-          [...(roles === undefined ? [] : [{ op: 'set', path: ['roles'], value: roles }]),
-            ...(wrapper === undefined ? [] : ['wrapperProvider', 'wrapperModel', 'wrapperEffort']
-              .filter((key) => Object.hasOwn(wrapper, key))
-              .map((key) => ({ op: 'set', path: ['volatile', key], value: (wrapper[key] ?? '').trim() })))],
-          revision,
-        );
+        // 两个通道的调用形态不同（见 writeChannel 的说明），必须分开调用。
+        if (form === 'form') {
+          const written = await channel.mutate(ops, revision);
+          return written === false
+            ? { ok: false, message: '写入被拒绝（configForms 通道返回 false）' }
+            : { ok: true, message: '已写入' };
+        }
+        const response = await channel.mutate(CONFIG_NS, ops, revision);
         if (response && response.ok === false) {
           const err = response.error;
           return { ok: false, message: String(err?.message ?? err ?? '写入失败') };
@@ -686,7 +697,7 @@ window.__ModuleLoader__.load({
     function RoleRow(props) {
       const { role, index, onChange, disabled } = props;
       const isCli = role.backend === 'cli';
-      const isBuiltin = ['spawn', 'fork'].includes(role.backend ?? 'spawn');
+      const isBuiltin = ['spawn'].includes(role.backend ?? 'spawn');
       // 当前驱动由**字段反推**，而不是读 `cliDriver` —— 这样即使用户手工改了参数，
       // 下拉框会如实显示「需重选预设」。浏览器无本机路径解析器，未知形态不猜测。
       const currentDriver = isCli ? inferCliDriver(role) : undefined;
@@ -1171,7 +1182,7 @@ window.__ModuleLoader__.load({
                     fontSize: '11px',
                     color:
                       notice.kind === 'error'
-                        ? 'var(--dsw-alias-label-error, var(--dsw-alias-label-secondary))'
+                        ? 'var(--dsw-alias-state-error-primary, var(--dsw-alias-label-secondary))'
                         : 'var(--dsw-alias-label-secondary)',
                   },
                 },
@@ -1198,7 +1209,7 @@ window.__ModuleLoader__.load({
         return wrap(
           h(
             'div',
-            { style: { color: 'var(--dsw-alias-label-error, var(--dsw-alias-label-secondary))' } },
+            { style: { color: 'var(--dsw-alias-state-error-primary, var(--dsw-alias-label-secondary))' } },
             `读取角色配置失败：${status.slice('error:'.length)}`,
             h('br'),
             '点「放弃改动」可重试。',
@@ -1438,7 +1449,7 @@ window.__ModuleLoader__.load({
       const routeLine = CLI_ROUTE_FACT_KEYS.filter((key) => routeFacts[key] !== undefined)
         .map((key) => `${key}=${routeFacts[key]}`).join(' · ');
       const diagnosticsColor = failed
-        ? 'var(--dsw-alias-label-error, var(--dsw-alias-label-secondary))'
+        ? 'var(--dsw-alias-state-error-primary, var(--dsw-alias-label-secondary))'
         : 'var(--dsw-alias-label-secondary)';
       useEffect(() => {
         if (!pinned || !expanded) return;

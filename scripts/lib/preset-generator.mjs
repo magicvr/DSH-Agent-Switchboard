@@ -1,5 +1,67 @@
 // Pure text generation shared with gen-preset; no archive I/O or writes.
 import { parse } from 'yaml';
+
+/**
+ * 把 `!!js` 平台条件翻译成**可 JSON 化**的声明式标记。
+ *
+ * ⚠️ 为什么必须翻译而不是保留原文：角色 preset 要在**运行期**由 Host 组装，
+ *    而 `!!js` 是 Loader 的 YAML 标签，JSON 里没有对应物。把表达式原文塞进
+ *    JSON 再在运行期 `eval` 是安全敏感面，绝不可取。
+ *
+ * 因此这里只接受**已知的**平台判断表达式；一旦上游写出别的条件就抛错，
+ * 让生成期失败（`check:preset` 会红），而不是在运行期静默猜错。
+ *
+ * @param {unknown} disabled - 解析后的 `disabled` 值。
+ * @param {string} rowId - 行 id，仅用于报错定位。
+ * @returns {{disabled: boolean}|{platform: 'win32'|'posix'}|undefined} 声明式标记。
+ */
+function encodeDisabled(disabled, rowId) {
+  if (disabled === undefined) return undefined;
+  if (typeof disabled === 'boolean') return { disabled };
+  if (typeof disabled === 'string') {
+    const normalized = disabled.replace(/\s+/g, ' ').trim();
+    // `disabled: process.platform === 'win32'` ⇒ 只在 win32 上关闭 ⇒ 仅 posix 启用。
+    if (normalized === "process.platform === 'win32'") return { platform: 'posix' };
+    if (normalized === "process.platform !== 'win32'") return { platform: 'win32' };
+  }
+  throw new Error(`无法翻译第 ${JSON.stringify(rowId)} 行的 disabled 表达式：${JSON.stringify(disabled)}；` +
+    '请在此处补一条明确的声明式映射，不要在运行期 eval');
+}
+
+/**
+ * 把标准清单的一行转成角色 preset 可用的 JSON 行。
+ *
+ * @param {object} row - 解析后的标准行。
+ * @returns {object} JSON 行。
+ */
+function encodeRow(row) {
+  const out = {};
+  if (row.id !== undefined) out.id = row.id;
+  if (row.name !== undefined) out.name = row.name;
+  if (row.group === true) out.group = true;
+  if (row.isolate !== undefined) out.isolate = row.isolate;
+  const disabled = encodeDisabled(row.disabled, row.id);
+  if (disabled !== undefined) Object.assign(out, disabled);
+  if (Array.isArray(row.config)) out.config = row.config.map(encodeRow);
+  else if (row.config !== undefined) out.config = row.config;
+  return out;
+}
+
+/**
+ * 由标准清单生成「角色 preset 的行模板」。
+ *
+ * 角色子代理靠一个**独立 preset** 拿到自己的 persona 与工具构成（0.2.1-rc.1 起
+ * `dsh-tool-subagent` 的 `persona` / `toolFilter` 已删除，见 docs/decisions.md）。
+ * 那个 preset 必须自带完整工具清单，所以这里把上游 standard 的行作为**数据**导出，
+ * 运行期再按角色裁剪；这样它随 DSH 升级自动同步，而不是在本插件里手抄一份。
+ *
+ * @param {object[]} standardPlugins - `generatePreset` 解析出的标准插件行。
+ * @returns {object[]} JSON 行数组。
+ */
+export function roleRowsTemplate(standardPlugins) {
+  return standardPlugins.map(encodeRow);
+}
+
 export function generatePreset(standardText, SELF_PACKAGE) {
 const PRESET_ID = 'preset-switchboard';
 const PRESET_KEY = 'switchboard';
@@ -108,9 +170,9 @@ const selfEntry = [
 
 主代理必须自己理解目标、架构与方法基础、已接受设计、交接信息、验收标准和核心约束；scout 可定位并提取辅助证据，不能替代主代理对决策依据的理解。主线上下文保留目标、状态、已确认事实、已接受决策、阻塞、风险、下一步和验收状态；大量搜索、日志、无关代码、探索过程与失败尝试由子代理隔离，返回可追溯的结论与必要证据。
 
-任务包提供最小充分上下文：目标、必要背景、范围、已知事实、关键约束、禁止事项、预期结果和验收条件。简单任务保持简洁，复杂任务必须自包含；不重复复制角色完整规则，只描述本次工作。子代理是边界清晰、输入明确、可独立完成、输出可验证的一次性专业工作单元，不长期接管整个目标；高级角色尤其要聚焦。独立任务仅在工具支持时并行，存在依赖或共享写入冲突时顺序执行，不为并行拆出无价值任务。
+任务包提供最小充分上下文：目标、必要背景、范围、已知事实、关键约束、禁止事项、预期结果和验收条件。简单任务保持简洁，复杂任务必须自包含；不重复复制角色完整规则，只描述本次工作。子代理是边界清晰、输入明确、可独立完成、输出可验证的一次性专业工作单元，不长期接管整个目标；高级角色尤其要聚焦。互不依赖的任务放在同一条消息里并行发起，存在依赖或共享写入冲突时顺序执行，不为并行拆出无价值任务。
 
-派发生命周期：delegate_to_* 阻塞等待结果，让当前任务自然完成；不要重复派发同一任务，不为催进度而打断。取消只用于用户明确要求、紧急纠偏或已确认安全风险。失败或取消后先检查部分文件与副作用，不把部分结果宣称为完整交付；不得盲目自动重试，先按失败性质补事实、拆分或改派。
+派发生命周期：delegate_to_* 只返回子代理 id 的受理确认，**不阻塞等待结果**；子代理执行完毕后由完成通知送达。受理后继续推进有用的工作，不要轮询、空转或重复派发同一任务，也不要为催进度打断子代理；只有下一步确实依赖该结果时才停下手上的事等它。相互独立的委派放在同一条消息里一起发起；存在依赖或共享写入冲突时顺序执行。取消只用于用户明确要求、紧急纠偏或已确认安全风险。失败或取消后先检查部分文件与副作用，不把部分结果宣称为完整交付；不得盲目自动重试，先按失败性质补事实、拆分或改派。
 
 结果与失败路由：核对结果是否回答任务、证据是否充分、是否矛盾以及是否需要下一角色。缺事实→scout；方向不明或原设计不可行→architect；方向明确的实现失败→worker 拆解或有依据地重试；正确性存疑→reviewer；reviewer 发现设计问题→architect。低风险结果可由主代理轻量验证，高风险或复杂实现、重构、架构与方法变更、目标完成验收应考虑独立 reviewer。reviewer 可以质疑主代理假设、architect 方案、worker 实现、测试有效性与验收满足程度，不能只做确认器。
 

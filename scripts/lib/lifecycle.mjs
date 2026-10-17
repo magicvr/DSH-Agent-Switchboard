@@ -6,15 +6,18 @@ import { resolvePaths, resolveAsar, REPO_ROOT } from './paths.mjs';
 import { readPatch, presetConfig, compareRules } from './preset-patch.mjs';
 import { generatePreset } from './preset-generator.mjs';
 import { CONFIG_FORMAT_VERSION, readConfigFileDetailed } from '../../src/config-file.js';
-import { parseVersion, compareVersions } from './version.mjs';
+import { parseVersion, compareVersions, formatVersion } from './version.mjs';
 
-// 有界范围判断，匹配 DSH includePrerelease:true；未知语法绝不猜测。
+// 有界范围判断，匹配 DSH includePrerelease:true 且 range 先 trim；未知语法绝不猜测。
 export function satisfiesDshRange(version, range) {
   const runtime = parseVersion(version);
   if (!runtime) return { status: 'unknown', reason: 'invalid-runtime-version' };
   if (typeof range !== 'string') return { status: 'unknown', reason: 'unsupported-range' };
-  const operator = /^[~^]/.test(range) ? range[0] : '';
-  const base = parseVersion(operator ? range.slice(1) : range);
+  const trimmed = range.trim();
+  // 真实 gate `satisfies`：`range.trim() !== "" && semver.satisfies(...)`；trim 后为空必定 unmet。
+  if (trimmed === '') return { status: 'incompatible', reason: '空范围在 DSH 中一律不满足' };
+  const operator = /^[~^]/.test(trimmed) ? trimmed[0] : '';
+  const base = parseVersion(operator ? trimmed.slice(1).trim() : trimmed);
   if (!base) return { status: 'unknown', reason: 'unsupported-range' };
   let accepts = compareVersions(runtime, base) === 0;
   if (operator) {
@@ -27,16 +30,73 @@ export function satisfiesDshRange(version, range) {
   return { status: accepts ? 'compatible' : 'incompatible', accepts };
 }
 
-export function evaluateDshPeers(version, peers) {
-  const ranges = Object.entries(peers).filter(([name]) => name === '@deepseek-ai/dsh' || name.startsWith('@deepseek-ai/dsh-'))
-    .map(([name, range]) => ({ name, range, ...satisfiesDshRange(version, range) }));
+const isDshPeerName = name => name === '@deepseek-ai/dsh' || name.startsWith('@deepseek-ai/dsh-');
+// 真实 gate 只对 peerDependencies 把这三个协议值解释为「当前运行时」。
+const WORKSPACE_PEER_RANGES = new Set(['workspace:^', 'workspace:~', 'workspace:*']);
+
+function requirementRow(version, name, range, workspaceIsCurrent) {
+  // 真实 gate：workspace:^/~/* 仅对 peers 视为当前运行时；同一批值出现在 engines.dsh 中必定 unmet。
+  if (WORKSPACE_PEER_RANGES.has(range))
+    return workspaceIsCurrent ? { name, range, ...satisfiesDshRange(version, version) }
+      : { name, range, status: 'incompatible', reason: `engines.dsh 不接受 ${range} 协议值` };
+  return { name, range, ...satisfiesDshRange(version, range) };
+}
+
+/** 镜像真实 gate `unmetRequirements`：manifest 自己的 engines.dsh 单独决定并完全忽略 peers，否则检查全部 dsh peers。 */
+export function evaluateDshRequirements(version, manifest) {
+  const fields = object(manifest) ? manifest : {};
+  // 真实 gate 对畸形 engines/peerDependencies 直接抛错；镜像不猜测判定，给出 unknown 原因。
+  if (Object.hasOwn(fields, 'engines') && !object(fields.engines))
+    return { source: 'engines', status: 'unknown', ranges: [], reason: '未验证：engines 必须是对象' };
+  const engines = object(fields.engines) ? fields.engines : null;
+  if (engines && Object.hasOwn(engines, 'dsh')) {
+    const range = engines.dsh;
+    if (typeof range !== 'string')
+      return { source: 'engines.dsh', status: 'unknown', ranges: [], reason: '未验证：engines.dsh 必须是字符串' };
+    const row = requirementRow(version, 'engines.dsh', range, false);
+    return { source: 'engines.dsh', status: row.status, ranges: [row],
+      reason: row.status === 'compatible' ? null : `${row.name}: ${row.reason ?? `${version} 不满足 ${range}`}` };
+  }
+  if (Object.hasOwn(fields, 'peerDependencies') && !object(fields.peerDependencies))
+    return { source: 'peerDependencies', status: 'unknown', ranges: [], reason: '未验证：peerDependencies 必须是对象' };
+  const peers = object(fields.peerDependencies) ? fields.peerDependencies : {};
+  const ranges = Object.entries(peers).filter(([name]) => isDshPeerName(name)).map(([name, range]) => typeof range === 'string'
+    ? requirementRow(version, name, range, true)
+    : { name, range, status: 'unknown', reason: '未验证：peerDependencies 的范围必须是字符串' });
   const status = ranges.some(row => row.status === 'incompatible') ? 'incompatible'
     : ranges.some(row => row.status === 'unknown') ? 'unknown' : 'compatible';
-  return { status, ranges, reason: ranges.filter(row => row.status !== 'compatible')
+  return { source: 'peerDependencies', status, ranges, reason: ranges.filter(row => row.status !== 'compatible')
     .map(row => `${row.name}: ${row.reason ?? `${version} 不满足 ${row.range}`}`).join('; ') || null };
 }
 
+/** 仅 peerDependencies 分支的便捷入口；完整判定（含 engines.dsh 优先级）走 evaluateDshRequirements。 */
+export function evaluateDshPeers(version, peers) {
+  return evaluateDshRequirements(version, { peerDependencies: peers });
+}
+
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+// 镜像真实 gate 的豁免记录校验：键必须是精确 package@version，值必须是精确规范 SemVer 列表；
+// 其余记录被 DSH 静默忽略，绝不改变判定。
+const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
+
+/** 镜像真实 gate `isExactPluginVersion`：拒绝范围、前缀、空白与畸形版本。 */
+export function isExactDshVersion(value) {
+  const parsed = parseVersion(value);
+  return parsed !== null && value === formatVersion(parsed);
+}
+
+/** 镜像真实 gate `isVersionList`。 */
+export function isExactDshVersionList(value) {
+  return Array.isArray(value) && value.every(version => isExactDshVersion(version));
+}
+
+/** 镜像真实 gate 对 compatibility.json 键的校验（精确 package@version）。 */
+export function isExactDshExemptionKey(key) {
+  const separator = typeof key === 'string' ? key.lastIndexOf('@') : -1;
+  return separator > 0 && PACKAGE_NAME.test(key.slice(0, separator)) && isExactDshVersion(key.slice(separator + 1));
+}
+
 function readJson(path) {
   try {
     const value = JSON.parse(readFileSync(path, 'utf8'));
@@ -65,8 +125,11 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
   const pkg = readJson(join(repoRoot, 'package.json'));
   if (!pkg.value?.name || !pkg.value.version) throw new Error(`仓库 package.json 无效：${pkg.error ?? '缺少 name/version'}`);
   const name = pkg.value.name;
+  const engines = object(pkg.value.engines) ? pkg.value.engines : null;
   const repo = { name, version: pkg.value.version, manifestVersion: pkg.value.dsh?.manifestVersion ?? null,
-    peerDependencies: Object.fromEntries(Object.entries(pkg.value.peerDependencies ?? {}).filter(([key]) => key === '@deepseek-ai/dsh' || key.startsWith('@deepseek-ai/dsh-'))),
+    peerDependencies: Object.fromEntries(Object.entries(pkg.value.peerDependencies ?? {}).filter(([key]) => isDshPeerName(key))),
+    // 仅记录 manifest 自己声明的 engines.dsh（非字符串也原样报告，判定层会给出 unknown 原因）。
+    enginesDsh: engines && Object.hasOwn(engines, 'dsh') ? engines.dsh : null,
     configFormatVersion: CONFIG_FORMAT_VERSION };
   const profilePackage = readJson(join(paths.profile, 'package.json'));
   // DSH 以 profile 目录 basename desktop 拒绝 CLI 管理；不从路径其他片段猜测。
@@ -120,14 +183,20 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
     count: Array.isArray(config?.roles) ? config.roles.length : null, wrapperPresent: wrapperKeys.length > 0, wrapperKeys };
   const compat = readJson(join(paths.profile, 'compatibility.json'));
   const key = `${name}@${repo.version}`;
-  const exemptionPresent = object(compat.value) && Object.hasOwn(compat.value, key);
-  const values = exemptionPresent ? compat.value[key] : null;
+  const keyValid = isExactDshExemptionKey(key);
+  const recordPresent = object(compat.value) && Object.hasOwn(compat.value, key);
+  const values = recordPresent ? compat.value[key] : null;
+  // 真实 gate 只把「合法键 + 精确规范 SemVer 列表」记为豁免；非法记录被静默忽略。
+  const exemptionAccepted = keyValid && isExactDshVersionList(values);
   const olderKeys = Object.keys(compat.value ?? {}).filter(entry => entry.startsWith(`${name}@`) && entry !== key);
+  // `peers` 保存真实 gate 的最终判定：engines.dsh 存在时 peers 被完全忽略（字段名沿用既有调用方）。
+  const requirements = runtime.status === 'known'
+    ? evaluateDshRequirements(runtime.version, pkg.value) : { status: 'unknown', reason: runtime.reason };
   const compatibility = { runtime, fileExists: compat.exists, error: compat.exists ? compat.error ?? null : null,
-    key, exemptionPresent, values, olderKeys,
-    exemption: exemptionPresent ? (Array.isArray(values) && values.every(v => typeof v === 'string') ? 'exempt' : 'invalid') : olderKeys.length ? 'expired' : 'absent',
-    runtimeExempt: runtime.status === 'known' ? (exemptionPresent && !Array.isArray(values) ? null : Array.isArray(values) && values.includes(runtime.version)) : null,
-    peers: runtime.status === 'known' ? evaluateDshPeers(runtime.version, repo.peerDependencies) : { status: 'unknown', reason: runtime.reason } };
+    key, keyValid, exemptionPresent: recordPresent, values, olderKeys,
+    exemption: recordPresent ? (exemptionAccepted ? 'exempt' : 'invalid') : olderKeys.length ? 'expired' : 'absent',
+    runtimeExempt: runtime.status === 'known' ? exemptionAccepted && values.includes(runtime.version) : null,
+    enginesDsh: repo.enginesDsh, peers: requirements };
   const snapshot = { paths, archive, repo, profile, registration, preset, roles, compatibility,
     restart: { requiredForModuleChange: true, reason: '插件模块改动必须完全退出并重启 DSH 进程；Node 模块缓存不能驱逐，reload 不能应用代码升级。' } };
   snapshot.verification = verifyLifecycle(snapshot);
@@ -158,7 +227,8 @@ export function verifyLifecycle(s) {
   if (s.preset.generatedDrift.status === 'drifted') add('preset.generatedDrift', s.preset.generatedDrift.reason);
   if (s.roles.verdict !== 'current' || !s.roles.ok) add('roles.format', `roles.json：${s.roles.verdict}；${s.roles.error ?? s.roles.format?.reason ?? '需要当前格式的角色文件'}`);
   if (s.compatibility.error) add('compatibility.file', s.compatibility.error);
-  if (s.compatibility.exemption === 'invalid') add('compatibility.exemption', '当前豁免值必须是运行时版本字符串数组');
+  if (!s.compatibility.keyValid) add('compatibility.key', `当前插件版本不是规范 SemVer，DSH 会忽略该精确豁免键：${s.compatibility.key}`);
+  if (s.compatibility.exemption === 'invalid') add('compatibility.exemption', '豁免值必须是精确规范 SemVer 字符串数组（范围、v 前缀、空白与畸形版本都会被 DSH 忽略）');
   if (s.compatibility.exemption === 'expired') add('compatibility.expired', `精确版本豁免已失效：只有 ${s.compatibility.olderKeys.join(', ')}，缺少 ${s.compatibility.key}`);
   if (s.compatibility.exemptionPresent && s.compatibility.runtimeExempt === false) add('compatibility.runtime', '当前运行时版本不在当前插件版本豁免值中');
   if (s.compatibility.peers.status === 'incompatible' && s.compatibility.runtimeExempt !== true)

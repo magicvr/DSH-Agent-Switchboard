@@ -7,8 +7,10 @@
  *   - 根 Config 经 loader/volatile-update 持久化到文件；工具骨架只注册一次，执行期现读角色配置。
  *     增删角色仍需改变工具集；Host 源码改动仍需重启一次装载。
  *   - 角色级固定 model / effort（D12），主代理无权覆盖。
- *   - `readOnly` 通过 `toolFilter.deny` 落地——这是**工具级**约束而非沙箱级，
- *     因为 `SubagentStartRequest` 没有沙箱字段（已核实）。
+ *   - `readOnly` 通过**角色自己的 Agent Preset** 落地：preset 插件清单里直接不给
+ *     写入类行，并把 `dsh-tool-fs` 的 write/edit 关掉。这是**工具级**约束而非沙箱级，
+ *     因为 `SubagentStartRequest` 没有沙箱字段（已核实），且旧版的 `toolFilter`
+ *     已被 DSH 0.2.1-rc.1 删除（见 src/role-presets.js）。
  *
  * ⚠️ 装载期诊断刻意做得很详细：Host 半边在 link 安装下不能热加载
  * （docs/architecture.md 3.3），每次排错都要重启 dsh，所以必须在**一次**
@@ -36,6 +38,7 @@ import {
   toolConfigFor,
 } from './roles.js';
 import { createCliTool } from './cli/provider.js';
+import { buildRolePresets } from './role-presets.js';
 import { CONFIG_FORMAT_VERSION, configPathFor, readConfigFileDetailed, createConfigFileResolver, writeConfigFile, initialConfig } from './config-file.js';
 
 /**
@@ -272,6 +275,8 @@ function newDiagnostics() {
     configErrors: [],
     mounts: [],
     providers: [],
+    /** 已注册的角色 preset（`{id, rows, ok}`）；角色 persona 与工具构成的承载点。 */
+    presets: [],
     executables: [],
     blocked: [],
     /** 本作用域解析出的角色（`{id, toolName}`）。用于自检在「本作用域不挂载工具」时说清原因。 */
@@ -280,6 +285,13 @@ function newDiagnostics() {
     configuredRoleCount: 0,
     /** 本实例是否负责挂载；配置角色数与工具挂载状态分别记录。 */
     mountHere: false,
+    /**
+     * 现读角色配置是否已偏离挂载时的组合。
+     *
+     * `instructions` / `readOnly` / `allowNestedDispatch` 在 0.2.1-rc.1 属**组合期**事实
+     * （写在角色 preset 里，只注册一次），改完必须重新组合（重启）才生效。
+     */
+    compositionStale: false,
     roleConfigPath: undefined,
     roleConfigRead: undefined,
     roleConfigSync: undefined,
@@ -289,17 +301,28 @@ function newDiagnostics() {
 }
 
 /**
- * 在**当前作用域**实时查询角色工具是否真的可用。
+ * 在**调用方作用域**实时查询角色工具是否真的可用。
  *
  * 为什么不读 `diagnostics.mounts`：那是 `import(...).then(...)` 异步写入的快照，
  * `apply` 返回时往往还是空的；而且同一插件会被多次激活（根条目 + 各 preset 会话），
  * 在某个作用域读到的快照未必对应当前作用域。**「工具在不在」本来就能当场查到。**
  *
+ * ⚠️ **必须按调用它的 agent 查询，不能按注册自检的那个作用域查询。**
+ *    0.2.1-rc.1 起委派工具由官方插件在**每个 agent 自己的作用域**里装载
+ *    （`agentPresets` 站立组合按 `agent/created` 逐个安装），而自检注册在 preset 作用域。
+ *    拿 preset 作用域去查会一律查不到，于是报告「0 个角色 / 工具未注册 / 不健康」——
+ *    而派发其实是好的。这正是本项目反复踩到的「诊断在骗人」，必须避免。
+ *
+ * ⚠️ 专属 CLI 工具**不再**由调用方作用域承载：它现在挂在**角色自己的 preset 作用域**里
+ *    （工具按作用域可见、不跨 preset 继承）。因此这里不再把它当作本作用域的失败条件，
+ *    只在已挂载时如实标注它的承载位置。
+ *
  * @param {object} ctx - Cordis 上下文。
  * @param {{id: string, toolName: string}[]} roles - 本作用域配置的角色。
+ * @param {object} [viewer] - 查询视角（通常是调用自检的 agent）；省略时退回本作用域。
  * @returns {{id: string, ok: boolean, detail: string, unverified?: boolean}[]} 实时结果；零角色返回空数组，不可查询逐角色标记未核实。
  */
-export function liveRoleTools(ctx, roles) {
+export function liveRoleTools(ctx, roles, viewer) {
   // 三态：零角色无需查询；服务可查询则逐角色核实；不可查询不能当作健康。
   if (roles.length === 0) return [];
   const unverified = (detail) => roles.map((role) => ({ id: role.id, ok: false, unverified: true, detail }));
@@ -312,12 +335,15 @@ export function liveRoleTools(ctx, roles) {
   if (tools == null || typeof tools.get !== 'function') {
     return unverified('无法核实：工具服务不可查询');
   }
+  const scope = viewer ?? scopeOf(ctx);
   return roles.map((role) => {
     let found;
     let cliFound = true;
     try {
-      found = tools.get(role.toolName, scopeOf(ctx));
-      if (role.cliToolName) cliFound = tools.get(role.cliToolName, scopeOf(ctx)) != null;
+      found = tools.get(role.toolName, scope);
+      // 专属 CLI 工具在**本 preset 作用域**注册（角色 preset 里另有一份给子代理用），
+      // 因此从主代理视角仍可核实；查不到就是真的没注册上。
+      if (role.cliToolName) cliFound = tools.get(role.cliToolName, scope) != null;
     } catch (error) {
       return { id: role.id, ok: false, detail: `查询抛错：${error instanceof Error ? error.message : String(error)}` };
     }
@@ -384,6 +410,14 @@ export const Config = z.object({
    * 而默认为 true 的后果是「工具出现在所有会话里」（隐性、且无提示）。
    */
   mount: z.boolean().default(false).description('是否在本作用域挂载角色工具（仅 preset 声明应为 true）'),
+  /**
+   * 角色子代理作用域专用：在本作用域注册这些角色的专属 CLI 工具。
+   *
+   * 由插件自动生成的角色 preset 写入（见 src/role-presets.js）。工具按作用域可见，
+   * 而角色子代理挂载的是**自己的** preset，所以专属 CLI 工具必须挂在它自己的作用域里，
+   * 否则子代理看不见它。设了这个字段的作用域**只**注册这些 CLI 工具。
+   */
+  cliToolFor: z.array(z.string()).description('仅内部使用：本作用域需要注册专属 CLI 工具的角色 id'),
   /** CLI 角色的默认可执行工作目录；角色自身可用 cliCwd 覆盖。 */
   cwd: z.string().description('CLI 角色的默认工作目录'),
   /** 角色列表。 */
@@ -415,7 +449,7 @@ export const Config = z.object({
         effort: z.union(EFFORT_VALUES),
         instructions: z.string().required(),
         readOnly: z.boolean().default(false),
-        backend: z.union(['spawn', 'fork', 'cli']),
+        backend: z.union(['spawn', 'cli']),
         allowNestedDispatch: z.boolean().default(false),
         // --- cli 后端需要：可执行文件与参数模板 ---
         // 放在角色**顶层**而非嵌套对象，是为了让设置面板把每一项当普通标量字段渲染。
@@ -597,6 +631,7 @@ export function selftestTool(ctx, diagnostics) {
           blocked: { type: 'string', required: true },
           presetRoster: { type: 'string', required: true },
           presetBroken: { type: 'string', required: true },
+          rolePresets: { type: 'string', required: true },
           settingsNamespaces: { type: 'string', required: true },
           roleConfigStatus: { type: 'string', required: true },
           configErrors: { type: 'string', required: true },
@@ -619,6 +654,7 @@ export function selftestTool(ctx, diagnostics) {
           `当前生效路由：${value.roleRoutes}`,
           `preset roster：${value.presetRoster}`,
           `preset 异常行：${value.presetBroken}`,
+          `角色 preset（persona 与工具构成的承载点）：${value.rolePresets}`,
           `settings 命名空间：${value.settingsNamespaces}`,
           `roleConfig 状态：${value.roleConfigStatus}`,
           `CLI 专属工具：${value.providers}`,
@@ -633,7 +669,7 @@ export function selftestTool(ctx, diagnostics) {
         return [{ type: 'text', text: lines.join('\n') }];
       },
     },
-    async execute() {
+    async execute(_args, exec) {
       diagnostics.refresh?.();
       // preset 诊断是异步的，且可能失败；失败不应让整个自检失败。
       const [presetRoster, presetBroken] = await Promise.all([
@@ -653,7 +689,8 @@ export function selftestTool(ctx, diagnostics) {
       // 「工具到底在不在」本来就可以当场查到（`ctx.get('tools').get(name, scopeOf(ctx))`），
       // 因此实时结果决定当前健康；快照只解释仍缺失的角色或曾延迟注册的历史。
       // 根实例只报告配置数量，不负责挂载，也不把配置角色当作应当可见的工具。
-      const live = diagnostics.mountHere ? liveRoleTools(ctx, diagnostics.configuredRoles) : [];
+      // ⚠️ 用**调用方 agent** 作为查询视角：委派工具装载在每个 agent 自己的作用域里。
+      const live = diagnostics.mountHere ? liveRoleTools(ctx, diagnostics.configuredRoles, exec?.agent) : [];
       // 快照仅解释历史，当前健康与挂载数量只能由实时查询证明。
       const mounted = live;
       const okCount = mounted.filter((m) => m.ok).length;
@@ -663,7 +700,12 @@ export function selftestTool(ctx, diagnostics) {
           : '未配置（profile 可能未同步 preset：需 gen:preset → inject:preset → 重启）';
       const format = diagnostics.roleConfigPath ? readConfigFileDetailed(diagnostics.roleConfigPath).format : null;
       const warnings = [packageWarning, diagnostics.mountHere && !diagnostics.readSupervisorRules?.() ? `调度规则：${scheduling}` : '',
-        format?.status === 'migrated' ? format.reason : ''].filter(Boolean).join('；');
+        format?.status === 'migrated' ? format.reason : '',
+        // 组合期字段改了但没重新组合：提示词与自检已按挂载时的快照如实描述，
+        // 但**子代理实际拿到的**仍是旧组合，必须让用户知道。
+        diagnostics.compositionStale
+          ? '角色配置已修改但未重新组合：instructions / readOnly / allowNestedDispatch 属组合期，需完全退出并重启 DSH 才生效'
+          : ''].filter(Boolean).join('；');
       const ok = diagnostics.fatal === undefined && diagnostics.configErrors.length === 0
         && format?.status !== 'future' && format?.status !== 'unsupported'
         && !diagnostics.wrapperSyncPending && !mounted.some(m => m.ok === false);
@@ -705,6 +747,14 @@ export function selftestTool(ctx, diagnostics) {
             : live.length === 0
               ? '（本作用域查不到角色工具）'
               : live.map((m) => `${m.id}=${m.unverified ? `未核实(${m.detail})` : m.ok ? 'OK' : '缺失'}`).join(' '),
+        rolePresets:
+          !diagnostics.mountHere
+            ? '（本作用域不注册角色 preset）'
+            : diagnostics.presets.length === 0
+              ? diagnostics.fatal ?? '（未注册；角色子代理将没有自己的 persona 与工具构成）'
+              : diagnostics.presets
+                  .map((p) => `${p.id}(${p.rows} 行${p.ok ? '' : '，注册失败'}）`)
+                  .join(' '),
         providers:
           diagnostics.providers.length === 0
             ? '（无 CLI 角色）'
@@ -774,16 +824,6 @@ export function selftestTool(ctx, diagnostics) {
  * @param {number} maxDepth - 允许嵌套时的额外层数。
  * @returns {Promise<{ok: boolean, detail: string}>} 挂载结果。
  */
-function mountedRoleOptions(ctx, roles, maxDepth) {
-  const tools = ctx.get('tools');
-  const scope = scopeOf(ctx);
-  return {
-    maxDepth,
-    availableToolNames: tools.schemas(scope).map((tool) => tool.name),
-    delegateToolNames: roles.filter((role) => tools.get(role.toolName, scope) != null).map((role) => role.toolName),
-  };
-}
-
 async function mountRoleTool(ctx, role, toolModule, resolver, roles, maxDepth, wrapperRoute, dispatch) {
   if (typeof ctx.plugin !== 'function') return { ok: false, detail: 'ctx.plugin 不可用' };
   try {
@@ -797,29 +837,33 @@ async function mountRoleTool(ctx, role, toolModule, resolver, roles, maxDepth, w
       getMaxDepth: () => (dispatch.storage.getStore() ?? resolver()).maxDepth,
       getWrapperRoute: () => (dispatch.storage.getStore() ?? resolver()).wrapperRoute,
       maxDepth, wrapperRoute,
-      availableToolNames: ctx.get('tools').schemas(scopeOf(ctx)).map(tool => tool.name),
-      delegateToolNames: roles.map(item => item.toolName),
-      getAvailableToolNames: () => dispatch.storage.getStore()?.availableToolNames ?? ctx.get('tools').schemas(scopeOf(ctx)).map(tool => tool.name),
-      getDelegateToolNames: () => dispatch.storage.getStore()?.delegateToolNames ?? roles.filter(item => ctx.get('tools').get(item.toolName, scopeOf(ctx))).map(item => item.toolName),
     });
     const fiber = ctx.plugin({ ...toolModule, apply: (toolCtx) => {
-      const tools = toolCtx.get('tools');
-      // 仅此角色插件的工具服务视图记录注册身份，不修改共享服务。
-      // 捕获实际 register 的定义，亦覆盖 provider 延迟出现或移除后重新注册。
-      const ownedTools = Object.create(tools, { register: { value(definition) {
-        const dispose = tools.register(definition);
-        if (definition.name === role.toolName) dispatch.tools.add(definition);
-        return dispose;
-      } } });
       // Cordis Config 校验产物会物化 getter；官方 apply 必须持有原 liveConfig 才能延迟解析。
-      toolModule.apply(toolCtx.extend({ tools: ownedTools, subagents: toolCtx.subagents,
+      //
+      // ⚠️ **必须 return**：0.2.1-rc.1 起官方 `apply` 是 async 的，抛错会变成**被丢弃的
+      //    rejected promise** —— 既不会被 `fiber.await()` 看到，诊断里也只剩一句
+      //    「工具尚未出现在工具注册表中」，而真正原因（例如旧字段被硬拒）就此丢失。
+      // ⚠️ **必须显式转发这四个服务**：这里直接调用模块的 `apply`，绕过了 Cordis 的
+      //    inject 装配；官方 `apply` 会直接读 `ctx.tools` / `ctx.subagents` /
+      //    `ctx.systemPrompt` / `ctx.sessionProjections`（属性访问），缺一个就报
+      //    `cannot get property "…" without inject`。
+      return toolModule.apply(toolCtx.extend({ tools: toolCtx.get('tools'), subagents: toolCtx.subagents,
         systemPrompt: toolCtx.systemPrompt, sessionProjections: toolCtx.sessionProjections }), liveConfig);
     } }, liveConfig);
     if (typeof fiber?.await === 'function') await fiber.await();
   } catch (error) { return { ok: false, detail: error instanceof Error ? error.message : String(error) }; }
   await Promise.resolve(); await Promise.resolve();
   const registered = ctx.get('tools')?.get(role.toolName, scopeOf(ctx));
-  return registered == null ? { ok: false, detail: '工具尚未出现在工具注册表中' } : { ok: true, detail: '已挂载并核实' };
+  // ⚠️ 0.2.1-rc.1 起，配了 `agentPreset` 的委派工具由**站立组合按 agent 安装**
+  //    （官方 `install()` 在 `agent/created` 时注册到该 agent 自己的作用域），
+  //    因此装载期它**不会**出现在本 preset 作用域。这里仍如实记录「此刻未出现」，
+  //    因为可用性本来就该由**实时查询**判定（自检会按调用方 agent 的作用域去查）；
+  //    但把原因写清楚，避免读成「挂载失败了」。真正失败的场景（`apply` 抛错）
+  //    已由包装层的 `return` + `fiber.await()` 单独捕获。
+  return registered == null
+    ? { ok: false, detail: '工具尚未出现在工具注册表中（0.2.1-rc.1 起委派工具按 agent 安装，装载期不在本 preset 作用域；可用性由自检实时核验）' }
+    : { ok: true, detail: '已挂载并核实' };
 }
 
 /**
@@ -836,6 +880,102 @@ function resolveFallbackDshHome() {
   if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) return fromEnv.trim();
   const home = process.env.USERPROFILE ?? process.env.HOME ?? '.';
   return join(home, '.dsh');
+}
+
+/**
+ * 解析 `$DSH_HOME`：优先 `ctx.profileContext.home`，否则按 `dsh-home-paths` 的语义回退。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @returns {string} `$DSH_HOME`。
+ */
+function resolveDshHome(ctx) {
+  const profileContext = typeof ctx.get === 'function' ? ctx.get('profileContext') : undefined;
+  return typeof profileContext?.home === 'string' && profileContext.home.length > 0
+    ? profileContext.home
+    : resolveFallbackDshHome();
+}
+
+/**
+ * 注册一个角色的专属 CLI 工具。
+ *
+ * 抽出来是因为它有**两个**挂载点：主代理 preset 作用域（旧路径，保留兼容）与
+ * 角色自己的 preset 作用域（0.2.1-rc.1 起子代理能看见专属工具的唯一途径）。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} role - 规范化后的角色。
+ * @param {Function} getRole - 执行期现读该角色。
+ * @param {object} diagnostics - 诊断记录。
+ * @returns {object} 已注册的工具。
+ */
+function registerCliTool(ctx, role, getRole, diagnostics) {
+  const executable = { id: role.id, command: role.cli.command, ok: true, resolved: '待执行时解析（尚未验证）' };
+  diagnostics.executables.push(executable);
+  const tool = createCliTool({
+    role,
+    getRole,
+    ctx,
+    spawn: spec => safeSpawn(ctx, spec),
+    resolveExecutable: async (command, env, signal) => {
+      executable.command = command;
+      try {
+        const result = await ctx.get('subprocess').resolveExecutable(command, env, signal);
+        Object.assign(executable, { ok: true, resolved: result, detail: undefined });
+        return result;
+      } catch (error) {
+        Object.assign(executable, { ok: false, resolved: undefined,
+          detail: `本次未解析可执行文件：${error.message ?? error}` });
+        throw error;
+      }
+    },
+  });
+  ctx.get('tools').register(tool);
+  if (!ctx.get('tools').get(tool.name, scopeOf(ctx))) throw new Error('专属 CLI 工具未注册');
+  diagnostics.providers.push({ id: role.id, name: tool.name, ok: true, detail: '已注册专属工具' });
+  return tool;
+}
+
+/**
+ * 在角色子代理自己的作用域里注册该角色的专属 CLI 工具。
+ *
+ * 由角色 preset 里的本插件条目（`cliToolFor`）触发。**只做这一件事**：不注册自检、
+ * 不挂角色工具、不做根配置同步 —— 这个作用域属于子代理，不该有主代理的东西。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} options - 选项。
+ * @param {string} options.roleConfigPath - 角色配置文件路径。
+ * @param {string[]} options.roleIds - 需要在此作用域注册 CLI 工具的角色 id。
+ * @param {object} options.diagnostics - 诊断记录。
+ */
+function mountCliToolsInThisScope(ctx, { roleConfigPath, roleIds, diagnostics }) {
+  const read = createRoleResolver(roleConfigPath, {});
+  let current;
+  try {
+    current = read();
+  } catch (error) {
+    diagnostics.fatal = `角色配置不可读，专属 CLI 工具未注册：${error instanceof Error ? error.message : String(error)}`;
+    return;
+  }
+  diagnostics.roleConfigRead = `（子代理作用域）${current.source ?? 'preset'} stale=${current.stale === true}`;
+  for (const roleId of roleIds) {
+    const role = current.roles.find(item => item.id === roleId);
+    if (role === undefined) {
+      diagnostics.blocked.push({ id: roleId, reason: '角色配置里找不到该角色，专属 CLI 工具未注册' });
+      continue;
+    }
+    if (role.backend !== CLI_BACKEND) {
+      diagnostics.blocked.push({ id: roleId, reason: `角色 ${roleId} 不是 cli 后端，无需注册专属工具` });
+      continue;
+    }
+    try {
+      registerCliTool(ctx, role, () => {
+        const live = read().roles.find(item => item.id === roleId);
+        if (live?.cliBlockReason) throw new Error(live.cliBlockReason);
+        return live;
+      }, diagnostics);
+    } catch (error) {
+      diagnostics.blocked.push({ id: roleId, reason: error instanceof Error ? error.message : String(error) });
+    }
+  }
 }
 
 /**
@@ -889,6 +1029,26 @@ function applyInner(ctx, config) {
   // 「只在选中本插件 preset 的会话里生效」由 preset 机制本身保证，无需探测。
   console.error(`[${name}] 激活（配置字段：${Object.keys(resolved).join(', ') || '空'}）`);
 
+  // `$DSH_HOME` 来自 profileContext。它在 profile 启动路径下一定存在；headless/sdk/acp
+  // 下 profileContext 本身不存在（dsh-base 里相关行都写成 `disabled: !!js "!ctx.get('profileContext')"`），
+  // 那种情况下退化为 `$DSH_HOME` 环境变量或默认 `~/.dsh`，保证角色配置仍然可用。
+  const dshHome = resolveDshHome(ctx);
+  const roleConfigPath = configPathFor(dshHome);
+  diagnostics.roleConfigPath = roleConfigPath;
+
+  // --- 角色子代理作用域：只注册该角色的专属 CLI 工具 -------------------------------
+  //
+  // DSH 0.2.1-rc.1 起，角色子代理挂载的是**自己的**独立 preset（见 src/role-presets.js），
+  // 而工具按作用域可见、不跨 preset 继承。所以专属 CLI 工具必须由角色 preset 自己
+  // 声明一行本插件条目、在**子代理的作用域里**注册，否则子代理看不见它。
+  //
+  // 这条路径刻意什么都不做别的：不注册自检、不挂角色工具、不做根配置同步。
+  const cliToolFor = readVolatileField(resolved, 'cliToolFor');
+  if (Array.isArray(cliToolFor) && cliToolFor.length > 0) {
+    mountCliToolsInThisScope(ctx, { roleConfigPath, roleIds: cliToolFor, diagnostics });
+    return;
+  }
+
   // 自检工具总是注册：即使角色配置全错，也要能用它看到错在哪。
   const disposeSelftest = ctx.tools.register(selftestTool(ctx, diagnostics));
 
@@ -899,16 +1059,6 @@ function applyInner(ctx, config) {
   //   2. 把 roles 移到根条目会让角色工具全局可见，污染其他 preset 的会话。
   // 换成插件自己的文件后，两条同时解开：配置随处可编辑，而工具是否可见只取决于
   // 本插件在哪个会话作用域被激活。
-  const profileContext = typeof ctx.get === 'function' ? ctx.get('profileContext') : undefined;
-  // `$DSH_HOME` 来自 profileContext。它在 profile 启动路径下一定存在；headless/sdk/acp
-  // 下 profileContext 本身不存在（dsh-base 里相关行都写成 `disabled: !!js "!ctx.get('profileContext')"`），
-  // 那种情况下退化为 `$DSH_HOME` 环境变量或默认 `~/.dsh`，保证角色配置仍然可用。
-  const dshHome =
-    typeof profileContext?.home === 'string' && profileContext.home.length > 0
-      ? profileContext.home
-      : resolveFallbackDshHome();
-  const roleConfigPath = configPathFor(dshHome);
-  diagnostics.roleConfigPath = roleConfigPath;
 
   // --- 是否在本作用域挂载角色工具（同时也是「是不是根条目」的判据）----------------
   //
@@ -1089,47 +1239,94 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     return;
   }
   const { active: activeCliRoles, blocked: blockedCliRoles } = planCliMounts(roles);
-  const dispatch = { storage: new AsyncLocalStorage(), tools: new WeakSet() };
+  // --- 组合期快照 ---------------------------------------------------------------
+  //
+  // ⚠️ 0.2.1-rc.1 起，`readOnly` / `allowNestedDispatch` / `instructions` 是**组合期**事实：
+  //    它们写在角色 preset 的插件清单里，而 preset 只在本作用域挂载时注册一次。
+  //    因此「子代理实际拿到了什么」取决于**这里的快照**，不是后来改过的配置文件。
+  //    提示词若按现读配置生成，就会在用户改完设置、还没重启时**谎报**能力
+  //    （例如对主代理说「只读」，而运行中的 preset 仍带着写工具）。这里把快照固定下来，
+  //    提示词与自检都用它，并把「配置已改但未重新组合」如实报出来。
+  const mountedFacts = new Map(roles.map(role => [role.id, {
+    readOnly: role.readOnly === true,
+    allowNestedDispatch: role.allowNestedDispatch === true,
+    instructions: role.instructions,
+  }]));
+  /** 现读配置是否已偏离挂载时的组合；偏离需要重新挂载（重启）才生效。 */
+  const compositionDrift = (currentRoles) => {
+    if (currentRoles.length !== mountedFacts.size) return true;
+    return currentRoles.some((role) => {
+      const fact = mountedFacts.get(role.id);
+      return fact === undefined || fact.readOnly !== (role.readOnly === true)
+        || fact.allowNestedDispatch !== (role.allowNestedDispatch === true)
+        || fact.instructions !== role.instructions;
+    });
+  };
+  const dispatch = { storage: new AsyncLocalStorage(), toolNames: new Set(roles.map(role => role.toolName)) };
   // 冻结点是 tools/execute 入口（路由预检之前），不包含模型生成工具调用的时刻。
   // CLI 这里只保证包裹委派请求同快照；底层 CLI 工具在另一个生命周期另行现读角色。
+  //
+  // ⚠️ 按**工具名**识别而不是按定义对象身份：0.2.1-rc.1 起官方插件把委派工具
+  //    按 agent 安装到各自的作用域，注册路径不再经过本插件包装的那层 `tools` 视图，
+  //    对象身份比对会永远不命中（快照与入口门禁静默失效）。工具名由角色 id 派生且唯一。
   ctx.on?.('tools/execute', (exec, next) => {
-    const tool = ctx.get('tools').get(exec.name, exec.agent);
-    if (!tool || !dispatch.tools.has(tool)) return next();
-    // resolver 与权限清单均同步捕获，跨 await 与并发调用由 ALS 隔离。
-    const current = resolver();
-    const snapshot = { ...current, ...mountedRoleOptions(ctx, current.roles, current.maxDepth) };
-    return dispatch.storage.run(snapshot, next);
+    if (!dispatch.toolNames.has(exec.name)) return next();
+    // resolver 快照同步捕获，跨 await 与并发调用由 ALS 隔离。
+    // 工具级权限清单已不再需要：0.2.1-rc.1 起角色 persona 与工具构成由角色 preset 决定。
+    //
+    // ⚠️ 识别只能按工具名（原因见上），因此理论上会命中「别的作用域注册的同名工具」。
+    //    这里刻意**不让快照失败影响那次调用**：拿不到有效快照就照常放行，让工具自己按
+    //    现读配置决定成败。否则一个配置问题会连带弄坏与本插件无关的同名工具。
+    let current;
+    try { current = resolver(); } catch { return next(); }
+    return dispatch.storage.run(current, next);
   });
   diagnostics.blocked = blockedCliRoles;
   for (const role of activeCliRoles) {
     try {
-      const executable = { id: role.id, command: role.cli.command, ok: true, resolved: '待执行时解析（尚未验证）' };
-      diagnostics.executables.push(executable);
-      const tool = createCliTool({ role, getRole: () => {
+      registerCliTool(ctx, role, () => {
         const current = resolver().roles.find(item => item.id === role.id);
         if (current?.cliBlockReason) throw new Error(current.cliBlockReason);
         return current;
-      }, ctx,
-        spawn: spec => safeSpawn(ctx, spec), resolveExecutable: async (command, env, signal) => {
-          executable.command = command;
-          try {
-            const result = await ctx.get('subprocess').resolveExecutable(command, env, signal);
-            Object.assign(executable, { ok: true, resolved: result, detail: undefined });
-            return result;
-          } catch (error) {
-            Object.assign(executable, { ok: false, resolved: undefined,
-              detail: `本次未解析可执行文件：${error.message ?? error}` });
-            throw error;
-          }
-        } });
-      ctx.get('tools').register(tool);
-      if (!ctx.get('tools').get(tool.name, scopeOf(ctx))) throw new Error('专属 CLI 工具未注册');
-      diagnostics.providers.push({ id: role.id, name: tool.name, ok: true, detail: '已注册专属工具' });
+      }, diagnostics);
     } catch (error) {
       diagnostics.blocked.push({ id: role.id, reason: error instanceof Error ? error.message : String(error) });
     }
   }
+
+  // --- 角色 preset 必须先注册，再挂委派工具 ---------------------------------------
+  //
+  // ⚠️ 顺序是硬要求：`dsh-tool-subagent` 在装载期就会校验 `agentPreset` 指向的
+  //    preset **已被声明**（`SubagentPresetSelection.validate`），先挂工具必然失败。
+  //
+  // ⚠️ 这也是角色 persona / readOnly / 嵌套派发能力的**唯一**承载点：它们在
+  //    0.2.1-rc.1 里已从工具 Config 移到 preset 插件清单，属于**组合期**事实。
+  //    因此改这些字段需要重新注册 preset（当前实现只在本作用域挂载时注册一次），
+  //    model / effort 仍走执行期 getter，保持热更新。
   import('@deepseek-ai/dsh-tool-subagent').then(async toolModule => {
+    const presetService = typeof ctx.get === 'function' ? ctx.get('agentPresets') : undefined;
+    if (presetService === undefined || typeof presetService.register !== 'function') {
+      diagnostics.fatal = 'agentPresets 服务不可用：无法为角色注册独立 preset，角色 persona 与工具构成无处承载';
+      return;
+    }
+    const presetDisposers = [];
+    try {
+      const definitions = buildRolePresets(roles, {
+        maxDepth: initial.maxDepth,
+        wrapperRoute: initial.wrapperRoute,
+      });
+      for (const definition of definitions) {
+        presetDisposers.push(await presetService.register(definition));
+        diagnostics.presets.push({ id: definition.id, rows: definition.plugins.length, ok: true });
+      }
+    } catch (error) {
+      const detail = `角色 preset 注册失败：${error instanceof Error ? error.message : String(error)}`;
+      diagnostics.fatal = detail;
+      console.error(`[${name}] ${detail}`);
+      return;
+    }
+    ctx.effect?.(() => () => { for (const dispose of presetDisposers) { try { dispose?.(); } catch {} } });
+
     for (const role of roles) {
       const blocked = diagnostics.blocked.find(item => item.id === role.id);
       if (blocked) { diagnostics.mounts.push({ id: role.id, ok: false, detail: blocked.reason }); continue; }
@@ -1140,10 +1337,20 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
   const disposeGuidance = ctx.get('systemPrompt').section({ name: 'agent-switchboard:roles', order: 10500,
     text: (context) => {
       if (!isMainAgentContext(context)) return '';
-      let current; try { current = resolver(); } catch { return '角色配置不可派发；请检查 switchboard_selftest。'; } return roleGuidanceText(current.roles, {
-      availableToolNames: ctx.get('tools').schemas(scopeOf(ctx)).map(tool => tool.name),
-      delegateToolNames: roles.filter(role => ctx.get('tools').get(role.toolName, scopeOf(ctx))).map(role => role.toolName),
-    }); } });
+      let current; try { current = resolver(); } catch { return '角色配置不可派发；请检查 switchboard_selftest。'; }
+      // ⚠️ 查询视角必须是**正在组装的这个 agent**：委派工具装载在它自己的作用域里，
+      //    用注册作用域去查会一律为空，于是把「可继续派发」谎报成「不可派发」。
+      const viewer = context?.agent ?? scopeOf(ctx);
+      // 能力描述用**组合期快照**，不用现读配置：见 mountedFacts 的说明。
+      const guidanceRoles = current.roles.map((role) => {
+        const fact = mountedFacts.get(role.id);
+        return fact === undefined ? role : { ...role, readOnly: fact.readOnly, allowNestedDispatch: fact.allowNestedDispatch };
+      });
+      diagnostics.compositionStale = compositionDrift(current.roles);
+      return roleGuidanceText(guidanceRoles, {
+        availableToolNames: ctx.get('tools').schemas(viewer).map(tool => tool.name),
+        delegateToolNames: guidanceRoles.filter(role => ctx.get('tools').get(role.toolName, viewer)).map(role => role.toolName),
+      }); } });
   const disposeScheduling = ctx.get('systemPrompt').section({ name: 'agent-switchboard:scheduling', order: 10510,
     text: context => isMainAgentContext(context) ? diagnostics.readSupervisorRules() : '' });
   ctx.effect?.(() => () => { disposeGuidance?.(); disposeScheduling?.(); disposeSelftest?.(); });

@@ -14,11 +14,35 @@ import { resolveDriverPlaceholders, validateCliPreset } from './cli/drivers.js';
 /** 思考强度的统一枚举。与 DSH 的 `ReasoningEffortId` 取值一致。 */
 export const EFFORT_VALUES = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']);
 
-/** 内置子代理后端名。两者都由 `dsh-base` 装载（已核实）。 */
-export const BUILTIN_PROVIDERS = Object.freeze(['spawn', 'fork']);
+/**
+ * 内置子代理后端名。
+ *
+ * ⚠️ `fork` 已**移除**（DSH 0.2.1-rc.1）：新的机制要求角色靠独立 Agent Preset
+ * 拿到自己的 persona 与工具构成，而 `dsh-subagent-fork-in-process` 声明
+ * `capabilities.agentPreset: false`，`dsh-tool-subagent` 对这类 provider 配置
+ * `agentPreset` 会直接抛错（`presets.assertProvider`）。也就是说 fork 子代理
+ * 在机制上**无法**拥有自己的角色指令与工具限制，保留它只会留下一个静默失效的
+ * 选项，因此不再提供；内置后端只剩 `spawn`。
+ */
+export const BUILTIN_PROVIDERS = Object.freeze(['spawn']);
 
 /** CLI 后端的 backend 名。 */
 export const CLI_BACKEND = 'cli';
+
+/** 角色 preset id 前缀；与宿主已有 preset 名字空间隔离。 */
+export const ROLE_PRESET_PREFIX = 'switchboard-role-';
+
+/**
+ * 角色 id 对应的独立 Agent Preset id。
+ *
+ * 角色子代理通过它选中「自己的」preset，从而拿到 persona 与工具构成。
+ *
+ * @param {string} roleId - 角色 id。
+ * @returns {string} preset id。
+ */
+export function rolePresetId(roleId) {
+  return `${ROLE_PRESET_PREFIX}${roleId}`;
+}
 
 /** 专属 CLI 工具与 delegate_to_* 使用同一角色后缀规则。 */
 export function cliToolName(roleId) {
@@ -26,10 +50,14 @@ export function cliToolName(roleId) {
 }
 
 /**
- * 写入类工具名。`readOnly` 角色通过 `toolFilter.deny` 从机制上挡住它们。
+ * 写入类工具名。`readOnly` 角色靠**角色 preset 的行级裁剪**从机制上挡住它们。
  *
  * ⚠️ 这是**工具级**约束，不是沙箱级。`SubagentStartRequest` 没有沙箱字段
  * （已核实），所以「只读」在本插件里只能这样落地，必须如实标注。
+ *
+ * ⚠️ 0.2.1-rc.1 起 `dsh-tool-subagent` 的 `toolFilter` 已被删除（传了就抛错），
+ * 因此这份清单**不再**交给工具层，而是作为 `src/role-presets.js` 里
+ * `READONLY_EXCLUDED_ROWS` 行裁剪策略的对照依据保留：两者必须表达同一组能力。
  */
 export const WRITE_TOOLS = Object.freeze([
   'write',
@@ -60,11 +88,17 @@ export function canStartAtDepth(parentDepth, absoluteLimit) {
 }
 
 /**
- * 当前作用域的有效出站权限。工具名必须来自已挂载清单，不使用通配符。
- * CLI 用 allow 只保留自身执行器与受控委派；内置用 deny 保持普通工具动态可见。
- * deny 只列采集时可用名以避免 DSH 报未知名；采集后新增的危险工具会缺失于 deny，
- * 因而是 fail-open，而非 fail-closed。跨角色隔离依赖工具名，不是调用方身份授权。
- * run_code 是 DSH 的保留传输，不能写入 toolFilter；其 SDK 同样受工具过滤约束。
+ * 当前作用域的**有效出站权限参照**。工具名必须来自已挂载清单，不使用通配符。
+ *
+ * ⚠️ 返回的 `toolFilter` **不再交给 DSH**：0.2.1-rc.1 已删除该配置字段（传了就抛错）。
+ *    真正的权限落地在 `src/role-presets.js` 的**行级裁剪**里。这里保留推导结果，
+ *    用途只有一个：让「哪些能力被挡掉」在纯逻辑层可断言、可对照，防止行裁剪与
+ *    设计意图漂移。`canDelegate` / `delegateToolNames` 仍被 CLI 包裹 persona 使用。
+ *
+ * 语义保持原样：CLI 用 allow 只保留自身执行器与受控委派；内置用 deny 保持普通工具
+ * 动态可见。deny 只列采集时可用名以避免 DSH 报未知名；采集后新增的危险工具会缺失于
+ * deny，因而是 fail-open，而非 fail-closed。跨角色隔离依赖工具名，不是调用方身份授权。
+ * `run_code` 是 DSH 的保留传输，不能出现在任何掩码里；其 SDK 同样受工具过滤约束。
  */
 export function dispatchPermissionsFor(role, { delegateToolNames = [], availableToolNames = [] } = {}) {
   const delegates = role.allowNestedDispatch ? [...new Set(delegateToolNames)] : [];
@@ -307,17 +341,48 @@ export function normalizeRoles(rawRoles, defaultProvider, defaultCwd) {
 }
 
 /**
+ * 角色的子代理 LLM 路由（provider / model / reasoningEffort）。
+ *
+ * CLI 角色用的是**包裹子代理**的路由：先在 DSH 内置 spawn 子代理里跑一个转交代理，
+ * 再由它调用专属 CLI 工具。内置角色用自己的 provider / model / effort。
+ *
+ * @param {Role} role - 规范化后的角色。
+ * @param {object} [wrapperRoute] - 插件级包裹路由（provider / model / effort）。
+ * @returns {object|undefined} `agentOptions`；没有任何取值时返回 undefined。
+ */
+export function agentOptionsFor(role, wrapperRoute) {
+  if (role.backend === CLI_BACKEND) {
+    const route = wrapperRoute ?? {};
+    const agentOptions = {};
+    for (const [key, target] of [['provider', 'provider'], ['model', 'model'], ['effort', 'reasoningEffort']]) {
+      const value = typeof route[key] === 'string' ? route[key].trim() : '';
+      if (value) agentOptions[target] = value;
+    }
+    return Object.keys(agentOptions).length > 0 ? agentOptions : undefined;
+  }
+  const agentOptions = { provider: role.provider, model: role.model };
+  if (role.effort !== undefined) agentOptions.reasoningEffort = role.effort;
+  return agentOptions;
+}
+
+/**
  * 为一个角色生成 `dsh-tool-subagent` 实例的配置。
  *
  * ⚠️ 用普通 JSON 对象而不是 schemastery：这份配置是我们**自己**喂给
  * `ctx.plugin()` 的，不走 Loader 的配置校验，因此不需要 schema 实例。
  *
+ * ⚠️ **绝不能再出现 `persona` / `toolFilter` / `backgroundMode` / `enableRunInBackground`。**
+ * 0.2.1-rc.1 的 `dsh-tool-subagent` 对前两者是**装载期硬抛错**（`Object.hasOwn` 判定，
+ * 键存在即失败，取值为 undefined 也算），后两者已从 Config 删除。角色的 persona 与
+ * 工具构成改由**角色的独立 Agent Preset** 承载，这里只负责用 `agentPreset` 选中它。
+ *
  * @param {Role} role - 规范化后的角色。
  * @param {object} options - 全局选项。
  * @param {number} options.maxDepth - 第一层之外，**额外**可用的层数。
- * @param {string[]} [options.delegateToolNames] - 当前作用域已挂载的受控委派工具名。
- * @param {string[]} [options.availableToolNames] - 当前作用域已挂载的工具名。
  * @param {object} [options.wrapperRoute] - 插件级包裹路由（provider / model / effort）。
+ * @param {Function} [options.getRole] - 执行期现读角色（配置可热更新）。
+ * @param {Function} [options.getMaxDepth] - 执行期现读深度预算。
+ * @param {Function} [options.getWrapperRoute] - 执行期现读包裹路由。
  * @returns {object} `dsh-tool-subagent` 的 Config。
  */
 export function toolConfigFor(role, options = {}) {
@@ -328,47 +393,24 @@ export function toolConfigFor(role, options = {}) {
   const getWrapperRoute = typeof options.getWrapperRoute === 'function'
     ? options.getWrapperRoute
     : () => options.wrapperRoute;
-  const getPermissions = () => {
-    const current = getRole() ?? role;
-    return dispatchPermissionsFor(current, {
-      delegateToolNames: options.getDelegateToolNames?.() ?? options.delegateToolNames ?? [],
-      availableToolNames: options.getAvailableToolNames?.() ?? options.availableToolNames ?? [],
-    });
-  };
-  const config = {
-    get provider() { return (getRole() ?? role).backend === CLI_BACKEND ? 'spawn' : (getRole() ?? role).backend; },
+  return {
+    get provider() { return DELEGATION_PROVIDER; },
     get toolName() { return (getRole() ?? role).toolName; },
-    backgroundMode: 'one-shot',
-    get toolFilter() { return getPermissions().toolFilter; },
-    get agentOptions() {
-      const current = getRole() ?? role;
-      if (current.backend === CLI_BACKEND) {
-        const route = getWrapperRoute() ?? {};
-        const agentOptions = {};
-        for (const [key, target] of [['provider', 'provider'], ['model', 'model'], ['effort', 'reasoningEffort']]) {
-          const value = typeof route[key] === 'string' ? route[key].trim() : '';
-          if (value) agentOptions[target] = value;
-        }
-        return Object.keys(agentOptions).length > 0 ? agentOptions : undefined;
-      }
-      return {
-        provider: current.provider,
-        model: current.model,
-        ...(current.effort === undefined ? {} : { reasoningEffort: current.effort }),
-      };
-    },
-    get persona() {
-      const current = getRole() ?? role;
-      return current.backend === CLI_BACKEND ? cliPersonaFor(current, getPermissions()) : current.instructions;
-    },
+    get agentOptions() { return agentOptionsFor(getRole() ?? role, getWrapperRoute()); },
+    // preset id 由角色 id 派生，不随 instructions/readOnly 变化；因此改这些字段
+    // 只需重注册 preset 的新 revision，不必重挂工具。
+    get agentPreset() { return rolePresetId((getRole() ?? role).id); },
     get maxDepth() { return absoluteDepthLimit(getMaxDepth() ?? 3); },
   };
-  if (role.backend === CLI_BACKEND) {
-    config.enableRunInBackground = false;
-    config.modelSelectionSettings = false;
-  }
-  return config;
 }
+
+/**
+ * 委派工具使用的 provider。
+ *
+ * 固定为 `spawn`：它是唯一同时支持 `agentOptions`、`agentPreset`、`depthLimit`
+ * 且 `inheritsParentContext === false` 的内置 provider（已核实）。
+ */
+export const DELEGATION_PROVIDER = 'spawn';
 
 /** 包裹子代理只转交任务；角色指令由执行器确定性前置，不能由模型改写。 */
 export function cliPersonaFor(role, permissions = dispatchPermissionsFor(role)) {
@@ -446,9 +488,9 @@ export function toolDescriptionFor(role, permissions = dispatchPermissionsFor(ro
 // 路由指引
 //
 // ⚠️ 为什么需要它：`dsh-tool-subagent` 的工具描述由它自己的 `providerWording()`
-// 生成，**Config 里没有任何字段可以覆盖**（Config 仅 provider / toolName /
-// modelSelectionSettings / enableRunInBackground / backgroundMode / agentOptions /
-// persona / toolFilter / maxDepth）。实测结果是四个角色工具的描述**逐字相同**，
+// 生成，**Config 里没有任何字段可以覆盖**（0.2.1-rc.1 的 Config 仅 provider /
+// toolName / modelSelectionSettings / agentOptions / agentPreset /
+// allowedAgentPresets / maxDepth）。实测结果是四个角色工具的描述**逐字相同**，
 // 主代理只能靠工具名猜「该派谁」——「何时用哪个角色」这套核心决策规则丢失了。
 //
 // 因此改成注册一段系统提示（ctx.systemPrompt.section）。这也更贴合设计意图：
@@ -473,6 +515,11 @@ export function roleGuidanceText(roles, options = {}) {
     'role work yourself when a role below fits. Pick one role per task and delegate through its',
     '`delegate_to_<role>` tool. Each role already has its own model, reasoning effort and',
     'instructions fixed by configuration, so never attempt to choose or override them.',
+    '',
+    'Delegation is asynchronous: the tool returns the child id as soon as it accepts the task and',
+    'the result arrives later as a completion notice. Keep making progress instead of waiting or',
+    'polling, and start independent delegations together in one message; only stop to wait when',
+    'your next action genuinely depends on a result.',
     '',
     'Route by asking what kind of question you have:',
     '',

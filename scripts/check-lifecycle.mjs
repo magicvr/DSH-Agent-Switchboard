@@ -8,7 +8,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { parse, stringify } from 'yaml';
 import { captureSync } from './lib/capture.mjs';
 import { REPO_ROOT, resolvePaths } from './lib/paths.mjs';
-import { collectLifecycle, satisfiesDshRange, evaluateDshPeers } from './lib/lifecycle.mjs';
+import { collectLifecycle, satisfiesDshRange, evaluateDshPeers, evaluateDshRequirements, isExactDshVersion, isExactDshVersionList, isExactDshExemptionKey } from './lib/lifecycle.mjs';
 import { generatePreset } from './lib/preset-generator.mjs';
 import { readPatch, presetConfig, stripInjectedPreset, isOurBlockLine, assertNoStrayOperations, planInjectedPreset, scanPackageReferences } from './lib/preset-patch.mjs';
 import { runLifecycle } from './ops/plugin-lifecycle.mjs';
@@ -24,6 +24,12 @@ function section(title) { console.log(`\n=== ${title} ===`); }
 const temp = mkdtempSync(join(tmpdir(), 'switchboard-lifecycle-'));
 const put = (path, value) => writeFileSync(path, typeof value === 'string' ? value : JSON.stringify(value));
 const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
+// fixture 运行时版本跟随仓库唯一精确 pin 的 dsh peer：manifest 升级 peers 后 stub 必须一起走，
+// 否则本检查会在陈旧 stub 上继续绿（0.2.0-rc.2 → 0.2.1-rc.1 事故正是这样漏掉的）。
+const dshPeerPins = [...new Set(Object.entries(pkg.peerDependencies ?? {})
+  .filter(([name]) => name === '@deepseek-ai/dsh' || name.startsWith('@deepseek-ai/dsh-'))
+  .map(([, range]) => range))];
+const stubRuntime = dshPeerPins.length === 1 && isExactDshVersion(dshPeerPins[0]) ? dshPeerPins[0] : '0.2.1-rc.1';
 const standard = stringify([{ insert: [{ id: 'preset-standard', config: { plugins: [
   { id: 'tool-subagent', name: '@deepseek-ai/dsh-tool-subagent' },
   { id: 'fixture-plugin', name: 'fixture-plugin', config: { text: '嵌套配置' } },
@@ -57,7 +63,7 @@ try {
   const compatibilityFile = join(paths.profile, 'compatibility.json');
   const archive = entry => {
     if (entry.endsWith('standard.patch.yml')) return standard;
-    if (entry === 'dsh/package.json') return JSON.stringify({ version: '0.2.0-rc.2' });
+    if (entry === 'dsh/package.json') return JSON.stringify({ version: stubRuntime });
     throw new Error(`fixture 无归档条目 ${entry}`);
   };
   const options = { paths, repoRoot, readArchive: archive };
@@ -148,7 +154,7 @@ try {
   let offset = 0;
   for (const [entry, content] of [
     ['dsh/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml', standard],
-    ['dsh/package.json', JSON.stringify({ version: '0.2.0-rc.2' })],
+    ['dsh/package.json', JSON.stringify({ version: stubRuntime })],
   ]) {
     const body = Buffer.from(content);
     const parts = entry.split('/');
@@ -167,11 +173,11 @@ try {
   const archiveEnv = { ...env, DSH_ASAR: archivePath };
   const cat = captureSync(process.execPath, [join(REPO_ROOT, 'scripts', 'dsh-cat.mjs'), 'dsh/package.json'], { env: archiveEnv });
   check('ASAR stderr 非空但退出成功且 JSON 可解析', cat.status === 0 && !cat.error
-    && cat.stderr.includes('ASAR:') && JSON.parse(cat.stdout).version === '0.2.0-rc.2', cat.stderr);
+    && cat.stderr.includes('ASAR:') && JSON.parse(cat.stdout).version === stubRuntime, cat.stderr);
   console.log(`  观察到 stderr：${cat.stderr.trim()}；JSON version=${JSON.parse(cat.stdout).version}`);
   s = collectLifecycle({ paths, repoRoot, env: archiveEnv });
   check('实际归档读取接受诊断 stderr 并验证生成物与运行时', s.preset.generatedDrift.status === 'current'
-    && s.compatibility.runtime.status === 'known' && s.compatibility.runtime.version === '0.2.0-rc.2');
+    && s.compatibility.runtime.status === 'known' && s.compatibility.runtime.version === stubRuntime);
 
   section('角色文件与精确版本豁免');
   check('角色文件 missing', collect().roles.verdict === 'missing');
@@ -185,24 +191,76 @@ try {
   put(compatibilityFile, {});
   s = collect();
   check('stub 运行时流入 absent 判据', s.compatibility.runtime.status === 'known'
-    && s.compatibility.runtime.version === '0.2.0-rc.2' && s.compatibility.exemption === 'absent'
+    && s.compatibility.runtime.version === stubRuntime && s.compatibility.exemption === 'absent'
     && !s.compatibility.exemptionPresent && s.compatibility.runtimeExempt === false);
   const key = `${pkg.name}@${pkg.version}`;
-  put(compatibilityFile, { [key]: ['0.2.0-rc.2'] }); s = collect();
+  put(compatibilityFile, { [key]: [stubRuntime] }); s = collect();
   check('stub 运行时流入 exempt 判据并命中', s.compatibility.runtime.status === 'known'
-    && s.compatibility.runtime.version === '0.2.0-rc.2' && s.compatibility.exemption === 'exempt'
+    && s.compatibility.runtime.version === stubRuntime && s.compatibility.exemption === 'exempt'
     && s.compatibility.exemptionPresent && s.compatibility.runtimeExempt === true);
-  put(compatibilityFile, { [`${pkg.name}@0.0.0`]: ['0.2.0-rc.2'] }); s = collect();
+  put(compatibilityFile, { [`${pkg.name}@0.0.0`]: [stubRuntime] }); s = collect();
   check('stub 运行时已知但旧版本豁免仍是 expired', s.compatibility.runtime.status === 'known'
-    && s.compatibility.runtime.version === '0.2.0-rc.2' && s.compatibility.exemption === 'expired'
+    && s.compatibility.runtime.version === stubRuntime && s.compatibility.exemption === 'expired'
     && s.compatibility.runtimeExempt === false && s.verification.issues.some(i => i.code === 'compatibility.expired'));
   put(compatibilityFile, { [key]: ['different-runtime'] });
   check('当前运行时不在豁免数组明确失败', collect().compatibility.runtimeExempt === false && invoke('verify').exitCode === 1);
-  put(compatibilityFile, { [key]: ['0.2.0-rc.2'] });
+  put(compatibilityFile, { [key]: [stubRuntime] });
   check('desktop basename 分类', collect().profile.kind === 'desktop');
   check('其他 basename 分类 cli-managed', collectLifecycle({ ...options, paths: { ...paths, profile: join(temp, 'server') } }).profile.kind === 'cli-managed');
   check('模块变化完整重启是固定事实', collect().restart.requiredForModuleChange === true);
   check('完全一致 fixture verify 退出 0', invoke('verify').exitCode === 0 && collect().verification.status === 'consistent');
+
+  section('真实 gate 镜像：stub 来源、engines.dsh 优先级与豁免校验');
+  check('fixture 运行时版本来自仓库唯一精确 dsh peer pin', dshPeerPins.length === 1 && isExactDshVersion(dshPeerPins[0])
+    && stubRuntime === dshPeerPins[0], JSON.stringify(dshPeerPins));
+  put(compatibilityFile, {});
+  // engines.dsh 存在时 peers 被完全忽略：这是真实 gate unmetRequirements 的第一个分支。
+  put(join(repoRoot, 'package.json'), { ...pkg, engines: { dsh: stubRuntime },
+    peerDependencies: { ...pkg.peerDependencies, '@deepseek-ai/dsh-tools': '0.0.0' } });
+  s = collect();
+  check('engines.dsh 满足时忽略不兼容 peers 并判 consistent', s.repo.enginesDsh === stubRuntime
+    && s.compatibility.peers.source === 'engines.dsh' && s.compatibility.peers.ranges.length === 1
+    && s.compatibility.peers.ranges[0].name === 'engines.dsh' && s.compatibility.peers.status === 'compatible'
+    && s.verification.status === 'consistent' && invoke('verify').exitCode === 0);
+  put(join(repoRoot, 'package.json'), { ...pkg, engines: { dsh: '0.0.0' } });
+  s = collect();
+  check('engines.dsh 不满足时忽略兼容 peers 并判 incompatible', s.compatibility.peers.source === 'engines.dsh'
+    && s.compatibility.peers.status === 'incompatible' && /^engines\.dsh: /.test(s.compatibility.peers.reason)
+    && s.verification.issues.some(i => i.code === 'compatibility.peers') && invoke('verify').exitCode === 1);
+  put(join(repoRoot, 'package.json'), { ...pkg, engines: {} });
+  s = collect();
+  check('engines 无 dsh 键时回退 peers', s.repo.enginesDsh === null
+    && s.compatibility.peers.source === 'peerDependencies' && s.compatibility.peers.status === 'compatible');
+  put(join(repoRoot, 'package.json'), { ...pkg, engines: { dsh: 1 } });
+  check('畸形 engines.dsh 不猜测判定', collect().compatibility.peers.status === 'unknown'
+    && /engines\.dsh/.test(collect().compatibility.peers.reason));
+  put(join(repoRoot, 'package.json'), { ...pkg, engines: [] });
+  check('非对象 engines 不猜测判定', collect().compatibility.peers.status === 'unknown');
+  put(join(repoRoot, 'package.json'), { ...pkg, peerDependencies: { ...pkg.peerDependencies, '@deepseek-ai/dsh-tools': 'workspace:^' } });
+  s = collect();
+  check('workspace:^ peer 视为当前运行时', s.compatibility.peers.status === 'compatible'
+    && s.compatibility.peers.ranges.find(row => row.name === '@deepseek-ai/dsh-tools')?.status === 'compatible');
+  put(join(repoRoot, 'package.json'), { ...pkg, peerDependencies: { ...pkg.peerDependencies,
+    '@deepseek-ai/dsh-tools': 'workspace:*', '@deepseek-ai/dsh-scope': 'workspace:~' } });
+  check('workspace:* 与 workspace:~ peer 同样满足', collect().compatibility.peers.status === 'compatible');
+  put(join(repoRoot, 'package.json'), pkg);
+  check('engines.dsh 中的 workspace: 协议值一律不满足', evaluateDshRequirements(stubRuntime, { engines: { dsh: 'workspace:^' } }).status === 'incompatible');
+  for (const invalid of [['0.2.*'], ['0.2.*', stubRuntime], ['v0.2.1'], [` ${stubRuntime}`], stubRuntime, [1], [stubRuntime, null]]) {
+    put(compatibilityFile, { [key]: invalid });
+    s = collect();
+    check(`非法豁免值 ${JSON.stringify(invalid)} 不被 DSH 接受`, s.compatibility.exemption === 'invalid'
+      && s.compatibility.exemptionPresent && s.compatibility.runtimeExempt === false
+      && s.verification.issues.some(i => i.code === 'compatibility.exemption') && invoke('verify').exitCode === 1);
+  }
+  put(compatibilityFile, { [key]: [] });
+  check('空豁免列表合法但不豁免任何运行时', collect().compatibility.exemption === 'exempt'
+    && collect().compatibility.runtimeExempt === false && invoke('verify').exitCode === 1);
+  put(compatibilityFile, { [key]: [stubRuntime] });
+  s = collect();
+  check('精确规范 SemVer 豁免仍被接受并命中', s.compatibility.exemption === 'exempt' && s.compatibility.runtimeExempt === true
+    && invoke('verify').exitCode === 0);
+  check('非法豁免键不会被 DSH 接受', isExactDshExemptionKey(key) && !isExactDshExemptionKey(`${pkg.name}@^${pkg.version}`)
+    && !isExactDshExemptionKey(pkg.name));
 
   section('命令行、零写入及实际输出');
   const cli = command => captureSync(process.execPath, [script, command, '--home', home, '--json'], { env, cwd: REPO_ROOT });
@@ -236,9 +294,32 @@ try {
     ['0.0.2', '^0.0.1', 'incompatible'], ['0.0.1', '^0.0.1', 'compatible'],
     ['0.2.0-rc.3', '^0.2.0-rc.2', 'compatible'], ['0.2.0+build', '0.2.0', 'compatible'],
     ['1.0.0', '>=1.0.0 || <2.0.0', 'unknown'], ['bad', '~0.2.0', 'unknown'],
+    // 真实 gate `satisfies` 先 trim 再判定：trim 后为空必定 unmet；周围空白不影响合法范围。
+    ['0.2.1-rc.1', '', 'incompatible'], ['0.2.1-rc.1', '   ', 'incompatible'],
+    ['0.2.1-rc.1', ' 0.2.1-rc.1 ', 'compatible'], ['0.2.1-rc.1', ' ~0.4.0 ', 'incompatible'],
+    // workspace: 由 evaluateDshRequirements 按真实 gate 分支解释，范围层保持 unknown（不猜测）。
+    ['0.2.1-rc.1', 'workspace:^', 'unknown'],
   ]) check(`${version} / ${range} → ${expected}`, satisfiesDshRange(version, range).status === expected);
   check('未支持范围明确报告 unsupported-range', satisfiesDshRange('1.0.0', '>=1.0.0 || <2.0.0').reason === 'unsupported-range');
+  check('空范围有明确原因且不接受', satisfiesDshRange('1.0.0', '  ').accepts === undefined && satisfiesDshRange('1.0.0', '  ').status === 'incompatible');
   check('仅镜像 DSH gate 包名范围', evaluateDshPeers('0.2.0', { '@deepseek-ai/dshx': 'bad', '@deepseek-ai/cordis': 'bad', '@deepseek-ai/dsh': '~0.2.0' }).status === 'compatible');
+  check('peers 之外的非 dsh 包名不参与判定', evaluateDshPeers('0.2.0', { '@deepseek-ai/cordis': 'bad', '@deepseek-ai/schemastery': 'bad' }).status === 'compatible');
+  check('engines.dsh 满足时 peers 完全忽略', evaluateDshRequirements('0.2.1-rc.1',
+    { engines: { dsh: '0.2.1-rc.1' }, peerDependencies: { '@deepseek-ai/dsh-tools': '0.0.0', '@deepseek-ai/dsh': '^9.0.0' } }).status === 'compatible');
+  check('畸形 engines/peerDependencies/范围不猜测判定', evaluateDshRequirements('0.2.1-rc.1', { engines: null }).status === 'unknown'
+    && evaluateDshRequirements('0.2.1-rc.1', { peerDependencies: [] }).status === 'unknown'
+    && evaluateDshRequirements('0.2.1-rc.1', { peerDependencies: { '@deepseek-ai/dsh-tools': 1 } }).status === 'unknown');
+  check('workspace:^/~/* peer 视为当前运行时', ['workspace:^', 'workspace:~', 'workspace:*']
+    .every(range => evaluateDshRequirements('0.2.1-rc.1', { peerDependencies: { '@deepseek-ai/dsh-tools': range } }).status === 'compatible'));
+  for (const [value, expected] of [['0.2.1-rc.1', true], ['0.2.1', true], ['0.2.0+build', true], ['0.2.*', false],
+    ['v0.2.1', false], [' 0.2.1', false], ['0.2.1 ', false], ['=0.2.1', false], ['^0.2.1', false], ['', false], [1, false]])
+    check(`精确规范 SemVer ${JSON.stringify(value)} → ${expected}`, isExactDshVersion(value) === expected);
+  check('豁免版本列表要求全部为精确规范 SemVer', isExactDshVersionList(['0.2.1-rc.1', '1.0.0'])
+    && !isExactDshVersionList(['0.2.*']) && !isExactDshVersionList(['0.2.1', '0.2.*']) && !isExactDshVersionList('0.2.1')
+    && isExactDshVersionList([]));
+  check('豁免键要求精确 package@version', isExactDshExemptionKey('@magicvr/dsh-agent-switchboard@0.2.1-rc.1')
+    && isExactDshExemptionKey('dsh@0.2.1') && !isExactDshExemptionKey('dsh@^0.2.1') && !isExactDshExemptionKey('dsh@0.2.1 ')
+    && !isExactDshExemptionKey('dsh') && !isExactDshExemptionKey('@Bad/pkg@0.2.1'));
 
   section('B4 合成 profile 收敛与安全屏障');
   let fixtureNumber = 0;
@@ -571,6 +652,20 @@ fs.writeFileSync = (...args) => {
   const incompatibleVerify = incompatible.run('verify', [], { collectOptions: { repoRoot,
     readArchive: entry => entry === 'dsh/package.json' ? JSON.stringify({ version: '0.3.0' }) : archive(entry) } });
   check('verify 不兼容且无豁免必须非零', incompatibleVerify.exitCode === 1 && incompatibleVerify.snapshot.compatibility.runtimeExempt === false);
+  // 运行时确实不兼容时：非法豁免值不得救场，精确 SemVer 才放行（真实 gate 的静默忽略语义）。
+  const mismatchArchive = entry => entry === 'dsh/package.json' ? JSON.stringify({ version: '0.3.0' }) : archive(entry);
+  const invalidExemption = fixture();
+  put(join(invalidExemption.p.profile, 'compatibility.json'), { [key]: ['0.3.*'] });
+  const invalidResult = invalidExemption.run('upgrade', ['--apply'], { collectOptions: { repoRoot, readArchive: mismatchArchive } });
+  check('运行时 0.3.0 下范围式豁免不被接受，仍需人工豁免 exit=3', invalidResult.exitCode === 3
+    && /兼容性人工豁免步骤/.test(invalidResult.output) && invalidResult.snapshot.compatibility.exemption === 'invalid'
+    && invalidResult.snapshot.compatibility.runtimeExempt === false, invalidResult.output);
+  const validExemption = fixture();
+  put(join(validExemption.p.profile, 'compatibility.json'), { [key]: ['0.3.0'] });
+  const validResult = validExemption.run('upgrade', ['--apply'], { collectOptions: { repoRoot, readArchive: mismatchArchive } });
+  check('运行时 0.3.0 下精确 SemVer 豁免被接受且放行', validResult.exitCode === 0
+    && validResult.snapshot.compatibility.exemption === 'exempt' && validResult.snapshot.compatibility.runtimeExempt === true
+    && validResult.snapshot.verification.status === 'consistent', validResult.output);
   const absentTarget = fixture();
   rmSync(absentTarget.p.profile, { recursive: true });
   for (const command of ['install', 'upgrade', 'uninstall']) {

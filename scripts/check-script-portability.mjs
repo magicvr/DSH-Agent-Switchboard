@@ -101,7 +101,14 @@ try {
   writeFileSync(wiringPatch, wiringText(supervisorRules));
   test('显式目标缺 roles 文件失败', () => { const r = runWiring(['--home', home]); return r.status === 1 && /缺少 roles 文件/.test(r.stderr); });
   mkdirSync(join(home, 'agent-switchboard')); writeFileSync(configPathFor(home), JSON.stringify({ roles: [] }));
-  test('非仓库 cwd 的完整 wiring fixture 跑满十一条', () => { const r = runWiring(['--home', home]); return r.status === 0 && /结果：11 通过 \/ 0 失败/.test(r.stdout); });
+  // ⚠️ 只断言「至少跑满 N 条且 0 失败」，不写死精确条数：写死会让**新增**一条断言
+  //    就误报为可移植性回归（本文件关心的是可移植性，不是 wiring 的断言数量）。
+  //    下界仍然保留了原意 —— fixture 若静默少跑断言，这里会失败。
+  const passedAtLeast = (stdout, min) => {
+    const match = /结果：(\d+) 通过 \/ (\d+) 失败/.exec(stdout);
+    return match !== null && Number(match[2]) === 0 && Number(match[1]) >= min;
+  };
+  test('非仓库 cwd 的完整 wiring fixture 跑满全部断言', () => { const r = runWiring(['--home', home]); return r.status === 0 && passedAtLeast(r.stdout, 11); });
   for (const rules of [undefined, '', ' \n\t', 42]) {
     writeFileSync(wiringPatch, wiringText(rules));
     test(`无效 supervisorRules ${JSON.stringify(rules)} 必须失败并提示修复`, () => {
@@ -113,9 +120,10 @@ try {
   writeFileSync(wiringPatch, wiringText(`${supervisorRules}fixture drift`));
   test('规则漂移必须失败并给出有限差异线索', () => {
     const r = runWiring(['--home', home]);
+    const match = /结果：(\d+) 通过 \/ (\d+) 失败/.exec(r.stdout);
     return r.status === 1 && /FAIL  profile supervisorRules/.test(r.stdout)
       && /profile 已过期，需重新注入/.test(r.stdout) && /首个不同位置/.test(r.stdout)
-      && /结果：10 通过 \/ 1 失败/.test(r.stdout);
+      && match !== null && Number(match[2]) === 1 && Number(match[1]) >= 10;
   });
 
   const formattedFailure = (result, label) => {

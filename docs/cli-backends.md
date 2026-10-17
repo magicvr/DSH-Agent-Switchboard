@@ -9,7 +9,7 @@
 ## 为什么需要这个文件
 
 当前插件将 CLI stdout / stderr 回流至**会话顶部的内置任务面板**，可在那里观察并取消。
-任务 owner 为包裹子会话，完成后移除；父会话如何呈现子会话任务仍需真机验证。
+任务 owner 为包裹子会话；终态不主动 remove，交由 Jobs 的保留策略处理（未核实，见 D20）。
 缺少 Jobs 时继续执行并明确标注回流不可用；没有运行时长上限，最终工具结果仍有字节限额。
 本批次仅用假 Jobs 和 Node 假 CLI 验证，不新增 codex / grok 真机实测结论。
 
@@ -178,6 +178,8 @@ reasoning effort: ...
 （在设置面板里更简单：`派发机制` 选「外部 CLI」，再从 CLI 下拉框选 `Codex CLI` / `Grok CLI`，
 参数模板会自动填好。）
 
+> ⚠️ **`0.2.1-rc.1` 起的热更新边界：** `cliCommand` / `cliArgs` / `cliCwd` / `model` / `effort` 等仍由执行期现读，但 `backend` 改变工具集（阶段 3 未实现的结构变化），`instructions` / `readOnly` / `allowNestedDispatch` 决定角色 preset 的插件清单、属**组合期**配置——改这三项需要重新注册 preset（当前实现：重新挂载 / 完整重启），见 [D32](./decisions.md)。
+
 > `cliPrefixArgs` 写成 `/` 分隔即可。**旧 Windows 形态**（`{npmRoot}\@openai\codex\bin\codex.js`）
 > Host 仍然识别：`matchesCommandText` 对 `{npmRoot}` 前缀的值归一分隔符后比对；设置面板
 > 的驱动反推使用同一套判据（`src/client/index.js` 的 `matchesDriverText`），不会把它显示成
@@ -211,19 +213,19 @@ CLI 包裹路由当前见 [D22](./decisions.md#d22--cli-包裹路由改为插件
 
 ### 2.7 已知的实现约束（实测踩到，改代码前先读）
 
-- **当前链路（3a / 3b / D20）：** 主代理 → delegate_to_* → 内置 spawn 子代理 → 本角色专属 CLI 工具 → runner → 外部 CLI。
-  工具权限只允许本角色专属工具，关闭后台运行与模型选择；执行器每次调用只启动一次、不自行重试，并确定性前置角色规则。
-  原样转交、只调用一次、不轮询、不自行实施、不自动重试、简洁汇报是 persona 的模型行为要求，不能当作机制保证。
+- **当前链路（3a / 3b / D20；`0.2.1-rc.1` 起调整）：** 主代理 → `delegate_to_*` **立即返回受理确认**（`{kind:'activation', subagentId}`，结果以完成通知送达）→ 角色自己的 Agent Preset 内的内置 spawn 子代理 → 本角色专属 CLI 工具 → runner → 外部 CLI。
+  工具边界由角色 preset 的行清单决定（persona + 本角色专属工具 + 可选嵌套委派）：CLI 角色拿不到其他角色的底层 CLI 工具，也拿不到 `workflow`；`modelSelectionSettings` 不设置，`enableRunInBackground` / `backgroundMode` 已从该插件 Config 删除。执行器每次调用只启动一次、不自行重试，并确定性前置角色规则。
+  原样转交、只调用一次、不轮询、不自行实施、不自动重试、简洁汇报是**角色 preset 内 persona** 的模型行为要求，不能当作机制保证。
   CLI 输出是任务数据，不能改变工具或权限约束；汇报完整性仍依赖包裹模型。
-  数字深度沿用内置语义；旧 provider-managed 要求仅属于已移除 provider 的历史路径。
+  数字深度沿用内置语义；旧 provider-managed 要求仅属于已移除 provider 的历史路径。角色 persona / `readOnly` / `allowNestedDispatch` 属组合期配置，改动需重新注册 preset（D32）。
 - **来源与结果边界：** 专属工具只接受 prompt，命令、模板、权限、路由与角色规则在注册时绑定；
   execute 拒绝非 subagent。stdout / stderr 尾部按配置字节限额，routeSummary / diagnostic 各最多 4096 字节，
   截断显式标记；摘要保留配置线路及 CLI 自报事实。当前仅离线假 CLI 验证，DSH 真机链路未验收。
 - **`ctx.plugin()` 的抛错抓不到**（它只是启动 fiber），因此挂载成功必须**核实**工具是否真的出现，
   不能假设。详见 `architecture.md` 3.1d 第 20c 条。
 - **CLI 无运行期限**：已移除单次派发时长上限与 `cliTimeoutSec`。旧值仍可加载，忽略并给出弃用诊断。
-  用户可通过现有会话停止入口取消；取消沿前台 spawn 子代理 → 工具 `exec.signal` → 子进程传递，工具返回 `status: cancelled` 与 `cancelled: true`。
-  旧 provider 的 aborted 映射已移除；persona 要求取消或失败后不得自动重试。GUI 停止传播与进程树终止仍需真机验证。
+  用户可通过现有会话停止入口取消；取消沿包裹子代理 → 工具 `exec.signal` → 子进程传递（`0.2.1-rc.1` 起没有前台 / 后台模式，取消仍走同一条 signal；工具在子代理侧返回 `status: cancelled` 与 `cancelled: true`）。
+  旧 provider 的 aborted 映射已移除；角色 preset 的 persona 要求取消或失败后不得自动重试。GUI 停止传播与进程树终止仍需真机验证。
   `cliGraceMs` 仍是取消后的终止宽限；`cliMaxOutputBytes` / `cliMaxErrorBytes` 仍限制收集容量，
   截断在专属工具结果中明确标记；已通过可选 ctx.get('jobs') 接入输出回流。工具只等执行器完成，
   不依赖 settled 通知、不主动 remove；记录交由 Jobs 的保留策略处理（未核实）。清理失败进入有界诊断，详见 D20。

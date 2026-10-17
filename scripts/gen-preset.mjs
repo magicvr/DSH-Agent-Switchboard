@@ -15,7 +15,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, unlinkSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { join, dirname } from 'node:path';
-import { generatePreset } from './lib/preset-generator.mjs';
+import { generatePreset, roleRowsTemplate } from './lib/preset-generator.mjs';
 import { captureSync } from './lib/capture.mjs';
 
 const ROOT = process.cwd();
@@ -27,6 +27,9 @@ const PRESET_ID = 'preset-switchboard';
 const PRESET_KEY = 'switchboard';
 const SELF_PACKAGE = '@magicvr/dsh-agent-switchboard';
 const OUT_FILE = join(ROOT, 'presets', 'switchboard.patch.yml');
+// 角色 preset 的**行模板**：同一份标准清单的数据形态，供 Host 在运行期按角色裁剪。
+// 与 YAML 产物同源同批生成，`--check` 一起比对，避免两者漂移。
+const OUT_ROWS_FILE = join(ROOT, 'presets', 'standard-plugins.json');
 const original = existsSync(OUT_FILE) ? readFileSync(OUT_FILE) : null;
 const expectedHash = process.env.DSH_PRESET_EXPECTED_SHA256;
 if (expectedHash && (!original || createHash('sha256').update(original).digest('hex') !== expectedHash)) {
@@ -101,6 +104,14 @@ console.log(
     : '改动：（无）',
 );
 
+// 角色 preset 的行模板（数据形态）。与 YAML 产物同源，必须一起保持一致。
+const roleRows = roleRowsTemplate(standardPlugins);
+const rowsBody = JSON.stringify({
+  generatedFrom: STANDARD_ENTRY,
+  note: '由 scripts/gen-preset.mjs 生成，请勿手改：Host 在运行期据此按角色裁剪出独立 preset。',
+  rows: roleRows,
+}, null, 2) + '\n';
+
 // 漂移检测：与已落盘的产物比对插件名序列。
 let drift = false;
 if (existsSync(OUT_FILE)) {
@@ -122,6 +133,19 @@ if (existsSync(OUT_FILE)) {
   console.log('\n（尚无落盘文件）');
 }
 
+// 行模板漂移：内容必须逐字节一致，因为它决定角色子代理能拿到什么工具。
+if (existsSync(OUT_ROWS_FILE)) {
+  const existingRows = readFileSync(OUT_ROWS_FILE, 'utf8');
+  if (existingRows !== rowsBody) {
+    drift = true;
+    console.warn('⚠️  已落盘的 presets/standard-plugins.json 与当前 standard 不一致（内容有变）。');
+  } else {
+    console.log('PASS  行模板无漂移（standard-plugins.json 一致）');
+  }
+} else {
+  console.log('（尚无行模板文件）');
+}
+
 if (process.argv.includes('--check')) {
   console.log(drift ? '\n--check：存在漂移，需要重新生成。' : '\n--check：一致。');
   process.exit(drift ? 1 : 0);
@@ -137,3 +161,15 @@ try {
   renameSync(temp, OUT_FILE);
 } finally { if (existsSync(temp)) unlinkSync(temp); }
 console.log(`\n已写入 ${OUT_FILE}`);
+
+// 行模板同步落盘；同一套原子替换与「规划后未变」校验。
+const rowsOriginal = existsSync(OUT_ROWS_FILE) ? readFileSync(OUT_ROWS_FILE) : null;
+const rowsTemp = `${OUT_ROWS_FILE}.${randomBytes(6).toString('hex')}.tmp`;
+try {
+  writeFileSync(rowsTemp, rowsBody, { encoding: 'utf8', flag: 'wx' });
+  const current = existsSync(OUT_ROWS_FILE) ? readFileSync(OUT_ROWS_FILE) : null;
+  if (rowsOriginal === null ? current !== null : current === null || !rowsOriginal.equals(current))
+    throw new Error('行模板文件在规划后已改变，拒绝写入，请重新运行');
+  renameSync(rowsTemp, OUT_ROWS_FILE);
+} finally { if (existsSync(rowsTemp)) unlinkSync(rowsTemp); }
+console.log(`已写入 ${OUT_ROWS_FILE}`);

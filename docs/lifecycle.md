@@ -48,7 +48,7 @@
 
 ### 2.2 预演、写入与退出码
 
-`install` / `upgrade` / `uninstall` 默认 dry-run，**没有 `--dry-run` flag**。省略 `--apply` 不写目标、不创建目录或备份；只有显式 `--apply` 才写，包括 git 跟踪的 `presets/switchboard.patch.yml`。发生变更时先做结构、格式与权限预检；profile patch 与角色文件生成独立时间戳备份，写后复读验证。仓库 preset 通过既有生成器写入，不另写 `.bak`，并复读检查字节改变及生成物达到 `current`；当前制品一致时不重复写入。反复运行是安全的，并会报告剩余步骤；人工包步骤仍必须由 DSH 完成。
+`install` / `upgrade` / `uninstall` 默认 dry-run，**没有 `--dry-run` flag**。省略 `--apply` 不写目标、不创建目录或备份；只有显式 `--apply` 才写，包括 git 跟踪的 `presets/switchboard.patch.yml` 与 `presets/standard-plugins.json`（生成器现在同时产出这两份：preset 声明 + 角色 preset 的行模板）。发生变更时先做结构、格式与权限预检；profile patch 与角色文件生成独立时间戳备份，写后复读验证。仓库 preset 通过既有生成器写入，不另写 `.bak`，并复读检查字节改变及生成物达到 `current`；当前制品一致时不重复写入。反复运行是安全的，并会报告剩余步骤；人工包步骤仍必须由 DSH 完成。
 
 | 退出码 | 生命周期含义 |
 | --- | --- |
@@ -103,6 +103,8 @@
 
 兼容性判定只评估 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` peers，镜像 DSH 门禁，不把 `engines.*` 当作已执行约束。范围判断仅支持完整精确版本、`~`、`^`，采用包含预发布版本的边界比较；其它语法给出 `unknown` / `unsupported-range`，不猜测。运行时版本来自 Electron 安装归档的 `dsh/package.json`，**不证明当前进程已运行该版本，也不使用另装 CLI 的版本代替**。
 
+> ⚠️ **两侧语义必须分清（`0.2.1-rc.1` 已核实）：** DSH 自己的门禁（`dsh-app-boot.unmetRequirements()`）是「manifest 声明了 `engines.dsh`（字符串）则**它单独决定并忽略全部 peers**，否则逐条校验 DSH peers」。本仓库工具与 `check-profile-wiring.mjs` 复刻的是**后一条分支**，因为本插件的 `package.json` **刻意不写 `engines.dsh`**——peer 精确 pin 是唯一真源，写了会静默覆盖 peers。旧说法「`engines.*` 不被当作已执行约束」只对 `0.2.0-rc.2` 成立（那个版本从不读 `engines`）。**当前本插件四个 dsh peers 精确 pin 到 `0.2.1-rc.1`，每次 DSH 升级都必须手工重 pin**：范围会让仓库 `node_modules` 解析到与运行时不同的构建，离线检查按错误接口版本通过（见 D32）。
+
 `compatibility.json` 豁免按精确 `package@version` 查找，值为允许的 DSH 版本字符串数组。插件版本改变后旧键在 DSH 中静默失效，工具会报告 `expired`；当前运行时不在数组中也会失败。工具只提示人工处理，GUI 豁免按钮和流程、CLI 豁免子命令均未验证。
 
 ## 5. 安全卸载与排障
@@ -125,7 +127,7 @@
 
 此前实施阶段记录的 `node scripts/check-lifecycle.mjs`：**144 通过 / 0 失败**；`node scripts/check-version.mjs`：**107 通过 / 0 失败**。`npm run check` 全链退出 `0`，包含 `check:lifecycle` / `check:version` 对应检查。合成 profile 验证路径隔离、零写入预演、幂等收敛、备份和写后复验、卸载顺序屏障、格式拒绝和有界兼容性范围；新增 tmpdir 仓库、ASAR 与真实生成器夹具验证再生成后重新注入、第二次零写入、生成器失败及假成功的拒绝屏障、归档不可用降级与两个帮助入口。手工将再生成调用替换为不写文件的假成功，检查为 **137 通过 / 7 失败**；手工恢复后回到 **144 通过 / 0 失败**。这些不等于真实 profile 写入验收。
 
-独立 `npm run check:preset` 使用默认归档路径时退出 `1`，原因为本机归档不可用；使用 tmpdir 合成 ASAR、显式 `DSH_ASAR` 后退出 `0`，确认共享生成器的 `--check` 入口可解析产物、检查插件清单且不写仓库预设。合成清单由现有产物构造，不代表当前 DSH standard 或 `!!js` 标签的真机验证；真实归档一致性仍未验证。
+独立 `npm run check:preset`（即 `node scripts/gen-preset.mjs --check`）比对**两个**生成物：`presets/switchboard.patch.yml` 的插件名序列与 `presets/standard-plugins.json` 的逐字节内容（后者是角色 preset 的行模板，供 Host 在运行期按角色裁剪）。本机实测（本次文档校准，默认归档路径）：归档可读，输出 `standard 插件数: 22` / `合计 23` / `!!js 表达式 2 → 2`，两个产物均报无漂移，`--check：一致。`（退出 `0`）。**该检查在 `0.2.1-rc.1` 升级落地时还不在 `npm run check` 主链内**，这是上游 standard 漂移（新增 `dsh-time-context` / `dsh-tool-schedule` / `dsh-plugin-market/tools`，移除 `tool-subagent-codex` / `tool-subagent-claude-code` / `tool-ralph`）长期未被发现的原因；现已作为 `check` 链的最后一步。归档不可用时生成器失败并退出 `1`，属于「未验证」，不能读成一致。
 
 ### 6.2 真机已验证
 
@@ -137,4 +139,18 @@ desktop CLI 硬拒绝、CLI 必须带 profile 及带 profile 的 `--help` 会初
 
 ### 6.3 仍未验证
 
-新增 `src/` 运行时行为尚待 DSH 完整重启：`switchboard_selftest` 的版本字段与配置格式门禁虽已实现并通过离线检查，不能宣称当前进程已生效。GUI 安装、启用、卸载及兼容豁免按钮的确切文案未验证；本轮未执行真实写入、包安装 / 移除、版本写入或 DSH 重启。客户端拒绝保存的错误展示仍是已知限制。
+`0.2.1-rc.1` 迁移已通过一次**真实重启**验收（见 §6.4）：插件正常装载、`plugin:verify` 报 consistent、四个角色 preset 在运行期注册成功。**仍未验证的只剩一项**：`delegate_to_*` 在**选中 Switchboard preset 的会话**里的实际挂载与一次真实派发——本轮根实例自检如实报告「本作用域不挂载角色工具」（根条目只注册自检并同步配置），因此 `agentPreset` 装载期校验通过后子代理**实际拿到的**工具构成与只读裁剪仍只有离线证据（D32）。`fork` 后端移除后的角色校验、`cliToolFor` 子作用域注册同属该批。客户端半边本轮**仅静态核实**，未做真实 GUI 往返。GUI 安装、启用、卸载及兼容豁免按钮的确切文案未验证；本轮未执行包安装 / 移除或版本写入。客户端拒绝保存的错误展示仍是已知限制。
+
+### 6.4 当前本机状态（真机实测）
+
+**profile 重新注入：** 运行 `node scripts/ops/plugin-lifecycle.mjs upgrade --apply`，输出 `DSH peers：compatible`、`PASS 写后复读验证`，原文件备份为 `cordis.patch.yml.bak-lifecycle-2026-10-17T09-03-32-369Z-226b6e831bdd`；注入前 `check-profile-wiring` 曾报 `12 通过 / 1 失败`（profile 内联着 `0.2.0-rc.2` 时代的旧 preset 正文），注入后为 **13 通过 / 0 失败**。
+
+**重启后真机结果（2026-10-17）：**
+- `node scripts/ops/plugin-lifecycle.mjs verify` → `验证：consistent`、`下一步：已就绪`；Electron DSH runtime `0.2.1-rc.1`；`DSH peers：compatible`；精确豁免 `absent`（不需要豁免）。
+- 主代理调用 `switchboard_selftest`（根实例）→ `健康：健康`、无 fatal；配置 4 个角色；`roleConfig` 读取 4 个并与文件一致。
+- **四个角色 preset 在运行期注册成功**：preset roster =
+  `standard ptc minimal cordis switchboard switchboard-role-architect switchboard-role-reviewer switchboard-role-scout switchboard-role-worker`，
+  `preset 异常行：（无异常行）`。这验证了 `agentPresets.register()` 接受本插件组装的角色 preset，且行组合通过真实注册表校验——是本轮移植最关键的一条真机证据。
+- 该会话使用 `standard` preset，根实例自检据此如实报告「本作用域不挂载角色工具；配置中有 4 个角色」。
+
+**仍待完成：** **完全退出并重启 DSH**，然后跑 `plugin:verify` 与 `switchboard_selftest`。重启之前不能宣称已真机验收——角色 preset 的实际注册、`agentPreset` 装载期校验、子代理拿到的工具可见性与只读裁剪都还只有离线证据。

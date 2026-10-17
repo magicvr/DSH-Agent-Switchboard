@@ -9,7 +9,8 @@ import {
 } from '../src/cli/argv.js';
 import { classifyRun, formatRunResult, parseRouteFacts } from '../src/cli/output.js';
 import { createCliTool } from '../src/cli/provider.js';
-import { normalizeRole, toolConfigFor } from '../src/roles.js';
+import { normalizeRole, rolePresetId, toolConfigFor } from '../src/roles.js';
+import { buildRolePreset } from '../src/role-presets.js';
 
 let pass = 0;
 let fail = 0;
@@ -262,8 +263,17 @@ section('专属 CLI 工具命名一致性（跨模块）');
   check('cli 角色规范化成功', role !== null);
   const cfg = toolConfigFor(role, { maxDepth: 3 });
   const tool = createCliTool({ role, spawn: () => { throw new Error('不应执行'); } });
-  check('toolFilter.allow 与专属工具注册名一致',
-    JSON.stringify(cfg.toolFilter.allow) === JSON.stringify([tool.name]));
+  // ⚠️ 这里**曾经**断言 `cfg.toolFilter.allow === [tool.name]`。0.2.1-rc.1 删除了
+  //    `toolFilter`（键存在即装载期硬抛错）：CLI 子代理的作用域改由角色 preset 里的
+  //    一行本插件条目承载（`config.cliToolFor`），工具 Config 只负责选中该 preset。
+  const cliPreset = buildRolePreset(role, { platform: process.platform, maxDepth: 3, roles: [role] });
+  const cliToolsRow = cliPreset.plugins.find((plugin) => plugin.name === '@magicvr/dsh-agent-switchboard');
+  check('专属工具注册名与 preset 的 cliToolFor 一致',
+    JSON.stringify(cliToolsRow?.config?.cliToolFor) === JSON.stringify([role.id]));
+  check('工具 Config 改用 agentPreset 选中角色组合',
+    cfg.agentPreset === rolePresetId('codex-scout') && !Object.hasOwn(cfg, 'toolFilter'));
+  check('preset 里带有专属工具行的 id 由角色 id 派生',
+    typeof cliToolsRow?.id === 'string' && cliToolsRow.id.endsWith(role.id));
   check('工具名包含与 delegate 相同的角色后缀', tool.name === 'switchboard_cli_run_codex_scout');
   check('CLI 委派后端是 spawn', cfg.provider === 'spawn');
 }

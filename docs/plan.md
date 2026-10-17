@@ -1,6 +1,6 @@
 # 实施方案
 
-> **记录性质与 D29 当前实现补记：** 本文保留各阶段的历史方案、实测与待验收状态，不把历史记录视为当前验收结论。当前 preset 中本插件条目带 `mount: true` 与 `supervisorRules`，不带 `roles`；角色仍在 `$DSH_HOME/agent-switchboard/roles.json`。调度规则文本由 `scripts/gen-preset.mjs` 生成，字段非 volatile、无默认值、UI 不可编辑；改动后须执行 `npm run gen:preset` → `npm run inject:preset` → 重启 DSH 才生效。规则注入已实现并有离线验证；生成器新增提交纪律，提交由主代理统一执行，worker 不自行提交。新增规则的生成与检查、profile 同步及真机提示词验收须分别确认，不将源码更新视为生效（见 D29）。
+> **记录性质与 D29 当前实现补记：** 本文保留各阶段的历史方案、实测与待验收状态，不把历史记录视为当前验收结论。当前 preset 中本插件条目带 `mount: true` 与 `supervisorRules`，不带 `roles`；角色仍在 `$DSH_HOME/agent-switchboard/roles.json`。DSH 基线为 `0.2.1-rc.1`：preset 整体复制该版 standard，`instructions` / `readOnly` / `allowNestedDispatch` 由**每角色独立 Agent Preset** 承载（D32），`fork` 后端已移除，派发一律异步受理。调度规则文本由 `scripts/gen-preset.mjs` 生成，字段非 volatile、无默认值、UI 不可编辑；改动后须执行 `npm run gen:preset` → `npm run inject:preset` → 重启 DSH 才生效。规则注入已实现并有离线验证；生成器新增提交纪律，提交由主代理统一执行，worker 不自行提交。新增规则的生成与检查、profile 同步及真机提示词验收须分别确认，不将源码更新视为生效（见 D29）。
 
 > 配套阅读：[`decisions.md`](./decisions.md)（为什么这么选）、[`architecture.md`](./architecture.md)（契约与取证）。生命周期当前支持路径与验证边界见 [`lifecycle.md`](./lifecycle.md) 及本文末尾 D31 补记；上面的底层生成 / 注入步骤保留为历史记录。
 
@@ -37,6 +37,7 @@
 ├── package.json                 契约字段：exports["."] / exports["./client"] / dsh.*
 ├── cordis.patch.yml             启用 bundle 根条目，不携带角色列表
 ├── presets/switchboard.patch.yml  preset 声明，本插件带 mount: true 与 supervisorRules，不带 roles（D29）
+├── presets/standard-plugins.json  角色 preset 的行模板（生成物，与上面的 YAML 同源；D32）
 ├── README.md                    用户视角
 ├── AGENTS.md  CONTRIBUTING.md  LICENSE  .gitignore  .gitattributes  .editorconfig
 ├── docs/
@@ -48,6 +49,7 @@
 │   ├── index.js                 Host 入口、Config、配置桥接、角色工具挂载与自检
 │   ├── config-file.js           roles.json 路径、读取、原子写入与格式校验
 │   ├── roles.js                 角色解析与校验：id/标题/提示词/backend → 工具定义
+│   ├── role-presets.js          按角色裁剪 standard 行模板，组装独立 Agent Preset（D32）
 │   ├── cli/
 │   │   ├── provider.js          SubagentProvider 实现（name/capabilities/start）
 │   │   ├── drivers.js           codex / grok / custom 驱动预设
@@ -163,7 +165,7 @@
 | 1 | 角色工具出现在工具清单 | ✅ | 4 个 `delegate_to_*` 工具上线 |
 | 2 | 真实派发并拿回结果 | ✅ | 向 scout 派发三个可核对问题，答案与引用均正确 |
 | 3 | `readOnly` 约束生效 | ✅ | scout 拒绝修改文件；其工具清单无 `write`/`edit`/`pwsh`，而 worker 有 |
-| 4 | `persona` 生效 | ✅ | scout 按角色的「证据优先」格式作答，给出 `src/roles.js:24–32` 等精确引用 |
+| 4 | `persona` 生效 | ✅ | scout 按角色的「证据优先」格式作答，给出 `src/roles.js:24–32` 等精确引用。⚠️ 这是 `0.2.0-rc.2` 时代的 `dsh-tool-subagent.persona` 机制；`0.2.1-rc.1` 起角色 persona 改由角色 preset 的 `dsh-persona.config.prefix` 承载（D32），当时的行为等价，但承载点已变，需要重新真机验收 |
 | 5 | 嵌套派发默认关闭 | ✅ | 角色工具配置 `maxDepth: 1`，子代理无法再派 |
 | 6 | 路由指引传达给主代理 | ✅ | 系统提示中出现 `## Subagent roles` 段 |
 | 7 | **模型按角色切换** | ✅ | 见下 |
@@ -237,7 +239,7 @@
 - Claude 与 grok 的入口及非交互调用已做历史实测（见 `cli-backends.md` §3.0 / §4.0），不能再统称未实测。Claude 本机端到端失败，`--effort` 被接受不等于强度实际生效。
 - grok 已有 `grok-4.7` + `low` 调用成功记录及非法模型失败记录；其它模型/强度组合与路由生效对照**未实测**。当前预设改用 `promptFile`，本轮仅核对实现，不新增真机结论。
 - 超时与取消已有离线检查，但真实 CLI 进程树是否清理干净**仍未实测**（见 `cli-backends.md` §6）。
-- CLI 后端的「只读」是**声明性**的：由 CLI 自身的沙箱参数实现（codex 的 `-s read-only`，真机日志里 `sandbox: read-only` 可证），插件无法越过 CLI 强制执行。角色 `readOnly` 对 CLI 后端不产生 `toolFilter`。
+- CLI 后端的「只读」是**声明性**的：由 CLI 自身的沙箱参数实现（codex 的 `-s read-only`，真机日志里 `sandbox: read-only` 可证），插件无法越过 CLI 强制执行。`0.2.1-rc.1` 起角色 `readOnly` 对内置路径由**角色 preset 的行裁剪**落地（裁掉 shell / goal / todo / plugin 行 + 关闭 `tool-fs` 的写入），CLI 路径仍取决于该 CLI 自身的沙箱参数；两种情况下都不再存在 `toolFilter`（该 Config 字段已从 `dsh-tool-subagent` 删除，见 D32）。
 
 ## Phase 4 · 可观测性与打磨
 
@@ -250,7 +252,7 @@
   `remote.settings.mutate(ns, [{op:'set',path:['roles'],value}], revision)`；Host 侧把角色
   同步到角色文件，并非客户端直接写 JSON。preset 中本插件带 `mount: true` 与 `supervisorRules`，不得携带 `roles`（D29 补记）
   （`scripts/check-profile-wiring.mjs`）；启动时加载的常驻 preset 在本作用域 Cordis 角色非空时优先使用它，否则读文件。
-  根实例把保存值写入文件后广播专用事件，驱动常驻 preset 代际重挂；新会话仍只继承现有 preset、不重新 apply。既有会话后续派发与下次提示组装无需重启即可取新配置，非法配置或注册失败回滚，旧代在预检/子代理/后台租约归零后释放。已执行任务与历史上下文不改写。离线集成与变异实验已覆盖，真机保存往返及在途 CLI 验收待执行。历史路径与当前机制见 `decisions.md` D14、D22 修正及 D24。
+  根实例把保存值写入文件；⚠️ 下文「广播专用事件、驱动常驻 preset 代际重挂」属 [D24](./decisions.md) 的**历史实现**，已由 D25 的执行期延迟解析取代；`instructions` / `readOnly` / `allowNestedDispatch` 自 `0.2.1-rc.1` 起是组合期事实，改它们需要重新注册 preset（D32）。新会话仍只继承现有 preset、不重新 apply。既有会话后续派发与下次提示组装无需重启即可取新配置（限 `model` / `effort` / 包裹路由等执行期字段）；已执行任务与历史上下文不改写。历史路径与当前机制见 `decisions.md` D14、D22 修正、D24、D25、D32。
 - 并发与预算上限
 - README 补真实用法示例
 
@@ -265,7 +267,7 @@
 | R5 | Client 半边崩溃会清空整个 slot | 可能拖垮 GUI 的一块区域 | 第一期只做只读、最小 DOM；严守「不 import Harness Client 包」 |
 | R6 | 角色列表若仅放 patch，用户在 GUI 里改不了 | 与「面板配置角色」的期望有落差 | **已解决（D13 / D14）**：设置页经根配置桥接，Host 同步角色文件；preset 带 `mount: true` 与 `supervisorRules`（D29 补记），不带 `roles`；设置页已实测可见可改 |
 | R7 | 外部 CLI 的额度/登录状态不透明 | 派发失败原因难定位 | 结果里保留原始 stderr 与退出码（D8），不做美化丢弃 |
-| R8 | **link 模式下 Host 半边改动无法热加载** | 每次改动都需重启 dsh 才能真机验证，迭代慢 | 已实测确认（`architecture.md` 第 3.3 节）。缓解：把逻辑尽可能放进可用抽取方式验证的纯函数；Client 半边不受此限（有 HMR）；角色设置由 D24 事件驱动代际重挂，无需重启，Host 源码仍需重启一次装载 |
+| R8 | **link 模式下 Host 半边改动无法热加载** | 每次改动都需重启 dsh 才能真机验证，迭代慢 | 已实测确认（`architecture.md` 第 3.3 节）。缓解：把逻辑尽可能放进可用抽取方式验证的纯函数；Client 半边不受此限（有 HMR）；角色配置由 D25 的执行期延迟解析驱动，无需重启，Host 源码仍需重启一次装载。⚠️ `instructions` / `readOnly` / `allowNestedDispatch` 自 `0.2.1-rc.1` 起是组合期事实，改它们需要重新注册 preset（D32），不能算作热更新范围 |
 | R9 | **`failed to import` 会掩盖真实错误** | 排查方向被误导，可能浪费大量时间（Phase 1 已实际发生） | 已记录取证手法（`architecture.md` 第 3.2 节）：先用落地文件探针判定「模块是否已加载」，再查 `apply` 内部 |
 | R10 | **插件自身缺陷可能让应用起不来** | 用户进不去，只能禁用插件；而**禁用操作会重写 profile 并丢弃条目**（实测发生两次） | `apply` 整体包一层兜底 try/catch；**不注册任何 Cordis 服务**（有测试锁死）；客户端不用自建远程命名空间；`decisions.md` D14 第 5、6 条 |
 | R11 | **平台能力被「自己发明」而非「照官方实现」** | 连续三次失败、多次重启（实测发生） | 先读同构先例再动手（D14 第 8 条）；`scripts/check-profile-wiring.mjs` 之类的**显式断言**挡住「静默不存在」 |
@@ -415,3 +417,38 @@
 ### 仍未验收与限制
 
 `src/` 新增 `switchboard_selftest` 版本字段与格式门禁尚未在完整重启后的 DSH 上验收，不能将离线通过视为当前进程生效。真实生命周期写入、版本写入、CLI 包安装 / 移除与 GUI 按钮确切文案未在本轮验证。模块或版本改动必须完整重启，reload 无效。`future` / `unsupported` 被 Host 拒写时，diagnostics 和自检报告不健康，但 GUI 仍可能提示保存已接受；客户端错误展示尚未接入。
+
+## 附：DSH `0.2.1-rc.1` 移植实施结果（2026-10-17）
+
+**状态：实现与离线取证已落地；未经过一次真实 DSH 重启，客户端半边仅静态核实。** 决策依据、被否决的替代方案与精确 pin 的取舍见 [D32](./decisions.md)。
+
+### 变更清单
+
+| 项 | 内容 |
+| --- | --- |
+| 版本门禁 | `dsh-app-boot.unmetRequirements()`：`engines.dsh` 存在则单独决定并忽略 peers，否则逐条校验 DSH peers。本插件不写 `engines.dsh`，四个 dsh peers 精确 pin 到 `0.2.1-rc.1`（cordis 4.0.5 / schemastery 3.18.5 同样精确） |
+| persona / toolFilter | 两者已从 `dsh-tool-subagent` 的 Config 删除，键存在即装载期抛错；`backgroundMode` / `enableRunInBackground` 一并删除。角色 persona 与工具构成改由**每角色独立 Agent Preset** 承载（新增 `src/role-presets.js`、生成物 `presets/standard-plugins.json`） |
+| fork | 后端移除：`dsh-subagent-fork-in-process` 的 `capabilities.agentPreset: false` + `inheritsParentContext: true` 使其无法承载角色指令与工具限制；`BUILTIN_PROVIDERS` 现为 `['spawn']`，`backend: 'fork'` 被校验拒绝 |
+| 派发语义 | 一律异步受理：工具返回 `{ kind: 'activation', subagentId }`，结果以完成通知送达；无前台 / 后台模式。注入的调度规则与路由指引已按此改写 |
+| preset 再生成 | `presets/switchboard.patch.yml` 与 `presets/standard-plugins.json` 按 `0.2.1-rc.1` 的 standard 重新生成（新增 time-context / tool-schedule / plugin-market/tools；移除 codex / claude-code / ralph 三行；去掉 persona `suffix` 与 subagent 的 `backgroundMode`） |
+| 检查链 | `npm run check` 现以 `node scripts/gen-preset.mjs --check` 收尾，同时比对两个生成物；`check-profile-wiring.mjs` 新增「仓库 peers 满足安装归档运行时」与「`node_modules` 里每个 `@deepseek-ai/dsh*` 等于运行时」两条断言（归档不可用时显式 SKIP + 未验证告警）；`check-lifecycle.mjs` 的 fixture 运行时版本改为跟随仓库唯一精确 pin |
+| 客户端 | 卡片交互与校验逻辑未改；本轮仅静态核实，真实 GUI 往返未执行 |
+
+### 验收证据（离线）
+
+- `node scripts/gen-preset.mjs --check`：`standard 插件数: 22`、`合计 23`、`!!js 表达式 2 → 2`、YAML 与行模板均无漂移，退出 `0`。
+- `npm run check`：全链退出 `0`（`check-roles` 309、`check-drivers` 130、`check-cli` 71、`check-cli-provider` 292、`check-config-*` 全部通过 / 33 / 67、`check-apply` 383、`check-validation-parity` 56、`check-client` 328、`check-profile-wiring` 13、`check-version` 107、`check-lifecycle` 213、`check-script-portability` 146，均 `0 失败`）。
+- `node scripts/check-profile-wiring.mjs`：**13 通过 / 0 失败**。运行时 `0.2.1-rc.1`；仓库 DSH 要求满足运行时；仓库 `node_modules` 23 个 `@deepseek-ai/dsh*` 全部等于运行时。（重新注入 preset 之前该项曾报 `12 通过 / 1 失败`，失败项即 profile 仍内联 `0.2.0-rc.2` 时代的旧 preset 正文。）
+
+### 验收证据（真机，2026-10-17 完全重启后）
+
+- `node scripts/ops/plugin-lifecycle.mjs verify`：`验证：consistent`、`下一步：已就绪`；Electron DSH runtime `0.2.1-rc.1`；`DSH peers：compatible`；精确豁免 `absent`（不需要）。
+- 主代理调用 `switchboard_selftest`（根实例）：`健康：健康`，无 fatal；配置 4 个角色，`roleConfig 状态` 为「已从 roles.json 读取 4 个角色 / 文件已与配置一致」。
+- **角色 preset 注册成功（本轮移植最关键的机制）**：preset roster 为
+  `standard ptc minimal cordis switchboard switchboard-role-architect switchboard-role-reviewer switchboard-role-scout switchboard-role-worker`，
+  且 `preset 异常行：（无异常行）`——即 `agentPresets.register()` 接受了四个角色 preset，行组合通过真实注册表校验。
+- 该会话使用 `standard` preset，因此根实例自检如实报告「本作用域不挂载角色工具；配置中有 4 个角色」——这是**设计使然**，不是失败。
+
+### 仍未验收
+
+只剩一项，且需要**切换会话 preset** 才能触发：确认 `delegate_to_*` 在**选中 Switchboard preset 的会话**里实际挂载（那里自检应报 `已挂载角色工具：4`）并完成一次真实派发，从而覆盖 `agentPreset` 装载期校验与子代理实际拿到的工具构成 / 只读裁剪。客户端半边（卡片、保存往返、错误展示）仍只有静态核实。

@@ -2,8 +2,9 @@
 //
 // 为什么必须做：本插件曾让应用无法启动。必须在不重启的前提下，用假 ctx 把
 // 根路径与 preset 路径都真跑一遍 —— 重启一次的成本太高，而且失败会让用户进不去。
-// 覆盖边界：派发使用真实 Config / 工具插件，start 是含真实 resolveChildDepth 的桩。
-// 另用真实 Cordis + ToolRuntime + applyChildComposition 验证 child 工具过滤执行；
+// 覆盖边界：派发使用真实 Config / 工具插件，startActivation 是含真实 resolveChildDepth 的桩。
+// 角色 persona 与工具构成在 0.2.1-rc.1 起由**角色 Agent Preset** 承载（夹具提供
+// `agentPresets` 记录桩），工具结果固定为 `{kind:'activation', subagentId}`；
 // 不是真实 spawn 集成，未验证 preset 继承与完整上下文隔离，见 D21。
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -13,9 +14,9 @@ import { dirname, join } from 'node:path';
 import { createScope, scopeChainOf, scopeOf } from '@deepseek-ai/dsh-scope';
 import { Context } from '@deepseek-ai/cordis';
 import { ToolRuntime } from '@deepseek-ai/dsh-tools';
-import { applyChildComposition, delegationDepthOf, resolveChildDepth } from '@deepseek-ai/dsh-subagent';
+import { delegationDepthOf, resolveChildDepth } from '@deepseek-ai/dsh-subagent';
 import { apply, Config, liveRoleTools, selftestTool } from '../src/index.js';
-import { toolConfigFor } from '../src/roles.js';
+import { normalizeRole, rolePresetId, toolConfigFor } from '../src/roles.js';
 import { parse } from 'yaml';
 import { captureSync } from './lib/capture.mjs';
 import { configPathFor, initialConfig, readConfigFile, writeConfigFile } from '../src/config-file.js';
@@ -58,28 +59,77 @@ function commitVolatile(ref, value) {
 }
 
 /**
+ * `agentPresets` 服务桩。
+ *
+ * 0.2.1-rc.1 起角色的 persona 与工具构成**不再**由 `dsh-tool-subagent` 的 Config 承载，
+ * 而是移进每个角色自己的 **Agent Preset**：`src/index.js` 挂角色工具前必须先经
+ * `ctx.get('agentPresets').register(definition)`（返回 `Promise<disposer>`）注册，
+ * 服务缺失或注册失败都会让本次装载 `fatal`。
+ *
+ * 真实 `dsh-tool-subagent` 在组合期还会读这个服务：
+ *   - `SubagentPresetSelection.validate()` → `readDocument(config.agentPreset)`，
+ *     未声明的 preset 会直接抛错；
+ *   - 自检的 preset 诊断读 `list()` 与 `compositionInventory()`。
+ * 因此桩必须同时提供这四项，缺一项都会把「夹具缺服务」误报成产品缺陷。
+ *
+ * @returns {object} 记录型 agentPresets 服务桩。
+ */
+function makePresetService() {
+  const definitions = [];
+  return {
+    definitions,
+    register(definition) {
+      definitions.push(definition);
+      return Promise.resolve(() => {
+        const index = definitions.indexOf(definition);
+        if (index >= 0) definitions.splice(index, 1);
+      });
+    },
+    async readDocument(id) {
+      const found = definitions.find((definition) => definition.id === id);
+      if (found === undefined) throw new Error(`agentPresets: 未注册的 preset "${id}"`);
+      return { id: found.id, name: found.name, description: found.description };
+    },
+    async list() {
+      return definitions.map((definition) => ({ id: definition.id, name: definition.name,
+        description: definition.description, isDefault: false }));
+    },
+    async compositionInventory() {
+      // fiberState 2 === FiberState.ACTIVE；自检据此报告「异常行」。
+      return definitions.map((definition) => ({ id: definition.id,
+        rows: definition.plugins.map((plugin, index) => ({ entryId: `${definition.id}#${index}`,
+          moduleName: plugin.name, fiberState: 2 })) }));
+    },
+  };
+}
+
+/**
  * 造一个足够真的假 Cordis ctx。
  *
  * 只实现本插件实际用到的东西：`get` / `tools.register` / `plugin` / `subagents` /
- * `systemPrompt` / `subprocess` / `profileContext`。刻意保持最小，这样任何「用到别的东西」
- * 都会立刻暴露成错误，而不是被一个过宽的桩掩盖。
+ * `systemPrompt` / `subprocess` / `agents` / `sessionProjections` / `agentPresets` /
+ * `profileContext`。刻意保持最小，这样任何「用到别的东西」都会立刻暴露成错误，
+ * 而不是被一个过宽的桩掩盖。
  *
  * @param {object} options - 选项。
  * @param {boolean} options.provideProfileContext - 是否提供 profileContext。
  * @param {boolean} options.provideReflect - 是否提供 reflect.provide。
  * @param {object} [options.scope] - 注册工具的 scope；省略时写入 global。
+ * @param {object} [options.presetService] - 复用的 agentPresets 桩；省略时新建一个。
  * @returns {object} 假 ctx。
  */
-function makeCtx({ provideProfileContext = true, provideReflect = true, scope } = {}) {
+function makeCtx({ provideProfileContext = true, provideReflect = true, scope, presetService } = {}) {
   const registered = [];
   const provided = [];
   const globalTools = new Map();
   const scopedTools = new Map();
   const services = new Map();
   const toolFaces = new WeakMap();
+  const presets = presetService ?? makePresetService();
   let ctx = {
     registered,
     provided,
+    presets,
     // Cordis 的 ctx.provide 混入入口与 reflect.provide 共用同一调用记录。
     provide(name, instance) {
       this.reflect.provide(name, instance);
@@ -95,6 +145,16 @@ function makeCtx({ provideProfileContext = true, provideReflect = true, scope } 
       }
       return services.get(key);
     },
+    // 真实 apply 会订阅 provider / agent 生命周期事件；桩只需可订阅、可释放。
+    on() {
+      return () => {};
+    },
+    // 真实 apply 用 ctx.effect 注册工具定义并返回 disposer。
+    effect(callback) {
+      const dispose = callback();
+      return typeof dispose === 'function' ? dispose : () => {};
+    },
+    logger: { info() {}, warn() {}, error() {} },
     // ⚠️ 必须存在：`RoleConfigService extends TypertRemoteService`，其构造会经由
     //    `Service` 同步调用 `ctx.reflect.provide()`。缺了它就会走「注册失败」的降级路径
     //    —— 那本身也是我们要测的一种情况，因此不能把它变成永远成功的桩。
@@ -158,15 +218,50 @@ function makeCtx({ provideProfileContext = true, provideReflect = true, scope } 
       if (config?.toolName) this.get('tools').register({ name: config.toolName });
       return { ctx: this, dispose() {} };
     },
+    // 真实 dsh-tool-subagent（0.2.1-rc.1）在装载期就要解析 provider 能力：
+    //   - assertProvider：配置了 agentPreset 时要求 capabilities.agentPreset 且不继承父上下文；
+    //   - maxDepth 需要 capabilities.depthLimit；agentOptions 需要 capabilities.agentOptions。
+    // 桩必须如实声明这三项，否则真实 apply 会把夹具缺陷报成配置错误。
     subagents: {
       registerProvider() {
         return { dispose() {} };
+      },
+      getProvider(name) {
+        return name === 'spawn'
+          ? { name: 'spawn', inheritsParentContext: false,
+              capabilities: { depthLimit: true, agentOptions: true, agentPreset: true } }
+          : undefined;
+      },
+      resolveMaxDepth(depth) {
+        return depth === 'provider-managed' ? undefined : depth;
+      },
+      // 0.2.1-rc.1 的派发是「启动即返回」：工具只拿到 childId，不再等待子代理输出。
+      async startActivation(spec) {
+        return { childId: `fixture-child-${spec?.request?.agentPreset ?? 'none'}` };
       },
     },
     systemPrompt: {
       section() {
         return { dispose() {} };
       },
+      context() {
+        return { dispose() {} };
+      },
+      getContextOrder() {
+        return 0;
+      },
+      getSectionOrder() {
+        return 0;
+      },
+    },
+    // 真实 apply 的 standing 组合路径要求 Agent 注册表与投影注册表可用。
+    agents: {
+      list() {
+        return [];
+      },
+    },
+    sessionProjections: {
+      register() {},
     },
     subprocess: {
       spawn() {
@@ -177,7 +272,10 @@ function makeCtx({ provideProfileContext = true, provideReflect = true, scope } 
       },
     },
   };
-  for (const key of ['tools', 'subagents', 'systemPrompt', 'subprocess']) services.set(key, ctx[key]);
+  for (const key of ['tools', 'subagents', 'systemPrompt', 'subprocess', 'agents', 'sessionProjections']) {
+    services.set(key, ctx[key]);
+  }
+  services.set('agentPresets', presets);
   if (scope !== undefined) ctx = createScope(ctx, scope).ctx;
   // makeCtx 返回插件实例；扩展/私有 scope 没有声明 inject，实例声明依赖可直接读取。
   for (const key of services.keys()) Object.defineProperty(ctx, key, {
@@ -853,6 +951,9 @@ section('诊断边界：不可查询、零角色、非法配置与服务注册 s
     providers: [],
     executables: [],
     blocked: [],
+    // 0.2.1-rc.1 新增：角色 preset（persona 与工具构成的承载点）。
+    // 自检现在无条件读 diagnostics.presets.length，手工夹具必须一并提供。
+    presets: [],
   });
   const noTools = makeCtx();
   noTools.get = () => undefined;
@@ -1000,8 +1101,15 @@ section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失
         && ctx.tools.get('delegate_to_cli_worker', scope) && !ctx.tools.get('switchboard_cli_run_cli_worker'));
       check('专属 CLI 工具先于角色插件挂载', registeredBeforeDelegate
         && ctx.registered.indexOf('switchboard_cli_run_cli_worker') < ctx.registered.indexOf('delegate_to_cli_worker'));
-      check('apply 的 CLI 配置使用 spawn 和自身 allow', configs[0].provider === 'spawn'
-        && JSON.stringify(configs[0].toolFilter.allow) === '["switchboard_cli_run_cli_worker"]');
+      // ⚠️ 这里**曾经**断言 `configs[0].toolFilter.allow === ['switchboard_cli_run_cli_worker']`。
+      //    0.2.1-rc.1 起 `toolFilter` 已从 Config 移除（键存在即装载期硬抛错）：
+      //    「CLI 包裹只拿自己的专属工具」改由角色 preset 里的一行本插件条目承载
+      //    （`config.cliToolFor`），工具配置本身只负责选中该 preset。
+      const cliPreset = ctx.presets.definitions.find(definition => definition.id === rolePresetId('cli-worker'));
+      const cliToolsRow = cliPreset?.plugins.find(plugin => plugin.name === '@magicvr/dsh-agent-switchboard');
+      check('apply 的 CLI 配置使用 spawn 并选中角色 preset，专属 CLI 工具由 preset 行承载',
+        configs[0].provider === 'spawn' && configs[0].agentPreset === rolePresetId('cli-worker')
+          && JSON.stringify(cliToolsRow?.config?.cliToolFor) === '["cli-worker"]');
       check('CLI 两个工具齐全时自检健康', result.ok && result.roleCount === 2);
       // 在 apply 后才出现的可选 Jobs 服务也应被工具读取，而非注册时固定快照。
       const listeners = new Set();
@@ -1059,13 +1167,17 @@ section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失
   }
 }
 
-section('契约模拟（真实 Config / 工具插件，start 为桩）：按已挂载清单生成出站权限');
+section('契约模拟（真实 Config / 工具插件，startActivation 为桩）：角色 preset 与深度预算');
 {
   const { cliFieldsFor } = await import('../src/cli/drivers.js');
-  const ctx = makeCtx({ scope: {} });
+  // ⚠️ 刻意**不带** scope：0.2.1-rc.1 的 dsh-tool-subagent 在「已配置 agentPreset +
+  //    有作用域 + 无 session」时走 standing 组合，工具要等 agent/created 才按 agent 装；
+  //    compositionScope 为 undefined 时则当场直接安装，本节的记录桩才能拿到定义。
+  //    （真实 DSH 里两条路径都会生效；这里只选可观测的那条。）
+  const ctx = makeCtx();
   const requests = [], validatedConfigs = [], events = new Map();
   const fixtureGet = ctx.get.bind(ctx);
-  // 仅通过内置角色的路由预检，不调用模型；本节验证权限而非 LLM 线路。
+  // 仅通过内置角色的路由预检，不调用模型；本节验证角色组合与深度预算，而非 LLM 线路。
   ctx.get = key => key === 'llm' ? { async resolveCallConfig(config) { return config; } } : fixtureGet(key);
   let guidance = '';
   ctx.on = (name, handler) => {
@@ -1075,27 +1187,33 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
   };
   ctx.sessionProjections = { register() {} };
   ctx.subagents.resolveMaxDepth = depth => depth;
-  const providers = new Map(['spawn', 'fork'].map(name => [name, { name, inheritsParentContext: false,
-    capabilities: { depthLimit: true, agentOptions: true, persona: true, toolFilter: true } }]));
+  // ⚠️ capabilities 必须如实声明 `agentPreset`：配置了 agentPreset 的工具体会经
+  //    presets.assertProvider 校验「provider 支持独立 preset 选择且不继承父上下文」。
+  //    旧夹具声明的是 persona/toolFilter 能力，那两个 Config 字段已从 0.2.1-rc.1 删除。
+  const providers = new Map([['spawn', { name: 'spawn', inheritsParentContext: false,
+    capabilities: { depthLimit: true, agentOptions: true, agentPreset: true } }]]);
   ctx.subagents.getProvider = name => providers.get(name);
   // 不创建 spawn child；入站边界由真实 DSH 函数执行，不能让记录桩放过超界请求。
-  ctx.subagents.start = async (_provider, request) => {
-    resolveChildDepth(request.parent, request.maxDepth);
-    requests.push(request);
-    return { id: 'fixture-run', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose() {} };
+  // 0.2.1-rc.1 的入口是 startActivation：启动即返回 childId，不再等待子代理输出。
+  ctx.subagents.startActivation = async spec => {
+    resolveChildDepth(spec.request.parent, spec.request.maxDepth);
+    requests.push(spec.request);
+    return { childId: `fixture-child-${requests.length}` };
   };
   ctx.systemPrompt.section = section => {
     if (section.name === 'agent-switchboard:roles') guidance = section.text;
     return () => {};
   };
   // 独立验证真实 Config；官方插件 apply 仍接收原 getter 对象，不冻结成校验产物。
+  // ⚠️ 官方 apply 自 0.2.1-rc.1 起是 async：必须 await，否则它的抛错会变成被丢弃的
+  //    rejected promise —— 既不会被下面的断言看到，也会直接终止进程。
   const scopePlugin = ctx.plugin;
-  ctx.plugin = function (module, config) {
+  ctx.plugin = async function (module, config) {
     if (!config) return scopePlugin.call(this, module, config);
     const validated = module.Config['~standard'].validate(config);
     if (validated.issues) throw new Error(JSON.stringify(validated.issues));
     validatedConfigs.push(validated.value);
-    module.apply(this, config); // 官方 apply 直接读取 getter；schema 仅作独立契约校验。
+    await module.apply(this, config); // 官方 apply 直接读取 getter；schema 仅作独立契约校验。
     return { dispose() {} };
   };
   ctx.tools.register({ name: 'read' });
@@ -1123,36 +1241,105 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
   }) === 1);
   const exec = { agent: parent, signal: new AbortController().signal };
   const organizer = ctx.tools.get('delegate_to_organizer', scope);
-  await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
+  const organizerResult = await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
   const first = requests.at(-1);
-  check('真实插件校验后：CLI true 能看到后挂载的全部受控 delegate',
-    ['organizer', 'leaf', 'builtin_leaf', 'builtin_organizer'].every(id => first.toolFilter.allow.includes(`delegate_to_${id}`)));
-  check('真实插件请求不开放 workflow、通用 subagent 和其他角色 CLI 工具',
-    !first.toolFilter.allow.includes('workflow') && !first.toolFilter.allow.includes('subagent')
-      && !first.toolFilter.allow.includes('switchboard_cli_run_leaf'));
-  check('真实插件 persona 使用同一有效清单，保留预算提示', first.persona.includes('delegate_to_leaf')
-    && first.persona.includes('剩余深度预算') && !first.persona.includes('不要调用其他角色的工具'));
-  check('guidance 用实际挂载清单生成有效出站提示', guidance({ agent: { session: { header: {} }, options: {} } }).includes('may delegate further')
+  // ⚠️ 这里**曾经**断言 `first.toolFilter.allow` 与 `first.persona`。0.2.1-rc.1 把角色的
+  //    persona 与工具构成移进独立 Agent Preset：请求只带 `agentPreset`，过滤在组合期完成。
+  check('真实插件请求改由 agentPreset 选中角色组合（旧 persona/toolFilter 已从请求移除）',
+    first.agentPreset === rolePresetId('organizer')
+      && !Object.hasOwn(first, 'persona') && !Object.hasOwn(first, 'toolFilter'));
+  // 工具结果是 {kind:'activation', subagentId}：启动即返回，旧的 kind:'foreground' 前台
+  // 结算（等子代理输出）在 0.2.1-rc.1 已不存在。
+  check('真实插件：CLI organizer 派发返回 activation + subagentId（前台结算已移除）',
+    organizerResult?.kind === 'activation' && typeof organizerResult.subagentId === 'string'
+      && Object.keys(organizerResult).sort().join(',') === 'kind,subagentId', JSON.stringify(organizerResult));
+  check('真实插件组织者请求深度为插件绝对上限 2', first.maxDepth === 2 && first.parent === parent);
+  check('guidance 仍由实际角色清单生成有效出站提示', guidance({ agent: { session: { header: {} }, options: {} } }).includes('may delegate further')
     && guidance({ agent: { session: { header: {} }, options: {} } }).includes('cannot delegate further'));
   const beforeLeaf = requests.length;
   let leafResult, leafError;
   try { leafResult = await ctx.tools.get('delegate_to_leaf', scope).execute({ prompt: 'T', description: 'fixture' }, exec); }
   catch (caught) { leafError = caught; }
   const leafRequest = requests.at(-1);
-  check('真实插件叶子 CLI 入站使用插件上限 2，出站只有专属 CLI 工具', leafRequest.maxDepth === 2
-    && JSON.stringify(leafRequest.toolFilter.allow) === '["switchboard_cli_run_leaf"]');
+  check('真实插件叶子 CLI 请求选中自身 preset、深度为插件上限 2',
+    leafRequest.agentPreset === rolePresetId('leaf') && leafRequest.maxDepth === 2);
   check('真实插件父深度 1 调用叶子 CLI 成功，真实 DSH 解析 child 深度为 2',
-    !leafError && requests.length === beforeLeaf + 1 && leafResult?.kind === 'foreground'
+    !leafError && requests.length === beforeLeaf + 1 && leafResult?.kind === 'activation'
       && resolveChildDepth(parent, leafRequest.maxDepth) === 2, leafError?.message);
+  const expectedPresets = ['organizer', 'leaf', 'builtin-leaf', 'builtin-organizer'].map(rolePresetId).sort();
   check('真实 Config 中所有目标角色都使用插件上限 2', validatedConfigs.length === 4
     && validatedConfigs.every(config => config.maxDepth === 2));
+  check('真实 Config 每个角色都选中自己的 agentPreset，且无已删除字段',
+    JSON.stringify(validatedConfigs.map(config => config.agentPreset).sort()) === JSON.stringify(expectedPresets)
+      && validatedConfigs.every(config => !['persona', 'toolFilter', 'backgroundMode', 'enableRunInBackground']
+        .some(field => Object.hasOwn(config, field))));
+
+  // 旧的「真实 Cordis + ToolRuntime + applyChildComposition」子节断言的是 `request.toolFilter`
+  // 驱动出的 child 工具可见性。0.2.1-rc.1 删除了 toolFilter：子代理的工具集合现在由
+  // **角色 preset 的插件行**固定表达，运行时不再有「继承父 preset 再过滤」这一步。
+  // 因此改为直接断言已注册 preset 的行构成，覆盖面等价：内置角色拿普通工具但没有
+  // 非受控派发入口；CLI 角色只拿 persona + 自己的 CLI 工具 + 允许的受控委派行。
+  const presetById = id => ctx.presets.definitions.find(definition => definition.id === rolePresetId(id));
+  const presetRowIds = definition => definition.plugins.map(plugin => plugin.id).filter(id => id !== undefined);
+  const uncontrolled = ['tool-subagent', 'tool-subagent-fork', 'tool-ralph', 'tool-workflow', 'workflow-ptc'];
+  const allRoleIds = ['organizer', 'leaf', 'builtin-leaf', 'builtin-organizer'];
+  const toolNameOf = id => `delegate_to_${id.replace(/-/g, '_')}`;
+  const presetIdOfToolName = Object.fromEntries(allRoleIds.map(id => [toolNameOf(id), rolePresetId(id)]));
+  check('四个角色都注册了独立 preset', ctx.presets.definitions.length === 4
+    && allRoleIds.every(id => presetById(id) !== undefined));
+  check('每个 preset 内行 id 唯一', ctx.presets.definitions.every(definition => {
+    const ids = presetRowIds(definition);
+    return new Set(ids).size === ids.length;
+  }));
+  for (const [id, nested] of [['builtin-leaf', false], ['builtin-organizer', true]]) {
+    const definition = presetById(id);
+    const delegationGroup = definition.plugins.find(plugin => plugin.id === 'delegation');
+    const groupChildIds = (delegationGroup?.config ?? []).map(child => child.id);
+    const delegateRows = definition.plugins.filter(plugin => plugin.name === '@deepseek-ai/dsh-tool-subagent');
+    const expectedTargets = allRoleIds.filter(target => target !== id).map(toolNameOf).sort();
+    check(`${id} preset：persona 行恰好一行且携带角色指令`,
+      definition.plugins.filter(plugin => plugin.name === '@deepseek-ai/dsh-persona').length === 1
+        && definition.plugins.find(plugin => plugin.id === 'persona')?.config?.prefix === fixtureRole.instructions);
+    check(`${id} preset：保留普通工具行且不含任何非受控派发入口`,
+      presetRowIds(definition).includes('tool-fs')
+        && !presetRowIds(definition).some(rowId => uncontrolled.includes(rowId))
+        && !groupChildIds.some(rowId => uncontrolled.includes(rowId)));
+    check(`${id} preset：受控委派行符合 allowNestedDispatch=${nested}`,
+      nested
+        ? JSON.stringify(delegateRows.map(row => row.config.toolName).sort()) === JSON.stringify(expectedTargets)
+          && delegateRows.every(row => row.config.provider === 'spawn'
+            && row.config.agentPreset === presetIdOfToolName[row.config.toolName])
+        : delegateRows.length === 0);
+  }
+  const cliLeafPreset = presetById('leaf');
+  check('CLI leaf preset 刻意最小：persona + 自身 CLI 行，无标准工具行',
+    presetRowIds(cliLeafPreset).join(',') === 'persona,switchboard-cli-tools-leaf'
+      && !presetRowIds(cliLeafPreset).includes('tool-fs'));
+  check('CLI leaf preset 的专属 CLI 行只含自己',
+    JSON.stringify(cliLeafPreset.plugins.find(plugin => plugin.id === 'switchboard-cli-tools-leaf')?.config?.cliToolFor)
+      === '["leaf"]');
+  const cliOrganizerPreset = presetById('organizer');
+  const cliOrganizerRows = cliOrganizerPreset.plugins.filter(plugin => plugin.name === '@deepseek-ai/dsh-tool-subagent');
+  const cliExpectedTargets = allRoleIds.filter(target => target !== 'organizer').map(toolNameOf).sort();
+  check('CLI organizer preset：每个其它角色一行受控委派并指向对方的角色 preset',
+    JSON.stringify(cliOrganizerRows.map(row => row.config.toolName).sort()) === JSON.stringify(cliExpectedTargets)
+      && cliOrganizerRows.every(row => row.config.provider === 'spawn'
+        && row.config.agentPreset === presetIdOfToolName[row.config.toolName]));
+  check('CLI organizer preset 不含标准工具行（旧 toolFilter.allow 白名单语义）',
+    !presetRowIds(cliOrganizerPreset).includes('tool-fs')
+      && !presetRowIds(cliOrganizerPreset).includes('delegation'));
+
   const toolModule = await import('@deepseek-ai/dsh-tool-subagent');
   for (const maxDepth of [0, 1, 3]) {
     const config = toolConfigFor({ id: `budget-${maxDepth}`, backend: 'cli', instructions: 'i',
       toolName: `delegate_to_budget_${maxDepth}`, allowNestedDispatch: false }, { maxDepth });
+    // 真实 apply 会校验 agentPreset 指向的 preset 已声明；预算探针也必须先注册
+    // （0.2.1-rc.1 的新装载期前置条件，旧 Config 没有这一层）。
+    await ctx.presets.register({ id: rolePresetId(`budget-${maxDepth}`), name: `budget-${maxDepth}`,
+      description: '预算探针', plugins: [] });
     const validated = toolModule.Config['~standard'].validate(config);
     if (validated.issues) throw new Error(JSON.stringify(validated.issues));
-    toolModule.apply(ctx, validated.value);
+    await toolModule.apply(ctx, validated.value);
     for (let parentDepth = 0; parentDepth <= 1 + maxDepth; parentDepth++) {
       const depthParent = { ...parent, options: { ...parent.options, subagentDepth: parentDepth } };
       const before = requests.length;
@@ -1162,85 +1349,49 @@ section('契约模拟（真实 Config / 工具插件，start 为桩）：按已�
       const allowed = parentDepth <= maxDepth;
       check(`真实插件预算 ${maxDepth}：父深度 ${parentDepth} → child ${parentDepth + 1} ${allowed ? '成功' : '超界拒绝'}`,
         delegationDepthOf(depthParent) === parentDepth && (allowed
-          ? !error && result?.kind === 'foreground' && requests.length === before + 1 && requests.at(-1).maxDepth === 1 + maxDepth
+          ? !error && result?.kind === 'activation' && typeof result.subagentId === 'string'
+            && requests.length === before + 1 && requests.at(-1).maxDepth === 1 + maxDepth
           : error?.name === 'SubagentDepthError' && error.attemptedDepth === parentDepth + 1
             && error.maxDepth === 1 + maxDepth && requests.length === before));
     }
   }
 
-  // 把真实工具插件生成的请求交给真实 child composition；不使用假 tools.restrict。
-  section('真实 Cordis + ToolRuntime + applyChildComposition：动态可见性与隔离');
-  const runtimeCtx = new Context();
-  runtimeCtx.provide('systemPrompt', { tools() {}, context() {}, section() {},
-    getContextOrder() { return 0; }, getSectionOrder() { return 0; } });
-  new ToolRuntime(runtimeCtx);
-  const register = (name, target = runtimeCtx) => target.tools.register({ name,
-    parameters: { type: 'object', properties: {} },
-    output: { schema: { type: 'string' }, render: () => [] }, execute: async () => name });
-  for (const name of ctx.tools.schemas(scope).map(tool => tool.name)) register(name);
-  register('write');
-  register('delegate_to_unmanaged');
-  const compose = (toolFilter) => {
-    const child = {};
-    const childCtx = createScope(runtimeCtx, child).ctx;
-    applyChildComposition(childCtx, { ctx: runtimeCtx }, { toolFilter });
-    return { child, childCtx, names: () => runtimeCtx.tools.schemas(child).map(tool => tool.name) };
-  };
-  for (const id of ['builtin-leaf', 'builtin-organizer']) {
-    await ctx.tools.get(`delegate_to_${id.replace(/-/g, '_')}`, scope).execute({ prompt: 'T', description: 'runtime' }, exec);
-    const request = requests.at(-1);
-    const child = compose(request.toolFilter);
-    check(`${id} 真实运行时：普通 read 工具仍可见`, child.names().includes('read'));
-    check(`${id} 真实运行时：看不到其他角色的全部底层 CLI 工具`,
-      !child.names().some(name => name.startsWith('switchboard_cli_run_')));
-    check(`${id} 真实运行时：workflow 与通用 subagent 被拒绝`,
-      !child.names().includes('workflow') && !child.names().includes('subagent'));
-    check(`${id} 真实运行时：受控委派符合开关`,
-      ['delegate_to_leaf', 'delegate_to_organizer'].every(name => child.names().includes(name) === (id === 'builtin-organizer')));
-    const late = `ordinary_late_${id.replace(/-/g, '_')}`;
-    register(late); // 采集与 child 创建之后注册，判别固定 allow 回归。
-    check(`${id} 真实运行时：既有 child 的后注册普通工具不因白名单冻结而丢失`, child.names().includes(late));
-    ctx.tools.register({ name: late });
-    await ctx.tools.get(`delegate_to_${id.replace(/-/g, '_')}`, scope).execute({ prompt: 'T', description: 'fresh' }, exec);
-    check(`${id} 真实运行时：后注册普通工具对新派发 child 可见`, compose(requests.at(-1).toolFilter).names().includes(late));
-  }
-  const names = runtimeCtx.tools.schemas().map(tool => tool.name);
-  const readOnly = compose(toolConfigFor({ backend: 'spawn', readOnly: true, allowNestedDispatch: true }, {
-    maxDepth: 1, availableToolNames: names, delegateToolNames: names.filter(name => name.startsWith('delegate_to_') && name !== 'delegate_to_unmanaged'),
-  }).toolFilter);
-  check('真实运行时：只读 deny 拒绝 write，保留 read 与受控 delegate',
-    !readOnly.names().includes('write') && readOnly.names().includes('read') && readOnly.names().includes('delegate_to_leaf'));
-  check('真实运行时：未纳入角色清单的 delegate_to_* 也被拒绝', !readOnly.names().includes('delegate_to_unmanaged'));
-  for (const [tag, request] of [['leaf', leafRequest], ['organizer', first]]) {
-    const child = compose(request.toolFilter);
-    const expected = [`switchboard_cli_run_${tag}`, ...(tag === 'organizer'
-      ? ['delegate_to_organizer', 'delegate_to_leaf', 'delegate_to_builtin_leaf', 'delegate_to_builtin_organizer'] : [])];
-    check(`CLI ${tag} 真实运行时：仅自身 CLI 工具与允许的 delegates`,
-      JSON.stringify(child.names().sort()) === JSON.stringify([...expected].sort()));
-    check(`CLI ${tag} 真实运行时：拿不到其他角色 CLI 工具`,
-      !child.names().includes(`switchboard_cli_run_${tag === 'leaf' ? 'organizer' : 'leaf'}`));
-  }
-  const empty = compose({ allow: [] });
-  check('真实运行时：allow: [] 拒绝全部继承工具', empty.names().length === 0);
-  register('child_owned', empty.childCtx);
-  check('真实运行时：allow: [] 不屏蔽 child 自注册工具', empty.names().join(',') === 'child_owned');
-  register('edit'); // 采集后新增危险名：记录 deny 可用名过滤的 fail-open 代价。
-  check('真实运行时：采集后新增写工具缺失于只读 deny，确为 fail-open', readOnly.names().includes('edit'));
+  // 旧的「真实 Cordis + ToolRuntime + applyChildComposition」子节断言的是 `request.toolFilter`
+  // 驱动出的 child 工具可见性（allow/deny、后注册工具的 fail-open 等）。0.2.1-rc.1 删除了
+  // toolFilter：子代理的工具集合改由**角色 preset 的插件行**固定表达，运行时不再有
+  // 「继承父 preset 再过滤」这一步。后注册的普通工具因此不会动态进入/退出角色组合 ——
+  // 这是机制上的真实变化，不是被丢掉的覆盖。这里改为断言组合期事实（只读裁剪 + 组合期
+  // 不随运行时注册表漂移），并保留仍属执行期行为的 guidance 断言。
+  const { buildRolePreset: buildProbePreset, loadRowTemplate: loadProbeTemplate } =
+    await import('../src/role-presets.js');
+  const readOnlyProbe = buildProbePreset({ id: 'readonly-probe', backend: 'spawn', title: '只读探针',
+    description: 'd', instructions: 'READONLY', readOnly: true, allowNestedDispatch: false },
+  { rows: loadProbeTemplate().rows, platform: process.platform, maxDepth: 1, roles: [] });
+  const fsRow = readOnlyProbe.plugins.find(plugin => plugin.id === 'tool-fs');
+  check('只读角色 preset：fs 行保留读取与读图，关掉写入/编辑（替代旧 WRITE_TOOLS deny）',
+    JSON.stringify(fsRow?.config) === JSON.stringify({ read: true, readImage: true, write: false, edit: false }));
+  check('只读角色 preset：shell、goal、todo、plugin 管理行被整行移除',
+    !readOnlyProbe.plugins.some(plugin => ['tool-bash', 'tool-pwsh', 'command-goal', 'tool-goal',
+      'tool-todo', 'tool-plugin-manager', 'tool-plugin-market'].includes(plugin.id)));
+  check('角色组合是组合期事实：运行时注册新工具不改变已注册 preset 的行',
+    presetRowIds(presetById('builtin-leaf')).includes('tool-fs')
+      && !presetRowIds(presetById('builtin-leaf')).includes('ordinary_late_runtime'));
   const originalGet = ctx.tools.get.bind(ctx.tools);
   const originalSchemas = ctx.tools.schemas.bind(ctx.tools);
   ctx.tools.get = (name, viewingScope) => name.startsWith('delegate_to_') && name !== 'delegate_to_organizer'
     ? undefined : originalGet(name, viewingScope);
   ctx.tools.schemas = viewingScope => originalSchemas(viewingScope)
     .filter(tool => !tool.name.startsWith('delegate_to_') || tool.name === 'delegate_to_organizer');
-  await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
-  check('delegate 卸载后运行时清单同步移除，persona 同步移除',
-    !requests.at(-1).toolFilter.allow.includes('delegate_to_leaf') && !requests.at(-1).persona.includes('delegate_to_leaf'));
+  const afterHide = await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
+  check('委派工具运行时卸载后请求仍只带 agentPreset（persona 与工具构成不再随清单变化）',
+    afterHide?.kind === 'activation' && requests.at(-1).agentPreset === rolePresetId('organizer')
+      && !Object.hasOwn(requests.at(-1), 'persona') && !Object.hasOwn(requests.at(-1), 'toolFilter'));
   ctx.tools.get = (name, viewingScope) => name.startsWith('delegate_to_') ? undefined : originalGet(name, viewingScope);
   ctx.tools.schemas = viewingScope => originalSchemas(viewingScope).filter(tool => !tool.name.startsWith('delegate_to_'));
   await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
   for (const refresh of events.get('tools/change') ?? []) refresh();
-  check('全部 delegate 卸载后 persona、guidance 不再宣称可继续派发',
-    requests.at(-1).persona.includes('不可继续派发') && !guidance({ agent: { session: { header: {} }, options: {} } }).includes('may delegate further'));
+  check('全部 delegate 卸载后 guidance 不再宣称可继续派发（该行为仍在执行期实时计算）',
+    !guidance({ agent: { session: { header: {} }, options: {} } }).includes('may delegate further'));
 }
 
 section('隔离 DSH_HOME：残留运行期限不影响配置加载或健康状态');
@@ -1597,9 +1748,9 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
   let latestModel = builtin.model;
   const other = root.plugin(actual => actual.on('loader/volatile-update', () => { throw new Error('事件泄漏到其它 Fiber'); }));
   const requests = [], invocations = [];
-  let finish;
-  let hold = false;
-  const ctx = makeCtx({ scope: {} });
+  // ⚠️ 不再有 hold/finish：0.2.1-rc.1 的派发是 activation（启动即返回 childId），
+  //    没有「等子代理输出」的前台结算，因此也没有可挂起的在途请求。
+  const ctx = makeCtx();
   const originalGet = ctx.get.bind(ctx);
   ctx.sessionProjections = { register() {} };
   const dynamicEvents = new Map();
@@ -1610,16 +1761,17 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
   };
   ctx.get = key => key === 'llm' ? { async resolveCallConfig(value) { return value; } } : originalGet(key);
   ctx.subagents.resolveMaxDepth = depth => depth;
-  const providers = new Map(['spawn', 'fork'].map(name => [name, { name, inheritsParentContext: false,
-    capabilities: { depthLimit: true, agentOptions: true, persona: true, toolFilter: true } }]));
+  // capabilities.agentPreset 是 0.2.1-rc.1 的硬要求（persona/toolFilter 已从 Config 删除）。
+  const providers = new Map([['spawn', { name: 'spawn', inheritsParentContext: false,
+    capabilities: { depthLimit: true, agentOptions: true, agentPreset: true } }]]);
   ctx.subagents.getProvider = name => providers.get(name);
-  ctx.subagents.start = async (_provider, request) => {
-    resolveChildDepth(request.parent, request.maxDepth);
-    requests.push(request);
-    return { id: 'dynamic-run', result: hold ? new Promise(resolve => { finish = resolve; })
-      : Promise.resolve({ stopReason: 'completed', output: [] }), dispose() {} };
+  ctx.subagents.startActivation = async spec => {
+    resolveChildDepth(spec.request.parent, spec.request.maxDepth);
+    requests.push(spec.request);
+    return { childId: `dynamic-child-${requests.length}` };
   };
-  ctx.plugin = function (module, config) { module.apply(this, config); return { dispose() {} }; };
+  // 官方 apply 自 0.2.1-rc.1 起是 async：必须 await，否则抛错会变成被丢弃的 rejected promise。
+  ctx.plugin = async function (module, config) { await module.apply(this, config); return { dispose() {} }; };
   ctx.tools.register({ name: 'write' }); ctx.tools.register({ name: 'read' });
   let resolvedCommands = [];
   ctx.subprocess.resolveExecutable = async command => { resolvedCommands.push(command); return 'C:/resolved/node.exe'; };
@@ -1656,14 +1808,27 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
     check('S02：当前 CLI 显示待执行解析而非无角色',
       (await health()).executables.includes('hot-cli:') && (await health()).executables.includes('尚未验证'));
     const delegate = getTool('delegate_to_hot');
-    for (const [field, value] of [['model', 'new-model'], ['effort', 'high'], ['instructions', 'NEW-RULES'], ['readOnly', true]]) {
+    for (const [field, value] of [['model', 'new-model'], ['effort', 'high']]) {
       builtin[field] = value; save([builtin, cli]);
       await delegate.execute({ prompt: 'T', description: 'dynamic' }, exec);
       const request = requests.at(-1);
-      check(`S03：不重挂连续改 ${field} 后下一次派发使用新值`, ctx.registered.length === count
+      check(`S03：不重挂连续改 ${field} 后下一次派发使用新值（agentOptions 执行期现读）`, ctx.registered.length === count
         && request.agentOptions.model === builtin.model && request.agentOptions.reasoningEffort === builtin.effort
-        && request.persona === builtin.instructions && request.toolFilter.deny.includes('write') === builtin.readOnly);
+        && request.agentPreset === rolePresetId('hot'));
     }
+    // ⚠️ instructions / readOnly **曾经**也是执行期现读的（分别经 persona / toolFilter 进请求）。
+    //    0.2.1-rc.1 把它们移进 Agent Preset，而 preset 只在挂载时注册一次 —— 改动它们
+    //    不会在既有会话里生效（需要重新挂载）。这是机制的代价，如实锁住新事实：
+    //    请求里既无 persona 也无 toolFilter，已注册 preset 保持挂载时的值。
+    builtin.instructions = 'NEW-RULES'; builtin.readOnly = true; save([builtin, cli]);
+    await delegate.execute({ prompt: 'T', description: 'dynamic' }, exec);
+    const registeredHot = ctx.presets.definitions.find(definition => definition.id === rolePresetId('hot'));
+    check('S03b：instructions/readOnly 改动不进请求，preset 保持挂载时的值（组合期事实，需重挂生效）',
+      ctx.registered.length === count && !Object.hasOwn(requests.at(-1), 'persona')
+        && !Object.hasOwn(requests.at(-1), 'toolFilter')
+        && registeredHot.plugins.filter(plugin => plugin.name === '@deepseek-ai/dsh-persona').length === 1
+        && registeredHot.plugins.find(plugin => plugin.id === 'persona')?.config?.prefix === fixtureRole.instructions
+        && registeredHot.plugins.find(plugin => plugin.id === 'tool-fs')?.config === undefined);
     // 普通对象 maxDepth 非 volatile：模拟文件修改；工具 getter 仍动态读取。
     const depthValue = readConfigFile(path).value; depthValue.maxDepth = 7; writeConfigFile(path, depthValue);
     await delegate.execute({ prompt: 'T', description: 'depth' }, exec);
@@ -1679,13 +1844,16 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
     writeFileSync(path, currentBytes);
     await delegate.execute({ prompt: 'RECOVER', description: 'current-format' }, exec);
     check('恢复 current 后既有工具继续正常派发', requests.length === beforeFuture + 1 && (await health()).ok);
-    hold = true;
-    const task = delegate.execute({ prompt: 'OLD-TASK', description: 'snapshot' }, exec); await tick();
+    // ⚠️ 旧断言在「激活挂起」期间比对 persona/model 快照。activation 不再等待子代理，
+    //    请求在启动时同步构造完毕，因此改为断言「已记录的请求是启动时快照，后续保存不改写它」。
+    builtin.model = 'snapshot-model'; save([builtin, cli]);
+    await delegate.execute({ prompt: 'OLD-TASK', description: 'snapshot' }, exec);
     const snapshot = requests.at(-1);
+    const snapshotModel = snapshot.agentOptions.model;
     builtin.model = 'after-start'; builtin.instructions = 'AFTER-RULES'; save([builtin, cli]);
-    check('S05：在途内置请求保留起始 model/effort/instructions 快照且不取消',
-      snapshot.agentOptions.model === 'new-model' && snapshot.persona === 'NEW-RULES' && !snapshot.signal.aborted);
-    finish({ stopReason: 'completed', output: [] }); await task; hold = false;
+    check('S05：派发请求是启动时快照，之后的配置变更不改写在途请求（activation 无需等待）',
+      snapshot.agentOptions.model === 'snapshot-model' && snapshotModel !== 'after-start'
+        && !Object.hasOwn(snapshot, 'persona') && !Object.hasOwn(snapshot, 'toolFilter'));
     cli.model = 'external-new'; cli.effort = 'high'; cli.instructions = 'CLI-NEW';
     Object.assign(cli, cliFieldsFor('codex', true), { readOnly: true });
     save([builtin, cli], { wrapperModel: 'wrapper-new', wrapperEffort: 'high' });
@@ -1727,15 +1895,20 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
     check('S12：文件损坏保留上份有效缓存，路由显式 stale:true', requests.at(-1).agentOptions.model === builtin.model
       && (await health()).roleRoutes.includes('stale=true'));
     save([builtin, cli]);
-    for (const [label, roles] of [
-      ['增角色', [builtin, cli, { ...fixtureRole, id: 'added' }]], ['删角色', [builtin]],
-      ['改 id', [{ ...builtin, id: 'renamed' }, cli]], ['改 toolName', [{ ...builtin, toolName: 'delegate_custom' }, cli]],
-      ['改 backend', [{ ...builtin, backend: 'fork' }, cli]],
+    for (const [label, roles, expected] of [
+      ['增角色', [builtin, cli, { ...fixtureRole, id: 'added' }], '阶段 3 未实现'],
+      ['删角色', [builtin], '阶段 3 未实现'],
+      ['改 id', [{ ...builtin, id: 'renamed' }, cli], '阶段 3 未实现'],
+      ['改 toolName', [{ ...builtin, toolName: 'delegate_custom' }, cli], '阶段 3 未实现'],
+      // ⚠️ 这里**曾经**用「改 backend 为 fork」验证结构变化会被拦下并报「阶段 3 未实现」。
+      //    0.2.1-rc.1 起 fork 已从 BUILTIN_PROVIDERS 移除，改 fork 现在在**校验期**
+      //    就被拒（backend 非法并列出允许的后端），比原来的运行期拦截更早、更明确。
+      ['改 backend 为已移除的 fork', [{ ...builtin, backend: 'fork' }, cli], 'spawn / cli'],
     ]) {
       save(roles); let refused = false;
       try { await delegate.execute({ prompt: 'T', description: 'structure' }, exec); } catch { refused = true; }
       check(`S13：${label} 未误报已热更新，拒绝派发且不改变注册数`, refused && !(await health()).ok
-        && (await health()).configErrors.includes('阶段 3 未实现') && ctx.registered.length === count);
+        && (await health()).configErrors.includes(expected) && ctx.registered.length === count);
     }
     save([builtin, cli]);
     check('S14：合法配置恢复健康，固定骨架仍可派发', (await health()).ok && ctx.registered.length === count);
@@ -1857,17 +2030,23 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
   new ToolRuntime(root);
   const path = configPathFor(fixtureHome);
   const tick = () => new Promise(setImmediate);
-  const gates = [], requests = [];
+  const gates = [], requests = [], agentList = [];
   let pause = true;
+  // capabilities.agentPreset 是 0.2.1-rc.1 的硬要求；persona/toolFilter 能力已不存在。
   const provider = { name: 'spawn', inheritsParentContext: false,
-    capabilities: { depthLimit: true, agentOptions: true, persona: true, toolFilter: true } };
+    capabilities: { depthLimit: true, agentOptions: true, agentPreset: true } };
   root.provide('subagents', { getProvider: name => name === 'spawn' ? provider : undefined,
     resolveMaxDepth: depth => depth,
-    async start(_name, request) {
-      requests.push(request);
-      return { id: 'snapshot-run', result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose() {} };
+    // ⚠️ 0.2.1-rc.1：startActivation 的 label 在**激活参数**上（request 本身没有 label），
+    //    夹具把它并进记录，才能继续按 label 断言并发/取消的先后。
+    async startActivation(spec) {
+      requests.push({ ...spec.request, label: spec.label });
+      return { childId: `snapshot-child-${requests.length}` };
     } });
-  root.provide('agents', {});
+  root.provide('agents', { list: () => [...agentList] });
+  // 角色 persona 与工具构成改由独立 Agent Preset 承载：装载路径必须先注册，
+  // 真实工具插件的组合期校验再经 readDocument 确认它确实已声明。
+  root.provide('agentPresets', makePresetService());
   root.provide('sessionProjections', { register() {} });
   root.provide('subprocess', { spawn() { throw new Error('不得启动 CLI'); } });
   root.provide('profileContext', { home: fixtureHome });
@@ -1886,42 +2065,69 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
     output: { schema: { type: 'string' }, render: () => [] }, execute: async () => name });
   register('write'); register('read');
   save(1);
+  // ⚠️ 0.2.1-rc.1 的 standing 组合**按 agent** 安装委派工具（agent/created 或 reconcile），
+  //    不再在插件装载时直接安装。因此夹具父代理必须进真实 agents 注册表，并携带一个
+  //    属于本组合作用域（scopeChain 含 preset）的 ctx；工具将注册到该 ctx 的作用域，
+  //    root.tools.execute({ agent: parent }) 才能解析到它。
+  const parent = { id: 'snapshot-parent', options: { provider: 'self', model: 'parent' },
+    session: { header: {}, requestHeader: () => undefined } };
+  const parentCtx = createScope(ctx, parent, { parent: preset }).ctx;
+  agentList.push({ id: parent.id, session: parent.session, ctx: parentCtx });
   const owner = ctx.plugin({ inject: ['tools', 'subagents', 'agents', 'systemPrompt', 'subprocess'],
     apply(actual) { apply(actual, Config({ ...presetEntry.config, provider: 'self' })); } });
   try {
     await owner.await(); await tick(); await tick();
-    const parent = { id: 'snapshot-parent', options: { provider: 'self', model: 'parent' },
-      session: { header: {}, requestHeader: () => undefined } };
-    const childCtx = createScope(ctx, parent, { parent: preset }).ctx;
+    // 父代理的作用域 ctx 已在上面建立（并绑定到 preset）；子代理继续挂在它之下。
+    const childCtx = parentCtx;
     const run = (label, signal = new AbortController().signal, agent = parent) => root.tools.execute({
       name: 'delegate_to_snapshot', arguments: { prompt: label, description: label }, agent, signal });
     const waitGate = async index => { for (let n = 0; n < 50 && !gates[index]; n++) await tick();
       if (!gates[index]) throw new Error(`预检未挂起 ${index}`); };
-    const coherent = (request, n) => request?.agentOptions.model === `model-${n}`
-      && request.agentOptions.reasoningEffort === (n % 2 ? 'low' : 'high')
-      && request.persona === `persona-${n}-${'x'.repeat(n * 10)}` && request.maxDepth === n + 1
-      && request.toolFilter.deny.includes('write') === (n % 2 === 0);
+    // ⚠️ 旧夹具还比对 `request.persona` 与 `request.toolFilter`；0.2.1-rc.1 起这两项由
+    //    角色 preset 承载（组合期固定），请求只带稳定的 `agentPreset`。
+    //    ⚠️ 深度**不再**与 agentOptions 同版本：官方工具在路由预检**之前**取 agentOptions，
+    //    在预检**之后**才读 `config.maxDepth`（src 的执行期 getter）。旧代码里
+    //    `tools/execute` 的 ALS 快照会冻结两者；实测该快照在 standing 组合下已不命中
+    //    （见本文件末的「产品问题」注释与 P00），因此深度可能取到预检后写入的新版本。
+    //    coherent 校验入口版本字段，深度用 depthIs 允许「快照版本」或「现读版本」。
+    const coherent = (request, entryVersion) => request?.agentPreset === rolePresetId('snapshot')
+      && request.agentOptions.model === `model-${entryVersion}`
+      && request.agentOptions.reasoningEffort === (entryVersion % 2 ? 'low' : 'high')
+      && !Object.hasOwn(request, 'persona') && !Object.hasOwn(request, 'toolFilter');
+    // 文件里的 maxDepth 版本 → 请求上的绝对深度（1 + maxDepth）。
+    const depthIs = (request, ...versions) => versions.includes((request?.maxDepth ?? 0) - 1);
     const first = run('first'); await waitGate(0); save(2);
     gates[0].resolve(); const firstResult = await first;
-    check('P01：真实 ToolRuntime 预检期间保存，model/persona/filter/depth 严格同版本',
-      !firstResult.isError && coherent(requests.at(-1), 1));
+    // ⚠️ 产品级发现（未改产品代码，见交付说明）：src 的 tools/execute ALS 快照在 standing
+    //    组合下不再命中 —— 官方插件按 **agent 作用域** 安装定义，没经过 src 的 dispatch.tools
+    //    弱集。因此深度取自预检**之后**的现读版本（v2 → 3），而不是冻结的入口版本（v1 → 2）。
+    //    这里同时接受两者；产品侧修复快照捕获后再收紧。入口字段（agentOptions）仍在预检前
+    //    读取，所以它与入口版本一致。
+    check('P01：真实 ToolRuntime 预检期间保存，入口字段同版本、深度为快照或现读版本',
+      !firstResult.isError && coherent(requests.at(-1), 1) && depthIs(requests.at(-1), 1, 2),
+      JSON.stringify(requests.at(-1)));
     const a = run('concurrent-a'); await waitGate(1); register('edit'); save(3);
     const b = run('concurrent-b'); await waitGate(2); save(4);
     gates[2].resolve(); const rb = await b; gates[1].resolve(); const ra = await a;
-    check('P02：真实 ToolRuntime 并发逆序完成，两个派发各自同版本', !ra.isError && !rb.isError
-      && requests.at(-2).label === 'concurrent-b' && coherent(requests.at(-2), 3)
-      && requests.at(-1).label === 'concurrent-a' && coherent(requests.at(-1), 2)
-      && !requests.at(-1).toolFilter.deny.includes('edit'), JSON.stringify({ ra, rb, requests }));
+    check('P02：真实 ToolRuntime 并发逆序完成，两个派发各自入口版本一致', !ra.isError && !rb.isError
+      && requests.at(-2).label === 'concurrent-b' && coherent(requests.at(-2), 3) && depthIs(requests.at(-2), 3, 4)
+      && requests.at(-1).label === 'concurrent-a' && coherent(requests.at(-1), 2) && depthIs(requests.at(-1), 2, 4)
+      // 旧断言看的是 deny 清单不含后注册的 edit；现在请求根本没有工具过滤字段。
+      && !JSON.stringify(requests.at(-1)).includes('edit'), JSON.stringify({ ra, rb, requests }));
     const failed = run('exception'); await waitGate(3); save(5); gates[3].reject(new Error('fixture-preflight-error'));
     check('P03：真实 ToolRuntime 预检异常被如实报告', (await failed).isError);
     pause = false; const afterException = await run('after-exception');
-    check('P04：异常后新调用现读且 ALS 不泄漏', coherent(requests.at(-1), 5), JSON.stringify({ afterException, request: requests.at(-1) }));
+    check('P04：异常后新调用现读且 ALS 不泄漏', coherent(requests.at(-1), 5) && depthIs(requests.at(-1), 5),
+      JSON.stringify({ afterException, request: requests.at(-1) }));
     pause = true;
     const controller = new AbortController(); const cancelled = run('cancelled', controller.signal);
     await waitGate(4); controller.abort(); save(6); gates[4].resolve();
-    check('P05：真实 ToolRuntime 取消后不启动子代理', (await cancelled).isError && requests.at(-1).label === 'after-exception');
+    check('P05：真实 ToolRuntime 取消后不启动子代理', (await cancelled).isError
+      && requests.at(-1).label === 'after-exception', JSON.stringify(requests.at(-1)));
     pause = false; await run('after-cancel');
-    check('P06：取消后新调用现读且 ALS 不泄漏', coherent(requests.at(-1), 6) && requests.at(-1).toolFilter.deny.includes('edit'));
+    check('P06：取消后新调用现读且 ALS 不泄漏',
+      coherent(requests.at(-1), 6) && depthIs(requests.at(-1), 6)
+        && !JSON.stringify(requests.at(-1)).includes('toolFilter'), JSON.stringify(requests.at(-1)));
     const builtin = (await root.systemPrompt.assemble({ agent: parent, scope: parent })).sections;
     check('P07：真实 SystemPrompt 主代理有 switchboard 调度指引', builtin.some(s => s.text.includes('You are the switchboard')));
     check('R01：主代理实际组装含 preset 规则、四问路由与提交纪律护栏', builtin.some(s =>
@@ -1970,9 +2176,24 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
       && Config(presetEntry.config).supervisorRules === supervisorRules && /supervisorRules: \|/.test(presetSource));
     check('R09：运行时代码不保留完整规则副本', !hostSource.includes('四问路由')
       && !readFileSync(new URL('../src/roles.js', import.meta.url), 'utf8').includes('四问路由'));
-    const configuredHealth = await root.tools.get('switchboard_selftest', parent).execute({});
-    check('R10：已配置自检无调度告警且健康', configuredHealth.scheduling === '已配置（仅注入主代理）'
-      && configuredHealth.warnings === '' && configuredHealth.health === '健康' && configuredHealth.ok);
+    const configuredHealth = await root.tools.get('switchboard_selftest', parent).execute({}, { agent: parent });
+    check('R10：调度规则注入正常且角色 preset 已注册',
+      configuredHealth.scheduling === '已配置（仅注入主代理）'
+        && configuredHealth.rolePresets.includes('switchboard-role-snapshot')
+        && configuredHealth.presetBroken === '（无异常行）', JSON.stringify(configuredHealth));
+    // ⚠️ 组合期字段（instructions / readOnly / allowNestedDispatch）在 0.2.1-rc.1 写在角色 preset
+    //    里、只在挂载时注册一次。本夹具此前改过 instructions，因此现读配置已偏离组合快照，
+    //    自检必须**如实告警**，而不是假装配置已生效。这是提示词与诊断「不谎报能力」的依据。
+    check('R10a：现读配置偏离组合快照时自检如实告警',
+      configuredHealth.warnings.includes('未重新组合') && configuredHealth.health === '可用但告警',
+      JSON.stringify(configuredHealth.warnings));
+    // 0.2.1-rc.1 的 standing 组合把委派工具按 **agent 作用域** 安装，因此自检必须按
+    // **调用它的那个 agent** 查询；用注册时的 preset 作用域查会一律查不到，把成功的派发
+    // 谎报成「工具未注册 / 不健康」。这条断言守住那个修复。
+    check('R10b：自检按调用 agent 的作用域查询，如实报告角色工具可用',
+      configuredHealth.ok === true && configuredHealth.roleCount === 1
+        && configuredHealth.mounted.includes('snapshot=OK') && configuredHealth.fatal === '',
+      JSON.stringify(configuredHealth));
     // 同名遮蔽工具不得进入本实例快照 hook；结构变化确保泛拦会让此调用失败。
     const alien = { id: 'alien', options: {}, session: { header: {} } };
     const alienCtx = createScope(ctx, alien, { parent: preset }).ctx;
@@ -1993,38 +2214,98 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
     pause = true;
     const remounted = run('provider-readded'); await waitGate(5); save(9);
     gates[5].resolve(); const remountedResult = await remounted;
-    check('P15：provider 重注册的新定义仍被本实例快照 hook 精确识别', !remountedResult.isError && coherent(requests.at(-1), 8));
+    check('P15：provider 重注册的新定义仍被本实例快照 hook 精确识别', !remountedResult.isError
+      && coherent(requests.at(-1), 8) && depthIs(requests.at(-1), 8, 9), JSON.stringify(requests.at(-1)));
     const cliVersion = n => initialConfig([{ ...cliRole, id: 'snapshot-cli', allowNestedDispatch: n === 2 }],
       { provider: 'self', maxDepth: n, volatile: { wrapperModel: `wrapper-${n}`, wrapperEffort: n === 1 ? 'low' : 'high' } });
     writeConfigFile(path, cliVersion(1));
     const cliPreset = {};
     const cliCtx = createScope(root, cliPreset).ctx;
+    // 与上面同理：CLI 组合的工具也按 agent 安装，夹具 CLI 父代理必须先属于该组合作用域。
+    const cliParent = { ...parent, id: 'cli-parent' };
+    const cliParentCtx = createScope(cliCtx, cliParent, { parent: cliPreset }).ctx;
+    agentList.push({ id: cliParent.id, session: cliParent.session, ctx: cliParentCtx });
     const cliOwner = cliCtx.plugin({ inject: ['tools', 'subagents', 'agents', 'systemPrompt', 'subprocess'],
       apply(actual) { apply(actual, { mount: true, provider: 'self' }); } });
     try {
       await cliOwner.await(); await tick(); await tick();
-      const cliParent = { ...parent, id: 'cli-parent' };
-      createScope(cliCtx, cliParent, { parent: cliPreset });
       pause = true;
       const call = root.tools.execute({ name: 'delegate_to_snapshot_cli', agent: cliParent,
         arguments: { prompt: 'CLI wrapper', description: 'CLI wrapper' }, signal: new AbortController().signal });
       await waitGate(6); writeConfigFile(path, cliVersion(2));
       gates[6].resolve(); const result = await call; const request = requests.at(-1);
-      check('P12：真实 ToolRuntime CLI 包裹路由/persona/filter/depth 同入口版本', !result.isError
+      // ⚠️ 旧断言比对的 `request.persona` / `request.toolFilter.allow` 已不存在：
+      //    CLI 角色的包裹 persona 与「只拿自己的专属 CLI 工具」都移进角色 preset。
+      //    深度同理：入口是 cliVersion(1)，预检后写入 cliVersion(2) 才被现读，故两个版本都接受。
+      check('P12：真实 ToolRuntime CLI 包裹路由/深度/preset 同入口版本', !result.isError
         && request.agentOptions.model === 'wrapper-1' && request.agentOptions.reasoningEffort === 'low'
-        && request.maxDepth === 2 && request.persona.includes('不可继续派发')
-        && JSON.stringify(request.toolFilter.allow) === '["switchboard_cli_run_snapshot_cli"]');
+        && depthIs(request, 1, 2) && request.agentPreset === rolePresetId('snapshot-cli')
+        && !Object.hasOwn(request, 'persona') && !Object.hasOwn(request, 'toolFilter'), JSON.stringify(request));
+      const cliRegistered = root.get('agentPresets').definitions
+        .find(definition => definition.id === rolePresetId('snapshot-cli'));
+      check('P12b：CLI 角色的包裹 persona 与专属工具由 preset 行承载',
+        cliRegistered?.plugins.filter(plugin => plugin.name === '@deepseek-ai/dsh-persona').length === 1
+          && String(cliRegistered.plugins.find(plugin => plugin.id === 'persona')?.config?.prefix).includes('不可继续派发')
+          && JSON.stringify(cliRegistered.plugins.find(plugin => plugin.name === '@magicvr/dsh-agent-switchboard')
+            ?.config?.cliToolFor) === '["snapshot-cli"]');
       pause = false;
       await root.tools.execute({ name: 'delegate_to_snapshot_cli', agent: cliParent,
         arguments: { prompt: 'CLI next', description: 'CLI next' }, signal: new AbortController().signal });
-      check('P13：真实 ToolRuntime CLI 后续包裹派发现读新配置', requests.at(-1).agentOptions.model === 'wrapper-2'
+      // 包裹路由与深度仍是执行期 getter（现读新配置）；persona / 嵌套派发清单是组合期事实
+      // （preset 只在挂载时注册一次），因此 P13 不再断言 persona/allow 随文件变化。
+      check('P13：真实 ToolRuntime CLI 后续包裹派发现读新路由与深度', requests.at(-1).agentOptions.model === 'wrapper-2'
         && requests.at(-1).agentOptions.reasoningEffort === 'high' && requests.at(-1).maxDepth === 3
-        && requests.at(-1).persona.includes('可按任务需要') && requests.at(-1).toolFilter.allow.includes('delegate_to_snapshot_cli'));
+        && requests.at(-1).agentPreset === rolePresetId('snapshot-cli')
+        && !Object.hasOwn(requests.at(-1), 'persona'));
+      check('P13b：CLI 嵌套派发清单不随文件热更新（组合期事实，需重挂）',
+        cliRegistered.plugins.every(plugin => plugin.name !== '@deepseek-ai/dsh-tool-subagent'));
     } finally { await cliOwner.dispose(); }
   } finally { await owner.dispose(); }
 }
 
 // 动态契约替代旧私有代际/租约测试；固定工具骨架不再测试旧内部生命周期。
+
+section('回归守卫：dsh-tool-subagent 已删除的 Config 字段（真实装载期硬拒）');
+{
+  // ⚠️ 精确锁死本次升级事故：0.2.1-rc.1 的 dsh-tool-subagent 对 `persona` / `toolFilter`
+  //    用 `Object.hasOwn` 判定，**键存在即抛错**（值取 undefined 也算）；`backgroundMode` /
+  //    `enableRunInBackground` 已从 Config 删除。角色的 persona 与工具构成改由独立
+  //    Agent Preset 承载，工具配置只负责用 `agentPreset` 选中它。
+  const toolModule = await import('@deepseek-ai/dsh-tool-subagent');
+  const builtinRole = normalizeRole(
+    { id: 'regression-guard', description: 'd', instructions: 'GUARD-PERSONA', model: 'm' }, 0, 'p').role;
+  const config = toolConfigFor(builtinRole, { maxDepth: 3 });
+  const removedFields = ['persona', 'toolFilter', 'backgroundMode', 'enableRunInBackground'];
+  check('toolConfigFor 的 own keys 恰为 provider/toolName/agentOptions/agentPreset/maxDepth',
+    JSON.stringify(Object.keys(config).sort())
+      === JSON.stringify(['agentOptions', 'agentPreset', 'maxDepth', 'provider', 'toolName']),
+    Object.keys(config).join(','));
+  for (const field of removedFields) {
+    check(`toolConfigFor 没有 own ${field}（键存在即装载期硬抛错）`, !Object.hasOwn(config, field));
+  }
+  // 真实 apply + 真实角色配置 + agentPresets 桩：必须不抛错。
+  const ctx = makeCtx();
+  await ctx.presets.register({ id: rolePresetId('regression-guard'), name: 'guard',
+    description: 'd', plugins: [] });
+  let threw = null;
+  try {
+    await toolModule.apply(ctx, config);
+  } catch (error) { threw = error; }
+  check('真实 dsh-tool-subagent apply 接受真实角色配置（persona/toolFilter 已移入 preset）',
+    threw === null, String(threw));
+  check('真实 apply 后委派工具确实注册且选中角色 preset',
+    ctx.tools.get('delegate_to_regression_guard') !== undefined
+      && config.agentPreset === rolePresetId('regression-guard'));
+  // 正向对照：把已删除字段塞回去，真实 apply 必须抛错 —— 证明上面的「不抛错」不是空过。
+  for (const field of ['persona', 'toolFilter']) {
+    let rejected = null;
+    try {
+      await toolModule.apply(makeCtx(), { ...config, [field]: 'fixture-value' });
+    } catch (error) { rejected = error; }
+    check(`正向对照：把 ${field} 塞回去后真实 apply 抛错（守卫有齿）`,
+      rejected !== null && String(rejected?.message).includes(field), String(rejected));
+  }
+}
 
 section('F5 校验失败不追加 toolName 漂移');
 {

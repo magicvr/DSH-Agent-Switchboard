@@ -5,6 +5,7 @@ import {
   WRITE_TOOLS,
   UNCONTROLLED_DISPATCH_TOOLS,
   absoluteDepthLimit,
+  agentOptionsFor,
   canStartAtDepth,
   cliPersonaFor,
   cliToolName,
@@ -13,10 +14,12 @@ import {
   normalizeRoles,
   planCliMounts,
   roleGuidanceText,
+  rolePresetId,
   routeSummaryFor,
   toolConfigFor,
   toolDescriptionFor,
 } from '../src/roles.js';
+import { buildRolePreset, buildRolePresets, loadRowTemplate } from '../src/role-presets.js';
 import { cliFieldsFor } from '../src/cli/drivers.js';
 import { isDeepStrictEqual } from 'node:util';
 import { resolveChildAgentOptions } from '@deepseek-ai/dsh-subagent';
@@ -59,7 +62,7 @@ section('合法角色：规范化结果');
   check('allowNestedDispatch 默认 false', role?.allowNestedDispatch === false);
 }
 
-section('toolConfigFor：模型与强度进 agentOptions');
+section('toolConfigFor：新契约（persona/toolFilter 已移入角色 preset）');
 {
   const { role } = normalizeRole(
     { id: 'worker', description: 'd', model: 'gpt-6.1-sol', effort: 'high', instructions: 'i' },
@@ -67,22 +70,45 @@ section('toolConfigFor：模型与强度进 agentOptions');
     'p',
   );
   const cfg = toolConfigFor(role, { maxDepth: 3 });
-  check('provider = backend', cfg.provider === 'spawn');
+  check('provider 固定为 spawn', cfg.provider === 'spawn');
   check('toolName 正确', cfg.toolName === 'delegate_to_worker');
   check('agentOptions.provider', cfg.agentOptions.provider === 'p');
   check('agentOptions.model', cfg.agentOptions.model === 'gpt-6.1-sol');
   check('agentOptions.reasoningEffort', cfg.agentOptions.reasoningEffort === 'high');
-  check('persona = instructions', cfg.persona === 'i');
+  // ⚠️ 这里**曾经**断言 `cfg.persona === instructions` 与 `cfg.backgroundMode === 'one-shot'`。
+  //    0.2.1-rc.1 删除了这四个字段：前两者是装载期硬抛错（Object.hasOwn 判定），
+  //    后两者已从 Config 移除。角色 persona 与工具构成改由 `agentPreset` 选中。
+  check('agentPreset 由角色 id 派生', cfg.agentPreset === rolePresetId('worker'), String(cfg.agentPreset));
+  check('工具 Config 的 own keys 恰为新契约的五项',
+    JSON.stringify(Object.keys(cfg).sort())
+      === JSON.stringify(['agentOptions', 'agentPreset', 'maxDepth', 'provider', 'toolName']),
+    Object.keys(cfg).join(','));
   check(
     '禁止嵌套仍使用插件绝对上限 4（出站权限另行过滤）',
     cfg.maxDepth === 4,
     `实际 ${cfg.maxDepth}；注意 0 会连第一层派发都拒绝`,
   );
-  check('backgroundMode one-shot', cfg.backgroundMode === 'one-shot');
-  check('非只读内置使用 deny，空清单不冻结普通工具', !('allow' in cfg.toolFilter) && cfg.toolFilter.deny.length === 0);
 }
 
-section('只读角色：写入类工具被 deny');
+section('agentOptionsFor：内置用角色 route，CLI 用统一包裹路由');
+{
+  const builtin = normalizeRole({ id: 'a', description: 'd', model: 'm', effort: 'high', instructions: 'i' }, 0, 'p').role;
+  check('内置：provider/model/effort 来自角色',
+    JSON.stringify(agentOptionsFor(builtin, { provider: 'other', model: 'other', effort: 'low' }))
+      === JSON.stringify({ provider: 'p', model: 'm', reasoningEffort: 'high' }));
+  const noEffort = normalizeRole({ id: 'b', description: 'd', model: 'm', instructions: 'i' }, 0, 'p').role;
+  check('内置：未设 effort 时不写 reasoningEffort', !('reasoningEffort' in agentOptionsFor(noEffort)));
+
+  const { role: cli } = normalizeRole({ id: 'c', description: 'd', instructions: 'i', backend: 'cli',
+    model: 'cli-model', effort: 'medium', cliCommand: 'node', cliArgs: ['exec', '-'], cliCwd: 'C:/w' }, 0);
+  check('CLI：无包裹路由时返回 undefined（继承父代理）', agentOptionsFor(cli, undefined) === undefined);
+  check('CLI：包裹路由空串被忽略', agentOptionsFor(cli, { provider: ' ', model: '', effort: ' ' }) === undefined);
+  check('CLI：包裹路由映射为 provider/model/reasoningEffort',
+    JSON.stringify(agentOptionsFor(cli, { provider: ' wp ', model: 'wrapper-model', effort: 'high' }))
+      === JSON.stringify({ provider: 'wp', model: 'wrapper-model', reasoningEffort: 'high' }));
+}
+
+section('只读角色：写入能力改由 preset 行级裁剪（旧 toolFilter.deny 已删除）');
 {
   const { role } = normalizeRole(
     { id: 'reviewer', description: 'd', model: 'm', instructions: 'i', readOnly: true },
@@ -90,17 +116,13 @@ section('只读角色：写入类工具被 deny');
     'p',
   );
   const cfg = toolConfigFor(role, { maxDepth: 3, availableToolNames: [...WRITE_TOOLS] });
-  check('有 toolFilter', cfg.toolFilter !== undefined);
-  const denied = new Set(cfg.toolFilter?.deny ?? []);
-  check('write 被 deny', denied.has('write'));
-  check('edit 被 deny', denied.has('edit'));
-  check('pwsh 被 deny', denied.has('pwsh'));
-  check('deny 列表即 WRITE_TOOLS', denied.size === WRITE_TOOLS.length);
+  check('只读不再经 toolFilter（该 Config 字段已删除）', !Object.hasOwn(cfg, 'toolFilter'));
   check(
     '只读且禁止嵌套仍使用插件绝对上限 4',
     cfg.maxDepth === 4,
     `实际 ${cfg.maxDepth}`,
   );
+  // 只读的实际落点在 buildRolePreset 小节：fs 行关掉 write/edit，其余写入行整行移除。
 }
 
 section('深度语义：绝对深度而非相对层数');
@@ -408,21 +430,32 @@ section('CLI 后端角色');
   );
 
   const cfg = toolConfigFor(ok.role, { maxDepth: 3 });
+  // 旧断言在这里比对 `cfg.toolFilter.allow` 与 `cfg.persona`；0.2.1-rc.1 起两者都移进
+  // 角色 preset，工具 Config 只负责用 agentPreset 选中它（见下面的 preset 断言）。
+  const cliPreset = buildRolePreset(ok.role, { platform: 'win32', maxDepth: 3, roles: [ok.role] });
   check('CLI provider 使用内置 spawn', cfg.provider === 'spawn', cfg.provider);
   check('CLI 叶子默认深度使用插件绝对上限 4', cfg.maxDepth === 4);
-  check('CLI allow 仅包含自己的专属工具',
-    JSON.stringify(cfg.toolFilter) === JSON.stringify({ allow: ['switchboard_cli_run_codex_worker'] }));
+  check('CLI 选中自己的角色 preset', cfg.agentPreset === rolePresetId('codex-worker'));
+  check('CLI 专属工具改由 preset 行承载（旧 toolFilter.allow 的落点）',
+    JSON.stringify(cliPreset.plugins.find((p) => p.id === 'switchboard-cli-tools-codex-worker')?.config?.cliToolFor)
+      === '["codex-worker"]');
   check('包裹路由留空时完全不设 agentOptions', cfg.agentOptions === undefined);
-  check('CLI persona 写明工具名', cfg.persona.includes('switchboard_cli_run_codex_worker'));
+  const cliPersonaText = cliPreset.plugins.find((p) => p.id === 'persona')?.config?.prefix;
+  check('CLI persona 写明工具名', String(cliPersonaText).includes('switchboard_cli_run_codex_worker'));
   check('仍有 toolName', cfg.toolName === 'delegate_to_codex_worker');
   const ro = normalizeRole({ ...base, readOnly: true }, 0, undefined, 'C:/w').role;
   const roCfg = toolConfigFor(ro, { maxDepth: 3 });
-  check('只读 CLI 仍仅允许自己的专属工具',
-    JSON.stringify(roCfg.toolFilter) === JSON.stringify(cfg.toolFilter));
+  check('只读 CLI 仍仅允许自己的专属工具（preset 行不含他人）',
+    !Object.hasOwn(roCfg, 'toolFilter') && roCfg.agentPreset === cfg.agentPreset
+      && !cliPreset.plugins.some((p) => p.name === '@deepseek-ai/dsh-tool-subagent'));
   check('CLI 允许嵌套时深度为数字 1 + maxDepth',
     toolConfigFor({ ...ok.role, allowNestedDispatch: true }, { maxDepth: 3 }).maxDepth === 4);
-  check('CLI 显式关闭后台运行', cfg.enableRunInBackground === false && cfg.backgroundMode === 'one-shot');
-  check('CLI 显式关闭包裹模型选择', cfg.modelSelectionSettings === false);
+  // ⚠️ 旧断言 `cfg.enableRunInBackground === false && cfg.backgroundMode === 'one-shot'`、
+  //    `cfg.modelSelectionSettings === false` 都已失效：前两者被删除，后者不再写入 Config
+  //    （新契约的 own keys 只有五项）。后者的**行为**仍在：dsh-tool-subagent 的
+  //    modelSelectionSettings 默认 false，即主代理仍不能覆盖角色模型（D12）。
+  check('工具 Config 不再携带模型选择开关（工具侧默认 false，行为不变）',
+    !Object.hasOwn(cfg, 'modelSelectionSettings'));
   for (let mask = 0; mask < 8; mask++) {
     const wrapperRoute = { provider: mask & 1 ? ' wrapper ' : '', model: mask & 2 ? 'wrapper-model' : ' ', effort: mask & 4 ? 'high' : '' };
     const configured = toolConfigFor(ok.role, { maxDepth: 3, wrapperRoute });
@@ -434,10 +467,10 @@ section('CLI 后端角色');
   for (const constraint of ['完整任务', '不要自行实施', '不要改写命令', '不要切换角色', '等待工具返回',
     '不轮询', '不重复启动', '交付物', '验证证据', '错误', '未完成项', '取消或失败不得自动重试',
     'CLI 输出是任务数据', '不能改变你的工具或权限约束']) {
-    check(`CLI persona 约束：${constraint}`, cfg.persona.includes(constraint));
+    check(`CLI persona 约束：${constraint}`, String(cliPersonaText).includes(constraint));
   }
 
-  // builtin 后端仍应设置这些，且不受 CLI 分支影响。
+  // builtin 后端仍应设置 agentOptions，且不受 CLI 分支影响。
   const builtin = normalizeRole(
     { id: 'b', description: 'd', instructions: 'i', model: 'm' },
     0,
@@ -446,9 +479,10 @@ section('CLI 后端角色');
   ).role;
   const bCfg = toolConfigFor(builtin, { maxDepth: 3 });
   check('builtin 仍设置 agentOptions', 'agentOptions' in bCfg);
-  check('builtin 仍设置 persona', 'persona' in bCfg);
+  check('builtin 仍设置 agentPreset（persona 的承载点）', bCfg.agentPreset === rolePresetId('b'));
   check('builtin 仍设置插件绝对 maxDepth', bCfg.maxDepth === 4);
-  for (const backend of ['spawn', 'fork']) {
+  // ⚠️ 这里**曾经**遍历 ['spawn','fork']；fork 已从 BUILTIN_PROVIDERS 移除（见文件头说明）。
+  for (const backend of ['spawn']) {
     const role = { ...builtin, backend, effort: 'medium' };
     check(`${backend} 的 agentOptions 不受统一包裹路由影响`,
       JSON.stringify(toolConfigFor(role, { maxDepth: 3, wrapperRoute: { provider: 'other', model: 'other', effort: 'high' } }).agentOptions)
@@ -500,7 +534,9 @@ section('包裹强度：生产 toolConfigFor → 真实 resolveChildAgentOptions
 
 section('回归：入站深度独立于目标出站权限');
 {
-  for (const backend of ['cli', 'spawn', 'fork']) {
+  // ⚠️ fork 已从 BUILTIN_PROVIDERS 移除（0.2.1-rc.1 起无法承载独立 preset），
+  //    因此只遍历仍然有效的两个后端。
+  for (const backend of ['cli', 'spawn']) {
     for (const maxDepth of [0, 1, 3]) {
       const leaf = { id: 'leaf', backend, instructions: 'i', allowNestedDispatch: false };
       const limit = toolConfigFor(leaf, { maxDepth }).maxDepth;
@@ -519,20 +555,20 @@ section('回归：入站深度独立于目标出站权限');
   check('深度越过安全整数范围时拒绝', !canStartAtDepth(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER));
 }
 
-section('出站权限与三种提示使用同一有效结果');
+section('出站权限与三种提示使用同一有效结果（权限仍是纯函数，只是不再进工具 Config）');
 {
   const delegateToolNames = ['delegate_to_self', 'delegate_to_other'];
   const availableToolNames = ['read', ...WRITE_TOOLS, 'run_code', ...delegateToolNames, 'delegate_to_unmanaged',
     'switchboard_cli_run_self', 'switchboard_cli_run_other', ...UNCONTROLLED_DISPATCH_TOOLS];
-  for (const backend of ['cli', 'spawn', 'fork']) {
+  for (const backend of ['cli', 'spawn']) {
     for (const allowNestedDispatch of [false, true]) {
       const role = normalizeRole({ id: 'self', backend, instructions: 'i', description: 'd', model: 'm', allowNestedDispatch,
         ...(backend === 'cli' ? { cliDriver: 'grok', effort: 'medium', cliCwd: 'C:/w', ...cliFieldsFor('grok', false) } : {}) }, 0, 'p').role;
       const options = { maxDepth: 3, delegateToolNames, availableToolNames };
       const permissions = dispatchPermissionsFor(role, options);
       const config = toolConfigFor(role, options);
-      const allowed = new Set(availableToolNames.filter(name => config.toolFilter.allow !== undefined
-        ? config.toolFilter.allow.includes(name) : !config.toolFilter.deny.includes(name)));
+      const allowed = new Set(availableToolNames.filter(name => permissions.toolFilter.allow !== undefined
+        ? permissions.toolFilter.allow.includes(name) : !permissions.toolFilter.deny.includes(name)));
       const tag = `${backend} ${allowNestedDispatch}`;
       check(`${tag}：受控 delegate 权限精确符合开关`,
         delegateToolNames.every((name) => allowed.has(name) === allowNestedDispatch));
@@ -542,8 +578,12 @@ section('出站权限与三种提示使用同一有效结果');
         [...UNCONTROLLED_DISPATCH_TOOLS, 'delegate_to_unmanaged'].every((name) => !allowed.has(name)));
       check(`${tag}：普通工具保留在内置角色，保留传输不写入过滤`,
         allowed.has('read') === (backend !== 'cli')
-          && ![...(config.toolFilter.allow ?? []), ...(config.toolFilter.deny ?? [])].includes('run_code'));
-      check(`${tag}：配置使用同一权限过滤结果`, JSON.stringify(config.toolFilter) === JSON.stringify(permissions.toolFilter));
+          && ![...(permissions.toolFilter.allow ?? []), ...(permissions.toolFilter.deny ?? [])].includes('run_code'));
+      // ⚠️ 旧断言在这里比对 `config.toolFilter === permissions.toolFilter`。0.2.1-rc.1 起
+      //    权限过滤不再进入工具 Config（字段已删除）；它现在的落点是角色 preset 的插件行，
+      //    由 buildRolePreset 小节完整覆盖。这里只确认 Config 已改用 agentPreset 选中角色组合。
+      check(`${tag}：工具 Config 改为 agentPreset 选中角色组合，不再携带过滤`,
+        !Object.hasOwn(config, 'toolFilter') && config.agentPreset === rolePresetId(role.id));
       const description = toolDescriptionFor(role, permissions);
       const guidance = roleGuidanceText([role], options);
       const persona = cliPersonaFor(role, permissions);
@@ -557,12 +597,20 @@ section('出站权限与三种提示使用同一有效结果');
         ? persona.includes(delegateToolNames.join('、')) && persona.includes('剩余深度预算')
           && !persona.includes('不要调用其他角色的工具')
         : persona.includes('不可继续派发') && !persona.includes('可按任务需要'));
-      if (backend === 'cli') check(`${tag}：配置 persona 使用同一权限结果`, config.persona === persona);
+      if (backend === 'cli') {
+        // persona 的实际落点：CLI 角色 preset 的 persona 行（替代旧的 config.persona）。
+        // buildRolePreset 自己从 roles 推导可派发清单，因此期望值也必须用同一份清单。
+        const other = normalizeRole({ id: 'other-target', description: 'd', instructions: 'i', model: 'm' }, 0, 'p').role;
+        const preset = buildRolePreset(role, { ...options, platform: 'win32', roles: [role, other] });
+        const presetPermissions = dispatchPermissionsFor(role, { ...options,
+          delegateToolNames: allowNestedDispatch ? [other.toolName] : [] });
+        check(`${tag}：preset persona 使用同一权限结果`,
+          preset.plugins.find((p) => p.id === 'persona')?.config?.prefix === cliPersonaFor(role, presetPermissions));
+      }
+      // 只读：旧断言比对 toolFilter.deny；现在只读是 preset 行级裁剪（另见 buildRolePreset 小节）。
       const readOnly = toolConfigFor({ ...role, readOnly: true }, options);
-      check(`${tag}：只读过滤保留且不否定受控委派`, backend === 'cli'
-        ? JSON.stringify(readOnly.toolFilter) === JSON.stringify(config.toolFilter)
-        : WRITE_TOOLS.every((name) => readOnly.toolFilter.deny.includes(name))
-          && delegateToolNames.every((name) => !readOnly.toolFilter.deny.includes(name) === allowNestedDispatch));
+      check(`${tag}：只读不再经 toolFilter，Config 保持同一 agentPreset`,
+        !Object.hasOwn(readOnly, 'toolFilter') && readOnly.agentPreset === rolePresetId(role.id));
       const empty = { ...options, delegateToolNames: [], availableToolNames: ['read'] };
       const unavailable = dispatchPermissionsFor(role, empty);
       check(`${tag}：无已挂载 delegate 时三种提示都不许宣称可继续派发`,
@@ -599,6 +647,32 @@ section('backend 取值校验');
     bad.errors.some((e) => e.includes('cli') && e.includes('spawn')),
     bad.errors.join('; '),
   );
+
+  // ⚠️ 回归：fork 已在 0.2.1-rc.1 从 BUILTIN_PROVIDERS 移除（fork 子代理无法拥有
+  //    独立 Agent Preset，因此无法承载角色 persona 与工具构成）。它必须被当成非法后端，
+  //    而不是留成一个静默失效的选项。
+  const fork = normalizeRole(
+    { id: 'legacy-fork', description: 'd', instructions: 'i', model: 'm', backend: 'fork' },
+    0,
+    'p',
+  );
+  check('已移除的 fork 后端被拒', fork.role === null && fork.errors.some((e) => e.includes('fork')), fork.errors.join('; '));
+  check(
+    'fork 的报错列出允许的后端（spawn / cli）',
+    fork.errors.some((e) => e.includes('spawn') && e.includes('cli')),
+    fork.errors.join('; '),
+  );
+  const forkSet = normalizeRoles(
+    [
+      { id: 'ok', description: 'd', model: 'm', instructions: 'i' },
+      { id: 'legacy', description: 'd', model: 'm', instructions: 'i', backend: 'fork' },
+    ],
+    'p',
+  );
+  check('normalizeRoles：含 fork 角色时整份拒绝且报错列出允许后端',
+    forkSet.roles.length === 0
+      && forkSet.errors.some((e) => e.includes('fork') && e.includes('spawn') && e.includes('cli')),
+    forkSet.errors.join('; '));
 }
 
 section('planCliMounts：有效 CLI 预设挂载（无全局闸门）');
@@ -608,7 +682,9 @@ section('planCliMounts：有效 CLI 预设挂载（无全局闸门）');
     id, backend, description: 'd', instructions: 'i', model: 'm', provider: 'p',
     readOnly: true, effort: 'medium', cliDriver: 'grok', ...cliFieldsFor('grok', true), cliCwd: 'C:/w',
   }, 0).role;
-  const roles = [mk('a', 'spawn'), mk('b', 'cli'), mk('c', 'cli'), mk('d', 'fork')];
+  // ⚠️ `mk('d','fork')` 曾经在这里，用于证明非 CLI 角色不进挂载计划。
+  //    fork 已从 BUILTIN_PROVIDERS 移除，`normalizeRole` 会返回 null；改用 spawn 表达同一不变式。
+  const roles = [mk('a', 'spawn'), mk('b', 'cli'), mk('c', 'cli'), mk('d', 'spawn')];
 
   const plan = planCliMounts(roles);
   check(
@@ -618,7 +694,7 @@ section('planCliMounts：有效 CLI 预设挂载（无全局闸门）');
   );
   check('有效预设的 blocked 为空（不再有全局闸门）', plan.blocked.length === 0, JSON.stringify(plan.blocked));
 
-  const noCli = planCliMounts([mk('a', 'spawn'), mk('b', 'fork')]);
+  const noCli = planCliMounts([mk('a', 'spawn'), mk('b', 'spawn')]);
   check('没有 CLI 角色时 active 与 blocked 都为空', noCli.active.length === 0 && noCli.blocked.length === 0);
 
   // ⚠️ 回归断言：这里**曾经**有一个 `allowCrossCli` 全局闸门，关闭时把所有 CLI 角色
@@ -637,7 +713,7 @@ section('planCliMounts：有效 CLI 预设挂载（无全局闸门）');
   }
 
   // 不变式：一个角色不可能既 active 又 blocked（曾是真实 bug：provider 与工具分开 gate）。
-  const mixed = [mk('s1', 'spawn'), mk('c1', 'cli'), mk('s2', 'fork'), mk('c2', 'cli')];
+  const mixed = [mk('s1', 'spawn'), mk('c1', 'cli'), mk('s2', 'spawn'), mk('c2', 'cli')];
   const mixedPlan = planCliMounts(mixed);
   const activeIds = new Set(mixedPlan.active.map((r) => r.id));
   const blockedIds = new Set(mixedPlan.blocked.map((b) => b.id));
@@ -651,6 +727,236 @@ section('planCliMounts：有效 CLI 预设挂载（无全局闸门）');
   );
 }
 
+
+section('buildRolePreset：角色 persona 与工具构成的唯一承载点');
+{
+  // DSH 0.2.1-rc.1 把 persona/toolFilter 从 dsh-tool-subagent 的 Config 删除，
+  // 角色组合改由「每个角色一个 Agent Preset」承载。本小节是该机制的核心覆盖。
+  const template = loadRowTemplate();
+  check('行模板来自生成物且含 persona 行与 delegation 组',
+    Array.isArray(template.rows) && template.rows.some((row) => row.id === 'persona')
+      && template.rows.some((row) => row.id === 'delegation'));
+
+  const builtin = normalizeRole({ id: 'builder', title: '构建者', description: 'd',
+    instructions: 'BUILTIN-INSTRUCTIONS', model: 'm', allowNestedDispatch: true }, 0, 'p').role;
+  const readOnlyRole = normalizeRole({ id: 'reviewer', title: '审查者', description: 'd',
+    instructions: 'RO-INSTRUCTIONS', model: 'm', readOnly: true }, 0, 'p').role;
+  const cli = normalizeRole({ id: 'codex-worker', description: 'd', instructions: 'CLI-INSTRUCTIONS', backend: 'cli',
+    model: 'gpt-6-luna', effort: 'medium', cliDriver: 'grok', ...cliFieldsFor('grok', false), cliCwd: 'C:/w' }, 0).role;
+  const cliLeaf = { ...cli, allowNestedDispatch: false };
+  const cliNested = { ...cli, allowNestedDispatch: true };
+  const roles = [builtin, readOnlyRole, cli];
+
+  const rowIds = (definition) => definition.plugins.map((plugin) => plugin.id);
+  const rowById = (definition, id) => definition.plugins.find((plugin) => plugin.id === id);
+  const personaRows = (definition) => definition.plugins.filter((plugin) => plugin.name === '@deepseek-ai/dsh-persona');
+  const uncontrolled = ['tool-subagent', 'tool-subagent-fork', 'tool-ralph', 'tool-workflow', 'workflow-ptc'];
+
+  for (const platform of ['win32', 'posix']) {
+    const definition = buildRolePreset(builtin, { platform, maxDepth: 3, roles });
+    check(`${platform}：id 为 rolePresetId（角色组合的稳定标识）`, definition.id === rolePresetId('builder'));
+    // 关键性质：persona 行是**替换**模板那一行，而不是并列追加 —— 两行 dsh-persona 会
+    // 重复注册 deployment:persona-prefix（该行刻意 fails loud）。
+    check(`${platform}：恰好一行 persona 且前缀为角色 instructions`,
+      personaRows(definition).length === 1
+        && rowById(definition, 'persona')?.config?.prefix === builtin.instructions);
+    check(`${platform}：模板自带的 persona 文案未残留（确为替换而非并列）`,
+      !definition.plugins.some((plugin) => String(plugin.config?.prefix).includes('coding agent powered by')));
+    check(`${platform}：始终排除非受控派发与 workflow 行`,
+      uncontrolled.every((id) => !rowIds(definition).includes(id)));
+    check(`${platform}：组行内部的非受控入口同样被剔除`,
+      (rowById(definition, 'delegation')?.config ?? [])
+        .every((child) => !uncontrolled.includes(child.id)));
+    check(`${platform}：平台行只保留本平台`,
+      rowIds(definition).includes(platform === 'win32' ? 'tool-pwsh' : 'tool-bash')
+        && !rowIds(definition).includes(platform === 'win32' ? 'tool-bash' : 'tool-pwsh'));
+    check(`${platform}：非只读的 fs 行无写入裁剪`, rowById(definition, 'tool-fs')?.config === undefined);
+    check(`${platform}：非只读保留 goal/todo/plugin 管理行`,
+      ['command-goal', 'tool-goal', 'tool-todo', 'tool-plugin-manager', 'tool-plugin-market']
+        .every((id) => rowIds(definition).includes(id)));
+    check(`${platform}：行 id 唯一`, new Set(rowIds(definition)).size === rowIds(definition).length);
+    const delegates = definition.plugins.filter((plugin) => plugin.name === '@deepseek-ai/dsh-tool-subagent');
+    const others = roles.filter((role) => role.id !== builtin.id);
+    check(`${platform}：允许嵌套时为每个其它角色生成一行受控委派并指向对方 preset`,
+      JSON.stringify(delegates.map((plugin) => plugin.config.toolName).sort())
+        === JSON.stringify(others.map((role) => role.toolName).sort())
+        && delegates.every((plugin) => plugin.config.provider === 'spawn'
+          && plugin.config.agentPreset
+            === rolePresetId(others.find((role) => role.toolName === plugin.config.toolName).id))
+        && delegates.every((plugin) => plugin.config.maxDepth === 4));
+  }
+
+  {
+    const definition = buildRolePreset(readOnlyRole, { platform: 'win32', maxDepth: 3, roles });
+    check('只读：fs 行保留读取与读图、关掉写入与编辑（替代旧 WRITE_TOOLS deny）',
+      JSON.stringify(rowById(definition, 'tool-fs')?.config)
+        === JSON.stringify({ read: true, readImage: true, write: false, edit: false }));
+    check('只读：shell/goal/todo/plugin 管理行被整行移除',
+      ['tool-bash', 'tool-pwsh', 'command-goal', 'tool-goal', 'tool-todo',
+        'tool-plugin-manager', 'tool-plugin-market'].every((id) => !rowIds(definition).includes(id)));
+    check('只读：persona 仍是角色自己的指令',
+      rowById(definition, 'persona')?.config?.prefix === readOnlyRole.instructions);
+    check('只读：未开启嵌套时没有委派行',
+      !definition.plugins.some((plugin) => plugin.name === '@deepseek-ai/dsh-tool-subagent'));
+    check('只读：行 id 唯一', new Set(rowIds(definition)).size === rowIds(definition).length);
+  }
+
+  {
+    const leaf = buildRolePreset(cliLeaf, { platform: 'win32', maxDepth: 3, roles });
+    check('CLI 叶子：persona 是包裹转交指令而不是 CLI 自己的 instructions',
+      rowById(leaf, 'persona')?.config?.prefix === cliPersonaFor(cliLeaf, dispatchPermissionsFor(cliLeaf))
+        && rowById(leaf, 'persona')?.config?.prefix !== cliLeaf.instructions);
+    check('CLI 叶子：恰有一行本插件且 cliToolFor 只含自己',
+      leaf.plugins.filter((plugin) => plugin.name === '@magicvr/dsh-agent-switchboard').length === 1
+        && JSON.stringify(rowById(leaf, 'switchboard-cli-tools-codex-worker')?.config?.cliToolFor)
+          === '["codex-worker"]');
+    check('CLI 叶子：刻意最小 —— 无标准工具行、无委派行',
+      !rowIds(leaf).includes('tool-fs') && !rowIds(leaf).includes('delegation')
+        && !leaf.plugins.some((plugin) => plugin.name === '@deepseek-ai/dsh-tool-subagent'));
+    check('CLI 叶子：行 id 唯一', new Set(rowIds(leaf)).size === rowIds(leaf).length);
+
+    // 再加一个 CLI 目标角色：统一包裹路由只对 CLI 目标的委派行生效（内置目标用自己的 route）。
+    const altCli = { ...cli, id: 'grok-worker', toolName: 'delegate_to_grok_worker' };
+    const nestedRoles = [...roles, altCli];
+    const nested = buildRolePreset(cliNested, { platform: 'win32', maxDepth: 2, roles: nestedRoles,
+      wrapperRoute: { provider: ' wp ', model: 'wrapper-model', effort: 'high' } });
+    const delegates = nested.plugins.filter((plugin) => plugin.name === '@deepseek-ai/dsh-tool-subagent');
+    const others = nestedRoles.filter((role) => role.id !== cliNested.id);
+    check('CLI 允许嵌套：每个其它角色一行委派，provider/toolName/agentPreset/深度正确',
+      delegates.length === others.length && delegates.every((plugin) => plugin.config.provider === 'spawn'
+        && others.some((role) => role.toolName === plugin.config.toolName)
+        && plugin.config.agentPreset
+          === rolePresetId(others.find((role) => role.toolName === plugin.config.toolName).id)
+        && plugin.config.maxDepth === 3));
+    check('CLI 允许嵌套：对 CLI 目标使用统一包裹路由作为子代理 agentOptions',
+      delegates.filter((plugin) => plugin.config.toolName === altCli.toolName).length === 1
+        && JSON.stringify(delegates.find((plugin) => plugin.config.toolName === altCli.toolName)?.config.agentOptions)
+          === JSON.stringify({ provider: 'wp', model: 'wrapper-model', reasoningEffort: 'high' }));
+    check('CLI 允许嵌套：仍不含标准工具行', !rowIds(nested).includes('tool-fs'));
+    check('CLI 允许嵌套：行 id 唯一', new Set(rowIds(nested)).size === rowIds(nested).length);
+  }
+
+  {
+    const definitions = buildRolePresets(roles, { platform: 'win32', maxDepth: 1 });
+    check('buildRolePresets 为每个角色生成一个 preset',
+      definitions.length === roles.length
+        && definitions.every((definition, index) => definition.id === rolePresetId(roles[index].id)));
+  }
+}
+
+section('回归守卫：已删除的 dsh-tool-subagent Config 字段不得回流');
+{
+  // ⚠️ 精确锁死本次升级事故：0.2.1-rc.1 对 `persona` / `toolFilter` 做 `Object.hasOwn`
+  //    判定，**键存在即装载期硬抛错**（值为 undefined 也算）；`backgroundMode` /
+  //    `enableRunInBackground` 已从 Config 删除。这里用 Object.hasOwn（而非取值判断）
+  //    断言四种角色形态都不再带这些字段。
+  const removed = ['persona', 'toolFilter', 'backgroundMode', 'enableRunInBackground'];
+  const builtin = normalizeRole({ id: 'guard', description: 'd', instructions: 'i', model: 'm' }, 0, 'p').role;
+  const readOnlyRole = normalizeRole({ id: 'guard-ro', description: 'd', instructions: 'i', model: 'm', readOnly: true }, 0, 'p').role;
+  const cli = normalizeRole({ id: 'guard-cli', description: 'd', instructions: 'i', backend: 'cli',
+    model: 'm', effort: 'medium', cliDriver: 'grok', ...cliFieldsFor('grok', false), cliCwd: 'C:/w' }, 0).role;
+  const shapes = [['builtin', builtin], ['readOnly', readOnlyRole], ['cli', cli],
+    ['cli 嵌套', { ...cli, allowNestedDispatch: true }]];
+  for (const [label, role] of shapes) {
+    const cfg = toolConfigFor(role, { maxDepth: 3, wrapperRoute: { provider: 'p', model: 'm', effort: 'low' } });
+    for (const field of removed) {
+      check(`${label}：toolConfigFor 没有 own ${field}`, !Object.hasOwn(cfg, field));
+    }
+    check(`${label}：own keys 恰为新契约五项`,
+      JSON.stringify(Object.keys(cfg).sort())
+        === JSON.stringify(['agentOptions', 'agentPreset', 'maxDepth', 'provider', 'toolName']),
+      Object.keys(cfg).join(','));
+    // persona 并未消失，只是换了承载点：必须在角色 preset 里恰好出现一次。
+    const preset = buildRolePreset(role, { platform: 'win32', maxDepth: 3, roles: [role] });
+    check(`${label}：persona 改由 preset 承载且恰好一行`,
+      preset.plugins.filter((plugin) => plugin.name === '@deepseek-ai/dsh-persona').length === 1);
+  }
+}
+
+section('回归守卫：真实 dsh-tool-subagent apply 必须接受新契约、拒绝旧字段');
+{
+  // ⚠️ 这条是本次升级事故的**可证伪**守卫。前一小节只能证明我们**产出的配置**没有旧字段；
+  //    这里把真实插件拉进来，证明「新配置不抛错」且「旧字段确实抛错」——
+  //    如果谁把 persona/toolFilter 重新塞回 toolConfigFor，本小节会立刻失败。
+  //
+  // 桩只需要真实 apply 在**无作用域**（compositionScope === undefined）下的直接安装路径：
+  // agentPresets 服务（register/readDocument 前置校验）、tools / subagents / systemPrompt /
+  // sessionProjections / agents、effect 与 logger。
+  const makeToolPluginCtx = (presetIds) => {
+    const registered = [];
+    const tools = {
+      register(definition) {
+        registered.push(definition.name);
+        return () => {};
+      },
+    };
+    const provider = { name: 'spawn', inheritsParentContext: false,
+      capabilities: { depthLimit: true, agentOptions: true, agentPreset: true } };
+    const subagents = { getProvider: (name) => (name === 'spawn' ? provider : undefined),
+      resolveMaxDepth: (depth) => depth, async startActivation() { return { childId: 'fixture' }; } };
+    const systemPrompt = { section: () => () => {}, context: () => () => {},
+      getContextOrder: () => 0, getSectionOrder: () => 0 };
+    const agentPresets = {
+      async register(definition) { presetIds.add(definition.id); return () => {}; },
+      async readDocument(id) {
+        if (!presetIds.has(id)) throw new Error(`agentPresets: 未注册的 preset "${id}"`);
+        return { id };
+      },
+    };
+    // 官方 apply 同时用 `ctx.get('x')` 与 `ctx.x`（真实 Cordis 把服务同时暴露为属性）。
+    return {
+      registered,
+      tools, subagents, systemPrompt,
+      agents: { list: () => [] },
+      sessionProjections: { register() {} },
+      get(key) {
+        if (key === 'tools') return tools;
+        if (key === 'agentPresets') return agentPresets;
+        if (key === 'agents') return { list: () => [] };
+        if (key === 'sessionProjections') return { register() {} };
+        if (key === 'subagents') return subagents;
+        if (key === 'systemPrompt') return systemPrompt;
+        return undefined;
+      },
+      on() { return () => {}; },
+      effect(callback) { const dispose = callback(); return typeof dispose === 'function' ? dispose : () => {}; },
+      logger: { info() {}, warn() {}, error() {} },
+    };
+  };
+
+  const toolModule = await import('@deepseek-ai/dsh-tool-subagent');
+  const guardBuiltin = normalizeRole({ id: 'guard-real', description: 'd', instructions: 'GUARD', model: 'm' }, 0, 'p').role;
+  const guardCli = normalizeRole({ id: 'guard-real-cli', description: 'd', instructions: 'i', backend: 'cli',
+    model: 'm', effort: 'medium', cliDriver: 'grok', ...cliFieldsFor('grok', false), cliCwd: 'C:/w' }, 0).role;
+  for (const [label, role] of [['builtin', guardBuiltin], ['cli', guardCli]]) {
+    const config = toolConfigFor(role, { maxDepth: 3 });
+    const presetIds = new Set([rolePresetId(role.id)]);
+    const ctx = makeToolPluginCtx(presetIds);
+    let threw = null;
+    try { await toolModule.apply(ctx, config); } catch (error) { threw = error; }
+    check(`${label}：真实 dsh-tool-subagent apply 接受新契约配置（不抛错）`, threw === null, String(threw));
+    check(`${label}：真实 apply 后委派工具已注册且选中角色 preset`,
+      ctx.registered.includes(role.toolName) && config.agentPreset === rolePresetId(role.id));
+  }
+  for (const field of ['persona', 'toolFilter']) {
+    const config = toolConfigFor(guardBuiltin, { maxDepth: 3 });
+    const presetIds = new Set([rolePresetId(guardBuiltin.id)]);
+    let threw = null;
+    try { await toolModule.apply(makeToolPluginCtx(presetIds), { ...config, [field]: 'fixture-value' }); }
+    catch (error) { threw = error; }
+    check(`正向对照：把 ${field} 塞回去后真实 apply 抛错（守卫有齿）`,
+      threw !== null && String(threw?.message).includes(field), String(threw));
+  }
+  // 另外两种已删除字段即使取值 undefined 也必须被拒（Object.hasOwn 判定）。
+  for (const field of ['persona', 'toolFilter']) {
+    const config = toolConfigFor(guardBuiltin, { maxDepth: 3 });
+    const presetIds = new Set([rolePresetId(guardBuiltin.id)]);
+    let threw = null;
+    try { await toolModule.apply(makeToolPluginCtx(presetIds), { ...config, [field]: undefined }); }
+    catch (error) { threw = error; }
+    check(`正向对照：${field} 取 undefined 仍然抛错（键存在即失败）`, threw !== null, String(threw));
+  }
+}
 
 section('F2 / F3 回归');
 {

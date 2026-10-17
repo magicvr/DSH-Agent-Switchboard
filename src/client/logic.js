@@ -10,8 +10,8 @@
  * 本模块不含任何 DOM / React / DSH 依赖，因此可以在 Node 里直接跑。
  */
 
-/** 后端取值，必须与 Host 的 `z.union(['spawn', 'fork', 'cli'])` 一致。 */
-export const BACKENDS = ['spawn', 'fork', 'cli'];
+/** 后端取值，必须与 Host 的 `z.union(['spawn', 'cli'])` 一致。 */
+export const BACKENDS = ['spawn', 'cli'];
 
 /** 思考强度取值，必须与 Host 的 `EFFORT_VALUES` 一致。 */
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];

@@ -148,7 +148,7 @@ roles.push({
     prefixArgs: [CODEX_JS],
     // 提示词走 stdin（codex exec - 即从此读取），因此模板里没有 {prompt}。
     // `-s read-only` 是 codex 自己的沙箱参数 —— CLI 后端的「只读」只能这样实现
-    // （toolFilter 只对 builtin provider 有效，见 D7）。
+    // （角色的行级工具裁剪只影响内置 prompt 工具，管不到外部 CLI 进程，见 D7）。
     args: ['exec', '-s', 'read-only', '--skip-git-repo-check', '-m', '{model}', '-c', 'model_reasoning_effort={effort}', '-'],
     promptDelivery: 'stdin',
     cwd: ROOT,

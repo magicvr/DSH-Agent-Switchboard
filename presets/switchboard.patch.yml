@@ -35,9 +35,9 @@
 
                 主代理必须自己理解目标、架构与方法基础、已接受设计、交接信息、验收标准和核心约束；scout 可定位并提取辅助证据，不能替代主代理对决策依据的理解。主线上下文保留目标、状态、已确认事实、已接受决策、阻塞、风险、下一步和验收状态；大量搜索、日志、无关代码、探索过程与失败尝试由子代理隔离，返回可追溯的结论与必要证据。
 
-                任务包提供最小充分上下文：目标、必要背景、范围、已知事实、关键约束、禁止事项、预期结果和验收条件。简单任务保持简洁，复杂任务必须自包含；不重复复制角色完整规则，只描述本次工作。子代理是边界清晰、输入明确、可独立完成、输出可验证的一次性专业工作单元，不长期接管整个目标；高级角色尤其要聚焦。独立任务仅在工具支持时并行，存在依赖或共享写入冲突时顺序执行，不为并行拆出无价值任务。
+                任务包提供最小充分上下文：目标、必要背景、范围、已知事实、关键约束、禁止事项、预期结果和验收条件。简单任务保持简洁，复杂任务必须自包含；不重复复制角色完整规则，只描述本次工作。子代理是边界清晰、输入明确、可独立完成、输出可验证的一次性专业工作单元，不长期接管整个目标；高级角色尤其要聚焦。互不依赖的任务放在同一条消息里并行发起，存在依赖或共享写入冲突时顺序执行，不为并行拆出无价值任务。
 
-                派发生命周期：delegate_to_* 阻塞等待结果，让当前任务自然完成；不要重复派发同一任务，不为催进度而打断。取消只用于用户明确要求、紧急纠偏或已确认安全风险。失败或取消后先检查部分文件与副作用，不把部分结果宣称为完整交付；不得盲目自动重试，先按失败性质补事实、拆分或改派。
+                派发生命周期：delegate_to_* 只返回子代理 id 的受理确认，**不阻塞等待结果**；子代理执行完毕后由完成通知送达。受理后继续推进有用的工作，不要轮询、空转或重复派发同一任务，也不要为催进度打断子代理；只有下一步确实依赖该结果时才停下手上的事等它。相互独立的委派放在同一条消息里一起发起；存在依赖或共享写入冲突时顺序执行。取消只用于用户明确要求、紧急纠偏或已确认安全风险。失败或取消后先检查部分文件与副作用，不把部分结果宣称为完整交付；不得盲目自动重试，先按失败性质补事实、拆分或改派。
 
                 结果与失败路由：核对结果是否回答任务、证据是否充分、是否矛盾以及是否需要下一角色。缺事实→scout；方向不明或原设计不可行→architect；方向明确的实现失败→worker 拆解或有依据地重试；正确性存疑→reviewer；reviewer 发现设计问题→architect。低风险结果可由主代理轻量验证，高风险或复杂实现、重构、架构与方法变更、目标完成验收应考虑独立 reviewer。reviewer 可以质疑主代理假设、architect 方案、worker 实现、测试有效性与验收满足程度，不能只做确认器。
 
@@ -47,12 +47,13 @@
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
-              suffix: Your working directory is {{cwd}}.
               prefix: You are a coding agent powered by the {{model}} model.
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
               maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
           - id: tool-bash
             name: '@deepseek-ai/dsh-tool-bash'
             disabled: !!js process.platform === 'win32'
@@ -67,6 +68,8 @@
               sampleOverCapGlobResults: false
           - id: tool-jobs
             name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
           - id: skill-filesystem
             name: '@deepseek-ai/dsh-skill-filesystem'
           - id: tool-skill
@@ -85,7 +88,7 @@
                 name: '@deepseek-ai/dsh-plan-mode'
                 config:
                   section: |
-                    You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
 
                     Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
 
@@ -130,42 +133,18 @@
                   provider: spawn
                   toolName: subagent
                   modelSelectionSettings: true
-                  backgroundMode: continuable
               - id: tool-subagent-fork
                 disabled: true
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: fork
                   toolName: subagent_fork
-                  backgroundMode: continuable
-              - id: tool-subagent-codex
-                name: '@deepseek-ai/dsh-tool-subagent'
-                disabled: true
-                config:
-                  provider: codex
-                  toolName: subagent_codex
-                  backgroundMode: one-shot
-                  maxDepth: provider-managed
-              - id: tool-subagent-claude-code
-                name: '@deepseek-ai/dsh-tool-subagent'
-                disabled: true
-                config:
-                  provider: claude-code
-                  toolName: subagent_claude_code
-                  backgroundMode: one-shot
-                  maxDepth: provider-managed
               - id: workflow-ptc
                 name: '@deepseek-ai/dsh-workflow-ptc'
                 config:
                   provider: spawn
               - id: tool-workflow
                 name: '@deepseek-ai/dsh-tool-workflow'
-              - id: tool-ralph
-                name: '@deepseek-ai/dsh-tool-ralph'
-                disabled: true
-                config:
-                  subagentProvider: spawn
-                  maxRounds: 64
           - id: tool-ask-user
             name: '@deepseek-ai/dsh-tool-ask-user'
           - id: tool-todo
@@ -181,5 +160,8 @@
             name: '@deepseek-ai/dsh-tool-present'
           - id: tool-plugin-manager
             name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: true
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
             disabled: true
 

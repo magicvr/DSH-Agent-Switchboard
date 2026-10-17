@@ -87,7 +87,41 @@ section('注册契约：必须调用 __ModuleLoader__.load 且 id 严格等于�
     m !== null && m[1] === pkg.name,
     m ? `实际 ${m[1]}` : '未取到',
   );
-  check('dsh.client 已声明（否则产物不会被加载）', pkg.dsh?.client !== undefined);
+  // 0.2.1 的加载判据（`@deepseek-ai/dsh-client-modules/lib/index.js`）：
+  //   - 声明了 `dsh.client` 却**没有** `exports["./client"]` → 组合期直接抛
+  //     `declares dsh.client but exports no "./client" bundle`；
+  //   - `dsh.client.platform !== "web"` → 该包被**静默跳过**（缓存 null，零诊断），
+  //     现象是设置页整个消失，最难排查；
+  //   - `dsh.client.inject` 必须是字符串数组（`optionalStringArray` 会抛错）。
+  // 三条都只在真实启动时才暴露，因此必须在这里逐项锁死，而不是只判断「声明了」。
+  const clientDeclaration = pkg.dsh?.client;
+  check(
+    'dsh.client 已声明为对象（否则产物不会被加载）',
+    clientDeclaration !== null && typeof clientDeclaration === 'object' && !Array.isArray(clientDeclaration),
+    `实际 ${JSON.stringify(clientDeclaration)}`,
+  );
+  const clientExport = typeof pkg.exports === 'object' && pkg.exports !== null
+    ? pkg.exports['./client'] : undefined;
+  // 与 DSH 的 `clientExportOf()` 同义：字符串，或带字符串 default 的对象。
+  const clientExportTarget = typeof clientExport === 'string'
+    ? clientExport
+    : clientExport !== null && typeof clientExport === 'object' ? clientExport.default : undefined;
+  check(
+    'exports["./client"] 已声明且解析为字符串（声明 dsh.client 却缺失会抛错）',
+    typeof clientExportTarget === 'string' && clientExportTarget.length > 0,
+    `实际 ${JSON.stringify(clientExport)}`,
+  );
+  check(
+    'dsh.client.platform 严格等于字符串 "web"（其它值是静默跳过，无诊断）',
+    clientDeclaration?.platform === 'web',
+    `实际 ${JSON.stringify(clientDeclaration?.platform)}`,
+  );
+  check(
+    'dsh.client.inject 是字符串数组',
+    Array.isArray(clientDeclaration?.inject) &&
+      clientDeclaration.inject.every((item) => typeof item === 'string'),
+    `实际 ${JSON.stringify(clientDeclaration?.inject)}`,
+  );
 }
 
 section('模块可被真跑：桩化 window/require 后 factory 返回合法插件对象');
@@ -106,7 +140,10 @@ section('模块可被真跑：桩化 window/require 后 factory 返回合法插�
           view: {
             writable: true,
             namespaces: [
-              { ns: 'agent-switchboard', value: { roles: [] }, revision: 1, writable: true },
+              // 0.2.1 `SettingsController.namespaceView()` 的行形态是
+              // `{ ns, autoGenerate, schema, value, applies, secrets, revision }`；
+              // `writable` 只在 `describe()`/view 根上，**不在**每行上。
+              { ns: 'agent-switchboard', value: { roles: [] }, revision: 1 },
             ],
           },
         }),
@@ -317,7 +354,9 @@ section('validateRoles：与 Host 的 normalizeRole 规则一致，且能给出�
     /派发机制|backend/.test(validateRoles([{ ...good, backend: 'nope' }]) ?? ''),
     String(validateRoles([{ ...good, backend: 'nope' }])),
   );
-  check('合法 backend 通过', validateRoles([{ ...good, backend: 'fork' }]) === null);
+  check('合法 backend 通过', validateRoles([{ ...good, backend: 'spawn' }]) === null);
+  // `fork` 在 0.2.1-rc.1 被移除：它无法承载独立 Agent Preset，保留只会是静默失效的选项。
+  check('已移除的 fork 后端被拒', /派发机制|backend/.test(validateRoles([{ ...good, backend: 'fork' }]) ?? ''));
 }
 
 section('防漂移：Client 内联的纯逻辑与 logic.js 必须逐字相同');
@@ -609,9 +648,9 @@ section('面板字段：源码结构与桩化 RoleRow（不替代真机验收）
 {
   const rowSource = CLIENT_SRC.slice(CLIENT_SRC.indexOf('    function RoleRow('), CLIENT_SRC.indexOf('    function WrapperSettings('));
   const renderSource = rowSource.slice(rowSource.indexOf('      return h('));
-  // 用条件分支锚点约束控件位置；再对 spawn / fork / cli 的元素树验证显示条件。
+  // 用条件分支锚点约束控件位置；再对 spawn / cli 的元素树验证显示条件。
   check('Provider 输入位于 builtin 条件分支',
-    rowSource.includes("const isBuiltin = ['spawn', 'fork'].includes(role.backend ?? 'spawn');") &&
+    rowSource.includes("const isBuiltin = ['spawn'].includes(role.backend ?? 'spawn');") &&
     /isBuiltin\s*\? h\([^\n]*field\('Provider', text\('provider', '留空使用默认 provider', true\)\)\)\s*: null/.test(renderSource));
   const cliBranch = renderSource.slice(renderSource.indexOf('        isCli\n'));
   check('CLI 分支无 provider 输入', !/text\('provider'/.test(cliBranch));
@@ -629,7 +668,7 @@ section('面板字段：源码结构与桩化 RoleRow（不替代真机验收）
     !rowSource.includes('driverDef.description') && !renderSource.includes('-s read-only'));
   check('外部模型与包裹模型标签明确区分',
     renderSource.includes("isCli ? '外部 CLI 模型' : '模型'") && CLIENT_SRC.includes('模型（非外部 CLI 模型）'));
-  for (const backend of ['spawn', 'fork', 'cli']) {
+  for (const backend of ['spawn', 'cli']) {
     const role = {
       id: 'r', backend, description: '描述', instructions: '原始指令\n第二行',
       model: 'external-model', effort: 'high', provider: 'route', agentProvider: 'wrapper-route', agentModel: 'wrapper-model',
@@ -753,7 +792,8 @@ section('统一包裹草稿：组件编辑、保存、清空与非法值的真�
   const mirror = { volatile: wrapper }; // 根未提供 roles，但有效角色存在于文件。
   const store = makeRoleStore({
     configForms: { describe: () => ({ ensure: async () => {}, getSnapshot: () => ({ view: { namespaces: [
-      { ns: 'agent-switchboard', value: mirror, revision, writable: true },
+      // 行形态与 Host 的 `namespaceView()` 一致：无 per-namespace `writable`。
+      { ns: 'agent-switchboard', value: mirror, revision },
     ] } }) }) },
     remote: { settings: { mutate: async (ns, ops, rev) => {
       calls.push({ ns, ops, rev });
@@ -840,7 +880,8 @@ section('角色卡片：真实编辑、草稿、校验、并发与增删回调')
   const mirror = { roles: [good, cli], volatile: {} }; let revision = 71, reject = false, readFails = false;
   const calls = [];
   const store = makeRoleStore({ configForms: { describe: () => ({ ensure: async () => { if (readFails) throw new Error('fixture read failure'); }, getSnapshot: () => ({ view: { namespaces: [
-    { ns: 'agent-switchboard', value: mirror, revision, writable: true },
+    // 行形态与 Host 的 `namespaceView()` 一致：无 per-namespace `writable`。
+    { ns: 'agent-switchboard', value: mirror, revision },
   ] } }) }) }, remote: { settings: { mutate: async (ns, ops, rev) => {
     calls.push({ ns, ops: structuredClone(ops), rev });
     if (reject) return { ok: false, error: { message: 'revision conflict' } };
@@ -1197,7 +1238,7 @@ section('CLI composer：one-shot 选择、官方只读占位与无 turn 输出')
   check('CLI 渲染：失败态诊断自动展开并改用错误色',
     detailsWith(deadTree, '过程与诊断')[0]?.props.open === true
       && cliNodes(deadTree).some(node => node.props?.['data-channel'] === 'stderr'
-        && node.props.style.color === 'var(--dsw-alias-label-error, var(--dsw-alias-label-secondary))'));
+        && node.props.style.color === 'var(--dsw-alias-state-error-primary, var(--dsw-alias-label-secondary))'));
   check('CLI 渲染：终态无 stdout 给出占位而非空白',
     channelText(CliJobOutput({ job: cliRow('quiet', 's', { status: 'completed' }) }), 'stdout')
       === '（CLI 未产生标准输出）'
