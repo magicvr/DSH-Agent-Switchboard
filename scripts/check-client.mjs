@@ -750,6 +750,24 @@ section('统一包裹小节：真实控件、读取与原子写入');
   });
   const read = await store.read();
   check('镜像读取统一三字段并保留同一 revision', JSON.stringify(read.wrapper) === JSON.stringify(wrapper) && read.revision === 23);
+  // ⚠️ split 模式：设置里只有旋钮层 `roleSettings`（角色定义住在 roles.json）。此时**不得**
+  //    渲染可编辑的空角色列表 —— 那既让人以为角色丢了，一次保存又会写回 `roles: []`，
+  //    把刚迁移好的设置退回「roles 与 roleSettings 并存」的回退陷阱。
+  const splitCalls = [];
+  const splitStore = makeRoleStore({
+    configForms: { describe: () => ({ ensure: async () => {}, getSnapshot: () => ({ view: { namespaces: [
+      { ns: 'agent-switchboard', value: { roleSettings: [{ id: 'scout', backend: 'spawn' }], volatile: wrapper }, revision: 24 },
+    ] } }) }) },
+    remote: { settings: { mutate: async (...args) => { splitCalls.push(args); return { ok: true }; } } },
+  });
+  const splitRead = await splitStore.read();
+  check('split 模式：明确拒绝渲染可编辑列表并说明去处（不静默显示零角色）',
+    splitRead.ok === false && splitRead.mode === 'split' && splitRead.writable === false
+      && /roles\.json/.test(splitRead.error) && /请勿在此保存/.test(splitRead.error),
+    JSON.stringify(splitRead));
+  await splitStore.write([], splitRead.revision, {});
+  check('split 模式下不产生任何 roles 写入',
+    splitCalls.every(args => !JSON.stringify(args).includes('"roles"')), JSON.stringify(splitCalls));
   const saved = await store.write([], read.revision, { wrapperProvider: ' route ', wrapperModel: ' ', wrapperEffort: '' });
   check('角色与 volatile 三路径在同一次 mutate 提交，使用读取 revision', saved.ok && calls.length === 1 &&
     JSON.stringify(calls[0]) === JSON.stringify(['agent-switchboard', [

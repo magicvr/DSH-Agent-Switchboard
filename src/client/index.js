@@ -419,6 +419,24 @@ window.__ModuleLoader__.load({
           };
         }
         const roles = Array.isArray(row.value?.roles) ? row.value.roles : [];
+        // ⚠️ split 模式（设置里只有旋钮层 `roleSettings`，角色**定义**住在 roles.json）：
+        //    本页面仍是完整角色编辑器，读不到定义只会渲染成**空列表**，而一次保存就会
+        //    写回 `roles: []` —— 既误导用户，又把刚迁移好的设置退回半迁移状态（重新引入
+        //    回退陷阱：`roles` 与 `roleSettings` 并存）。
+        //    旋钮编辑器尚未实现，所以这里**如实拒绝**渲染可编辑列表，而不是静默显示零角色。
+        if (Array.isArray(row.value?.roleSettings)) {
+          return {
+            ok: false,
+            roles: [],
+            mode: 'split',
+            revision: row.revision,
+            writable: false,
+            error: '角色已迁移为「定义住在 $DSH_HOME/agent-switchboard/roles.json、设置只存旋钮」的形态；'
+              + '本页面的旋钮编辑器尚未实现，因此这里不再显示可编辑的角色列表 —— '
+              + '静默显示成空列表会让人以为角色丢了，而在本页保存还会写回空的 roles。'
+              + '请直接编辑 roles.json；面板升级前请勿在此保存。',
+          };
+        }
         return {
           ok: true,
           roles,
@@ -592,11 +610,20 @@ window.__ModuleLoader__.load({
      * @returns {{read: Function, write: Function}} 操作回调。
      */
     function makeRoleStore(ctx) {
+      // 模式由**最近一次读**决定，写路径据此自保。
+      //
+      // ⚠️ 为什么需要它：split 模式下设置里只有旋钮层 `roleSettings`，若此时仍写
+      //    `roles`，就会把刚迁移好的设置退回「roles 与 roleSettings 并存」的回退陷阱
+      //    （roleSettings 一旦被清空，那份陈旧 roles 会静默覆盖用户在面板上的改动）。
+      //    界面在 split 模式下已经不提供保存，但**守在这里**才不依赖界面行为。
+      let mode = 'legacy';
       return {
         /** 读角色。 */
-        read: () => fetchRoles(ctx),
+        read: async () => { const result = await fetchRoles(ctx); mode = result.mode ?? 'legacy'; return result; },
         /** 写角色；`revision` 来自上一次读。 */
-        write: (roles, revision, wrapper) => saveRoles(ctx, roles, revision, wrapper),
+        write: (roles, revision, wrapper) => (mode === 'split'
+          ? Promise.resolve({ ok: false, message: '角色设置处于「定义 + 旋钮」形态；本页面不写 roles（会退回半迁移状态）' })
+          : saveRoles(ctx, roles, revision, wrapper)),
       };
     }
 
