@@ -33,6 +33,7 @@ import {
   cliToolName,
   mergeRoleLayers,
   normalizeRoles,
+  pickOverrideFields,
   planCliMounts,
   roleGuidanceText,
   routeSummaryFor,
@@ -1179,10 +1180,23 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
   diagnostics.roleConfigRead = current.detail;
   if (current.ok) noteLegacyTimeout(current.value, diagnostics);
   if (current.ok) noteLegacyWrapper(current.value, diagnostics);
+  // split 模式：设置层只给**旋钮**，定义归文件所有（判据与 `createRoleResolver` 同一处说明，
+  // 都是显式的：设置层提供 `roleSettings` 即为 split）。
+  const configuredSettings = readVolatileField(resolved, 'roleSettings');
+  const splitMode = configuredSettings !== undefined;
+  if (splitMode && !Array.isArray(configuredSettings)) {
+    diagnostics.configuredRoleCount = 0;
+    diagnostics.configuredRoles = [];
+    diagnostics.configErrors = ['roleSettings 必须是数组（undefined 表示未提供）'];
+    diagnostics.roleConfigSync = '角色旋钮设置非法，未同步';
+    console.error(`[${name}] ${diagnostics.configErrors[0]}`);
+    return false;
+  }
   // `undefined` 表示配置对象没有提供 roles，必须保留文件；数组（包括 []）表示
   // 显式提交，空数组也必须写回，不能把「未提供」误当成「清空」。
-  const providedRoles = cordisRoles !== undefined;
-  if (providedRoles && !Array.isArray(cordisRoles)) {
+  // split 模式下这条判据由 `roleSettings` 承担（它已定义），legacy 语义不变。
+  const providedRoles = splitMode || cordisRoles !== undefined;
+  if (!splitMode && providedRoles && !Array.isArray(cordisRoles)) {
     diagnostics.configuredRoleCount = 0;
     diagnostics.configuredRoles = [];
     diagnostics.configErrors = ['roles 必须是数组（undefined 表示未提供）'];
@@ -1190,7 +1204,25 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
     console.error(`[${name}] ${diagnostics.configErrors[0]}`);
     return false;
   }
-  const rawRoles = providedRoles ? cordisRoles : current.ok ? current.value.roles : [];
+  const fileDefinitions = current.ok && current.missing !== true && Array.isArray(current.value.roles)
+    ? current.value.roles : [];
+  const fileOverrides = current.ok && current.missing !== true && Array.isArray(current.value.overrides)
+    ? current.value.overrides : [];
+  // 诊断与字段级校验都用**生效角色**；legacy 下它就是设置层的 roles（逐字不变）。
+  const rawRoles = splitMode
+    ? mergeRoleLayers({ definitions: fileDefinitions, overrides: fileOverrides, configured: configuredSettings })
+    : providedRoles ? cordisRoles : current.ok ? current.value.roles : [];
+  // split 模式下定义必须住在文件里；文件没有定义就如实报错，而不是派发一批空壳角色。
+  if (splitMode && fileDefinitions.length === 0) {
+    const detail = '设置了角色旋钮（roleSettings），但角色文件里没有角色定义；'
+      + '请先把定义写入文件，或继续用 roles 提供完整定义';
+    diagnostics.configErrors = [detail];
+    diagnostics.roleConfigSync = detail;
+    console.error(`[${name}] ${detail}`);
+    return false;
+  }
+  const overrideProjection = splitMode
+    ? configuredSettings.map(pickOverrideFields).filter(entry => entry !== undefined) : [];
   diagnostics.configuredRoleCount = rawRoles.length;
   const { roles, errors } = normalizeRoles(rawRoles,
     (current.ok && current.value.provider) || resolved.provider,
@@ -1214,27 +1246,40 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
   }
 
   // 与文件比对后再写，避免每次启动都做一次无意义写盘。
+  // 比的是「本次会写下去的那一层」：split 写旋钮覆盖层，legacy 写 roles。
   if (current.ok && current.missing !== true) {
-    const same = JSON.stringify(current.value.roles) === JSON.stringify(cordisRoles);
+    const same = splitMode
+      ? JSON.stringify(current.value.overrides ?? null) === JSON.stringify(overrideProjection)
+      : JSON.stringify(current.value.roles) === JSON.stringify(cordisRoles);
     if (same && !depthChanged) {
-      diagnostics.roleConfigSync = `文件已与配置一致（${cordisRoles.length} 个），未重写`;
+      diagnostics.roleConfigSync = splitMode
+        ? `文件已与配置一致（${overrideProjection.length} 个旋钮覆盖），未重写`
+        : `文件已与配置一致（${cordisRoles.length} 个），未重写`;
       return;
     }
   }
 
   const existing = current.ok && current.missing !== true ? current.value : {};
-  // 以现有文件为基底只替换 roles：未知顶层字段与 formatVersion 都必须原样保留；
-  // volatile 也整体保留，继续沿用既有的包裹路由/兼容字段语义。
+  // 以现有文件为基底只替换**本次负责的那一层**：未知顶层字段与 formatVersion 都必须
+  // 原样保留；volatile 也整体保留，继续沿用既有的包裹路由/兼容字段语义。
+  //
+  // ⚠️ split 模式下这里**只写 overrides，绝不碰 roles** —— 定义归文件所有，
+  //    这正是「手改 `roles.json` 不会被设置覆盖」的实现点。
+  const layer = splitMode ? { overrides: overrideProjection } : { roles: rawRoles };
   const writtenValue = current.ok && current.missing !== true
-    ? { ...existing, roles: rawRoles, ...(depth === undefined ? {} : { maxDepth: depth }) }
+    ? { ...existing, ...layer, ...(depth === undefined ? {} : { maxDepth: depth }) }
     : initialConfig(rawRoles, {
       provider: resolved.provider,
       cwd: resolved.cwd,
       maxDepth: resolved.maxDepth,
+      // 首次播种时一并落一份旋钮覆盖层，之后即可只维护这一层。
+      ...(overrideProjection.length > 0 ? { overrides: overrideProjection } : {}),
     });
   const written = writeConfigFile(roleConfigPath, writtenValue);
   diagnostics.roleConfigSync = written.ok
-    ? `已把 ${rawRoles.length} 个角色从配置同步到文件`
+    ? splitMode
+      ? `已把 ${overrideProjection.length} 个角色的旋钮覆盖写入文件（定义层保持不动）`
+      : `已把 ${rawRoles.length} 个角色从配置同步到文件`
     : `同步失败：${written.error}`;
   // 成功同步可修复本次的读取失败；只把当前写入失败加入健康门禁，不锁存历史。
   if (!written.ok) diagnostics.configErrors.push(diagnostics.roleConfigSync);

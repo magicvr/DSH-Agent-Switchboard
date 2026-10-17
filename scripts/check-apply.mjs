@@ -1463,6 +1463,72 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   check('包裹同步完整保留 roles/provider/cwd/maxDepth/formatVersion 与其它顶层字段',
     ['roles', 'provider', 'cwd', 'maxDepth', 'formatVersion', 'custom'].every(key =>
       JSON.stringify(file[key]) === JSON.stringify(originalFile[key])));
+  // --- split 模式：设置层只给旋钮（roleSettings），定义归文件 ---------------------
+  //
+  // 目标形态：DSH 系统配置里只留旋钮，角色**定义**（persona / 工具构成 / CLI 契约）
+  // 住在插件自己的 roles.json。写入侧因此**只写覆盖层 `overrides`，绝不覆盖 `roles`** ——
+  // 这就是「手改 roles.json 不会被设置覆盖」的实现点。
+  //
+  // ⚠️ 本段会重写 `path`，因此必须把文件字节存下来、跑完恢复：后续的 R2 与
+  //    「volatile 兼容字段仍保留」都依赖当前文件内容（第一次写时就是这样把两条断言弄挂的）。
+  const splitFileBytes = readFileSync(path);
+  try {
+    const splitDefinitions = [{ id: 'worker', description: '保持不变的定义', instructions: 'persona 原文',
+      model: 'from-definition', backend: 'spawn' }];
+    writeConfigFile(path, initialConfig(splitDefinitions, { provider: 'self' }));
+    const splitBefore = JSON.parse(readFileSync(path, 'utf8'));
+    // 根作用域负责同步（preset 作用域不写盘）。
+    apply(makeCtx(), Config({ provider: 'self',
+      roleSettings: [{ id: 'worker', model: 'from-settings', readOnly: true }] }));
+    const splitAfter = JSON.parse(readFileSync(path, 'utf8'));
+    check('split：文件里的角色定义逐字未被覆盖',
+      JSON.stringify(splitAfter.roles) === JSON.stringify(splitBefore.roles),
+      JSON.stringify({ before: splitBefore.roles, after: splitAfter.roles }));
+    check('split：旋钮覆盖写进文件的 overrides 层',
+      JSON.stringify(splitAfter.overrides) === JSON.stringify([{ id: 'worker', model: 'from-settings', readOnly: true }]),
+      JSON.stringify(splitAfter.overrides));
+    check('split：定义与旋钮之外的顶层字段仍原样保留',
+      splitAfter.formatVersion === splitBefore.formatVersion && splitAfter.provider === splitBefore.provider);
+    // 幂等：旋钮没变时第二次同步不重写。
+    apply(makeCtx(), Config({ provider: 'self',
+      roleSettings: [{ id: 'worker', model: 'from-settings', readOnly: true }] }));
+    check('split：旋钮未变时第二次同步不重写文件',
+      JSON.stringify(JSON.parse(readFileSync(path, 'utf8'))) === JSON.stringify(splitAfter));
+    // preset 作用域读文件：生效角色必须是「定义 ⨝ 旋钮」。
+    const splitMounted = await mount({ roleSettings: [{ id: 'worker', model: 'from-settings', readOnly: true }] });
+    check('split：生效角色由定义与旋钮合并而来（model 取旋钮、persona 取定义）',
+      splitMounted.result.roleCount === 1 && splitMounted.result.roleRoutes.includes('from-settings')
+        && !splitMounted.result.roleRoutes.includes('from-definition'),
+      JSON.stringify({ count: splitMounted.result.roleCount, routes: splitMounted.result.roleRoutes }));
+    check('split：合并后仍挂载角色工具（不是空壳）',
+      splitMounted.configs.length === 1, JSON.stringify(splitMounted.configs.length));
+    // 定义缺失：根作用域明确拒绝同步（而不是派发一批空壳角色）。
+    writeConfigFile(path, initialConfig([], { provider: 'self' }));
+    const splitGuardCtx = makeCtx();
+    apply(splitGuardCtx, Config({ provider: 'self', roleSettings: [{ id: 'worker', model: 'm' }] }));
+    const splitGuard = await splitGuardCtx.tools.get('switchboard_selftest').execute({});
+    check('split：文件里没有定义时根作用域明确报错',
+      !splitGuard.ok && splitGuard.configErrors.includes('没有角色定义'),
+      JSON.stringify(splitGuard.configErrors));
+    // preset 作用域只能读文件，此时也必须如实报错、不挂载。
+    const splitNoDefs = await mount({ roleSettings: [{ id: 'worker', model: 'm' }] });
+    check('split：文件无定义时 preset 作用域如实报错、不挂载空壳角色',
+      !splitNoDefs.result.ok && splitNoDefs.result.roleCount === 0,
+      JSON.stringify({ ok: splitNoDefs.result.ok, count: splitNoDefs.result.roleCount }));
+    // legacy 仍然完全独立：设置层给 roles 时，文件里的 overrides 不得参与。
+    writeConfigFile(path, initialConfig([{ id: 'worker', description: 'd', instructions: 'i' }],
+      { provider: 'self', overrides: [{ id: 'worker', model: 'from-overrides' }] }));
+    const legacyIgnoresOverrides = await mount({ roles: [{ id: 'worker', description: 'd', instructions: 'i',
+      model: 'from-roles' }] });
+    check('legacy：设置层的 roles 仍是完整列表，文件里的 overrides 不参与合并',
+      legacyIgnoresOverrides.result.roleCount === 1
+        && legacyIgnoresOverrides.result.roleRoutes.includes('from-roles')
+        && !legacyIgnoresOverrides.result.roleRoutes.includes('from-overrides'),
+      JSON.stringify(legacyIgnoresOverrides.result.roleRoutes));
+  } finally {
+    writeFileSync(path, splitFileBytes);
+  }
+
   const explicitlyEmpty = await mount({ roles: [] });
   check('R2：非空文件 + preset 显式 [] 不挂载旧角色，且保持文件角色',
     explicitlyEmpty.configs.length === 0 && explicitlyEmpty.result.roleCount === 0 && explicitlyEmpty.result.ok &&
