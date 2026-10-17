@@ -956,7 +956,7 @@ for (const field of ["persona", "toolFilter"])
   if (Object.hasOwn(config, field)) throw new Error(`tool-subagent: ${field} is no longer supported;
     configure persona and tool plugins in an Agent Preset and select it with agentPreset (spawn only)`);
 ```
-判定用 `Object.hasOwn`：键存在即失败，取值为 `undefined` 也算。`backgroundMode` / `enableRunInBackground` 同样已从 Config 删除。官方只给了一条迁移路径——把 persona 与工具构成写进 **Agent Preset**，再用 `agentPreset` 选中——因此本插件改为**每个角色注册一个独立 Agent Preset**（`src/role-presets.js`，id `switchboard-role-<roleId>`），子代理不再「继承父 preset 再过滤」。同批：`fork` 后端移除；四个 dsh peers 精确 pin 到 `0.2.1-rc.1`。
+判定用 `Object.hasOwn`：键存在即失败，取值为 `undefined` 也算。`backgroundMode` / `enableRunInBackground` 同样已从 Config 删除。官方只给了一条迁移路径——把 persona 与工具构成写进 **Agent Preset**，再用 `agentPreset` 选中——因此本插件改为**每个角色注册一个独立 Agent Preset**（`src/role-presets.js`，id `switchboard-role-<roleId>`），子代理不再「继承父 preset 再过滤」。同批：`fork` 后端移除；四个 dsh peers 精确 pin 到 `0.2.1-rc.2`。
 
 **依据（已核实）：**
 - `dsh-tool-subagent` 的 Config 现为 `{ provider, toolName, modelSelectionSettings, agentOptions, agentPreset, allowedAgentPresets, maxDepth }`。
@@ -981,13 +981,17 @@ for (const field of ["persona", "toolFilter"])
 3. **把每角色 preset 静态生成进 `presets/switchboard.patch.yml`（从 `roles.json` 展开）** —— 否决。这会把角色搬回生成物，破坏既有设计：角色住在**热可编辑的用户文件** `$DSH_HOME/agent-switchboard/roles.json`，生成 YAML 不允许手改（下次生成会洗掉）。代价是改一个角色就要重新生成、注入并重启，且多 profile 各自漂移。运行期注册保住了「配置随处可编辑、工具不外溢」。
 4. **手写一份角色工具清单** —— 否决。上游清单随 DSH 升级漂移，手抄必然过期。改为由 `scripts/gen-preset.mjs` 从上游 standard 生成 `presets/standard-plugins.json`，与 YAML 产物一起受 `check:preset` 覆盖（未知 `!!js` 表达式让生成失败，而不是在运行期猜）。
 
-**精确 pin 决策（与本节同批）：** 四个 dsh peers（`@deepseek-ai/dsh-tools` / `dsh-scope` / `dsh-tool-subagent` / `dsh-typert-protocol`）精确 pin 到 `0.2.1-rc.1`，`@deepseek-ai/cordis` 4.0.5、`@deepseek-ai/schemastery` 3.18.5 同样精确。**代价是有意的：每次 DSH 升级都必须手工重 pin**，否则 DSH 在 profile 导入插件前就以 incompatible-version 拒载（bundle 被跳过、插件行 `disabled: true`、设置页静默消失）。不用范围的理由：本仓库离线检查 import 的是**仓库 `node_modules` 里那一份** `@deepseek-ai/dsh*`，范围会让 npm 解析出与正在运行的运行时**不必然相同**的构建，检查于是按错误的接口版本通过，而真实运行时拒绝加载——这正是本次事故被静默掩盖的机制（事故记录：npm 解析到的另一构建为 `0.2.1-rc.2`，其自身 peer 集不自洽；该版本未在本机安装，未独立复核）。`engines.dsh` 同样不写：它一旦存在就**单独决定并忽略全部 peers**，等于用一个字段覆盖掉这层断言。
+**精确 pin 决策（与本节同批）：** 四个 dsh peers（`@deepseek-ai/dsh-tools` / `dsh-scope` / `dsh-tool-subagent` / `dsh-typert-protocol`）精确 pin 到 `0.2.1-rc.2`，`@deepseek-ai/cordis` 4.0.5、`@deepseek-ai/schemastery` 3.18.5 同样精确。**代价是有意的：每次 DSH 升级都必须手工重 pin**，否则 DSH 在 profile 导入插件前就以 incompatible-version 拒载（bundle 被跳过、插件行 `disabled: true`、设置页静默消失）。不用范围的理由：本仓库离线检查 import 的是**仓库 `node_modules` 里那一份** `@deepseek-ai/dsh*`，范围会让 npm 解析出与正在运行的运行时**不必然相同**的构建，检查于是按错误的接口版本通过，而真实运行时拒绝加载——这正是本次事故被静默掩盖的机制。`engines.dsh` 同样不写：它一旦存在就**单独决定并忽略全部 peers**，等于用一个字段抹掉这层断言。
+
+**后续实测：`0.2.1-rc.1 → rc.2` 是一次纯版本坐标变更。** 升级落地后 DSH 又从 rc.1 升到 rc.2，四个 dsh peers 再次不匹配、插件再次被门禁拒载。逐包核对后确认：**所有相关包的代码树逐字节相同**（对每个包的 `lib/` 等非 `package.json` 文件做 SHA-256 聚合对比，`dsh-tool-subagent` / `dsh-subagent` / `dsh-tools` / `dsh-agent-preset-registry` / `dsh-app-boot` / `dsh-scope` / `dsh-system-prompt` / `dsh-agent` / `dsh-typert-protocol` 全部一致），唯一差异是 `package.json` 里的版本号与依赖 pin；上游 `standard.patch.yml` 也逐字节相同，因此生成物与行模板无需重新生成。**结论：这次只需重 pin，零代码改动**——`npm run check` 与 `plugin:verify` 随即全绿。
+
+这条实测同时说明**精确 pin 的代价是真的**：一个完全兼容的版本照样会被拒载。之所以仍然保留精确 pin：拒载是**响亮且安全**的（插件不加载、设置页消失、stderr 有明确原因），而不是静默地按错误接口运行；代价是一次重 pin 加一次差异核对。**不放宽成 `~0.2.1-rc.1`**：范围会顺带接受与运行时不同的构建，与本仓库「离线检查必须与运行时同版本」的前提冲突。**也不提供「按运行时版本自动改写 pin」的辅助命令**：那种命令会在没有核对接口差异的情况下让插件加载到一个可能已破坏 API 的运行时上，正是本项目一直在防的静默失效。每次 DSH 升级的正确流程是固定仪式：先 `plugin:verify` 看裁决 → 拉两版做逐包代码比对（`0.2.1-rc.1 → rc.2` 这次结论是零代码改动，只需重 pin）→ 改 pin → `npm install` → `npm run check` → `plugin:verify`；流程见 [`lifecycle.md`](./lifecycle.md)。
 
 **防复发（结构修复）：**
 - `scripts/check-profile-wiring.mjs` 新增两条依赖环境的断言：仓库声明的 DSH 要求必须满足**安装归档里的运行时**；仓库 `node_modules` 中每个 `@deepseek-ai/dsh*` 必须与运行时**完全同版本**。归档不可用时显式 SKIP 并打「未验证」告警，**不计入通过**。
 - `scripts/check-lifecycle.mjs` 的 fixture 运行时版本不再硬编码，改为取仓库唯一精确的 dsh peer pin，并有断言要求 pins 是**同一个精确版本**（不一致即失败，`:29–32`、`:214–215`）：manifest 升级 peers 后 stub 必须一起走，否则检查会继续在陈旧 stub 上绿。
 - `package.json` 的 `check` 链现以 `node scripts/gen-preset.mjs --check` 收尾，同时比对 `presets/switchboard.patch.yml` 与 `presets/standard-plugins.json`。升级落地时该检查还不在主链内，这是 standard 漂移（含三个被移除的行）长期未被发现的原因。
 
-**验证边界（2026-10-17 真机重启后更新）：** profile 已重新注入（`upgrade --apply`，写后复读验证通过），并已完成一次**完全重启**的真机验收：插件正常装载（`switchboard_selftest` 健康：健康、无 fatal）、`plugin:verify` 报 `consistent / 已就绪`、运行时 `0.2.1-rc.1` 且 `DSH peers：compatible`（无需豁免）；**四个角色 preset 在 preset roster 中全部出现且「无异常行」**，即 `agentPresets.register()` 接受本插件组装的角色 preset。**仍未验收的只剩一项**：`delegate_to_*` 在**选中 Switchboard preset 的会话**里的实际挂载与一次真实派发（根实例只注册自检、不挂载角色工具，所以本轮自检如实报告「本作用域不挂载角色工具」）；`agentPreset` 装载期校验通过后子代理实际拿到的工具构成与只读裁剪，以及客户端半边，仍只有静态 / 离线证据。详见 [`lifecycle.md`](./lifecycle.md) §6.3 / §6.4。
+**验证边界（2026-10-17 真机重启后更新）：** profile 已重新注入（`upgrade --apply`，写后复读验证通过），并已完成一次**完全重启**的真机验收：插件正常装载（`switchboard_selftest` 健康：健康、无 fatal）、`plugin:verify` 报 `consistent / 已就绪`、运行时 `0.2.1-rc.2` 且 `DSH peers：compatible`（无需豁免）；**四个角色 preset 在 preset roster 中全部出现且「无异常行」**，即 `agentPresets.register()` 接受本插件组装的角色 preset。**仍未验收的只剩一项**：`delegate_to_*` 在**选中 Switchboard preset 的会话**里的实际挂载与一次真实派发（根实例只注册自检、不挂载角色工具，所以本轮自检如实报告「本作用域不挂载角色工具」）；`agentPreset` 装载期校验通过后子代理实际拿到的工具构成与只读裁剪，以及客户端半边，仍只有静态 / 离线证据。详见 [`lifecycle.md`](./lifecycle.md) §6.3 / §6.4。
 
 ---

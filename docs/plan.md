@@ -1,6 +1,6 @@
 # 实施方案
 
-> **记录性质与 D29 当前实现补记：** 本文保留各阶段的历史方案、实测与待验收状态，不把历史记录视为当前验收结论。当前 preset 中本插件条目带 `mount: true` 与 `supervisorRules`，不带 `roles`；角色仍在 `$DSH_HOME/agent-switchboard/roles.json`。DSH 基线为 `0.2.1-rc.1`：preset 整体复制该版 standard，`instructions` / `readOnly` / `allowNestedDispatch` 由**每角色独立 Agent Preset** 承载（D32），`fork` 后端已移除，派发一律异步受理。调度规则文本由 `scripts/gen-preset.mjs` 生成，字段非 volatile、无默认值、UI 不可编辑；改动后须执行 `npm run gen:preset` → `npm run inject:preset` → 重启 DSH 才生效。规则注入已实现并有离线验证；生成器新增提交纪律，提交由主代理统一执行，worker 不自行提交。新增规则的生成与检查、profile 同步及真机提示词验收须分别确认，不将源码更新视为生效（见 D29）。
+> **记录性质与 D29 当前实现补记：** 本文保留各阶段的历史方案、实测与待验收状态，不把历史记录视为当前验收结论。当前 preset 中本插件条目带 `mount: true` 与 `supervisorRules`，不带 `roles`；角色仍在 `$DSH_HOME/agent-switchboard/roles.json`。DSH 基线为 `0.2.1-rc.2`：preset 整体复制该版 standard，`instructions` / `readOnly` / `allowNestedDispatch` 由**每角色独立 Agent Preset** 承载（D32），`fork` 后端已移除，派发一律异步受理。调度规则文本由 `scripts/gen-preset.mjs` 生成，字段非 volatile、无默认值、UI 不可编辑；改动后须执行 `npm run gen:preset` → `npm run inject:preset` → 重启 DSH 才生效。规则注入已实现并有离线验证；生成器新增提交纪律，提交由主代理统一执行，worker 不自行提交。新增规则的生成与检查、profile 同步及真机提示词验收须分别确认，不将源码更新视为生效（见 D29）。
 
 > 配套阅读：[`decisions.md`](./decisions.md)（为什么这么选）、[`architecture.md`](./architecture.md)（契约与取证）。生命周期当前支持路径与验证边界见 [`lifecycle.md`](./lifecycle.md) 及本文末尾 D31 补记；上面的底层生成 / 注入步骤保留为历史记录。
 
@@ -426,7 +426,7 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本门禁 | `dsh-app-boot.unmetRequirements()`：`engines.dsh` 存在则单独决定并忽略 peers，否则逐条校验 DSH peers。本插件不写 `engines.dsh`，四个 dsh peers 精确 pin 到 `0.2.1-rc.1`（cordis 4.0.5 / schemastery 3.18.5 同样精确） |
+| 版本门禁 | `dsh-app-boot.unmetRequirements()`：`engines.dsh` 存在则单独决定并忽略 peers，否则逐条校验 DSH peers。本插件不写 `engines.dsh`，四个 dsh peers 精确 pin 到 `0.2.1-rc.2`（cordis 4.0.5 / schemastery 3.18.5 同样精确） |
 | persona / toolFilter | 两者已从 `dsh-tool-subagent` 的 Config 删除，键存在即装载期抛错；`backgroundMode` / `enableRunInBackground` 一并删除。角色 persona 与工具构成改由**每角色独立 Agent Preset** 承载（新增 `src/role-presets.js`、生成物 `presets/standard-plugins.json`） |
 | fork | 后端移除：`dsh-subagent-fork-in-process` 的 `capabilities.agentPreset: false` + `inheritsParentContext: true` 使其无法承载角色指令与工具限制；`BUILTIN_PROVIDERS` 现为 `['spawn']`，`backend: 'fork'` 被校验拒绝 |
 | 派发语义 | 一律异步受理：工具返回 `{ kind: 'activation', subagentId }`，结果以完成通知送达；无前台 / 后台模式。注入的调度规则与路由指引已按此改写 |
@@ -438,11 +438,11 @@
 
 - `node scripts/gen-preset.mjs --check`：`standard 插件数: 22`、`合计 23`、`!!js 表达式 2 → 2`、YAML 与行模板均无漂移，退出 `0`。
 - `npm run check`：全链退出 `0`（`check-roles` 309、`check-drivers` 130、`check-cli` 71、`check-cli-provider` 292、`check-config-*` 全部通过 / 33 / 67、`check-apply` 383、`check-validation-parity` 56、`check-client` 328、`check-profile-wiring` 13、`check-version` 107、`check-lifecycle` 213、`check-script-portability` 146，均 `0 失败`）。
-- `node scripts/check-profile-wiring.mjs`：**13 通过 / 0 失败**。运行时 `0.2.1-rc.1`；仓库 DSH 要求满足运行时；仓库 `node_modules` 23 个 `@deepseek-ai/dsh*` 全部等于运行时。（重新注入 preset 之前该项曾报 `12 通过 / 1 失败`，失败项即 profile 仍内联 `0.2.0-rc.2` 时代的旧 preset 正文。）
+- `node scripts/check-profile-wiring.mjs`：**13 通过 / 0 失败**。运行时 `0.2.1-rc.2`；仓库 DSH 要求满足运行时；仓库 `node_modules` 23 个 `@deepseek-ai/dsh*` 全部等于运行时。（重新注入 preset 之前该项曾报 `12 通过 / 1 失败`，失败项即 profile 仍内联 `0.2.0-rc.2` 时代的旧 preset 正文。）
 
 ### 验收证据（真机，2026-10-17 完全重启后）
 
-- `node scripts/ops/plugin-lifecycle.mjs verify`：`验证：consistent`、`下一步：已就绪`；Electron DSH runtime `0.2.1-rc.1`；`DSH peers：compatible`；精确豁免 `absent`（不需要）。
+- `node scripts/ops/plugin-lifecycle.mjs verify`：`验证：consistent`、`下一步：已就绪`；Electron DSH runtime `0.2.1-rc.2`；`DSH peers：compatible`；精确豁免 `absent`（不需要）。
 - 主代理调用 `switchboard_selftest`（根实例）：`健康：健康`，无 fatal；配置 4 个角色，`roleConfig 状态` 为「已从 roles.json 读取 4 个角色 / 文件已与配置一致」。
 - **角色 preset 注册成功（本轮移植最关键的机制）**：preset roster 为
   `standard ptc minimal cordis switchboard switchboard-role-architect switchboard-role-reviewer switchboard-role-scout switchboard-role-worker`，

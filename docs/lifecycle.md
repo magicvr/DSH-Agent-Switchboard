@@ -103,7 +103,18 @@
 
 兼容性判定只评估 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` peers，镜像 DSH 门禁，不把 `engines.*` 当作已执行约束。范围判断仅支持完整精确版本、`~`、`^`，采用包含预发布版本的边界比较；其它语法给出 `unknown` / `unsupported-range`，不猜测。运行时版本来自 Electron 安装归档的 `dsh/package.json`，**不证明当前进程已运行该版本，也不使用另装 CLI 的版本代替**。
 
-> ⚠️ **两侧语义必须分清（`0.2.1-rc.1` 已核实）：** DSH 自己的门禁（`dsh-app-boot.unmetRequirements()`）是「manifest 声明了 `engines.dsh`（字符串）则**它单独决定并忽略全部 peers**，否则逐条校验 DSH peers」。本仓库工具与 `check-profile-wiring.mjs` 复刻的是**后一条分支**，因为本插件的 `package.json` **刻意不写 `engines.dsh`**——peer 精确 pin 是唯一真源，写了会静默覆盖 peers。旧说法「`engines.*` 不被当作已执行约束」只对 `0.2.0-rc.2` 成立（那个版本从不读 `engines`）。**当前本插件四个 dsh peers 精确 pin 到 `0.2.1-rc.1`，每次 DSH 升级都必须手工重 pin**：范围会让仓库 `node_modules` 解析到与运行时不同的构建，离线检查按错误接口版本通过（见 D32）。
+> ⚠️ **两侧语义必须分清（`0.2.1-rc.1` 已核实）：** DSH 自己的门禁（`dsh-app-boot.unmetRequirements()`）是「manifest 声明了 `engines.dsh`（字符串）则**它单独决定并忽略全部 peers**，否则逐条校验 DSH peers」。本仓库工具与 `check-profile-wiring.mjs` 复刻的是**后一条分支**，因为本插件的 `package.json` **刻意不写 `engines.dsh`**——peer 精确 pin 是唯一真源，写了会静默覆盖 peers。旧说法「`engines.*` 不被当作已执行约束」只对 `0.2.0-rc.2` 成立（那个版本从不读 `engines`）。**当前本插件四个 dsh peers 精确 pin 到 `0.2.1-rc.2`，每次 DSH 升级都必须手工重 pin**：范围会让仓库 `node_modules` 解析到与运行时不同的构建，离线检查按错误接口版本通过（见 D32）。
+
+**DSH 升级后的固定仪式（每次都照做，不要跳步）：**
+
+1. `node scripts/ops/plugin-lifecycle.mjs verify` —— 看裁决。`DSH peers：incompatible` 就是被门禁拒载了（症状：设置页静默消失，只写 stderr）。
+2. **拉两版做逐包代码比对，判断是「只改版本坐标」还是「接口真的变了」。** 只有前者才可以直接重 pin；后者必须先按差异改代码。`0.2.1-rc.1 → rc.2` 实测结论是前者：所有相关包除 `package.json` 外**代码树逐字节相同**，上游 `standard.patch.yml` 也相同，因此零代码改动。判断方法（本轮用过）：`npm pack @deepseek-ai/<pkg>@<旧版>` 与新版分别解包，对每个包的**非 `package.json` 文件**做 SHA-256 聚合比对；完全相同即只改坐标。
+3. 改 `package.json` 的四个 dsh peer pin（`cordis` / `schemastery` 若归档里也变了则一并改），然后 `npm install` 重生成 lock 与 `node_modules`。
+4. `npm run check` 全链；`node scripts/check-profile-wiring.mjs` 会断言仓库 peers 满足归档运行时、且 `node_modules` 每个 `@deepseek-ai/dsh*` 与运行时同版本。
+5. `node scripts/ops/plugin-lifecycle.mjs verify` 应回到 `consistent`。**preset 正文没变就不需要重新注入**；若上游 `standard.patch.yml` 变了，`check:preset` 会报漂移，先 `npm run gen:preset` 再 `upgrade --apply`。
+6. 完全退出并重启 DSH，再跑 `plugin:verify` 与 `switchboard_selftest`。
+
+> **刻意不提供「按运行时版本自动改写 pin」的命令**：那种命令会在没有核对接口差异的前提下让插件加载到可能已破坏 API 的运行时上，正是本项目一直在防的静默失效。摩擦要靠上面的固定仪式降下来，不能靠放宽范围或自动改写。
 
 `compatibility.json` 豁免按精确 `package@version` 查找，值为允许的 DSH 版本字符串数组。插件版本改变后旧键在 DSH 中静默失效，工具会报告 `expired`；当前运行时不在数组中也会失败。工具只提示人工处理，GUI 豁免按钮和流程、CLI 豁免子命令均未验证。
 
@@ -145,12 +156,14 @@ desktop CLI 硬拒绝、CLI 必须带 profile 及带 profile 的 `--help` 会初
 
 **profile 重新注入：** 运行 `node scripts/ops/plugin-lifecycle.mjs upgrade --apply`，输出 `DSH peers：compatible`、`PASS 写后复读验证`，原文件备份为 `cordis.patch.yml.bak-lifecycle-2026-10-17T09-03-32-369Z-226b6e831bdd`；注入前 `check-profile-wiring` 曾报 `12 通过 / 1 失败`（profile 内联着 `0.2.0-rc.2` 时代的旧 preset 正文），注入后为 **13 通过 / 0 失败**。
 
-**重启后真机结果（2026-10-17）：**
+**重启后真机结果（2026-10-17，DSH `0.2.1-rc.1`）：**
 - `node scripts/ops/plugin-lifecycle.mjs verify` → `验证：consistent`、`下一步：已就绪`；Electron DSH runtime `0.2.1-rc.1`；`DSH peers：compatible`；精确豁免 `absent`（不需要豁免）。
 - 主代理调用 `switchboard_selftest`（根实例）→ `健康：健康`、无 fatal；配置 4 个角色；`roleConfig` 读取 4 个并与文件一致。
 - **四个角色 preset 在运行期注册成功**：preset roster =
   `standard ptc minimal cordis switchboard switchboard-role-architect switchboard-role-reviewer switchboard-role-scout switchboard-role-worker`，
   `preset 异常行：（无异常行）`。这验证了 `agentPresets.register()` 接受本插件组装的角色 preset，且行组合通过真实注册表校验——是本轮移植最关键的一条真机证据。
+
+**再次升级到 `0.2.1-rc.2`（同日）：** DSH 随后升到 `0.2.1-rc.2`，四个精确 pin 再次不匹配、插件再次被门禁拒载（这正是精确 pin 的已知代价）。逐包 SHA-256 对比确认 `rc.1 → rc.2` **只改版本坐标**：所有相关包的代码树逐字节相同，上游 `standard.patch.yml` 也相同，因此**零代码改动**，只把四个 peer pin 改成 `0.2.1-rc.2`。重装依赖后 `npm run check` 全链退出 `0`、`plugin:verify` 报 `DSH peers：compatible / 验证：consistent / 下一步：已就绪`，**profile 无需重新注入**（preset 正文未变）。
 - 该会话使用 `standard` preset，根实例自检据此如实报告「本作用域不挂载角色工具；配置中有 4 个角色」。
 
 **仍待完成：** **完全退出并重启 DSH**，然后跑 `plugin:verify` 与 `switchboard_selftest`。重启之前不能宣称已真机验收——角色 preset 的实际注册、`agentPreset` 装载期校验、子代理拿到的工具可见性与只读裁剪都还只有离线证据。
