@@ -761,13 +761,18 @@ section('统一包裹小节：真实控件、读取与原子写入');
     remote: { settings: { mutate: async (...args) => { splitCalls.push(args); return { ok: true }; } } },
   });
   const splitRead = await splitStore.read();
-  check('split 模式：明确拒绝渲染可编辑列表并说明去处（不静默显示零角色）',
-    splitRead.ok === false && splitRead.mode === 'split' && splitRead.writable === false
-      && /roles\.json/.test(splitRead.error) && /请勿在此保存/.test(splitRead.error),
-    JSON.stringify(splitRead));
+  check('split 模式：读回旋钮层与 revision（面板据此渲染旋钮表单，而不是空的角色列表）',
+    splitRead.ok === true && splitRead.mode === 'split' && Array.isArray(splitRead.settings)
+      && splitRead.settings.length === 1 && splitRead.settings[0]?.id === 'scout'
+      && splitRead.revision === 24, JSON.stringify(splitRead));
   await splitStore.write([], splitRead.revision, {});
-  check('split 模式下不产生任何 roles 写入',
+  check('split 模式下 write 不产生任何 roles 写入（store 自保，不依赖界面）',
     splitCalls.every(args => !JSON.stringify(args).includes('"roles"')), JSON.stringify(splitCalls));
+  const splitSaved = await splitStore.writeSettings([{ id: 'scout', backend: 'cli' }], splitRead.revision);
+  check('split 模式下 writeSettings 只写 roleSettings，绝不写 roles',
+    splitSaved.ok && JSON.stringify(splitCalls.at(-1)) === JSON.stringify(['agent-switchboard',
+      [{ op: 'set', path: ['roleSettings'], value: [{ id: 'scout', backend: 'cli' }] }], 24]),
+    JSON.stringify(splitCalls.at(-1)));
   const saved = await store.write([], read.revision, { wrapperProvider: ' route ', wrapperModel: ' ', wrapperEffort: '' });
   check('角色与 volatile 三路径在同一次 mutate 提交，使用读取 revision', saved.ok && calls.length === 1 &&
     JSON.stringify(calls[0]) === JSON.stringify(['agent-switchboard', [

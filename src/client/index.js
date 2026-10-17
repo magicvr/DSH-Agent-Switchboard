@@ -426,15 +426,15 @@ window.__ModuleLoader__.load({
         //    旋钮编辑器尚未实现，所以这里**如实拒绝**渲染可编辑列表，而不是静默显示零角色。
         if (Array.isArray(row.value?.roleSettings)) {
           return {
-            ok: false,
-            roles: [],
+            ok: true,
             mode: 'split',
+            roles: [],
+            settings: row.value.roleSettings,
+            wrapper: Object.fromEntries(['wrapperProvider', 'wrapperModel', 'wrapperEffort']
+              .map((key) => [key, row.value?.volatile?.[key] ?? ''])),
             revision: row.revision,
-            writable: false,
-            error: '角色已迁移为「定义住在 $DSH_HOME/agent-switchboard/roles.json、设置只存旋钮」的形态；'
-              + '本页面的旋钮编辑器尚未实现，因此这里不再显示可编辑的角色列表 —— '
-              + '静默显示成空列表会让人以为角色丢了，而在本页保存还会写回空的 roles。'
-              + '请直接编辑 roles.json；面板升级前请勿在此保存。',
+            writable: view.writable ?? row.writable,
+            missing: false,
           };
         }
         return {
@@ -553,7 +553,7 @@ window.__ModuleLoader__.load({
      * @param {number|undefined} revision - 读取时拿到的 revision，用于并发保护。
      * @returns {Promise<{ok: boolean, message: string}>} 结果。
      */
-    async function saveRoles(ctx, roles, revision, wrapper) {
+    async function saveRoles(ctx, roles, revision, wrapper, path = ['roles']) {
       const { channel, tried, form } = writeChannel(ctx, CONFIG_NS);
       if (channel === undefined) {
         return {
@@ -563,7 +563,7 @@ window.__ModuleLoader__.load({
             `诊断：${tried.join(' | ')}。`,
         };
       }
-      const ops = [...(roles === undefined ? [] : [{ op: 'set', path: ['roles'], value: roles }]),
+      const ops = [...(roles === undefined ? [] : [{ op: 'set', path, value: roles }]),
         ...(wrapper === undefined ? [] : ['wrapperProvider', 'wrapperModel', 'wrapperEffort']
           .filter((key) => Object.hasOwn(wrapper, key))
           .map((key) => ({ op: 'set', path: ['volatile', key], value: (wrapper[key] ?? '').trim() })))];
@@ -624,6 +624,14 @@ window.__ModuleLoader__.load({
         write: (roles, revision, wrapper) => (mode === 'split'
           ? Promise.resolve({ ok: false, message: '角色设置处于「定义 + 旋钮」形态；本页面不写 roles（会退回半迁移状态）' })
           : saveRoles(ctx, roles, revision, wrapper)),
+        /**
+         * 写**旋钮层**（split 模式专用）：只 `set(['roleSettings'])`，绝不碰 `roles`。
+         *
+         * 与 `write` 分开而不是重载，是为了让「split 下不写 roles」这条自保保持简单可验证。
+         */
+        writeSettings: (settings, revision) => (mode === 'split'
+          ? saveRoles(ctx, settings, revision, undefined, ['roleSettings'])
+          : Promise.resolve({ ok: false, message: '当前不是「定义 + 旋钮」形态，无需写 roleSettings' })),
       };
     }
 
@@ -1042,6 +1050,8 @@ window.__ModuleLoader__.load({
       const [cardProblem, setCardProblem] = useState(null);
       const [wrapper, setWrapper] = useState({});
       const [status, setStatus] = useState('loading');
+      // split 模式（设置里只有旋钮层 `roleSettings`，角色定义住在 roles.json）的旋钮草稿。
+      const [splitSettings, setSplitSettings] = useState(null);
       const [notice, setNotice] = useState(null);
       const [busy, setBusy] = useState(false);
       // 读取时拿到的 revision 必须留到写回时使用，否则并发保护无从谈起。
@@ -1080,6 +1090,14 @@ window.__ModuleLoader__.load({
           // revision 用于并发保护：写回时必须带上读取时的那一个。
           setRevision(result.revision);
           setReadSucceeded(true);
+          // split 模式：设置里只有旋钮层，角色**定义**住在 roles.json。
+          // 这里渲染旋钮小表单，保存只写 `roleSettings`。
+          if (result.mode === 'split') {
+            setSplitSettings((result.settings ?? []).map((entry) => ({ ...entry })));
+            setStatus('split');
+            return;
+          }
+          setSplitSettings(null);
           setStatus(result.roles.length > 0 ? 'ready' : result.missing === true ? 'missing' : 'empty');
         });
       }, [store]);
@@ -1227,6 +1245,56 @@ window.__ModuleLoader__.load({
       }
       if (draft === null) {
         return wrap(h('div', null, '正在读取配置…'));
+      }
+      if (status === 'split') {
+        // split 模式：设置里只有**旋钮层**，角色定义（persona / 工具构成 / CLI 参数）住在
+        // `$DSH_HOME/agent-switchboard/roles.json`。保存只写 `roleSettings`，绝不碰 `roles`。
+        const entries = splitSettings ?? [];
+        const patch = (index, field, value) => setSplitSettings((current) =>
+          (current ?? []).map((entry, i) => (i === index ? { ...entry, [field]: value } : entry)));
+        const saveSettings = async () => {
+          if (store === undefined || typeof store.writeSettings !== 'function') return;
+          setBusy(true);
+          try {
+            const result = await store.writeSettings(entries, revision);
+            setNotice({ kind: result.ok ? 'info' : 'error',
+              text: result.ok ? '已保存旋钮设置。组合期字段（只读 / 嵌套派发）会在下次派发前重建。' : result.message });
+          } finally { setBusy(false); }
+        };
+        const checkbox = (entry, index, field, label) => h('label', {
+          style: { display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px' },
+        }, h('input', { type: 'checkbox', checked: entry[field] === true, disabled: busy,
+          onChange: (event) => patch(index, field, event?.target?.checked === true) }), label);
+        return wrap(h('div', null,
+          h('div', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '8px' } },
+            '角色定义（persona、工具构成、CLI 参数）住在 $DSH_HOME/agent-switchboard/roles.json，'
+            + '本页只调每个角色的旋钮。改动保存后：模型与强度立即生效；'
+            + '只读与嵌套派发属组合期，会在下次派发前自动重建 —— 不确定时完全退出并重启 DSH 可确保生效。'),
+          h('ul', { style: { margin: 0, padding: 0, listStyle: 'none', display: 'flex',
+            flexDirection: 'column', gap: '10px' } },
+          entries.map((entry, index) => h('li', { key: String(entry.id ?? index),
+            style: { border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '6px', padding: '8px' } },
+          h('div', { style: { fontWeight: 600, fontSize: '12px', marginBottom: '6px' } }, String(entry.id ?? '（无 id）')),
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
+            h('span', { style: { fontSize: '11px', width: '56px' } }, '派发方式'),
+            h('select', { value: entry.backend ?? '', disabled: busy, style: selectStyle(),
+              onChange: (event) => patch(index, 'backend', event?.target?.value || undefined) },
+            h('option', { value: '' }, '（默认 spawn）'),
+            BACKENDS.map((value) => h('option', { key: value, value }, BACKEND_LABEL[value] ?? value)))),
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
+            h('span', { style: { fontSize: '11px', width: '56px' } }, '模型'),
+            h('input', { type: 'text', value: entry.model ?? '', disabled: busy, style: inputStyle(),
+              placeholder: '留空则跟随默认', onChange: (event) => patch(index, 'model', event?.target?.value ?? '') })),
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
+            h('span', { style: { fontSize: '11px', width: '56px' } }, '思考强度'),
+            h('select', { value: entry.effort ?? '', disabled: busy, style: selectStyle(),
+              onChange: (event) => patch(index, 'effort', event?.target?.value || undefined) },
+            h('option', { value: '' }, '（不指定）'),
+            EFFORTS.map((value) => h('option', { key: value, value }, value)))),
+          h('div', { style: { display: 'flex', gap: '12px' } },
+            checkbox(entry, index, 'readOnly', '只读（组合期）'),
+            checkbox(entry, index, 'allowNestedDispatch', '允许嵌套派发（组合期）'))))),
+          h('div', { style: { marginTop: '10px' } }, button('保存旋钮', saveSettings, { disabled: busy }))));
       }
       if (status.startsWith('error:')) {
         // 读取失败必须显式呈现原因，而不是显示成「尚未配置」——后者会让用户以为配置丢了。
