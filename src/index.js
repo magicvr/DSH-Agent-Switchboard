@@ -23,7 +23,7 @@
  */
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { scopeOf } from '@deepseek-ai/dsh-scope';
+import { scopeChainOf, scopeOf } from '@deepseek-ai/dsh-scope';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -39,7 +39,7 @@ import {
   routeSummaryFor,
   toolConfigFor,
 } from './roles.js';
-import { createCliTool } from './cli/provider.js';
+import { createCliDispatchTool, createCliTool } from './cli/provider.js';
 import { buildRolePresets } from './role-presets.js';
 import { CONFIG_FORMAT_VERSION, configPathFor, readConfigFileDetailed, createConfigFileResolver, writeConfigFile, initialConfig } from './config-file.js';
 
@@ -1305,6 +1305,112 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
 }
 
 /**
+ * 为**本组合内的每个 agent** 安装 CLI 角色的直派工具（后台任务，不经中继子代理）。
+ *
+ * ⚠️ 安装方式是这套设计的核心，照抄官方 standing 组合的做法：
+ *    - **按 agent** 注册进该 agent 自己的作用域（`agent.ctx.inject(['tools'], …)`），
+ *      而不是注册在本 preset 作用域。`restrict` 只遮蔽**继承来的**工具，不隐藏同作用域
+ *      注册的 —— 若注册在 preset 作用域，嵌套子代理会继承它，
+ *      `allowNestedDispatch: false` 就被绕过了。
+ *    - 归属判定用 `scopeChainOf(scopeOf(agent.ctx)).includes(compositionScope)`：
+ *      只服务作用域链包含本 preset 的 agent，别的 preset 的会话不受污染。
+ *    - `agent/created` / `agent/disposed` / `tools/change` 三个钩子 + 启动时一次 reconcile，
+ *      与官方一致（热重组后仍正确）。
+ *
+ * @param {object} ctx - 本 preset 作用域的 Cordis 上下文。
+ * @param {object[]} cliRoles - 需要直派工具的 CLI 角色。
+ * @param {Function} resolver - 现读角色配置。
+ * @param {object} dispatch - 派发快照（ALS）。
+ * @returns {{ok: boolean, detail: string}} 结果。
+ */
+function mountCliDispatchTools(ctx, cliRoles, resolver, dispatch) {
+  if (cliRoles.length === 0) return { ok: true, detail: '（无 CLI 角色）' };
+  const agents = ctx.get('agents');
+  if (agents === undefined || typeof agents.list !== 'function') {
+    return { ok: false, detail: 'agents 注册表不可用，无法按 agent 安装直派工具' };
+  }
+  const compositionScope = scopeOf(ctx);
+  const makeTool = (role, runtimeCtx) => createCliDispatchTool({
+    role,
+    getRole: () => {
+      const current = (dispatch.storage.getStore() ?? resolver()).roles.find(item => item.id === role.id);
+      if (current?.cliBlockReason) throw new Error(current.cliBlockReason);
+      return current;
+    },
+    ctx: runtimeCtx,
+    spawn: spec => safeSpawn(runtimeCtx, spec),
+    resolveExecutable: async (command, env, signal) =>
+      runtimeCtx.get('subprocess').resolveExecutable(command, env, signal),
+  });
+  if (compositionScope === undefined) {
+    // 与官方模块一致：**没有作用域时当场直接安装**（官方在该分支走 `install(ctx, void 0)`）。
+    // 「按 agent 安装」的全部意义在于作用域继承关系；没有作用域就没有继承可言，直接装到本
+    // ctx 才是与官方同形的那条路。真实 DSH 里本插件的挂载路径总在 preset 作用域内，
+    // 因此这是简化组合（无 preset 装载 / 测试夹具）的路径。
+    try {
+      const tools = ctx.get('tools');
+      if (typeof tools?.register !== 'function') return { ok: false, detail: 'tools 服务不可用' };
+      for (const role of cliRoles) tools.register(makeTool(role, ctx));
+    } catch (error) {
+      return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+    }
+    return { ok: true, detail: `无作用域组合：直接安装 ${cliRoles.length} 个 CLI 直派工具（与官方 install 同形）` };
+  }
+  if (typeof scopeChainOf !== 'function') {
+    return { ok: false, detail: '作用域链查询不可用，拒绝在不判定归属的情况下按 agent 安装' };
+  }
+  const installed = new WeakMap();
+  const belongsToComposition = (candidate) => {
+    try { return scopeChainOf(scopeOf(candidate.ctx)).includes(compositionScope); } catch { return false; }
+  };
+  const installScoped = (candidate) => {
+    const existing = installed.get(candidate);
+    if (existing !== undefined) return existing;
+    let fiber;
+    try {
+      fiber = candidate.ctx.inject(['tools'], (runtimeCtx) => {
+        for (const role of cliRoles) {
+          runtimeCtx.tools.register(createCliDispatchTool({
+            role,
+            getRole: () => {
+              const current = (dispatch.storage.getStore() ?? resolver()).roles.find(item => item.id === role.id);
+              if (current?.cliBlockReason) throw new Error(current.cliBlockReason);
+              return current;
+            },
+            ctx: runtimeCtx,
+            spawn: spec => safeSpawn(runtimeCtx, spec),
+            resolveExecutable: async (command, env, signal) =>
+              runtimeCtx.get('subprocess').resolveExecutable(command, env, signal),
+          }));
+        }
+      });
+    } catch (error) {
+      return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+    }
+    installed.set(candidate, fiber);
+    return fiber;
+  };
+  const removeScoped = (candidate) => {
+    const fiber = installed.get(candidate);
+    if (fiber === undefined) return;
+    installed.delete(candidate);
+    // 释放失败只记诊断：它不该影响其它 agent 的工具。
+    try { Promise.resolve(fiber?.dispose?.()).catch(() => {}); } catch { /* 尽力而为 */ }
+  };
+  const reconcile = () => {
+    for (const candidate of agents.list()) {
+      if (belongsToComposition(candidate)) installScoped(candidate);
+      else removeScoped(candidate);
+    }
+  };
+  ctx.on?.('agent/created', ({ agent }) => { installScoped(agent); });
+  ctx.on?.('agent/disposed', ({ agent }) => { removeScoped(agent); });
+  ctx.on?.('tools/change', reconcile);
+  reconcile();
+  return { ok: true, detail: `已按 agent 安装 ${cliRoles.length} 个 CLI 角色的直派工具（不经中继子代理）` };
+}
+
+/**
  * 在**本作用域**挂载角色工具（只有 `mount: true` 的 preset 作用域会走到这里）。
  *
  * @param {object} ctx - Cordis 上下文。
@@ -1527,9 +1633,20 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     }
     ctx.effect?.(() => () => { void disposeRegistered(); });
 
+    // ⚠️ CLI 角色走**直派后台任务**（按 agent 安装，不经中继子代理）；spawn 角色仍由官方
+    //    `dsh-tool-subagent` 按 agent 安装委派工具。两者装法一致，原因见各自的注释。
+    // ⚠️ 必须排除**被阻断**的角色（旧格式 / 配置非法）：它们不该有任何可派发入口 ——
+    //    否则「阻断」只体现在执行期报错，工具本身却已经出现在清单里。
+    const cliDispatch = mountCliDispatchTools(ctx,
+      roles.filter(role => role.backend === CLI_BACKEND
+        && !diagnostics.blocked.some(item => item.id === role.id)), resolver, dispatch);
     for (const role of roles) {
       const blocked = diagnostics.blocked.find(item => item.id === role.id);
       if (blocked) { diagnostics.mounts.push({ id: role.id, ok: false, detail: blocked.reason }); continue; }
+      if (role.backend === CLI_BACKEND) {
+        diagnostics.mounts.push({ id: role.id, ok: cliDispatch.ok, detail: cliDispatch.detail });
+        continue;
+      }
       const outcome = await mountRoleTool(ctx, role, toolModule, resolver, roles, initial.maxDepth, initial.wrapperRoute, dispatch);
       diagnostics.mounts.push({ id: role.id, ok: outcome.ok, detail: outcome.detail });
     }

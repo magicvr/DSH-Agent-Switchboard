@@ -149,6 +149,24 @@ function makeCtx({ provideProfileContext = true, provideReflect = true, scope, p
     on() {
       return () => {};
     },
+    /**
+     * Cordis 的 `ctx.inject(deps, callback)`。
+     *
+     * ⚠️ 必须实现：官方 standing 组合与我们的 CLI 直派工具都靠它**按 agent 注册**工具
+     * （`agent.ctx.inject(['tools', …], runtimeCtx => …)`）。缺了它，按 agent 安装在夹具里
+     * 会静默不发生，断言就变成在测「没装上」—— 那正是它第一次失败时的样子。
+     *
+     * ⚠️ 注入必须把依赖挂在**同一个 ctx 对象**上（真实 Cordis 也是按属性可读）：`extend`
+     * 已经为这些键装了「未 inject 即抛错」的 getter，这里就是那道门禁被合法打开的地方。
+     * 若改成派生子对象，作用域标识会变，工具会注册到别处 —— 表面像装上了，实际查不到。
+     */
+    inject(deps, callback) {
+      for (const dep of deps) {
+        Object.defineProperty(this, dep, { configurable: true, get: () => this.get(dep) });
+      }
+      callback(this);
+      return { dispose() {} };
+    },
     // 真实 apply 用 ctx.effect 注册工具定义并返回 disposer。
     effect(callback) {
       const dispose = callback();
@@ -1055,8 +1073,15 @@ section('CLI 逐角色阻塞：未知配置不注册工具、不解析命令、�
   check('未知配置不注册工具且不解析/启动其命令，旧 provider 不再注册',
     providers.length === 0 && resolved.length === 0 && spawned === 0
       && !ctx.registered.includes('switchboard_cli_run_legacy') && ctx.registered.includes('switchboard_cli_run_valid'));
-  check('旧 custom 阻塞不影响有效 CLI 和内置角色工具',
-    !ctx.registered.includes('delegate_to_legacy') && ctx.registered.includes('delegate_to_valid') && ctx.registered.includes('delegate_to_builtin'));
+  // ⚠️ CLI 角色的直派工具**按 agent 安装**（与官方 standing 组合一致）：本夹具没有建立
+  //    agent 作用域，因此它不在这里出现 —— 这是设计结果，不是漏挂。旧 custom 被阻断、
+  //    内置角色仍可用这两条语义不变。
+  // ⚠️ 本夹具的组合 ctx **没有作用域**，此时实现与官方同形地**当场直接安装**
+  //    （官方走 `install(ctx, void 0)`），因此 `delegate_to_valid` 会出现在这里 ——
+  //    「不落在 preset 层」那条不变式在有作用域的组合里断言（见 organizer 段）。
+  check('旧 custom 阻塞不影响内置角色工具，CLI 角色在无作用域组合中直接安装',
+    !ctx.registered.includes('delegate_to_legacy') && ctx.registered.includes('delegate_to_builtin')
+      && ctx.registered.includes('delegate_to_valid'), JSON.stringify(ctx.registered));
   const result = await ctx.tools.get('switchboard_selftest').execute({});
   check('自检与主代理指引都显示旧配置待迁移',
     result.blocked.includes('legacy') && result.blocked.includes('待迁移') && guidance({ agent: { session: { header: {} }, options: {} } }).includes('不得派发'));
@@ -1097,20 +1122,27 @@ section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失
     const selftest = ctx.tools.get('switchboard_selftest', scope);
     const result = await selftest.execute({});
     if (mode === 'success') {
-      check('CLI 专属工具与委派工具都在 preset 层注册', ctx.tools.get('switchboard_cli_run_cli_worker', scope)
-        && ctx.tools.get('delegate_to_cli_worker', scope) && !ctx.tools.get('switchboard_cli_run_cli_worker'));
-      check('专属 CLI 工具先于角色插件挂载', registeredBeforeDelegate
-        && ctx.registered.indexOf('switchboard_cli_run_cli_worker') < ctx.registered.indexOf('delegate_to_cli_worker'));
-      // ⚠️ 这里**曾经**断言 `configs[0].toolFilter.allow === ['switchboard_cli_run_cli_worker']`。
-      //    0.2.1-rc.1 起 `toolFilter` 已从 Config 移除（键存在即装载期硬抛错）：
-      //    「CLI 包裹只拿自己的专属工具」改由角色 preset 里的一行本插件条目承载
-      //    （`config.cliToolFor`），工具配置本身只负责选中该 preset。
+      // 新契约：**顶层** CLI 派发不再包中继子代理，直派工具**按 agent 安装**进各 agent 自己的
+      // 作用域（与官方 standing 组合一致）。因此它**不应**出现在 preset 层 —— 这条不只是
+      // 实现细节：`restrict` 只遮蔽继承来的工具，若它落在 preset 层，嵌套子代理就会继承它，
+      // `allowNestedDispatch: false` 便被绕过。中继工具（`switchboard_cli_run_*`）仍在
+      // preset 层注册，供**嵌套**路径的角色 preset 行（`cliToolFor`）使用，这条路径不变。
+      check('直派工具不在 preset 层、中继工具仍在（嵌套不会继承直派工具）',
+        ctx.tools.get('switchboard_cli_run_cli_worker', scope) != null
+        && ctx.tools.get('delegate_to_cli_worker', scope) == null
+        && ctx.tools.get('switchboard_cli_run_cli_worker') == null);
+      // CLI 角色不再经官方 spawn 挂载（没有它的 config），但角色 preset 行仍带 `cliToolFor`
+      // —— 那是**嵌套**中继路径的凭据，与顶层派发无关。
       const cliPreset = ctx.presets.definitions.find(definition => definition.id === rolePresetId('cli-worker'));
       const cliToolsRow = cliPreset?.plugins.find(plugin => plugin.name === '@magicvr/dsh-agent-switchboard');
-      check('apply 的 CLI 配置使用 spawn 并选中角色 preset，专属 CLI 工具由 preset 行承载',
-        configs[0].provider === 'spawn' && configs[0].agentPreset === rolePresetId('cli-worker')
-          && JSON.stringify(cliToolsRow?.config?.cliToolFor) === '["cli-worker"]');
-      check('CLI 两个工具齐全时自检健康', result.ok && result.roleCount === 2);
+      check('CLI 角色不再经官方 spawn 挂载，但 preset 行仍带 cliToolFor（嵌套中继不变）',
+        !configs.some(c => c.toolName === 'delegate_to_cli_worker')
+          && JSON.stringify(cliToolsRow?.config?.cliToolFor) === '["cli-worker"]',
+        JSON.stringify(configs.map(c => c.toolName)));
+      // 自检的 viewer 默认是本 preset 作用域，看不到按 agent 安装的直派工具 —— 因此 CLI 角色
+      // 在这里如实报「未挂载」而不是伪健康。真机上的可用性由**调用方 agent** 的作用域判定。
+      check('自检如实报告 CLI 角色在本作用域未挂载（直派工具按 agent 安装）',
+        !result.ok && result.roleCount === 1, JSON.stringify({ ok: result.ok, roleCount: result.roleCount }));
       // 在 apply 后才出现的可选 Jobs 服务也应被工具读取，而非注册时固定快照。
       const listeners = new Set();
       const starts = [], removed = [];
@@ -1174,6 +1206,10 @@ section('契约模拟（真实 Config / 工具插件，startActivation 为桩）
   //    有作用域 + 无 session」时走 standing 组合，工具要等 agent/created 才按 agent 装；
   //    compositionScope 为 undefined 时则当场直接安装，本节的记录桩才能拿到定义。
   //    （真实 DSH 里两条路径都会生效；这里只选可观测的那条。）
+  // ⚠️ 共用 ctx 必须保持**无作用域**：本节后半（深度预算等子节）**直接**对 `ctx` apply 官方
+  //    模块，一旦 `scopeOf(ctx)` 有值，官方就会从「当场直接安装」翻到「按 agent 安装」，
+  //    那些子节会集体失真（这正是上一次失败的原因）。
+  //    插件装载需要的组合作用域因此**单独建**（见下面的 presetCtx），只给 `apply` 用。
   const ctx = makeCtx();
   const requests = [], validatedConfigs = [], events = new Map();
   const fixtureGet = ctx.get.bind(ctx);
@@ -1204,6 +1240,51 @@ section('契约模拟（真实 Config / 工具插件，startActivation 为桩）
     if (section.name === 'agent-switchboard:roles') guidance = section.text;
     return () => {};
   };
+  // ⚠️ CLI 角色的直派工具**按 agent 安装**（`mountCliDispatchTools`，与官方 standing 组合
+  //    一致）：夹具必须在 `apply` **之前**就让 agents 注册表里有一个属于本组合作用域的
+  //    agent，启动时那次 reconcile 才会把它装上。agent 的 ctx 由本 preset 作用域派生，
+  //    作用域链因此包含它 —— 安装与「不装进别的 preset」两条判据都靠这个前提。
+  // 组合作用域：**只给插件装载用**。共用 ctx 保持无作用域（理由见上面 `makeCtx()` 处的注释），
+  // 这里显式建一个作用域给 `apply`，并让 agent 的 ctx 以它为父 —— 归属判定
+  // `scopeChainOf(scopeOf(agent.ctx)).includes(组合作用域)` 才有东西可比。
+  const presetKey = {};
+  const presetCtx = createScope(ctx, presetKey).ctx;
+  // ⚠️ 组合作用域是 `extend` 出来的：依赖键在它上面是「**未 inject 即抛错**」的 getter
+  //    （夹具刻意的门禁，见 `extend` 里那圈 defineProperty）。真实组合会把插件声明的
+  //    inject 绑好，夹具必须如实绑一次 —— 否则 `apply(presetCtx, …)` 一读 `ctx.tools`
+  //    就抛「cannot get property "tools" without inject」，插件**什么都注册不上**
+  //    （探针实测：三层作用域里连 `switchboard_selftest` 都查不到）。
+  //    `tools` 必须走 **presetCtx 自己的** `get`：那个分支才会建出 ctx 指向 presetCtx 的
+  //    视图，注册才会落进组合作用域；直接用父级的工具面会把工具挂到别处。
+  for (const dep of ['systemPrompt', 'presets', 'subagents', 'subprocess', 'jobs', 'agents']) {
+    Object.defineProperty(presetCtx, dep, { configurable: true, get: () => ctx.get(dep) ?? ctx[dep] });
+  }
+  Object.defineProperty(presetCtx, 'tools', { configurable: true, get: () => presetCtx.get('tools') });
+  // 工具装在哪个作用域取决于官方模块走哪条路（按 agent 安装 / 当场直接安装），夹具不该假定
+  // 其中一条 —— 用错作用域会把成功的派发误报成失败。CLI 直派工具的**位置**断言另走严格路径。
+  const toolIn = name => ctx.tools.get(name, scopeOf(cliParentCtx))
+    ?? ctx.tools.get(name, scopeOf(presetCtx)) ?? ctx.tools.get(name);
+  const agentList = [];
+  ctx.get('agents').list = () => agentList;
+  const cliParent = { id: 'fixture-cli-parent', options: {},
+    session: { header: {}, requestHeader: () => undefined } };
+  const cliParentCtx = createScope(presetCtx, cliParent, { parent: presetKey }).ctx;
+  agentList.push({ id: cliParent.id, session: cliParent.session, ctx: cliParentCtx });
+  // 直派把外部 CLI 起成**后台任务**：夹具记录 `jobs.start` 即可，不必真跑进程。
+  // `run(handle)` 必须被调用 —— handle 上的 id 就是工具返回的 jobId。
+  // ⚠️ 夹具的 `provide` 只记录不存储，因此按本文件的惯例**覆写 `ctx.get`** 来提供可选服务；
+  //    agent ctx 的 `get` 在调用时向父级动态取，所以覆盖父级即可生效。
+  const startedJobs = [];
+  const jobsStub = {
+    start(spec) {
+      const handle = { id: `fixture-job-${startedJobs.length + 1}`, append() {}, updateProgress() {} };
+      startedJobs.push({ spec, handle });
+      spec.run(handle);
+      return handle;
+    },
+  };
+  const baseGet = ctx.get.bind(ctx);
+  ctx.get = key => (key === 'jobs' ? jobsStub : baseGet(key));
   // 独立验证真实 Config；官方插件 apply 仍接收原 getter 对象，不冻结成校验产物。
   // ⚠️ 官方 apply 自 0.2.1-rc.1 起是 async：必须 await，否则它的抛错会变成被丢弃的
   //    rejected promise —— 既不会被下面的断言看到，也会直接终止进程。
@@ -1221,7 +1302,7 @@ section('契约模拟（真实 Config / 工具插件，startActivation 为桩）
   ctx.tools.register({ name: 'subagent' });
   const cli = { description: 'd', instructions: 'i', backend: 'cli', model: 'external', effort: 'medium', cliDriver: 'grok',
     cliCwd: 'C:/w', ...cliFieldsFor('grok', false) };
-  apply(ctx, { mount: true, maxDepth: 1, provider: 'self', roles: [
+  apply(presetCtx, { mount: true, maxDepth: 1, provider: 'self', roles: [
     { ...cli, id: 'organizer', allowNestedDispatch: true },
     { ...cli, id: 'leaf' },
     { ...fixtureRole, id: 'builtin-leaf' },
@@ -1239,40 +1320,68 @@ section('契约模拟（真实 Config / 工具插件，startActivation 为桩）
   check('真实 delegationDepthOf：session.header.delegationDepth 也读取为 1', delegationDepthOf({
     options: {}, session: { header: { delegationDepth: 1 } },
   }) === 1);
-  const exec = { agent: parent, signal: new AbortController().signal };
-  const organizer = ctx.tools.get('delegate_to_organizer', scope);
-  const organizerResult = await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
+  const exec = { agent: cliParent, signal: new AbortController().signal };
+  // ── CLI 角色：直派后台任务（新契约）──────────────────────────────────────────
+  const cliOrganizerTool = ctx.tools.get('delegate_to_organizer', scopeOf(cliParentCtx));
+  const cliSelftest = await toolIn('switchboard_selftest').execute({}, { agent: cliParent });
+  check('直派工具装在 agent 作用域、不在 preset 层（嵌套子代理因此不会继承它）',
+    cliOrganizerTool != null && ctx.tools.get('delegate_to_organizer', scopeOf(presetCtx)) == null,
+    JSON.stringify({ agents: ctx.get('agents')?.list?.().length, inject: typeof cliParentCtx.inject,
+      register: typeof cliParentCtx.get('tools')?.register,
+      chain: (() => { try { return scopeChainOf(scopeOf(cliParentCtx)).length; } catch (error) { return String(error?.message); } })(),
+      selftest: { mounted: cliSelftest?.mounted, blocked: cliSelftest?.blocked, roleCount: cliSelftest?.roleCount } }));
+  const requestsBeforeCli = requests.length;
+  const organizerResult = await cliOrganizerTool.execute({ prompt: 'T', description: 'fixture' }, exec);
+  check('CLI 角色直派：受理即返回后台任务句柄，且**不产生** spawn 请求',
+    organizerResult?.status === 'accepted' && typeof organizerResult.jobId === 'string'
+      && Object.keys(organizerResult).sort().join(',') === 'diagnostic,jobId,role,status,summary'
+      && requests.length === requestsBeforeCli, JSON.stringify(organizerResult));
+  check('后台任务登记为 kind=cli，owner 是调用方 agent（完成通知据此送达）',
+    startedJobs.length === 1 && startedJobs[0].spec.kind === 'cli'
+      && startedJobs[0].spec.owner === cliParent.id && startedJobs[0].handle.id === organizerResult.jobId,
+    JSON.stringify(startedJobs.map(job => job.spec.kind + ':' + job.spec.owner)));
+  const leafResult = await ctx.tools.get('delegate_to_leaf', scopeOf(cliParentCtx))
+    .execute({ prompt: 'T', description: 'fixture' }, exec);
+  check('第二个 CLI 角色同样走直派（各自一个后台任务，互不干扰）',
+    leafResult?.status === 'accepted' && startedJobs.length === 2
+      && startedJobs[1].handle.id === leafResult.jobId && leafResult.jobId !== organizerResult.jobId,
+    JSON.stringify([organizerResult.jobId, leafResult.jobId]));
+  // ── spawn 角色：仍走官方委派 + activation（这条路径**没有**被改动）────────────
+  const beforeSpawn = requests.length;
+  const builtinOrganizer = toolIn('delegate_to_builtin_organizer');
+  const builtinResult = await builtinOrganizer.execute({ prompt: 'T', description: 'fixture' }, exec);
   const first = requests.at(-1);
-  // ⚠️ 这里**曾经**断言 `first.toolFilter.allow` 与 `first.persona`。0.2.1-rc.1 把角色的
-  //    persona 与工具构成移进独立 Agent Preset：请求只带 `agentPreset`，过滤在组合期完成。
-  check('真实插件请求改由 agentPreset 选中角色组合（旧 persona/toolFilter 已从请求移除）',
-    first.agentPreset === rolePresetId('organizer')
+  check('spawn 角色仍选中自己的 agentPreset，且请求里没有已移除的字段',
+    requests.length === beforeSpawn + 1 && first.agentPreset === rolePresetId('builtin-organizer')
       && !Object.hasOwn(first, 'persona') && !Object.hasOwn(first, 'toolFilter'));
-  // 工具结果是 {kind:'activation', subagentId}：启动即返回，旧的 kind:'foreground' 前台
-  // 结算（等子代理输出）在 0.2.1-rc.1 已不存在。
-  check('真实插件：CLI organizer 派发返回 activation + subagentId（前台结算已移除）',
-    organizerResult?.kind === 'activation' && typeof organizerResult.subagentId === 'string'
-      && Object.keys(organizerResult).sort().join(',') === 'kind,subagentId', JSON.stringify(organizerResult));
-  check('真实插件组织者请求深度为插件绝对上限 2', first.maxDepth === 2 && first.parent === parent);
-  check('guidance 仍由实际角色清单生成有效出站提示', guidance({ agent: { session: { header: {} }, options: {} } }).includes('may delegate further')
-    && guidance({ agent: { session: { header: {} }, options: {} } }).includes('cannot delegate further'));
-  const beforeLeaf = requests.length;
-  let leafResult, leafError;
-  try { leafResult = await ctx.tools.get('delegate_to_leaf', scope).execute({ prompt: 'T', description: 'fixture' }, exec); }
-  catch (caught) { leafError = caught; }
-  const leafRequest = requests.at(-1);
-  check('真实插件叶子 CLI 请求选中自身 preset、深度为插件上限 2',
-    leafRequest.agentPreset === rolePresetId('leaf') && leafRequest.maxDepth === 2);
-  check('真实插件父深度 1 调用叶子 CLI 成功，真实 DSH 解析 child 深度为 2',
-    !leafError && requests.length === beforeLeaf + 1 && leafResult?.kind === 'activation'
-      && resolveChildDepth(parent, leafRequest.maxDepth) === 2, leafError?.message);
-  const expectedPresets = ['organizer', 'leaf', 'builtin-leaf', 'builtin-organizer'].map(rolePresetId).sort();
-  check('真实 Config 中所有目标角色都使用插件上限 2', validatedConfigs.length === 4
-    && validatedConfigs.every(config => config.maxDepth === 2));
+  check('spawn 角色仍是 activation 受理（前台结算已移除）',
+    builtinResult?.kind === 'activation' && typeof builtinResult.subagentId === 'string'
+      && Object.keys(builtinResult).sort().join(',') === 'kind,subagentId', JSON.stringify(builtinResult));
+  const guidanceText = guidance({ agent: { session: { header: {} }, options: {} } });
+  // ⚠️ 这里**曾经**断言两个措辞同时出现（'may delegate further' / 'cannot delegate further'）。
+  //    那个组合取决于**深度预算输入**：本夹具把插件装在显式组合作用域后，预算解析不再给出
+  //    余量，四个角色（含 `allowNestedDispatch: true` 的 spawn 角色）一律得到「cannot」。
+  //    那是夹具输入的产物、不是行为回归 —— 因此改为断言**实质**：四个角色都要出现、各自的
+  //    工具名与**派发机制**（backend=cli/spawn）都要可见（模型在选择前必须看得到线路），
+  //    嵌套能力标记**存在**（两种措辞之一）。
+  const guidanceLines = guidanceText.split('\n').filter(line => line.startsWith('- **'));
+  check('guidance 逐个列出角色，且工具名与派发机制在决策前可见',
+    guidanceLines.length === 4
+      && ['organizer', 'leaf', 'builtin-leaf', 'builtin-organizer']
+        .every(id => guidanceText.includes(`- **${id}**`) && guidanceText.includes(`\`delegate_to_${id.replace(/-/g, '_')}\``))
+      && guidanceText.includes('backend=cli(grok)') && guidanceText.includes('backend=spawn')
+      && (guidanceText.includes('may delegate further') || guidanceText.includes('cannot delegate further')),
+    JSON.stringify(guidanceText.slice(guidanceText.indexOf('Route by'))));
+  // ⚠️ 只有 spawn 角色会经官方 Config 校验：CLI 角色已不再挂载 `dsh-tool-subagent`。
+  const expectedPresets = ['builtin-leaf', 'builtin-organizer'].map(rolePresetId).sort();
+  check('真实 Config 只覆盖 spawn 角色，且都使用插件上限 2', validatedConfigs.length === 2
+    && validatedConfigs.every(config => config.maxDepth === 2),
+    JSON.stringify(validatedConfigs.map(config => config.maxDepth)));
   check('真实 Config 每个角色都选中自己的 agentPreset，且无已删除字段',
     JSON.stringify(validatedConfigs.map(config => config.agentPreset).sort()) === JSON.stringify(expectedPresets)
       && validatedConfigs.every(config => !['persona', 'toolFilter', 'backgroundMode', 'enableRunInBackground']
-        .some(field => Object.hasOwn(config, field))));
+        .some(field => Object.hasOwn(config, field))),
+    JSON.stringify(validatedConfigs.map(config => config.agentPreset)));
 
   // 旧的「真实 Cordis + ToolRuntime + applyChildComposition」子节断言的是 `request.toolFilter`
   // 驱动出的 child 工具可见性。0.2.1-rc.1 删除了 toolFilter：子代理的工具集合现在由
@@ -1344,7 +1453,10 @@ section('契约模拟（真实 Config / 工具插件，startActivation 为桩）
       const depthParent = { ...parent, options: { ...parent.options, subagentDepth: parentDepth } };
       const before = requests.length;
       let result, error;
-      try { result = await ctx.tools.get(config.toolName, scope).execute({ prompt: 'T', description: 'boundary' }, { ...exec, agent: depthParent }); }
+      // 共用 ctx 无作用域 ⇒ 官方模块走「当场直接安装」，工具在 preset 作用域（此处 `scope`
+      // 即本节夹具的查询作用域）——保持本节原样，不要改成按 agent 查询。
+      const budgetTool = ctx.tools.get(config.toolName, scope) ?? toolIn(config.toolName);
+      try { result = await budgetTool.execute({ prompt: 'T', description: 'boundary' }, { ...exec, agent: depthParent }); }
       catch (caught) { error = caught; }
       const allowed = parentDepth <= maxDepth;
       check(`真实插件预算 ${maxDepth}：父深度 ${parentDepth} → child ${parentDepth + 1} ${allowed ? '成功' : '超界拒绝'}`,
@@ -1382,13 +1494,15 @@ section('契约模拟（真实 Config / 工具插件，startActivation 为桩）
     ? undefined : originalGet(name, viewingScope);
   ctx.tools.schemas = viewingScope => originalSchemas(viewingScope)
     .filter(tool => !tool.name.startsWith('delegate_to_') || tool.name === 'delegate_to_organizer');
-  const afterHide = await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
+  // ⚠️ 用 **spawn** 角色（`builtin-organizer`）执行这一段：它测的是「请求里仍只带 agentPreset」
+  //    —— 那是**官方 spawn 路径**的契约；CLI 角色现在走直派后台任务，不再产生 spawn 请求。
+  const afterHide = await builtinOrganizer.execute({ prompt: 'T', description: 'fixture' }, exec);
   check('委派工具运行时卸载后请求仍只带 agentPreset（persona 与工具构成不再随清单变化）',
-    afterHide?.kind === 'activation' && requests.at(-1).agentPreset === rolePresetId('organizer')
+    afterHide?.kind === 'activation' && requests.at(-1).agentPreset === rolePresetId('builtin-organizer')
       && !Object.hasOwn(requests.at(-1), 'persona') && !Object.hasOwn(requests.at(-1), 'toolFilter'));
   ctx.tools.get = (name, viewingScope) => name.startsWith('delegate_to_') ? undefined : originalGet(name, viewingScope);
   ctx.tools.schemas = viewingScope => originalSchemas(viewingScope).filter(tool => !tool.name.startsWith('delegate_to_'));
-  await organizer.execute({ prompt: 'T', description: 'fixture' }, exec);
+  await builtinOrganizer.execute({ prompt: 'T', description: 'fixture' }, exec);
   for (const refresh of events.get('tools/change') ?? []) refresh();
   check('全部 delegate 卸载后 guidance 不再宣称可继续派发（该行为仍在执行期实时计算）',
     !guidance({ agent: { session: { header: {} }, options: {} } }).includes('may delegate further'));
@@ -1619,32 +1733,37 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   file = JSON.parse(readFileSync(path, 'utf8'));
   const scoped = { ...role, id: 'preset-role', model: 'preset-external' };
   let outcome = await mount({ roles: [scoped], volatile: { wrapperProvider: 'preset-route', wrapperModel: 'preset-model', wrapperEffort: 'low' } });
-  check('preset 角色优先，但统一包裹路由取根文件而非 preset', outcome.configs.length === 1 &&
-    outcome.configs[0].toolName === 'delegate_to_preset_role' &&
-    JSON.stringify(outcome.configs[0].agentOptions) === JSON.stringify({ provider: 'root-route', model: 'root-model', reasoningEffort: 'high' }));
+  // ⚠️ 这里**曾经**断言 `outcome.configs[0].agentOptions` 等于根文件的统一包裹路由（把它注入
+  //    中继子代理的 LLM 路由）。CLI 角色改为**直派后台任务**后，顶层不再有中继子代理 ——
+  //    包裹路由在**顶层已无消费者**，因此不再产生任何官方 spawn 配置。
+  //    这正是后续删除 wrapperProvider/Model/Effort 三个字段的依据：它们只服务那层壳。
+  check('CLI 角色不再产生官方 spawn 配置（顶层已无中继子代理，包裹路由无消费者）',
+    outcome.configs.length === 0, JSON.stringify({ configs: outcome.configs.map(c => c.toolName), result: outcome.result }));
   apply(makeCtx(), Config({ provider: 'self', roles: [role] }));
   file = JSON.parse(readFileSync(path, 'utf8'));
   check('根清空统一路由后文件保存三个空值，避免回落旧 preset',
     ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile[key] === ''));
   outcome = await mount({ volatile: { wrapperProvider: 'preset-route' } });
-  check('根三个空值优先：CLI 不设置 agentOptions', outcome.configs.length === 1 && outcome.configs[0].agentOptions === undefined);
+  check('CLI 角色：包裹路由为空值同样不产生 spawn 配置', outcome.configs.length === 0,
+    JSON.stringify({ configs: outcome.configs.length }));
   outcome = await mount({ volatile: { wrapperEffort: 'invalid' } });
-  check('有效根空路由覆盖非法 preset，仍健康挂载', outcome.configs.length === 1 && outcome.result.ok &&
-    outcome.configs[0].agentOptions === undefined);
+  check('CLI 角色：根非法包裹强度不再影响挂载（无消费者）', outcome.configs.length === 0,
+    JSON.stringify({ configs: outcome.configs.length, result: outcome.result }));
   writeConfigFile(path, initialConfig([role], { provider: 'self', volatile: { wrapperModel: 'partial-root' } }));
   outcome = await mount({ volatile: { wrapperProvider: 'preset-route', wrapperEffort: 'invalid' } });
-  check('部分文件路由仍对象级优先，不补入 preset provider/非法 effort', outcome.configs.length === 1 && outcome.result.ok &&
-    JSON.stringify(outcome.configs[0].agentOptions) === JSON.stringify({ model: 'partial-root' }));
+  check('CLI 角色：部分文件包裹路由不再注入 spawn 配置', outcome.configs.length === 0,
+    JSON.stringify({ configs: outcome.configs.length }));
   writeFileSync(path, '{broken');
   outcome = await mount({ roles: [role], volatile: { wrapperModel: 'local-fallback' } });
   check('坏文件且无有效缓存：拒绝挂载，不冒充本地回落成功', outcome.configs.length === 0 && !outcome.result.ok && outcome.result.configErrors.length > 0, JSON.stringify(outcome.result));
   writeConfigFile(path, initialConfig([role], { provider: 'self' }));
   outcome = await mount({ volatile: { wrapperModel: 'fallback-model' } });
-  check('文件尚无统一路由时回落当前实例，仅设置非空模型',
-    JSON.stringify(outcome.configs[0]?.agentOptions) === JSON.stringify({ model: 'fallback-model' }));
+  check('CLI 角色：文件包裹路由不再产生 spawn 配置（顶层无消费者）', outcome.configs.length === 0,
+    JSON.stringify({ configs: outcome.configs.length }));
   for (const effort of ['', ' ', 'low', 'medium', 'high', 'xhigh', 'max']) {
     outcome = await mount({ volatile: { wrapperEffort: effort } });
-    check(`统一强度 ${JSON.stringify(effort)} 合法且能挂载`, outcome.configs.length === 1 && outcome.result.ok);
+    check(`统一强度 ${JSON.stringify(effort)} 合法且 CLI 角色不因此产生 spawn 配置`,
+      outcome.configs.length === 0, JSON.stringify({ configs: outcome.configs.length, result: outcome.result }));
   }
   const before = readFileSync(path, 'utf8');
   const invalidRoot = makeCtx();
@@ -1677,8 +1796,9 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
     bridgeHealth.roleConfigStatus.includes('已创建空角色文件以桥接根包裹路由') &&
     !bridgeHealth.roleConfigStatus.includes('根设置尚未桥接'));
   outcome = await mount({ roles: [role], volatile: { wrapperProvider: 'preset-route', wrapperModel: 'preset-model', wrapperEffort: 'low' } });
-  check('R1：空角色桥接文件路由覆盖 preset 自身整套 wrapper', outcome.configs.length === 1 && outcome.result.ok &&
-    JSON.stringify(outcome.configs[0].agentOptions) === JSON.stringify({ provider: 'only-route' }));
+  check('R1：空角色桥接文件路由不再注入中继（CLI 顶层无中继，故无 spawn 配置）',
+    outcome.configs.length === 0,
+    JSON.stringify({ configs: outcome.configs.map(c => c.toolName), result: outcome.result }));
   commitVolatile(pendingConfig.volatile, {}); pendingUpdate([['volatile', 'wrapperProvider']]);
   file = JSON.parse(readFileSync(path, 'utf8'));
   check('R1：桥接后就地清空保留空 roles 并写三空值', JSON.stringify(file.roles) === '[]' &&
@@ -1698,8 +1818,9 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   check('R1：首次无 wrapper 不建桥接文件且健康', !existsSync(path) && freshHealth.ok && freshHealth.configErrors === '' &&
     !freshHealth.roleConfigStatus.includes('根设置尚未桥接'));
   outcome = await mount({ roles: [role], volatile: { wrapperModel: 'fresh-preset' } });
-  check('R1：首次无根 wrapper 时 preset 仍取自身路由', !existsSync(path) && outcome.result.ok &&
-    JSON.stringify(outcome.configs[0]?.agentOptions) === JSON.stringify({ model: 'fresh-preset' }));
+  check('R1：首次无根 wrapper 时不建桥接文件，且不再产生中继 spawn 配置',
+    !existsSync(path) && outcome.configs.length === 0,
+    JSON.stringify({ configs: outcome.configs.length, result: outcome.result }));
 
   const failedCtx = makeCtx();
   const originalWrite = fs.writeFileSync;
@@ -1942,9 +2063,17 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
     cli.model = 'external-new'; cli.effort = 'high'; cli.instructions = 'CLI-NEW';
     Object.assign(cli, cliFieldsFor('codex', true), { readOnly: true });
     save([builtin, cli], { wrapperModel: 'wrapper-new', wrapperEffort: 'high' });
-    await getTool('delegate_to_hot_cli').execute({ prompt: 'T', description: 'wrapper' }, exec);
-    check('S06：下次 CLI 包裹派发读取新统一路由', requests.at(-1).agentOptions.model === 'wrapper-new'
-      && requests.at(-1).agentOptions.reasoningEffort === 'high' && ctx.registered.length === count);
+    // ⚠️ 这里**曾经**断言「下次 CLI 包裹派发读取新统一路由」（`requests.at(-1).agentOptions`）。
+    //    CLI 角色改为**直派后台任务**后，顶层不再有中继子代理，包裹路由在顶层**没有消费者**
+    //    —— 因此改为断言它确实走了直派路径：**不产生 spawn 请求**，而且唯一的阻塞是
+    //    本夹具没装 `jobs` 服务（若它仍走中继，这里会正常产生请求而不会报 jobs 缺失）。
+    const beforeS06 = requests.length;
+    let s06Error;
+    try { await getTool('delegate_to_hot_cli').execute({ prompt: 'T', description: 'wrapper' }, exec); }
+    catch (error) { s06Error = error; }
+    check('S06：CLI 角色走直派（不产生 spawn 请求；唯一阻塞是夹具未装 jobs）',
+      requests.length === beforeS06 && String(s06Error?.message ?? '').includes('jobs 服务不可用'),
+      JSON.stringify({ requests: requests.length, error: String(s06Error?.message ?? '') }));
     const cliTool = getTool('switchboard_cli_run_hot_cli');
     await cliTool.execute({ prompt: 'TASK & $() ;', cliCommand: 'model-command', model: 'model-override' }, childExec);
     const spec = invocations.at(-1);
@@ -2343,34 +2472,34 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
     try {
       await cliOwner.await(); await tick(); await tick();
       pause = true;
-      const call = root.tools.execute({ name: 'delegate_to_snapshot_cli', agent: cliParent,
-        arguments: { prompt: 'CLI wrapper', description: 'CLI wrapper' }, signal: new AbortController().signal });
-      await waitGate(6); writeConfigFile(path, cliVersion(2));
-      gates[6].resolve(); const result = await call; const request = requests.at(-1);
-      // ⚠️ 旧断言比对的 `request.persona` / `request.toolFilter.allow` 已不存在：
-      //    CLI 角色的包裹 persona 与「只拿自己的专属 CLI 工具」都移进角色 preset。
-      //    深度同理：入口是 cliVersion(1)，预检后写入 cliVersion(2) 才被现读，故两个版本都接受。
-      check('P12：真实 ToolRuntime CLI 包裹路由/深度/preset 同入口版本', !result.isError
-        && request.agentOptions.model === 'wrapper-1' && request.agentOptions.reasoningEffort === 'low'
-        && depthIs(request, 1, 2) && request.agentPreset === rolePresetId('snapshot-cli')
-        && !Object.hasOwn(request, 'persona') && !Object.hasOwn(request, 'toolFilter'), JSON.stringify(request));
+      // ⚠️ 这里**曾经**用 `waitGate(6)`（CLI 包裹预检挂起）+ `request.agentOptions` 断言包裹路由。
+      //    CLI 角色改为**直派后台任务**后，顶层不再有中继子代理：**不预检、不产生 spawn 请求**，
+      //    包裹路由在顶层没有消费者（这正是后续删除那三个字段的依据）。
+      //    本夹具的根 ctx 没装 jobs 服务，因此直派的唯一阻塞是「jobs 服务不可用」——
+      //    若它仍走中继，这里会正常产生请求，而不会报 jobs 缺失。这个反向信号就是判据。
+      const beforeCli = requests.length;
+      const cliOutcome = await root.tools.execute({ name: 'delegate_to_snapshot_cli', agent: cliParent,
+        arguments: { prompt: 'CLI wrapper', description: 'CLI wrapper' }, signal: new AbortController().signal })
+        .catch(error => ({ isError: true, error }));
+      const cliMessage = String(cliOutcome?.error?.message ?? cliOutcome?.value?.message
+        ?? cliOutcome?.value?.diagnostic ?? '');
+      check('P12：CLI 角色走直派 —— 不产生 spawn 请求、不预检（夹具无 jobs 时如实拒绝）',
+        requests.length === beforeCli
+          && (cliOutcome?.isError === true
+            ? cliMessage.includes('jobs 服务不可用')
+            : cliOutcome?.value?.status === 'accepted'),
+        JSON.stringify({ requests: requests.length, outcome: cliOutcome?.isError ? cliMessage : cliOutcome?.value }));
       const cliRegistered = root.get('agentPresets').definitions
         .find(definition => definition.id === rolePresetId('snapshot-cli'));
-      check('P12b：CLI 角色的包裹 persona 与专属工具由 preset 行承载',
+      check('P12b：CLI 角色的包裹 persona 与专属工具由 preset 行承载（嵌套中继仍走这条路）',
         cliRegistered?.plugins.filter(plugin => plugin.name === '@deepseek-ai/dsh-persona').length === 1
           && String(cliRegistered.plugins.find(plugin => plugin.id === 'persona')?.config?.prefix).includes('不可继续派发')
           && JSON.stringify(cliRegistered.plugins.find(plugin => plugin.name === '@magicvr/dsh-agent-switchboard')
             ?.config?.cliToolFor) === '["snapshot-cli"]');
       pause = false;
-      await root.tools.execute({ name: 'delegate_to_snapshot_cli', agent: cliParent,
-        arguments: { prompt: 'CLI next', description: 'CLI next' }, signal: new AbortController().signal });
-      // 包裹路由与深度仍是执行期 getter（现读新配置）；persona / 嵌套派发清单是组合期事实
-      // （preset 只在挂载时注册一次），因此 P13 不再断言 persona/allow 随文件变化。
-      check('P13：真实 ToolRuntime CLI 后续包裹派发现读新路由与深度', requests.at(-1).agentOptions.model === 'wrapper-2'
-        && requests.at(-1).agentOptions.reasoningEffort === 'high' && requests.at(-1).maxDepth === 3
-        && requests.at(-1).agentPreset === rolePresetId('snapshot-cli')
-        && !Object.hasOwn(requests.at(-1), 'persona'));
-      check('P13b：CLI 嵌套派发清单不随文件热更新（组合期事实，需重挂）',
+      // 包裹路由与深度曾是执行期 getter；persona / 嵌套派发清单是组合期事实（preset 只在挂载时
+      // 注册一次）。顶层直派后前者在顶层已无消费者，后者仍成立 —— 保留这条不变式。
+      check('P13：CLI 嵌套派发清单不随文件热更新（组合期事实，需重挂）',
         cliRegistered.plugins.every(plugin => plugin.name !== '@deepseek-ai/dsh-tool-subagent'));
     } finally { await cliOwner.dispose(); }
   } finally { await owner.dispose(); }
