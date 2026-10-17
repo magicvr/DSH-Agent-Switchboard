@@ -1131,14 +1131,13 @@ section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失
         ctx.tools.get('switchboard_cli_run_cli_worker', scope) != null
         && ctx.tools.get('delegate_to_cli_worker', scope) == null
         && ctx.tools.get('switchboard_cli_run_cli_worker') == null);
-      // CLI 角色不再经官方 spawn 挂载（没有它的 config），但角色 preset 行仍带 `cliToolFor`
-      // —— 那是**嵌套**中继路径的凭据，与顶层派发无关。
-      const cliPreset = ctx.presets.definitions.find(definition => definition.id === rolePresetId('cli-worker'));
-      const cliToolsRow = cliPreset?.plugins.find(plugin => plugin.name === '@magicvr/dsh-agent-switchboard');
-      check('CLI 角色不再经官方 spawn 挂载，但 preset 行仍带 cliToolFor（嵌套中继不变）',
+      // CLI 角色不再经官方 spawn 挂载，也**不再产出 preset** —— 中继子代理与 `cliToolFor`
+      // 承载行一并退役（嵌套可达性改由调用方 preset 的 `cliDispatchFor` 表达）。
+      check('CLI 角色不再经官方 spawn 挂载，也不再产出 preset',
         !configs.some(c => c.toolName === 'delegate_to_cli_worker')
-          && JSON.stringify(cliToolsRow?.config?.cliToolFor) === '["cli-worker"]',
-        JSON.stringify(configs.map(c => c.toolName)));
+          && ctx.presets.definitions.every(definition => definition.id !== rolePresetId('cli-worker')),
+        JSON.stringify({ configs: configs.map(c => c.toolName),
+          presets: ctx.presets.definitions.map(definition => definition.id) }));
       // 自检的 viewer 默认是本 preset 作用域，看不到按 agent 安装的直派工具 —— 因此 CLI 角色
       // 在这里如实报「未挂载」而不是伪健康。真机上的可用性由**调用方 agent** 的作用域判定。
       check('自检如实报告 CLI 角色在本作用域未挂载（直派工具按 agent 安装）',
@@ -1394,8 +1393,12 @@ section('契约模拟（真实 Config / 工具插件，startActivation 为桩）
   const allRoleIds = ['organizer', 'leaf', 'builtin-leaf', 'builtin-organizer'];
   const toolNameOf = id => `delegate_to_${id.replace(/-/g, '_')}`;
   const presetIdOfToolName = Object.fromEntries(allRoleIds.map(id => [toolNameOf(id), rolePresetId(id)]));
-  check('四个角色都注册了独立 preset', ctx.presets.definitions.length === 4
-    && allRoleIds.every(id => presetById(id) !== undefined));
+  const spawnRoleIds = ['builtin-leaf', 'builtin-organizer'];
+  check('只为 **spawn** 角色注册 preset（CLI 角色直派后台任务，没有 agent 需要组合）',
+    ctx.presets.definitions.length === 2
+      && spawnRoleIds.every(id => presetById(id) !== undefined)
+      && ['organizer', 'leaf'].every(id => presetById(id) === undefined),
+    JSON.stringify(ctx.presets.definitions.map(definition => definition.id)));
   check('每个 preset 内行 id 唯一', ctx.presets.definitions.every(definition => {
     const ids = presetRowIds(definition);
     return new Set(ids).size === ids.length;
@@ -1405,7 +1408,8 @@ section('契约模拟（真实 Config / 工具插件，startActivation 为桩）
     const delegationGroup = definition.plugins.find(plugin => plugin.id === 'delegation');
     const groupChildIds = (delegationGroup?.config ?? []).map(child => child.id);
     const delegateRows = definition.plugins.filter(plugin => plugin.name === '@deepseek-ai/dsh-tool-subagent');
-    const expectedTargets = allRoleIds.filter(target => target !== id).map(toolNameOf).sort();
+    const cliTargets = allRoleIds.filter(target => target !== id && !spawnRoleIds.includes(target));
+    const spawnTargets = spawnRoleIds.filter(target => target !== id);
     check(`${id} preset：persona 行恰好一行且携带角色指令`,
       definition.plugins.filter(plugin => plugin.name === '@deepseek-ai/dsh-persona').length === 1
         && definition.plugins.find(plugin => plugin.id === 'persona')?.config?.prefix === fixtureRole.instructions);
@@ -1415,28 +1419,27 @@ section('契约模拟（真实 Config / 工具插件，startActivation 为桩）
         && !groupChildIds.some(rowId => uncontrolled.includes(rowId)));
     check(`${id} preset：受控委派行符合 allowNestedDispatch=${nested}`,
       nested
-        ? JSON.stringify(delegateRows.map(row => row.config.toolName).sort()) === JSON.stringify(expectedTargets)
+        ? JSON.stringify(delegateRows.map(row => row.config.toolName).sort())
+            === JSON.stringify(spawnTargets.map(toolNameOf).sort())
           && delegateRows.every(row => row.config.provider === 'spawn'
             && row.config.agentPreset === presetIdOfToolName[row.config.toolName])
         : delegateRows.length === 0);
+    // CLI 目标不产生 spawn 行（那正是中继子代理），改由本插件的宿主行直派。
+    check(`${id} preset：CLI 目标走 cliDispatchFor 直派宿主行（allowNestedDispatch=${nested}）`,
+      nested
+        ? JSON.stringify(definition.plugins.find(plugin => plugin.id === `switchboard-cli-dispatch-${id}`)
+          ?.config?.cliDispatchFor) === JSON.stringify(cliTargets)
+          && !delegateRows.some(row => cliTargets.some(target => toolNameOf(target) === row.config.toolName))
+        : definition.plugins.every(plugin => plugin.config?.cliDispatchFor === undefined),
+      JSON.stringify(definition.plugins.map(plugin => plugin.id)));
   }
-  const cliLeafPreset = presetById('leaf');
-  check('CLI leaf preset 刻意最小：persona + 自身 CLI 行，无标准工具行',
-    presetRowIds(cliLeafPreset).join(',') === 'persona,switchboard-cli-tools-leaf'
-      && !presetRowIds(cliLeafPreset).includes('tool-fs'));
-  check('CLI leaf preset 的专属 CLI 行只含自己',
-    JSON.stringify(cliLeafPreset.plugins.find(plugin => plugin.id === 'switchboard-cli-tools-leaf')?.config?.cliToolFor)
-      === '["leaf"]');
-  const cliOrganizerPreset = presetById('organizer');
-  const cliOrganizerRows = cliOrganizerPreset.plugins.filter(plugin => plugin.name === '@deepseek-ai/dsh-tool-subagent');
-  const cliExpectedTargets = allRoleIds.filter(target => target !== 'organizer').map(toolNameOf).sort();
-  check('CLI organizer preset：每个其它角色一行受控委派并指向对方的角色 preset',
-    JSON.stringify(cliOrganizerRows.map(row => row.config.toolName).sort()) === JSON.stringify(cliExpectedTargets)
-      && cliOrganizerRows.every(row => row.config.provider === 'spawn'
-        && row.config.agentPreset === presetIdOfToolName[row.config.toolName]));
-  check('CLI organizer preset 不含标准工具行（旧 toolFilter.allow 白名单语义）',
-    !presetRowIds(cliOrganizerPreset).includes('tool-fs')
-      && !presetRowIds(cliOrganizerPreset).includes('delegation'));
+  // ⚠️ 这里**曾经**断言 CLI 角色 preset（`leaf`/`organizer`）的行构成：包裹 persona、自身
+  //    `cliToolFor` 行、以及「每个其它角色一行受控委派」。CLI 角色改为**直派后台任务**后不再
+  //    产出 preset，那层中继子代理整体退役；**嵌套**可达性改由调用方 preset 的
+  //    `cliDispatchFor` 宿主行表达（见下面 builtin-organizer 的断言）。
+  check('CLI 角色不产出 preset（顶层与嵌套都直派，没有 agent 需要组合）',
+    presetById('leaf') === undefined && presetById('organizer') === undefined,
+    JSON.stringify(ctx.presets.definitions.map(definition => definition.id)));
 
   const toolModule = await import('@deepseek-ai/dsh-tool-subagent');
   for (const maxDepth of [0, 1, 3]) {
@@ -2489,18 +2492,12 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
             ? cliMessage.includes('jobs 服务不可用')
             : cliOutcome?.value?.status === 'accepted'),
         JSON.stringify({ requests: requests.length, outcome: cliOutcome?.isError ? cliMessage : cliOutcome?.value }));
-      const cliRegistered = root.get('agentPresets').definitions
-        .find(definition => definition.id === rolePresetId('snapshot-cli'));
-      check('P12b：CLI 角色的包裹 persona 与专属工具由 preset 行承载（嵌套中继仍走这条路）',
-        cliRegistered?.plugins.filter(plugin => plugin.name === '@deepseek-ai/dsh-persona').length === 1
-          && String(cliRegistered.plugins.find(plugin => plugin.id === 'persona')?.config?.prefix).includes('不可继续派发')
-          && JSON.stringify(cliRegistered.plugins.find(plugin => plugin.name === '@magicvr/dsh-agent-switchboard')
-            ?.config?.cliToolFor) === '["snapshot-cli"]');
+      // ⚠️ 这里**曾经**断言 CLI 角色 preset 的「包裹 persona + 专属工具行 + 嵌套清单」。
+      //    CLI 角色不再产出 preset：顶层与嵌套都直派后台任务，那层中继整体退役。
+      check('P12b：CLI 角色不再产出 preset（包裹 persona 与专属工具行随中继退役）',
+        root.get('agentPresets').definitions.every(definition => definition.id !== rolePresetId('snapshot-cli')),
+        JSON.stringify(root.get('agentPresets').definitions.map(definition => definition.id)));
       pause = false;
-      // 包裹路由与深度曾是执行期 getter；persona / 嵌套派发清单是组合期事实（preset 只在挂载时
-      // 注册一次）。顶层直派后前者在顶层已无消费者，后者仍成立 —— 保留这条不变式。
-      check('P13：CLI 嵌套派发清单不随文件热更新（组合期事实，需重挂）',
-        cliRegistered.plugins.every(plugin => plugin.name !== '@deepseek-ai/dsh-tool-subagent'));
     } finally { await cliOwner.dispose(); }
   } finally { await owner.dispose(); }
 }

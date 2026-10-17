@@ -433,6 +433,14 @@ export const Config = z.object({
    * 否则子代理看不见它。设了这个字段的作用域**只**注册这些 CLI 工具。
    */
   cliToolFor: z.array(z.string()).description('仅内部使用：本作用域需要注册专属 CLI 工具的角色 id'),
+  /**
+   * 仅内部使用：本作用域需要注册 CLI **直派**工具（后台任务）的角色 id。
+   *
+   * 与 `cliToolFor` 的分工：那个给**中继子代理**提供阻塞式 CLI 工具（旧路径，将退役）；
+   * 这个让**可嵌套派发的角色**在自己的 preset 作用域里直接拿到 `delegate_to_<cliRole>` ——
+   * 于是嵌套派发也不需要中继子代理。只由 role-presets 按 `allowNestedDispatch` 决定是否声明。
+   */
+  cliDispatchFor: z.array(z.string()).description('仅内部使用：本作用域需要注册 CLI 直派工具的角色 id'),
   /** CLI 角色的默认可执行工作目录；角色自身可用 cliCwd 覆盖。 */
   cwd: z.string().description('CLI 角色的默认工作目录'),
   /** 角色列表。 */
@@ -1038,6 +1046,69 @@ function mountCliToolsInThisScope(ctx, { roleConfigPath, roleIds, diagnostics })
 }
 
 /**
+ * 在**本作用域**注册 CLI 角色的直派工具（后台任务）。
+ *
+ * 由角色 preset 里的本插件条目（`cliDispatchFor`）触发：嵌套子代理在自己的 preset 作用域
+ * 里直接拿到 `delegate_to_<cliRole>`，因此**嵌套派发也不需要中继子代理**。是否声明该行由
+ * role-presets 按调用方角色的 `allowNestedDispatch` 决定 —— 嵌套权限仍在组合期固定。
+ *
+ * 与 `mountCliToolsInThisScope` 一样**只做这一件事**：不注册自检、不挂角色工具、不做根配置同步。
+ *
+ * @param {object} ctx - Cordis 上下文。
+ * @param {object} options - 选项。
+ * @param {string} options.roleConfigPath - 角色配置文件路径。
+ * @param {string[]} options.roleIds - 需要在此作用域注册直派工具的角色 id。
+ * @param {object} options.diagnostics - 诊断记录。
+ */
+function mountCliDispatchInThisScope(ctx, { roleConfigPath, roleIds, diagnostics }) {
+  const read = createRoleResolver(roleConfigPath, {});
+  let current;
+  try {
+    current = read();
+  } catch (error) {
+    diagnostics.fatal = `角色配置不可读，直派工具未注册：${error instanceof Error ? error.message : String(error)}`;
+    return;
+  }
+  diagnostics.roleConfigRead = `（子代理作用域·直派）${current.source ?? 'preset'} stale=${current.stale === true}`;
+  const tools = ctx.get('tools');
+  if (typeof tools?.register !== 'function') {
+    diagnostics.fatal = 'tools 服务不可用，直派工具未注册';
+    return;
+  }
+  for (const roleId of roleIds) {
+    const role = current.roles.find(item => item.id === roleId);
+    if (role === undefined) {
+      diagnostics.blocked.push({ id: roleId, reason: '角色配置里找不到该角色，直派工具未注册' });
+      continue;
+    }
+    if (role.backend !== CLI_BACKEND) {
+      diagnostics.blocked.push({ id: roleId, reason: `角色 ${roleId} 不是 cli 后端，无需直派工具` });
+      continue;
+    }
+    if (role.cliBlockReason) {
+      diagnostics.blocked.push({ id: roleId, reason: role.cliBlockReason });
+      continue;
+    }
+    try {
+      tools.register(createCliDispatchTool({
+        role,
+        getRole: () => {
+          const live = read().roles.find(item => item.id === roleId);
+          if (live?.cliBlockReason) throw new Error(live.cliBlockReason);
+          return live;
+        },
+        ctx,
+        spawn: spec => safeSpawn(ctx, spec),
+        resolveExecutable: async (command, env, signal) =>
+          ctx.get('subprocess').resolveExecutable(command, env, signal),
+      }));
+    } catch (error) {
+      diagnostics.blocked.push({ id: roleId, reason: error instanceof Error ? error.message : String(error) });
+    }
+  }
+}
+
+/**
  * 插件入口。
  *
  * ⚠️ **整个函数体被一层兜底 try/catch 包住**，这是硬要求，不是保险起见。
@@ -1102,6 +1173,11 @@ function applyInner(ctx, config) {
   // 声明一行本插件条目、在**子代理的作用域里**注册，否则子代理看不见它。
   //
   // 这条路径刻意什么都不做别的：不注册自检、不挂角色工具、不做根配置同步。
+  const cliDispatchFor = readVolatileField(resolved, 'cliDispatchFor');
+  if (Array.isArray(cliDispatchFor) && cliDispatchFor.length > 0) {
+    mountCliDispatchInThisScope(ctx, { roleConfigPath, roleIds: cliDispatchFor, diagnostics });
+    return;
+  }
   const cliToolFor = readVolatileField(resolved, 'cliToolFor');
   if (Array.isArray(cliToolFor) && cliToolFor.length > 0) {
     mountCliToolsInThisScope(ctx, { roleConfigPath, roleIds: cliToolFor, diagnostics });

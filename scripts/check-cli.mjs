@@ -8,7 +8,7 @@ import {
   validateTemplate,
 } from '../src/cli/argv.js';
 import { classifyRun, formatRunResult, parseRouteFacts } from '../src/cli/output.js';
-import { createCliTool } from '../src/cli/provider.js';
+import { createCliDispatchTool, createCliTool } from '../src/cli/provider.js';
 import { normalizeRole, rolePresetId, toolConfigFor } from '../src/roles.js';
 import { buildRolePreset } from '../src/role-presets.js';
 
@@ -263,17 +263,16 @@ section('专属 CLI 工具命名一致性（跨模块）');
   check('cli 角色规范化成功', role !== null);
   const cfg = toolConfigFor(role, { maxDepth: 3 });
   const tool = createCliTool({ role, spawn: () => { throw new Error('不应执行'); } });
-  // ⚠️ 这里**曾经**断言 `cfg.toolFilter.allow === [tool.name]`。0.2.1-rc.1 删除了
-  //    `toolFilter`（键存在即装载期硬抛错）：CLI 子代理的作用域改由角色 preset 里的
-  //    一行本插件条目承载（`config.cliToolFor`），工具 Config 只负责选中该 preset。
-  const cliPreset = buildRolePreset(role, { platform: process.platform, maxDepth: 3, roles: [role] });
-  const cliToolsRow = cliPreset.plugins.find((plugin) => plugin.name === '@magicvr/dsh-agent-switchboard');
-  check('专属工具注册名与 preset 的 cliToolFor 一致',
-    JSON.stringify(cliToolsRow?.config?.cliToolFor) === JSON.stringify([role.id]));
-  check('工具 Config 改用 agentPreset 选中角色组合',
-    cfg.agentPreset === rolePresetId('codex-scout') && !Object.hasOwn(cfg, 'toolFilter'));
-  check('preset 里带有专属工具行的 id 由角色 id 派生',
-    typeof cliToolsRow?.id === 'string' && cliToolsRow.id.endsWith(role.id));
+  const dispatch = createCliDispatchTool({ role, ctx: { get: () => undefined },
+    spawn: () => { throw new Error('不应执行'); } });
+  // ⚠️ 这里**曾经**断言「专属工具注册名与 preset 的 cliToolFor 一致」「preset 里带有专属工具行
+  //    的 id 由角色 id 派生」—— 那是**中继子代理**的落点。CLI 角色改为**直派后台任务**后：
+  //    没有 relay 工具、没有角色 preset、也没有 cliToolFor。工具名直接取自角色的 `toolName`。
+  check('CLI 角色的直派工具名取自角色 toolName',
+    dispatch.name === role.toolName && dispatch.name === 'delegate_to_codex_scout');
+  check('CLI 角色不再产出 preset（cliToolFor 的承载点已随中继退役）',
+    buildRolePreset(role, { platform: process.platform, maxDepth: 3, roles: [role] }) === undefined);
+  check('工具 Config 不带 toolFilter（键存在即装载期硬抛错）', !Object.hasOwn(cfg, 'toolFilter'));
   check('工具名包含与 delegate 相同的角色后缀', tool.name === 'switchboard_cli_run_codex_scout');
   check('CLI 委派后端是 spawn', cfg.provider === 'spawn');
 }

@@ -36,7 +36,6 @@ import {
   DELEGATION_PROVIDER,
   absoluteDepthLimit,
   agentOptionsFor,
-  cliPersonaFor,
   dispatchPermissionsFor,
   rolePresetId,
 } from './roles.js';
@@ -150,6 +149,9 @@ export function buildRolePreset(role, options = {}) {
   const platform = options.platform ?? process.platform;
   const rows = options.rows ?? loadRowTemplate().rows;
   const isCli = role.backend === CLI_BACKEND;
+  // ⚠️ CLI 角色**不再需要 preset**：顶层与嵌套都直接派发后台任务，没有任何东西会 spawn 它。
+  //    中继子代理退役后，这份 preset（包裹 persona + 专属 CLI 工具行）整体失去意义。
+  if (isCli) return undefined;
 
   // 该角色可以继续派发出去的角色（只有允许嵌套时才有）。
   const nested = role.allowNestedDispatch
@@ -162,48 +164,43 @@ export function buildRolePreset(role, options = {}) {
     availableToolNames: options.availableToolNames ?? [],
   });
 
-  // CLI 角色只拿「角色指令 + 自己的专属 CLI 工具 + 可选的嵌套委派入口」，
-  // 与旧 toolFilter.allow 白名单一致：不冻结普通工具，而是根本不给。
-  const cliToolRoleIds = isCli
-    ? [role.id]
-    : nested.filter(item => item.backend === CLI_BACKEND).map(item => item.id);
-
+  // CLI 角色不再需要 preset：顶层与嵌套都直接派发后台任务，**没有任何东西会 spawn 它**。
+  // 这个分支保留为显式拒绝，避免将来有人误以为「CLI 角色也该有 preset」。
   const plugins = [];
 
-  // ① persona：角色指令（CLI 角色是包裹转交指令）。
+  // ① persona：角色指令。
   //    ⚠️ 必须**替换**模板里那一行 persona，不能另加一行：同一个 preset 里两行
   //    `@deepseek-ai/dsh-persona` 会重复注册 `deployment:persona-prefix`，
   //    而该行是刻意「fails loud」的（见 dsh-persona README）。
-  const personaRow = {
+  plugins.push({
     id: 'persona',
     name: '@deepseek-ai/dsh-persona',
-    config: { prefix: isCli ? cliPersonaFor(role, permissions) : role.instructions },
-  };
+    config: { prefix: role.instructions },
+  });
 
-  // ② 工具构成：内置角色复制裁剪后的 standard 清单；CLI 角色刻意保持最小。
-  if (!isCli) {
-    plugins.push(personaRow);
-    for (const row of rows) {
-      if (row.id === 'persona') continue;
-      const entry = materializeRow(row, platform, { readOnly: role.readOnly === true });
-      if (entry) plugins.push(entry);
-    }
-  } else {
-    plugins.push(personaRow);
+  // ② 工具构成：复制裁剪后的 standard 清单（只读角色裁掉写入类行）。
+  for (const row of rows) {
+    if (row.id === 'persona') continue;
+    const entry = materializeRow(row, platform, { readOnly: role.readOnly === true });
+    if (entry) plugins.push(entry);
   }
 
-  // ③ 专属 CLI 工具的宿主行：CLI 工具由本插件注册，必须挂进**子代理自己的**作用域，
-  //    否则子代理看不见它（工具按作用域可见，不跨 preset 继承）。
-  if (cliToolRoleIds.length > 0) {
+  // ③ 宿主行：让**本角色**在自己的作用域里拿到需要的工具。
+  //
+  //    - `cliDispatchFor`：可嵌套派发的 CLI 目标 —— 直派后台任务，**不需要**中继子代理。
+  //      只列 CLI 目标：spawn 目标仍由 ④ 的官方委派行承载。
+  const cliTargets = nested.filter(item => item.backend === CLI_BACKEND).map(item => item.id);
+  if (cliTargets.length > 0) {
     plugins.push({
-      id: `switchboard-cli-tools-${role.id}`,
+      id: `switchboard-cli-dispatch-${role.id}`,
       name: '@magicvr/dsh-agent-switchboard',
-      config: { cliToolFor: cliToolRoleIds },
+      config: { cliDispatchFor: cliTargets },
     });
   }
 
-  // ④ 嵌套派发入口：每个可派发角色一个委派工具，各自指向对方的角色 preset。
-  for (const target of nested) {
+  // ④ 嵌套派发入口：**spawn** 目标各一行受控委派，指向对方的角色 preset。
+  //    CLI 目标已在 ③ 直派，不再产生 spawn 行 —— 那正是旧的中继子代理。
+  for (const target of nested.filter(item => item.backend !== CLI_BACKEND)) {
     plugins.push({
       id: `switchboard-delegate-${target.id}`,
       name: '@deepseek-ai/dsh-tool-subagent',
@@ -211,9 +208,6 @@ export function buildRolePreset(role, options = {}) {
         provider: DELEGATION_PROVIDER,
         toolName: target.toolName,
         agentPreset: rolePresetId(target.id),
-        ...(agentOptionsFor(target, options.wrapperRoute) === undefined
-          ? {}
-          : { agentOptions: agentOptionsFor(target, options.wrapperRoute) }),
         maxDepth: absoluteDepthLimit(options.maxDepth ?? 0),
       },
     });
@@ -230,10 +224,13 @@ export function buildRolePreset(role, options = {}) {
 /**
  * 为一个作用域组装全部角色 preset。
  *
+ * ⚠️ **CLI 角色不产出 preset**（`buildRolePreset` 对它们返回 undefined，这里过滤掉）：
+ * 它们的派发不经过任何子代理，因此没有需要独立组合的 agent。
+ *
  * @param {object[]} roles - 规范化后的角色列表。
  * @param {object} options - 选项，透传给 `buildRolePreset`。
  * @returns {object[]} preset 定义列表。
  */
 export function buildRolePresets(roles, options = {}) {
-  return roles.map(role => buildRolePreset(role, { ...options, roles }));
+  return roles.map(role => buildRolePreset(role, { ...options, roles })).filter(Boolean);
 }
