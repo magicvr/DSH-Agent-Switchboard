@@ -92,10 +92,24 @@ try {
     && !s.registration.resolved && s.verification.issues.some(i => i.code === 'registration.resolution'));
   mkdirSync(join(packageBody, '..'), { recursive: true }); put(packageBody, pkg);
 
-  section('preset 和严格剥离 guard');
+  section('preset：权威副本在仓库，profile 只应保持干净');
   put(paths.patch, cleanPatch); s = collect();
-  check('preset 缺失有明确判据', !s.preset.present && s.verification.issues.some(i => i.code === 'preset.structure'));
-  put(paths.patch, cleanPatch + generated);
+  check('profile 干净时 preset 判据来自仓库且无 preset 问题',
+    s.preset.present && s.preset.rules.status === 'current' && !s.preset.injectedInProfile
+      && !s.verification.issues.some(i => i.code.startsWith('preset.')),
+    JSON.stringify({ present: s.preset.present, rules: s.preset.rules, injected: s.preset.injectedInProfile,
+      bundle: s.preset.bundleDeclaresPreset, drift: s.preset.generatedDrift,
+      issues: s.verification.issues.map(i => `${i.code}:${i.reason}`) }));
+  put(paths.patch, cleanPatch + generated); s = collect();
+  check('profile 里残留注入副本时明确失败并给出剥离指令',
+    s.preset.injectedInProfile && s.verification.issues.some(i => i.code === 'preset.injectedInProfile'
+      && /剥离/.test(i.reason)));
+  // bundle 未声明 preset 文件时，声明不会被合成，必须明确失败（临时改 fixture 的 package.json）。
+  put(join(repoRoot, 'package.json'), { ...pkg, dsh: { ...pkg.dsh, bundle: { patch: ['./cordis.patch.yml'] } } });
+  check('bundle 未声明 preset 文件时明确失败',
+    collect().verification.issues.some(i => i.code === 'preset.bundleDeclaration'));
+  put(join(repoRoot, 'package.json'), pkg);
+  put(paths.patch, cleanPatch);
   check('cwd 中含 Switchboard 不属于本块', !isOurBlockLine('        cwd: DSH-Agent-Switchboard'));
   check('剥离只删除 preset 并保留 cwd', stripInjectedPreset(cleanPatch + generated).includes('cwd: DSH-Agent-Switchboard')
     && !stripInjectedPreset(cleanPatch + generated).includes('id: preset-switchboard'));
@@ -115,14 +129,24 @@ try {
     && scanPackageReferences(rootReference + generated, pkg.name)[0].line === 3);
   const aliasReferences = scanPackageReferences(`- insert:\n    - id: alias-owner\n      module: &pkg ${JSON.stringify(pkg.name)}\n    - id: alias-user\n      package: *pkg\n`, pkg.name);
   check('等价字段与 alias 引用保留 id 和行', aliasReferences.length === 2 && aliasReferences[1].id === 'alias-user' && aliasReferences[1].line === 5);
-  put(paths.patch, patchWith({ ...config, supervisorRules: config.supervisorRules + 'x' })); s = collect();
-  check('supervisorRules 一字节漂移精确报告', s.preset.rules.status === 'drifted' && /首个不同位置/.test(s.preset.rules.reason));
-  check('status 漂移仍退出 0', invoke('status').exitCode === 0);
-  check('verify 漂移退出非零', invoke('verify').exitCode === 1);
-  put(paths.patch, patchWith({ ...config, roles: [] }));
+  // 仓库 preset（权威副本）自身的结构问题仍必须逐条报告。
+  const generatedFile = join(repoRoot, 'presets', 'switchboard.patch.yml');
+  put(generatedFile, '- insert: []\n'); s = collect();
+  check('仓库 preset 缺少 preset-switchboard 时明确失败',
+    s.verification.issues.some(i => i.code === 'preset.structure'));
+  put(generatedFile, patchWith({ ...config, supervisorRules: '' })); s = collect();
+  check('仓库 preset 的 supervisorRules 仅含空白时明确失败',
+    s.preset.rules.status === 'invalid' && s.verification.issues.some(i => i.code === 'preset.rules'));
+  put(generatedFile, patchWith({ ...config, roles: [] }));
   check('禁止 roles 字段明确失败', collect().preset.hasRoles && collect().verification.issues.some(i => i.code === 'preset.roles'));
-  put(paths.patch, generated);
-  check('规则逐字一致且生成物无漂移', collect().preset.rules.status === 'current' && collect().preset.generatedDrift.status === 'current');
+  put(generatedFile, patchWith({ ...config, mount: false }));
+  check('仓库 preset 缺少 mount:true 时明确失败',
+    collect().verification.issues.some(i => i.code === 'preset.mount'));
+  put(generatedFile, generated);
+  check('规则有效且生成物无漂移', collect().preset.rules.status === 'current' && collect().preset.generatedDrift.status === 'current');
+  put(paths.patch, cleanPatch + generated);
+  check('profile 残留注入副本让 verify 退出非零', invoke('verify').exitCode === 1);
+  put(paths.patch, cleanPatch);
   check('成功读取 standard 后无漂移原因为空', collect().preset.generatedDrift.reason === null);
   put(join(repoRoot, 'presets', 'switchboard.patch.yml'), generated + '\n');
   s = collect();
@@ -270,10 +294,12 @@ try {
   check('status / verify CLI 退出 0 且 JSON 是单份快照', status.status === 0 && verify.status === 0
     && JSON.parse(status.stdout).paths.sources.home === '--home' && JSON.parse(verify.stdout).verification.status === 'consistent', status.stderr + verify.stderr);
   check('零写入：所有 fixture 文件 mtimeMs 与 size 及文件集合不变', fingerprint(temp) === before);
-  put(paths.patch, patchWith({ ...config, supervisorRules: config.supervisorRules + 'x' }));
+  put(paths.patch, cleanPatch + generated);
   const drift = cli('verify');
-  check('真实 CLI 漂移退出 1 且给出精确原因', drift.status === 1 && JSON.parse(drift.stdout).verification.issues.some(i => i.code === 'preset.rules' && /首个不同位置/.test(i.reason)));
-  put(paths.patch, generated);
+  check('真实 CLI 漂移退出 1 且给出精确原因', drift.status === 1
+    && JSON.parse(drift.stdout).verification.issues.some(i => i.code === 'preset.injectedInProfile'
+      && /剥离/.test(i.reason)));
+  put(paths.patch, cleanPatch);
   const missing = captureSync(process.execPath, [script, 'verify', '--profile', join(temp, 'absent-profile')], { env });
   check('CLI 显式缺 profile 失败', missing.status === 1 && /显式目标缺少 profile package.json/.test(missing.stdout));
   const shim = `import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module';
@@ -399,7 +425,7 @@ try {
   put(join(cleanConfig.p.profile, 'cordis.yml'), 'plugins: []\n');
   check('存在无包引用的 profile cordis.yml 仍允许人工移包', cleanConfig.run('uninstall', ['--apply']).exitCode === 3);
   for (const command of ['install', 'upgrade', 'uninstall']) {
-    const f = fixture({ patch: command === 'uninstall' ? cleanPatch + generated : cleanPatch });
+    const f = fixture({ patch: cleanPatch + generated });
     const changed = readFileSync(f.p.patch, 'utf8') + '# 并发编辑\n';
     let edited = false;
     const r = f.run(command, ['--apply'], { log: line => {
@@ -526,7 +552,7 @@ fs.writeFileSync = (...args) => {
   writeFileSync(generatorFile, generatorOriginal);
   for (const readArchive of [null, () => { throw new Error('fixture unavailable'); }]) {
     const f = regenerationFixture(), beforeRepo = fingerprint(regenerationRepo);
-    put(f.p.patch, cleanPatch);
+    put(f.p.patch, cleanPatch + generated);
     const degraded = f.run('upgrade', ['--apply'], { collectOptions: { repoRoot: regenerationRepo, readArchive } });
     check('归档不可用明确未验证与手工回退，继续同步已知制品', degraded.exitCode === 0
       && /漂移未验证/.test(degraded.output) && /npm run gen:preset/.test(degraded.output)
@@ -556,7 +582,9 @@ fs.writeFileSync = (...args) => {
     }
   }
   for (const command of ['install', 'upgrade', 'uninstall']) {
-    const f = fixture({ patch: command === 'uninstall' ? cleanPatch + generated : cleanPatch, roles: command === 'install' ? null : rich });
+    // 起点都带「历史上内联进 profile 的 preset 副本」：现在 install/upgrade/uninstall 的
+    // 写盘动作就是**剥离**它，所以这样才有真实的写入可验证。
+    const f = fixture({ patch: cleanPatch + generated, roles: command === 'install' ? null : rich });
     const before = fingerprint(f.home), patchBefore = readFileSync(f.p.patch), rolesBefore = fs.existsSync(f.p.roles) ? readFileSync(f.p.roles) : null;
     const dry = f.run(command);
     check(`${command} dry-run 全树 mtime+size 零写入`, fingerprint(f.home) === before, dry.output);
@@ -566,7 +594,8 @@ fs.writeFileSync = (...args) => {
     check(`${command} --apply 备份及写后验证`, backups.length === 1
       && readFileSync(join(f.p.profile, backups[0])).equals(patchBefore)
       && /PASS  写后复读验证/.test(applied.output) && applied.exitCode === (command === 'uninstall' ? 3 : 0), applied.output);
-    check(`${command} preset 目标状态正确`, Boolean(readPatch(f.p.patch).entries.some(row => row.id === 'preset-switchboard')) === (command !== 'uninstall'));
+    check(`${command} 后 profile 里不再有内联 preset 副本`,
+      !readPatch(f.p.patch).entries.some(row => row.id === 'preset-switchboard'), applied.output);
     if (command === 'uninstall') {
       check('卸载必须先剥离并复读验证，再输出包移除步骤', applied.output.indexOf('PASS  preset 剥离后复读验证') >= 0
         && applied.output.indexOf('PASS  preset 剥离后复读验证') < applied.output.indexOf('人工包移除步骤：') && applied.exitCode === 3, applied.output);
@@ -583,7 +612,8 @@ fs.writeFileSync = (...args) => {
     console.log(`  ${command} dry-run exit=${dry.exitCode}；apply exit=${applied.exitCode}；patch bytes ${patchBefore.length} → ${patchAfter.length}；backup=${backups.join(', ')}\n${applied.events.join('\n')}`);
   }
   for (const command of ['install', 'upgrade']) {
-    const f = fixture();
+    // 「已一致」= profile 里没有残留副本（清理后的稳态）→ 不应有任何写入。
+    const f = fixture({ patch: cleanPatch });
     const before = fingerprint(f.home), result = f.run(command, ['--apply']);
     check(`${command} 已一致 profile 不写盘`, result.exitCode === 0 && fingerprint(f.home) === before, result.output);
     const stale = fixture({ roles: { roles: [{ id: 'user' }], rich: { keep: true } } });
@@ -624,7 +654,7 @@ fs.writeFileSync = (...args) => {
   }
   // 平台无关的权限拒绝 fixture：注入 OS EACCES，避免 Windows chmod 无法模拟 ACL 的假测试。
   for (const command of ['install', 'upgrade', 'uninstall']) {
-    const f = fixture({ patch: command === 'uninstall' ? cleanPatch + generated : cleanPatch });
+    const f = fixture({ patch: cleanPatch + generated });
     const before = bytesTree(f.home), access = fs.accessSync;
     let result;
     try {
@@ -633,7 +663,7 @@ fs.writeFileSync = (...args) => {
     } finally { fs.accessSync = access; syncBuiltinESMExports(); }
     check(`${command} unwritable fixture 预检失败全树字节不变`, result.exitCode === 1 && /EACCES/.test(result.output) && bytesTree(f.home) === before);
   }
-  const postWrite = fixture({ patch: cleanPatch });
+  const postWrite = fixture();
   const read = fs.readFileSync, rename = fs.renameSync;
   let written = false, failure;
   try {
@@ -672,7 +702,7 @@ fs.writeFileSync = (...args) => {
     const before = fingerprint(absentTarget.home), result = absentTarget.run(command, ['--apply']);
     check(`${command} profile 不存在拒绝且不创建`, result.exitCode === 1 && fingerprint(absentTarget.home) === before);
   }
-  const jsonFixture = fixture({ patch: cleanPatch });
+  const jsonFixture = fixture();
   const jsonLogs = [];
   const jsonResult = jsonFixture.run('install', ['--apply', '--json'], { log: line => jsonLogs.push(line) });
   check('mutating --json 单份快照包含路径、验证事件与退出码', jsonResult.exitCode === 0 && jsonLogs.length === 1
@@ -691,7 +721,7 @@ fs.writeFileSync = (...args) => {
     && !/人工包移除步骤/.test(cliDanglingResult.stdout), cliDanglingResult.stdout + cliDanglingResult.stderr);
   console.log(`  双引用 CLI exit=${cliDanglingResult.status}；${cliDanglingResult.stdout.split('\n').filter(line => /悬空引用|id=/.test(line)).join('；')}`);
   for (const command of ['install', 'upgrade', 'uninstall']) {
-    const f = fixture({ patch: command === 'uninstall' ? cleanPatch + generated : cleanPatch });
+    const f = fixture({ patch: cleanPatch + generated });
     const before = fingerprint(f.home), patchBefore = readFileSync(f.p.patch);
     const args = [isolatedScript, command, '--home', f.home, '--profile', f.p.profile];
     const dry = captureSync(process.execPath, args, { env, cwd: temp });
@@ -720,7 +750,8 @@ fs.writeFileSync = (...args) => {
   put(paths.patch, cleanPatch);
   console.log('\n缺 preset fixture status：');
   runLifecycle({ argv: ['status'], paths, collectOptions: options });
-  console.log(`\n一致 verify exit=${verify.status}；漂移 verify exit=${drift.status}，${JSON.parse(drift.stdout).verification.issues.find(i => i.code === 'preset.rules').reason}`);
+  const driftReason = JSON.parse(drift.stdout).verification.issues.find(i => i.code === 'preset.injectedInProfile')?.reason;
+  console.log(`\n一致 verify exit=${verify.status}；漂移 verify exit=${drift.status}，${driftReason}`);
 } finally { rmSync(temp, { recursive: true, force: true }); }
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);

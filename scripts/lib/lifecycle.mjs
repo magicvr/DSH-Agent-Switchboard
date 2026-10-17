@@ -3,7 +3,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { captureSync } from './capture.mjs';
 import { resolvePaths, resolveAsar, REPO_ROOT } from './paths.mjs';
-import { readPatch, presetConfig, compareRules } from './preset-patch.mjs';
+import { readPatch, presetConfig } from './preset-patch.mjs';
 import { generatePreset } from './preset-generator.mjs';
 import { CONFIG_FORMAT_VERSION, readConfigFileDetailed } from '../../src/config-file.js';
 import { parseVersion, compareVersions, formatVersion } from './version.mjs';
@@ -145,11 +145,36 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
     resolved: Boolean(resolved.value?.name === name && typeof resolved.value.version === 'string'),
     resolvedVersion: resolved.value?.version ?? null, resolvedManifestVersion: resolved.value?.dsh?.manifestVersion ?? null, resolutionError: resolved.error ?? null,
     silentFailureTrap: dependencyPresent && !inBundles };
+  // ⚠️ preset 声明的**权威副本在仓库** `presets/switchboard.patch.yml`：它由本包
+  //    `package.json` 的 `dsh.bundle.patch` 投递，bundle 层与 profile 的覆盖层一起被
+  //    app-boot 合成。profile patch 里**不应**再有注入的副本——顶层 `insert` 是纯追加、
+  //    不按 id 去重，而 `dsh-agent-preset` 注册重复 id 会**硬抛**，于是那份副本既是多余的
+  //    又会装载失败。历史实现把 preset 内联进 profile，这里改为以仓库那份为准，
+  //    并把「profile 里是否还留着多余注入」单列出来。
   const generated = presetConfig(readPatch(join(repoRoot, 'presets', 'switchboard.patch.yml')), name);
-  const actual = presetConfig(readPatch(paths.patch), name);
-  const preset = { present: Boolean(actual.preset), mount: actual.config?.mount === true,
-    hasRoles: actual.config !== undefined && Object.hasOwn(actual.config, 'roles'),
-    error: actual.error ?? null, rules: compareRules(actual.config?.supervisorRules, generated.config?.supervisorRules),
+  // 「profile 里没有这份声明」是**期望状态**，不是解析错误——所以按条目直接判定，
+  // 而不是复用 presetConfig 的「缺少声明」错误串（那会把正常状态报成无法解析）。
+  const injectedPatch = readPatch(paths.patch);
+  const injectedPresent = injectedPatch.error === undefined
+    && injectedPatch.entries.some(row => row.id === 'preset-switchboard');
+  // 声明本身以仓库 preset 为准。
+  const bundlePatches = pkg.value?.dsh?.bundle?.patch;
+  const preset = {
+    // 声明本身以仓库 preset 为准。
+    present: Boolean(generated.preset),
+    mount: generated.config?.mount === true,
+    hasRoles: generated.config !== undefined && Object.hasOwn(generated.config, 'roles'),
+    error: generated.error ?? null,
+    rules: typeof generated.config?.supervisorRules === 'string' && generated.config.supervisorRules.trim()
+      ? { status: 'current' }
+      : { status: 'invalid', reason: '仓库 preset 的 supervisorRules 缺失、类型错误或仅含空白' },
+    // 投递路径是否正确：bundle 必须声明这个 patch 文件，profile 必须把本包登记为 bundle。
+    bundleDeclaresPreset: Array.isArray(bundlePatches)
+      && bundlePatches.some(entry => String(entry).replace(/^\.\//, '') === 'presets/switchboard.patch.yml'),
+    bundleDeclaresError: pkg.error ?? null,
+    // 清理前的历史状态：profile 里还留着注入的副本（应当为 false）。
+    injectedInProfile: injectedPresent,
+    injectedError: injectedPatch.error ?? null,
     generatedError: generated.error ?? null, generatedDrift: unknown('尚未读取 DSH standard preset') };
   let runtime = unknown('尚未读取 Electron 安装归档');
   let archive = null;
@@ -224,6 +249,12 @@ export function verifyLifecycle(s) {
   if (s.preset.hasRoles) add('preset.roles', 'preset 携带禁止的 roles 字段；角色只能存放在 roles.json');
   if (s.preset.generatedError) add('preset.generated', s.preset.generatedError);
   if (s.preset.rules.status !== 'current') add('preset.rules', s.preset.rules.reason);
+  // preset 由 bundle 投递：这两条是「声明真的会被合成」的前提。
+  if (s.preset.bundleDeclaresError) add('preset.bundleDeclaration', `无法读取仓库 package.json：${s.preset.bundleDeclaresError}`);
+  else if (!s.preset.bundleDeclaresPreset) add('preset.bundleDeclaration', 'package.json 的 dsh.bundle.patch 未声明 presets/switchboard.patch.yml，bundle 不会投递该 preset');
+  // 历史实现把 preset 内联进 profile；顶层 insert 不去重，重复声明会让第二个条目装载失败。
+  if (s.preset.injectedError) add('preset.injectedInProfile', `profile patch 无法解析：${s.preset.injectedError}`);
+  else if (s.preset.injectedInProfile) add('preset.injectedInProfile', 'profile patch 里还留着注入的 preset 副本（与 bundle 投递的声明重复）；运行同步即可剥离');
   if (s.preset.generatedDrift.status === 'drifted') add('preset.generatedDrift', s.preset.generatedDrift.reason);
   if (s.roles.verdict !== 'current' || !s.roles.ok) add('roles.format', `roles.json：${s.roles.verdict}；${s.roles.error ?? s.roles.format?.reason ?? '需要当前格式的角色文件'}`);
   if (s.compatibility.error) add('compatibility.file', s.compatibility.error);
@@ -246,8 +277,9 @@ function nextStep(s) {
       ? `打开 Electron DSH → 设置 → Plugins → 安装本地目录 ${s.paths.repoRoot}；确认 dependencies 与 dsh.profile.bundles 均登记 ${s.repo.name}，完全退出并重启 DSH。`
       : `dsh plugin --profile ${quote(s.profile.name)} add ${quote(spec)}`;
   }
+  // preset 由 bundle 投递，profile 里只应**剥离**残留的注入副本。
   if (s.verification.issues.some(i => i.code.startsWith('preset.')))
-    return `node scripts/gen-preset.mjs && node scripts/ops/probe-preset.mjs --inject --home ${quote(s.paths.home)} --profile ${quote(s.paths.profile)} --patch ${quote(s.paths.patch)}；然后完全退出并重启 DSH。`;
+    return `node scripts/gen-preset.mjs && node scripts/ops/plugin-lifecycle.mjs install --apply --home ${quote(s.paths.home)} --profile ${quote(s.paths.profile)} --patch ${quote(s.paths.patch)}；然后完全退出并重启 DSH。`;
   if (s.verification.issues.some(i => i.code.startsWith('roles.')))
     return '打开 DSH → 设置 → 角色与派发 → 保存角色配置；然后重新运行 verify。';
   if (s.verification.issues.length) return `打开 DSH → 设置 → Plugins → 检查 ${s.repo.name}@${s.repo.version} 的安装版本和兼容性提示；处理后完全退出并重启 DSH，再运行 verify。`;

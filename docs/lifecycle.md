@@ -9,7 +9,7 @@
 | 责任方 | 负责内容 |
 | --- | --- |
 | DSH | 包安装与移除、`dependencies` 和 `dsh.profile.bundles` 登记、兼容性门禁、模块加载 |
-| 本仓库工具 | 漂移的仓库 preset 再生成、内联 `preset-switchboard` 同步与剥离、`roles.json` 播种和格式迁移、状态采集与验证、仓库版本收口 |
+| 本仓库工具 | 漂移的仓库 preset 再生成、剥离 profile 里残留的内联 `preset-switchboard`（权威副本在仓库，由 `dsh.bundle.patch` 投递）、`roles.json` 播种和格式迁移、状态采集与验证、仓库版本收口 |
 | 使用者 | 完成人工包步骤和必要的兼容性确认、配置角色、完全退出并重启 DSH |
 
 本地目录以 `link:` 依赖安装。profile `package.json` 中必须同时有包依赖与 `dsh.profile.bundles` 成员；只有依赖会静默不加载。`status` 分别报告依赖 spec、bundle 成员资格和磁盘 `node_modules/<包名>/package.json` 的可解析性，三者不能互相替代。
@@ -80,7 +80,7 @@
 ### 3.3 版本 bump 后升级
 
 1. 用 `npm run version:show` 检查基线，运行 `npm run version:bump -- patch` 或选定类型预演。审阅后才使用 `--apply`（本轮真实写入未验证），再用 `version:show` 复核三个文件。
-2. 运行 `npm run plugin:upgrade`。profile 的 preset 是内联副本，不会自动跟随仓库变化；预演报告仓库生成物漂移及待再生成步骤，不写盘。DSH 归档可读且生成物判定为 `drifted` 时，`install` / `upgrade --apply` 自动调用既有 `scripts/gen-preset.mjs`，无需先手工生成；不要手改生成 YAML。
+2. 运行 `npm run plugin:upgrade`。preset 由 bundle 投递、不依赖 profile 内联副本；profile 里若还留着历史注入的副本，同步会剥离它；预演报告仓库生成物漂移及待再生成步骤，不写盘。DSH 归档可读且生成物判定为 `drifted` 时，`install` / `upgrade --apply` 自动调用既有 `scripts/gen-preset.mjs`，无需先手工生成；不要手改生成 YAML。
 3. 审阅后运行 `npm run plugin:upgrade -- --apply`（本轮真实写入未验证）。版本不匹配时按 DSH 官方通道更新包；若 `link:` 已直接解析到新版本，可能无需重装包。兼容性不通过时由使用者确认豁免，工具不代写。反复运行升级直到制品一致，并运行 `plugin:verify`。
 4. **版本变化或任何插件 JavaScript 变化都要完全退出并重启 DSH。** Node 模块缓存不能驱逐，reload、开关插件或再次安装不能代替进程重启。重启后再核对自检版本与格式门禁。
 
@@ -113,7 +113,7 @@
    - 已实测：`0.2.1-rc.1 → rc.2` 报 `0`（12 个包除版本坐标外逐字节相同；唯一差异是 `dsh-web-app` 的 `cordis.patch.yml` 这个本插件不消费的资产文件），而 `0.2.0-rc.2 → rc.2` 报 `1` 并列出真实变化的代码文件。
 3. 改 `package.json` 的四个 dsh peer pin（`cordis` / `schemastery` 若归档里也变了则一并改），然后 `npm install` 重生成 lock 与 `node_modules`。
 4. `npm run check` 全链；`node scripts/check-profile-wiring.mjs` 会断言仓库 peers 满足归档运行时、且 `node_modules` 每个 `@deepseek-ai/dsh*` 与运行时同版本。
-5. `node scripts/ops/plugin-lifecycle.mjs verify` 应回到 `consistent`。**preset 正文没变就不需要重新注入**；若上游 `standard.patch.yml` 变了，`check:preset` 会报漂移，先 `npm run gen:preset` 再 `upgrade --apply`。
+5. `node scripts/ops/plugin-lifecycle.mjs verify` 应回到 `consistent`。**profile 不需要内联 preset**（声明由 `dsh.bundle.patch` 投递；仓库生成物变了只需 `gen:preset`）；若上游 `standard.patch.yml` 变了，`check:preset` 会报漂移，先 `npm run gen:preset` 再 `upgrade --apply`。
 6. 完全退出并重启 DSH，再跑 `plugin:verify` 与 `switchboard_selftest`。
 
 > **刻意不提供「按运行时版本自动改写 pin」的命令**：那种命令会在没有核对接口差异的前提下让插件加载到可能已破坏 API 的运行时上，正是本项目一直在防的静默失效。`npm run dsh:delta` 只做**判定**（只读、可自动化），改 pin 仍由人看过结论后手动改——摩擦降在判定上，不降在把关强度上。

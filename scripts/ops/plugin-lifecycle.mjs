@@ -97,13 +97,16 @@ function converge(command, s, { apply, purge, collect, env, log }) {
       || pluginsWithoutName(generated.preset.config.plugins).length) throw new Error('仓库 preset 无效，拒绝同步');
     if (s.roles.exists && !s.roles.ok) throw new Error(`roles.json 不可安全迁移：${s.roles.error}`);
   }
-  let next = planInjectedPreset(original, block, { remove: command === 'uninstall' });
+  // ⚠️ preset 由 **bundle**（`dsh.bundle.patch`）投递，profile 里不再内联副本：
+  //    顶层 `insert` 是纯追加、不按 id 去重，而 `dsh-agent-preset` 注册重复 id 会硬抛，
+  //    所以内联的那份既是多余的、又会装载失败。这里统一**剥离**残留副本。
+  let next = planInjectedPreset(original, block, { remove: true });
   if (command !== 'uninstall') {
     if (s.preset.generatedDrift.status === 'unknown')
       log(`仓库生成物漂移未验证；无法自动再生成：${s.preset.generatedDrift.reason}；手工回退：npm run gen:preset；继续收敛可验证制品。`);
     if (s.preset.generatedDrift.status === 'drifted') {
       log('仓库生成物漂移：待再生成 presets/switchboard.patch.yml（git 跟踪文件）。');
-      if (!apply) log('未写盘：preset 再生成待 --apply；随后重新注入并验证。');
+      if (!apply) log('未写盘：preset 再生成待 --apply；随后剥离残留注入并验证。');
       else {
         // 在生成器写入前完成现有目标的结构、格式和权限预检。
         writableParent(generatedPath);
@@ -127,7 +130,7 @@ function converge(command, s, { apply, purge, collect, env, log }) {
         log('PASS  preset 再生成后复读验证：字节已改变，生成物 current。');
         s = afterGeneration;
         block = regenerated;
-        next = planInjectedPreset(original, block);
+        next = planInjectedPreset(original, block, { remove: true });
       }
     }
   }
@@ -142,7 +145,7 @@ function converge(command, s, { apply, purge, collect, env, log }) {
     if (patchChanged) writableParent(s.paths.patch);
     if (seed || migrate || purgeRoles) writableParent(s.paths.roles);
   }
-  log(`${apply ? 'apply' : 'dry-run'}：preset ${patchChanged ? command === 'uninstall' ? '将剥离' : '将同步' : '无需改动'}；roles ${seed ? '将播种空角色列表' : migrate ? '将迁移格式' : purgeRoles ? '将删除' : '保留原始字节'}。`);
+  log(`${apply ? 'apply' : 'dry-run'}：preset ${patchChanged ? command === 'uninstall' ? '将剥离' : '将剥离残留注入副本' : '无需改动'}；roles ${seed ? '将播种空角色列表' : migrate ? '将迁移格式' : purgeRoles ? '将删除' : '保留原始字节'}。`);
   if (patchChanged && apply) backedChange(s.paths.patch, next, log, patchOriginal);
   if (command === 'uninstall') {
     // 强制屏障：复读确认引用已消失，才能输出包移除指令。
@@ -234,8 +237,10 @@ export function runLifecycle({ argv = process.argv.slice(2), env = process.env, 
       `dsh.profile.bundles：${s.registration.inBundles ? '已登记' : '未登记'}`,
       `磁盘包体：${s.registration.resolved ? `可解析（${s.registration.resolvedVersion}）` : '不可解析'}`,
       ...(s.registration.silentFailureTrap ? ['静默不加载陷阱：dependencies 有本包，但 bundles 缺少本包。'] : [])]);
-    section('preset', [`preset-switchboard 存在=${s.preset.present}；mount:true=${s.preset.mount}；禁止的 roles 字段=${s.preset.hasRoles}`,
-      `supervisorRules：${verdict(s.preset.rules)}`, `仓库生成物：${verdict(s.preset.generatedDrift)}`]);
+    section('preset', [`仓库 preset 的 preset-switchboard 存在=${s.preset.present}；mount:true=${s.preset.mount}；禁止的 roles 字段=${s.preset.hasRoles}`,
+      `supervisorRules：${verdict(s.preset.rules)}`, `仓库生成物：${verdict(s.preset.generatedDrift)}`,
+      `bundle 投递（dsh.bundle.patch 声明 presets/switchboard.patch.yml）：${s.preset.bundleDeclaresPreset ? '已声明' : '未声明'}`,
+      `profile 里的残留注入副本：${s.preset.injectedInProfile ? '仍有（需剥离）' : '无'}`]);
     section('roles', [`roles.json：${s.roles.verdict}；角色数=${s.roles.count ?? '未知'}；wrapper=${s.roles.wrapperPresent}`,
       ...(s.roles.error ? [s.roles.error] : []), ...(s.roles.wrapperKeys.length ? [`wrapper 字段：${s.roles.wrapperKeys.join(', ')}`] : [])]);
     section('compatibility', [`Electron DSH runtime：${s.compatibility.runtime.version ?? verdict(s.compatibility.runtime)}`,

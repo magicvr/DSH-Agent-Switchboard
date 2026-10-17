@@ -405,8 +405,49 @@ check(
   `${bundleDetail} disabled:true 会让客户端设置页完全不出现，且没有任何报错。`,
 );
 
-// --- 3) preset 声明里必须带 mount:true 与同步的调度规则 -------------------------
-console.log('\n=== profile cordis.patch.yml（preset 声明）===');
+// --- 3) preset 声明的权威副本在**仓库**，由 bundle 投递；profile 不应内联 -------------
+//
+// ⚠️ 历史实现把 preset 内联进 profile。顶层 `insert` 是纯追加、**不按 id 去重**，而
+//    `dsh-agent-preset` 注册重复 id 会**硬抛**，所以 profile 里那份副本既是多余的、
+//    又会装载失败（第二个条目 mount 失败）。现在以仓库那份为准，profile 只应保持干净。
+const repoPresetPath = new URL('../presets/switchboard.patch.yml', import.meta.url);
+console.log('\n=== 仓库 presets/switchboard.patch.yml（preset 声明的权威副本）===');
+const repoPreset = presetConfig(readPatch(repoPresetPath));
+const { preset, selfRow, config } = repoPreset;
+const presetDetail = `${repoPreset.error ?? '仓库 preset 配置缺失或漂移'}；${repairRules}`;
+check('仓库 preset 里存在 preset-switchboard 声明', preset !== undefined, presetDetail);
+check('仓库 preset 的 plugins 里含本包', selfRow !== undefined, presetDetail);
+check(
+  '仓库 preset 里本包声明了 mount:true（否则角色工具不会挂载）',
+  config?.mount === true,
+  `${presetDetail} 没有 mount:true 时插件在 preset 会话里也不挂载任何角色工具。`,
+);
+check(
+  '仓库 preset 里本包不再携带 roles（角色已迁到配置文件）',
+  config !== undefined && config.roles === undefined,
+  `${presetDetail} roles 若仍在这里，会与 $DSH_HOME/agent-switchboard/roles.json 形成两份真相。`,
+);
+
+const repoRules = config?.supervisorRules;
+const hasRepoRules = typeof repoRules === 'string' && repoRules.trim().length > 0;
+check(
+  '仓库 preset 里本包的 supervisorRules 存在且为非空字符串',
+  hasRepoRules,
+  `调度规则缺失、类型错误或仅含空白；${presetDetail}`,
+);
+
+console.log('\n=== bundle 投递装配 ===');
+const repoPackage = readDocument(new URL('../package.json', import.meta.url), JSON.parse);
+const bundlePatches = repoPackage.data?.dsh?.bundle?.patch;
+const bundleDeclaresPreset = Array.isArray(bundlePatches)
+  && bundlePatches.some(entry => String(entry).replace(/^\.\//, '') === 'presets/switchboard.patch.yml');
+check(
+  'package.json 的 dsh.bundle.patch 声明了 presets/switchboard.patch.yml',
+  bundleDeclaresPreset,
+  `${repoPackage.error ?? `当前为 ${JSON.stringify(bundlePatches)}`}；bundle 不声明该文件时 preset 根本不会被合成，而 profile 里也不会再有副本兜底。`,
+);
+
+console.log('\n=== profile cordis.patch.yml（不应再有内联副本）===');
 const profilePatch = paths.patch;
 if (!existsSync(profilePatch)) {
   console.error(`FAIL  找不到 ${profilePatch}`);
@@ -414,54 +455,12 @@ if (!existsSync(profilePatch)) {
 }
 const profileDoc = readPatch(profilePatch);
 const profilePreset = presetConfig(profileDoc);
-const { preset, selfRow, config } = profilePreset;
-const presetDetail = `${profilePreset.error ?? 'preset 配置缺失或漂移'}；${repairRules}`;
-check('存在 preset-switchboard 声明', preset !== undefined, presetDetail);
-check('preset 的 plugins 里含本包', selfRow !== undefined, presetDetail);
+const cleanDetail = `${profilePreset.error ?? '仍存在内联的 preset-switchboard 声明'}；`
+  + `运行 node scripts/ops/plugin-lifecycle.mjs install --apply 剥离；${repairRules}`;
 check(
-  'preset 里本包声明了 mount:true（否则角色工具不会挂载）',
-  config?.mount === true,
-  `${presetDetail} 没有 mount:true 时插件在 preset 会话里也不挂载任何角色工具。`,
-);
-check(
-  'preset 里本包不再携带 roles（角色已迁到配置文件）',
-  config !== undefined && config.roles === undefined,
-  `${presetDetail} roles 若仍在这里，会与 $DSH_HOME/agent-switchboard/roles.json 形成两份真相。`,
-);
-
-const profileRules = config?.supervisorRules;
-const hasProfileRules = typeof profileRules === 'string' && profileRules.trim().length > 0;
-check(
-  'preset 里本包的 supervisorRules 存在且为非空字符串',
-  hasProfileRules,
-  `调度规则缺失、类型错误或仅含空白；${presetDetail}`,
-);
-
-const repoPresetPath = new URL('../presets/switchboard.patch.yml', import.meta.url);
-const repoPreset = presetConfig(readPatch(repoPresetPath));
-const repoRules = repoPreset.config?.supervisorRules;
-const repoRulesError = repoPreset.error
-  ? `仓库 preset 生成物：${repoPreset.error}`
-  : typeof repoRules !== 'string' || !repoRules.trim()
-    ? '仓库生成物的 supervisorRules 缺失或非有效字符串' : undefined;
-
-let rulesDetail;
-if (repoRulesError) {
-  rulesDetail = `${repoRulesError}；${repairRules}`;
-} else if (!hasProfileRules) {
-  rulesDetail = `profile 未同步有效调度规则；${repairRules}`;
-} else if (profileRules !== repoRules) {
-  let offset = 0;
-  while (offset < Math.min(profileRules.length, repoRules.length)
-    && profileRules[offset] === repoRules[offset]) offset++;
-  const snippet = value => JSON.stringify(value.slice(Math.max(0, offset - 12), offset + 20));
-  rulesDetail = `profile 已过期，需重新注入；长度（UTF-16）：profile=${profileRules.length}，生成物=${repoRules.length}；`
-    + `首个不同位置（从 0 起）=${offset}，附近 profile=${snippet(profileRules)}，生成物=${snippet(repoRules)}。${repairRules}`;
-}
-check(
-  'profile supervisorRules 与仓库 preset 生成物逐字符一致',
-  !repoRulesError && hasProfileRules && profileRules === repoRules,
-  rulesDetail,
+  'profile patch 里没有内联的 preset-switchboard 副本',
+  profilePreset.error !== undefined && /缺少 preset-switchboard/.test(profilePreset.error),
+  cleanDetail,
 );
 
 // --- 4) 角色配置文件 -----------------------------------------------------------
