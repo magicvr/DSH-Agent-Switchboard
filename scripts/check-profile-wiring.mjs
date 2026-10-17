@@ -14,7 +14,10 @@ import { parse } from 'yaml';
 import { resolvePaths, printPaths, resolveAsar } from './lib/paths.mjs';
 
 const SELF = '@magicvr/dsh-agent-switchboard';
-const repairRules = '执行 npm run gen:preset && npm run inject:preset，然后重启 DSH。';
+// ⚠️ 提示必须跟着机制走：preset 声明由 **bundle** 投递，而 `--inject` 往 profile 里写副本
+//    正是 `5fa1ae9` 修掉的重复声明。旧文案还教用户跑 `inject:preset`，等于让人把 bug 装回去。
+const repairRules = '执行 npm run gen:preset；若 profile 里残留内联副本，'
+  + '执行 node scripts/ops/plugin-lifecycle.mjs install --apply 剥离，然后完全重启 DSH。';
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 function readDocument(path, parser) {

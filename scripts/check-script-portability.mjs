@@ -97,8 +97,12 @@ try {
     .find(plugin => plugin?.name === self).config.supervisorRules;
   writeFileSync(join(profile, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: [self] } }, dependencies: { [self]: '*' } }));
   const wiringPatch = join(profile, 'cordis.patch.yml');
-  const wiringText = rules => `- insert:\n  - id: preset-switchboard\n    config:\n      plugins:\n      - name: "${self}"\n        config:\n          mount: true\n${rules === undefined ? '' : `          supervisorRules: ${JSON.stringify(rules)}\n`}`;
-  writeFileSync(wiringPatch, wiringText(supervisorRules));
+  // ⚠️ preset 声明的权威副本在**仓库** `presets/switchboard.patch.yml`，由 bundle 投递；
+  //    profile 里**不应**有内联副本（顶层 insert 不去重，重复声明会让第二个条目装载失败）。
+  //    因此「完整 wiring fixture」现在是一个**干净** profile，而不是注入了 preset 的 profile。
+  const cleanWiringPatch = '- insert:\n  - id: fixture-unrelated\n    name: fixture-unrelated\n';
+  const injectedWiringPatch = rules => `- insert:\n  - id: preset-switchboard\n    config:\n      plugins:\n      - name: "${self}"\n        config:\n          mount: true\n${rules === undefined ? '' : `          supervisorRules: ${JSON.stringify(rules)}\n`}`;
+  writeFileSync(wiringPatch, cleanWiringPatch);
   test('显式目标缺 roles 文件失败', () => { const r = runWiring(['--home', home]); return r.status === 1 && /缺少 roles 文件/.test(r.stderr); });
   mkdirSync(join(home, 'agent-switchboard')); writeFileSync(configPathFor(home), JSON.stringify({ roles: [] }));
   // ⚠️ 只断言「至少跑满 N 条且 0 失败」，不写死精确条数：写死会让**新增**一条断言
@@ -109,22 +113,20 @@ try {
     return match !== null && Number(match[2]) === 0 && Number(match[1]) >= min;
   };
   test('非仓库 cwd 的完整 wiring fixture 跑满全部断言', () => { const r = runWiring(['--home', home]); return r.status === 0 && passedAtLeast(r.stdout, 11); });
-  for (const rules of [undefined, '', ' \n\t', 42]) {
-    writeFileSync(wiringPatch, wiringText(rules));
-    test(`无效 supervisorRules ${JSON.stringify(rules)} 必须失败并提示修复`, () => {
+  // profile 里**残留**内联副本 → 必须失败并给出剥离指令（`5fa1ae9` 引入的判据）。
+  //
+  // 原先这里逐个测「profile 的 supervisorRules 无效 / 漂移」，那两条判据已随权威副本迁到
+  // 仓库 preset 而移除。覆盖没有丢，只是**搬了家**：见下方 `runRepoPatch` 那组
+  // （在子进程里拦截仓库文件读取，不改动真实生成物）。
+  for (const rules of [undefined, '', ' \n\t', 42, `${supervisorRules}fixture drift`]) {
+    writeFileSync(wiringPatch, injectedWiringPatch(rules));
+    test(`profile 残留内联 preset 副本必须失败并提示剥离`, () => {
       const r = runWiring(['--home', home]);
-      return r.status === 1 && /FAIL  preset 里本包的 supervisorRules/.test(r.stdout)
-        && /npm run gen:preset && npm run inject:preset，然后重启 DSH/.test(r.stdout);
+      return r.status === 1 && /FAIL  profile patch 里没有内联的 preset-switchboard 副本/.test(r.stdout)
+        && /install --apply/.test(r.stdout) && /剥离/.test(r.stdout);
     });
   }
-  writeFileSync(wiringPatch, wiringText(`${supervisorRules}fixture drift`));
-  test('规则漂移必须失败并给出有限差异线索', () => {
-    const r = runWiring(['--home', home]);
-    const match = /结果：(\d+) 通过 \/ (\d+) 失败/.exec(r.stdout);
-    return r.status === 1 && /FAIL  profile supervisorRules/.test(r.stdout)
-      && /profile 已过期，需重新注入/.test(r.stdout) && /首个不同位置/.test(r.stdout)
-      && match !== null && Number(match[2]) === 1 && Number(match[1]) >= 10;
-  });
+  writeFileSync(wiringPatch, cleanWiringPatch);
 
   const formattedFailure = (result, label) => {
     const output = result.stdout + result.stderr;
@@ -151,30 +153,17 @@ try {
     return r.status === 0 && /结果：0 通过 \/ 0 失败（跳过）/.test(r.stdout)
       && /\[os.homedir\(\)\]/.test(r.stdout) && !/FAIL/.test(r.stdout + r.stderr);
   });
-  const validPatch = parse(wiringText(supervisorRules));
-  for (const [label, mutate, failLabel] of [
-    ['顶层为 Object', () => ({ insert: validPatch[0].insert }), '存在 preset-switchboard 声明'],
-    ['insert 为 Object', doc => { doc[0].insert = doc[0].insert[0]; return doc; }, '存在 preset-switchboard 声明'],
-    ['plugins 为 Object', doc => { doc[0].insert[0].config.plugins = doc[0].insert[0].config.plugins[0]; return doc; }, 'preset 的 plugins 里含本包'],
-    ['preset-switchboard 缺失', doc => { doc[0].insert[0].id = 'other-preset'; return doc; }, '存在 preset-switchboard 声明'],
-    ['preset config 缺失', doc => { delete doc[0].insert[0].config; return doc; }, 'preset 的 plugins 里含本包'],
-    ['preset config 非对象', doc => { doc[0].insert[0].config = []; return doc; }, 'preset 的 plugins 里含本包'],
-    ['本包 config 缺失', doc => { delete doc[0].insert[0].config.plugins[0].config; return doc; }, 'preset 里本包不再携带 roles'],
-    ['本包 config 非对象', doc => { doc[0].insert[0].config.plugins[0].config = 'invalid'; return doc; }, 'preset 里本包不再携带 roles'],
-    ['insert 含 null', doc => { doc[0].insert.unshift(null); return doc; }, '存在 preset-switchboard 声明'],
-    ['plugins 含 null', doc => { doc[0].insert[0].config.plugins.unshift(null); return doc; }, 'preset 的 plugins 里含本包'],
-  ]) {
-    writeFileSync(wiringPatch, JSON.stringify(mutate(structuredClone(validPatch))));
-    test(`${label} 必须格式化 FAIL 且无异常栈`, () => {
-      const r = runWiring(['--home', home, '--patch', wiringPatch]);
-      return formattedFailure(r, failLabel)
-        && r.stdout.includes('npm run gen:preset && npm run inject:preset，然后重启 DSH');
-    });
-  }
+  // 只作为后续 `runRepoPatch` 那组的**畸形仓库 preset** 基底；不再写进 profile。
+  const validPatch = parse(injectedWiringPatch(supervisorRules));
+  // ⚠️ 这里原本还有 10 条「把畸形 preset 结构写进 **profile** 并断言结构化 FAIL」的 fixture。
+  //    它们随 `5fa1ae9` 一起失效：preset 声明的权威副本已迁到**仓库**，profile 里必须是
+  //    干净的（上面那组已覆盖）。畸形结构真正该改的是那个受版本控制的真文件，检查脚本
+  //    不该去改它 —— 而下面 `runRepoPatch` 那组已经用「子进程拦截文件读取」的方式
+  //    覆盖了同一批结构变体，所以这里不再重复。
   writeFileSync(wiringPatch, '- insert: [');
   test('profile YAML 损坏必须格式化 FAIL 且无异常栈', () =>
-    formattedFailure(runWiring(['--home', home]), '存在 preset-switchboard 声明'));
-  writeFileSync(wiringPatch, wiringText(supervisorRules));
+    formattedFailure(runWiring(['--home', home]), 'profile patch 里没有内联的 preset-switchboard 副本'));
+  writeFileSync(wiringPatch, cleanWiringPatch);
   for (const [label, text] of [
     ['roles 为 Object', '{"roles":{}}'], ['角色文件顶层 null', 'null'], ['角色 JSON 损坏', '{bad'],
     ['roles 含 null', '{"roles":[null]}'],
@@ -228,8 +217,11 @@ try {
     ['supervisorRules 非字符串', doc => { doc[0].insert[0].config.plugins[0].config.supervisorRules = 42; return doc; }],
   ]) test(`仓库 preset ${label} 必须格式化 FAIL 且无异常栈`, () => {
     const r = runRepoPatch('presets/switchboard.patch.yml', JSON.stringify(mutate(structuredClone(validPatch))));
-    return formattedFailure(r, 'profile supervisorRules 与仓库 preset 生成物逐字符一致')
-      && r.stdout.includes('npm run gen:preset && npm run inject:preset，然后重启 DSH');
+    // 结构变体各自命中的是**不同的**仓库 preset 断言（缺声明 / plugins 非数组 /
+    // 缺 mount:true / 携带 roles / rules 非字符串），因此只断言「有仓库 preset 断言失败」，
+    // 不逐条钉死标签 —— 钉死会让任何一条断言的措辞调整都误报为可移植性回归。
+    return formattedFailure(r, '仓库 preset ')
+      && /npm run gen:preset/.test(r.stdout) && /install --apply/.test(r.stdout);
   });
 
   section('角色文件迁移与删源前复读');
