@@ -298,6 +298,13 @@ function newDiagnostics() {
     compositionRefreshedAt: undefined,
     /** 组合热同步失败的原因；此时派发沿用上一版组合。 */
     compositionRefreshError: undefined,
+    /**
+     * 迁移未收尾：split 模式已生效，但设置里仍留着旧的完整 `roles`。
+     *
+     * 此刻它惰性无害，但它是**回退陷阱**：`roleSettings` 一旦被清空就回到 legacy 模式，
+     * 那份陈旧定义立刻生效，静默覆盖用户在面板上做过的改动。自检必须告警。
+     */
+    staleRolesAlongsideSettings: false,
     /** 由挂载作用域注入：当场计算组合是否偏离（自检用它，而不是读快照）。 */
     compositionDrift: undefined,
     roleConfigPath: undefined,
@@ -745,7 +752,15 @@ export function selftestTool(ctx, diagnostics) {
         diagnostics.compositionRefreshError
           ?? (diagnostics.compositionDrift?.()
             ? '角色配置已修改但尚未重建组合：下次派发前会热同步；若持续出现请检查 agentPresets 服务'
-            : '')].filter(Boolean).join('；');
+            : ''),
+        // ⚠️ 迁移未收尾：split 模式已生效（设置层在用 roleSettings），但设置里仍留着旧的
+        //    完整 `roles`。此刻它是**惰性的**，可一旦 roleSettings 被清空（部分保存、误操作），
+        //    就会回退到 legacy 模式，那份陈旧定义立刻重新生效 —— 之后在面板上改过的
+        //    model / effort / readOnly 会被**静默回滚**。必须让用户看见并把它清掉。
+        diagnostics.staleRolesAlongsideSettings
+          ? '设置里同时存在已启用的 roleSettings 与旧的完整 roles：旧的这份会被静默忽略，'
+            + '但一旦 roleSettings 被清空就会回退并覆盖你的改动；请把它清掉以完成迁移'
+          : ''].filter(Boolean).join('；');
       const ok = diagnostics.fatal === undefined && diagnostics.configErrors.length === 0
         && format?.status !== 'future' && format?.status !== 'unsupported'
         && !diagnostics.wrapperSyncPending && !mounted.some(m => m.ok === false);
@@ -1223,6 +1238,8 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
   }
   const overrideProjection = splitMode
     ? configuredSettings.map(pickOverrideFields).filter(entry => entry !== undefined) : [];
+  // 迁移未收尾：split 已生效，但旧的完整 `roles` 还在设置里 —— 报告它（见字段说明里的回退陷阱）。
+  diagnostics.staleRolesAlongsideSettings = splitMode && Array.isArray(cordisRoles) && cordisRoles.length > 0;
   diagnostics.configuredRoleCount = rawRoles.length;
   const { roles, errors } = normalizeRoles(rawRoles,
     (current.ok && current.value.provider) || resolved.provider,

@@ -1525,6 +1525,25 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
         && legacyIgnoresOverrides.result.roleRoutes.includes('from-roles')
         && !legacyIgnoresOverrides.result.roleRoutes.includes('from-overrides'),
       JSON.stringify(legacyIgnoresOverrides.result.roleRoutes));
+    // ⚠️ 迁移未收尾的回退陷阱：split 已生效但旧的完整 roles 还在设置里 → 自检必须告警。
+    //    它是惰性的，可 roleSettings 一旦被清空就会回退到 legacy，那份陈旧定义立刻生效，
+    //    静默覆盖用户在面板上做过的改动。这条断言保证这个状态**不会静默存在**。
+    const staleCtx = makeCtx();
+    apply(staleCtx, Config({ provider: 'self',
+      roles: [{ id: 'worker', description: 'd', instructions: 'i', model: '陈旧' }],
+      roleSettings: [{ id: 'worker', model: '新值' }] }));
+    const staleRoles = await staleCtx.tools.get('switchboard_selftest').execute({});
+    check('split 生效但设置里仍留着旧 roles 时自检明确告警',
+      staleRoles.warnings.includes('回退并覆盖你的改动'), JSON.stringify(staleRoles.warnings));
+    check('该状态下生效的是 roleSettings（旧 roles 被忽略）',
+      staleRoles.mounted.includes('配置中有 1 个角色'), JSON.stringify(staleRoles.mounted));
+    // 收尾（清掉旧 roles）后告警消失。
+    const migratedCtx = makeCtx();
+    apply(migratedCtx, Config({ provider: 'self', roleSettings: [{ id: 'worker', model: '新值' }] }));
+    const migrated = await migratedCtx.tools.get('switchboard_selftest').execute({});
+    check('清掉旧 roles 后回退陷阱告警消失',
+      !migrated.warnings.includes('回退并覆盖你的改动') && migrated.mounted.includes('配置中有 1 个角色'),
+      JSON.stringify({ warnings: migrated.warnings, mounted: migrated.mounted }));
   } finally {
     writeFileSync(path, splitFileBytes);
   }
