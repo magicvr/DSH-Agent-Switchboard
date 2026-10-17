@@ -77,7 +77,7 @@ Jobs 不可用时 CLI 照常执行，结果标注回流不可用。CLI 没有运
 
 内置 `spawn` 显示角色级 **Provider** 文本输入，留空使用插件默认 provider；CLI 模式仍隐藏该角色输入。角色列表前始终显示「包裹子代理」小节，插件级统一配置 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`，仅用于外部 CLI 角色的内置 spawn 转交代理。Provider / 模型留空遵循宿主的路由继承规则；思考强度的空选项为「留空：不指定强度」。留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。「父代理当前强度」指最近一次请求配置；尚无请求时取创建配置。包裹模型与外部 CLI 的角色 `model` 分开标注；内置角色仍使用自身的 provider / model / effort。根设置经 `loader/volatile-update` 原子同步到角色文件；静态工具骨架只注册一次，后续派发执行期现读文件缓存。文件已保存的统一设置优先于 preset 自身设置（包含空值）；增删角色或改变工具标识仍需工具集变化。所有后端都有必填的多行「角色指令」输入，描述不会代填指令。`instructions` / `readOnly` / `allowNestedDispatch` 自 `0.2.1-rc.1` 起写入角色 preset，属**组合期**事实：改这三项需要重新注册 preset（当前实现：重新挂载 / 完整重启）；`model` / `effort` 仍是执行期 getter，保持热更新。Host 源码改动仍需重启一次加载。
 
-角色配置文件为 **`$DSH_HOME/agent-switchboard/roles.json`**，由 DSH 启动时加载的常驻 Switchboard preset 读取。设置页保存后，根实例监听 `loader/volatile-update` 并在事件返回前写盘；既有 Switchboard 会话的工具骨架不重挂，后续委派和下次提示组装执行期读取新配置。文件损坏时保留上一份有效缓存并标记陈旧；无有效缓存时拒绝派发。
+角色的**耐久真源是根条目 `agent-switchboard` 的 `config.roles`**（设置页唯一可写的命名空间，DSH 把它持久化在 profile patch 里）。根实例在 `loader/volatile-update` 返回前把它**同步进** `$DSH_HOME/agent-switchboard/roles.json`，常驻 Switchboard preset 再读那个文件——因为 preset 作用域看不到根条目的 config。⚠️ 因此 **`roles.json` 是派生副本，不是权威**：解析优先级是「本作用域 config 的 `roles` 优先，为空才回退到文件」，**手改 `roles.json` 会在下次同步时被 config 覆盖**；要改角色请走设置页。既有 Switchboard 会话的工具骨架不重挂，后续委派和下次提示组装执行期读取新配置；`instructions` / `readOnly` / `allowNestedDispatch` 属组合期，改后由**派发前热同步**重建角色 preset（无需重启）。文件损坏时保留上一份有效缓存并标记陈旧；无有效缓存时拒绝派发。
 设置面板读 `configForms` 镜像、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，
 Host 根实例将配置同步到文件。根条目保持启用，但只在 `mount: true` 的作用域挂载角色工具；
 文件含任一 wrapper 字段即整个包裹路由对象优先（包含空值），不逐字段补入 preset；只校验有效来源，被覆盖的非法 preset 路由忽略。

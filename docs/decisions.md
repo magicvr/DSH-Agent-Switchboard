@@ -994,4 +994,25 @@ for (const field of ["persona", "toolFilter"])
 
 **验证边界（2026-10-17 真机重启后更新）：** profile 已重新注入（`upgrade --apply`，写后复读验证通过），并已完成一次**完全重启**的真机验收：插件正常装载（`switchboard_selftest` 健康：健康、无 fatal）、`plugin:verify` 报 `consistent / 已就绪`、运行时 `0.2.1-rc.2` 且 `DSH peers：compatible`（无需豁免）；**四个角色 preset 在 preset roster 中全部出现且「无异常行」**，即 `agentPresets.register()` 接受本插件组装的角色 preset。**仍未验收的只剩一项**：`delegate_to_*` 在**选中 Switchboard preset 的会话**里的实际挂载与一次真实派发（根实例只注册自检、不挂载角色工具，所以本轮自检如实报告「本作用域不挂载角色工具」）；`agentPreset` 装载期校验通过后子代理实际拿到的工具构成与只读裁剪，以及客户端半边，仍只有静态 / 离线证据。详见 [`lifecycle.md`](./lifecycle.md) §6.3 / §6.4。
 
+#### D32 补记一：角色组合改为**派发前热同步**
+
+**问题：** 迁移到每角色 Agent Preset 后，`instructions` / `readOnly` / `allowNestedDispatch` 变成**组合期**事实，而 preset 只在挂载时注册一次。结果是设置页改了 persona 或只读裁剪后**必须完全重启**才生效——比迁移前明显退步（迁移前这些字段是执行期读取）。
+
+**依据（已核实）：** `agentPresets.register()` 对已存在的 id **硬抛** `Duplicate agent preset`（`dsh-agent-preset-registry/lib/index.js`），所以「更新组合」不能原地改，只能 **dispose → 重新 register**，中间有一个极短的「该 id 未注册」窗口。`tools/execute` 支持 `async (exec, next)` 监听（官方 `dsh-session-checkpoint-policy` 就是这么写的），因此刷新可以放在自来水钩子里同步完成。
+
+**决策：** 在本插件的 `tools/execute` 钩子里，**每次派发前**用现读角色重算角色 preset 定义，与已注册的逐字比对，只有真的变了才 dispose → register；因为钩子 `await` 这次刷新，**本插件自己的派发不会撞上那个空窗**。刷新成功后同步更新「组合期快照」，`compositionDrift` 随之归零，自检的「需重启」告警消失，并报告 `最近热同步 <时间>`。
+
+**代价与边界：** 每次派发多一次逐字比对（很便宜，只在真变了时才重建）；角色**增删改 id** 仍是结构变化（工具集本身要变），依旧需要重新挂载并如实拒绝；刷新失败**不让派发失败**——退回上一版组合并在自检里报 `compositionRefreshError`，避免一个配置问题把派发整个弄坏。回归断言：`check-apply` 的 R11/R11b/R12/R13（改 persona / 翻转只读 / 不产生重复 id / 告警消失）。
+
+#### D32 补记二：profile 里注入的 preset 块是**重复声明**（已核实成分，待改）
+
+**发现：** 把 profile 的各 patch 层按 app-boot 的 `applyEntryPatches` 语义离线合成一遍后，`preset-switchboard` 顶层条目出现 **两次**——一次来自 bundle 的 `presets/switchboard.patch.yml`，一次来自 profile patch 里由 `probe-preset.mjs --inject` 注入的那约 130 行（两者内容一致，都含 23 个 plugins）。
+
+**依据（已核实）：** `applyEntryPatches` 的顶层 `insert`（无 `id`）是 `data.push(...insert)`——**纯追加、不按 id 去重**；`prepareProfilePatches` 只做兼容性预检，不去重。而 `@deepseek-ai/dsh-agent-preset` 的 `[Service.init]()` 是 `yield await this.ctx.agentPresets.register(this.config)`，**没有 catch**——重复 id 会抛，第二个条目应当装载失败。
+
+**尚未确认的一环：**「第二个条目确实装载失败」是由上述代码**推断**的，还没有在运行进程上直接观察到（启动期的 stderr 才看得到，而 `switchboard_selftest` 的 `presetBroken` 枚举的是 **preset 组合内的行**，看不到顶层条目的失败）。重启后看启动 stderr 即可判定。
+
+**拟改（待定）：** 让 `--inject` 不再往 profile 写 preset 声明（只保留 bundle 的贡献），`plugin:verify` 的 `preset.rules` 改为校验仓库 preset 与 bundle 装配、而不是 profile 里那份副本。改动会动到用户的 profile，且必须重启验证，故先记录不改。
+
+
 ---

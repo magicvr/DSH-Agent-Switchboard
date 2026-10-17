@@ -286,12 +286,18 @@ function newDiagnostics() {
     /** 本实例是否负责挂载；配置角色数与工具挂载状态分别记录。 */
     mountHere: false,
     /**
-     * 现读角色配置是否已偏离挂载时的组合。
+     * 现读角色配置是否已偏离已注册的组合。
      *
-     * `instructions` / `readOnly` / `allowNestedDispatch` 在 0.2.1-rc.1 属**组合期**事实
-     * （写在角色 preset 里，只注册一次），改完必须重新组合（重启）才生效。
+     * 0.2.1-rc.1 起 `instructions` / `readOnly` / `allowNestedDispatch` 属**组合期**事实；
+     * 热同步会在下次派发前重建，因此这里描述的是「还没重建」这一瞬态。
      */
     compositionStale: false,
+    /** 最近一次组合热同步成功的时间（ISO 字符串）；从未同步则为 undefined。 */
+    compositionRefreshedAt: undefined,
+    /** 组合热同步失败的原因；此时派发沿用上一版组合。 */
+    compositionRefreshError: undefined,
+    /** 由挂载作用域注入：当场计算组合是否偏离（自检用它，而不是读快照）。 */
+    compositionDrift: undefined,
     roleConfigPath: undefined,
     roleConfigRead: undefined,
     roleConfigSync: undefined,
@@ -701,11 +707,13 @@ export function selftestTool(ctx, diagnostics) {
       const format = diagnostics.roleConfigPath ? readConfigFileDetailed(diagnostics.roleConfigPath).format : null;
       const warnings = [packageWarning, diagnostics.mountHere && !diagnostics.readSupervisorRules?.() ? `调度规则：${scheduling}` : '',
         format?.status === 'migrated' ? format.reason : '',
-        // 组合期字段改了但没重新组合：提示词与自检已按挂载时的快照如实描述，
-        // 但**子代理实际拿到的**仍是旧组合，必须让用户知道。
-        diagnostics.compositionStale
-          ? '角色配置已修改但未重新组合：instructions / readOnly / allowNestedDispatch 属组合期，需完全退出并重启 DSH 才生效'
-          : ''].filter(Boolean).join('；');
+        // 组合期字段改了但组合还没跟上：提示词与自检都按**已注册的**快照如实描述，
+        // 但子代理实际拿到的仍是那一版。热同步会在下次派发前重建；若重建失败，
+        // 下面那条错误会顶上来，必须让用户看见。
+        diagnostics.compositionRefreshError
+          ?? (diagnostics.compositionDrift?.()
+            ? '角色配置已修改但尚未重建组合：下次派发前会热同步；若持续出现请检查 agentPresets 服务'
+            : '')].filter(Boolean).join('；');
       const ok = diagnostics.fatal === undefined && diagnostics.configErrors.length === 0
         && format?.status !== 'future' && format?.status !== 'unsupported'
         && !diagnostics.wrapperSyncPending && !mounted.some(m => m.ok === false);
@@ -754,7 +762,11 @@ export function selftestTool(ctx, diagnostics) {
               ? diagnostics.fatal ?? '（未注册；角色子代理将没有自己的 persona 与工具构成）'
               : diagnostics.presets
                   .map((p) => `${p.id}(${p.rows} 行${p.ok ? '' : '，注册失败'}）`)
-                  .join(' '),
+                  .join(' ')
+                // 热同步后附上时间，便于确认「改了设置但没重启」时组合确实重建过。
+                + (diagnostics.compositionRefreshedAt === undefined
+                  ? ''
+                  : `；最近热同步 ${diagnostics.compositionRefreshedAt.slice(11, 19)}`),
         providers:
           diagnostics.providers.length === 0
             ? '（无 CLI 角色）'
@@ -1242,17 +1254,25 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
   // --- 组合期快照 ---------------------------------------------------------------
   //
   // ⚠️ 0.2.1-rc.1 起，`readOnly` / `allowNestedDispatch` / `instructions` 是**组合期**事实：
-  //    它们写在角色 preset 的插件清单里，而 preset 只在本作用域挂载时注册一次。
-  //    因此「子代理实际拿到了什么」取决于**这里的快照**，不是后来改过的配置文件。
-  //    提示词若按现读配置生成，就会在用户改完设置、还没重启时**谎报**能力
-  //    （例如对主代理说「只读」，而运行中的 preset 仍带着写工具）。这里把快照固定下来，
-  //    提示词与自检都用它，并把「配置已改但未重新组合」如实报出来。
-  const mountedFacts = new Map(roles.map(role => [role.id, {
-    readOnly: role.readOnly === true,
-    allowNestedDispatch: role.allowNestedDispatch === true,
-    instructions: role.instructions,
-  }]));
-  /** 现读配置是否已偏离挂载时的组合；偏离需要重新挂载（重启）才生效。 */
+  //    它们写在角色 preset 的插件清单里，而 `agentPresets.register()` 对重复 id **硬抛**
+  //    （`Duplicate agent preset`），所以更新组合只能先注销再重注册。
+  //    这里维护「当前已注册的组合」快照：提示词与自检都用它，而不是现读配置——否则在用户
+  //    改完设置、组合还没重建时会**谎报**能力（例如对主代理说「只读」，而运行中的 preset
+  //    仍带着写工具）。热同步成功后这份快照一并刷新，告警随之消失。
+  const mountedFacts = new Map();
+  /** 用一组角色刷新组合期快照（挂载时与热同步后共用）。 */
+  const recordFacts = (currentRoles) => {
+    mountedFacts.clear();
+    for (const role of currentRoles) {
+      mountedFacts.set(role.id, {
+        readOnly: role.readOnly === true,
+        allowNestedDispatch: role.allowNestedDispatch === true,
+        instructions: role.instructions,
+      });
+    }
+  };
+  recordFacts(roles);
+  /** 现读配置是否已偏离**已注册的**组合；偏离则下次派发前会重建，自检也会告警。 */
   const compositionDrift = (currentRoles) => {
     if (currentRoles.length !== mountedFacts.size) return true;
     return currentRoles.some((role) => {
@@ -1262,14 +1282,27 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
         || fact.instructions !== role.instructions;
     });
   };
+  // 自检用它当场判断组合是否落后于配置，而不是读一个可能过时的布尔快照。
+  diagnostics.compositionDrift = () => {
+    try { return compositionDrift(resolver().roles); } catch { return false; }
+  };
   const dispatch = { storage: new AsyncLocalStorage(), toolNames: new Set(roles.map(role => role.toolName)) };
+  /**
+   * 组合热同步入口；由下方 `import(...)` 成功注册 preset 后赋值。
+   *
+   * 默认是空实现：`agentPresets` 不可用时（例如 headless 形态）派发照旧，只是没有热同步。
+   */
+  let ensureCompositionCurrent = async () => {};
   // 冻结点是 tools/execute 入口（路由预检之前），不包含模型生成工具调用的时刻。
   // CLI 这里只保证包裹委派请求同快照；底层 CLI 工具在另一个生命周期另行现读角色。
   //
   // ⚠️ 按**工具名**识别而不是按定义对象身份：0.2.1-rc.1 起官方插件把委派工具
   //    按 agent 安装到各自的作用域，注册路径不再经过本插件包装的那层 `tools` 视图，
   //    对象身份比对会永远不命中（快照与入口门禁静默失效）。工具名由角色 id 派生且唯一。
-  ctx.on?.('tools/execute', (exec, next) => {
+  //
+  // ⚠️ 这里是 `async` 的：官方 `dsh-session-checkpoint-policy` 等插件同样用
+  //    `async (exec, next)` 监听该 waterfall，返回 `next()` 的结果即可。
+  ctx.on?.('tools/execute', async (exec, next) => {
     if (!dispatch.toolNames.has(exec.name)) return next();
     // resolver 快照同步捕获，跨 await 与并发调用由 ALS 隔离。
     // 工具级权限清单已不再需要：0.2.1-rc.1 起角色 persona 与工具构成由角色 preset 决定。
@@ -1279,6 +1312,8 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     //    现读配置决定成败。否则一个配置问题会连带弄坏与本插件无关的同名工具。
     let current;
     try { current = resolver(); } catch { return next(); }
+    // 组合变了就先重建角色 preset（改 persona / readOnly / 嵌套派发后无需重启）。
+    await ensureCompositionCurrent();
     return dispatch.storage.run(current, next);
   });
   diagnostics.blocked = blockedCliRoles;
@@ -1309,23 +1344,95 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
       diagnostics.fatal = 'agentPresets 服务不可用：无法为角色注册独立 preset，角色 persona 与工具构成无处承载';
       return;
     }
-    const presetDisposers = [];
-    try {
-      const definitions = buildRolePresets(roles, {
-        maxDepth: initial.maxDepth,
-        wrapperRoute: initial.wrapperRoute,
-      });
-      for (const definition of definitions) {
-        presetDisposers.push(await presetService.register(definition));
-        diagnostics.presets.push({ id: definition.id, rows: definition.plugins.length, ok: true });
+    // --- 角色 preset：注册 + 热同步 ---------------------------------------------
+    //
+    // ⚠️ 顺序是硬要求：`dsh-tool-subagent` 在装载期就校验 `agentPreset` 指向的 preset
+    //    **已被声明**（`SubagentPresetSelection.validate`），先挂工具必然失败。
+    //
+    // ⚠️ 真正的约束来自注册表：`agentPresets.register()` 对已存在的 id **硬抛**
+    //    `Duplicate agent preset`，所以「组合变了」不能原地更新，只能**先 dispose 再
+    //    重新 register**。这留下一个极短的「id 未注册」窗口；因此刷新只在本插件的派发
+    //    钩子里同步进行（钩子 await 它），自己的派发不会撞上那个窗口。
+    //
+    // 触发方式：每次**本插件的派发**前，用现读角色重算定义并与已注册的逐字比对，
+    //    只有真的变了才重建。这样改 `instructions` / `readOnly` / `allowNestedDispatch` /
+    //    `maxDepth` 保存后**下次派发即生效**，不必重启；`model` / `effort` 本来就走
+    //    执行期 getter。角色增删改 id 仍属结构变化（工具集要变），由既有逻辑拒绝。
+    const registered = new Map(); // presetId → { definition, dispose }
+    let refreshing;
+
+    const disposeRegistered = async () => {
+      for (const [id, entry] of [...registered]) {
+        try { await entry.dispose?.(); } catch {}
+        registered.delete(id);
       }
+    };
+
+    /**
+     * 用**现读**角色重建角色 preset，只重建变化的部分。
+     *
+     * @returns {Promise<number>} 已注册的 preset 数量。
+     * @throws 当角色配置不可读或注册被拒时（调用方决定是否降级）。
+     */
+    const publish = async () => {
+      const current = resolver();
+      const definitions = buildRolePresets(current.roles, {
+        maxDepth: current.maxDepth ?? initial.maxDepth,
+        wrapperRoute: current.wrapperRoute ?? initial.wrapperRoute,
+      });
+      const wanted = new Map(definitions.map((definition) => [definition.id, definition]));
+
+      // 先收回已不再需要的（角色被删或改名）。
+      for (const [id, entry] of [...registered]) {
+        if (wanted.has(id)) continue;
+        try { await entry.dispose?.(); } catch {}
+        registered.delete(id);
+      }
+      for (const definition of definitions) {
+        const existing = registered.get(definition.id);
+        if (existing !== undefined && JSON.stringify(existing.definition) === JSON.stringify(definition)) continue;
+        // 必须先注销：注册表对重复 id 硬抛。
+        if (existing !== undefined) {
+          try { await existing.dispose?.(); } catch {}
+          registered.delete(definition.id);
+        }
+        const dispose = await presetService.register(definition);
+        registered.set(definition.id, { definition, dispose });
+      }
+
+      diagnostics.presets = [...wanted.keys()].map((id) => ({
+        id, rows: wanted.get(id).plugins.length, ok: true,
+      }));
+      // 组合已重建：快照跟上，`compositionDrift` 随之归零，自检的「需重启」告警消失。
+      recordFacts(current.roles);
+      diagnostics.compositionStale = false;
+      diagnostics.compositionRefreshedAt = new Date().toISOString();
+      return registered.size;
+    };
+
+    /** 保证组合与现读配置一致；并发调用合并成同一次刷新。 */
+    ensureCompositionCurrent = async () => {
+      try {
+        refreshing ??= publish().finally(() => { refreshing = undefined; });
+        await refreshing;
+        diagnostics.compositionRefreshError = undefined;
+      } catch (error) {
+        // 刷新失败不能让派发本身失败：退回用上一版组合，并如实记录。
+        const detail = error instanceof Error ? error.message : String(error);
+        diagnostics.compositionRefreshError = `角色组合热同步失败（本次派发沿用上一版组合）：${detail}`;
+        diagnostics.compositionStale = true;
+      }
+    };
+
+    try {
+      await publish();
     } catch (error) {
       const detail = `角色 preset 注册失败：${error instanceof Error ? error.message : String(error)}`;
       diagnostics.fatal = detail;
       console.error(`[${name}] ${detail}`);
       return;
     }
-    ctx.effect?.(() => () => { for (const dispose of presetDisposers) { try { dispose?.(); } catch {} } });
+    ctx.effect?.(() => () => { void disposeRegistered(); });
 
     for (const role of roles) {
       const blocked = diagnostics.blocked.find(item => item.id === role.id);

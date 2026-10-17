@@ -2046,7 +2046,8 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
   root.provide('agents', { list: () => [...agentList] });
   // 角色 persona 与工具构成改由独立 Agent Preset 承载：装载路径必须先注册，
   // 真实工具插件的组合期校验再经 readDocument 确认它确实已声明。
-  root.provide('agentPresets', makePresetService());
+  const presetService = makePresetService();
+  root.provide('agentPresets', presetService);
   root.provide('sessionProjections', { register() {} });
   root.provide('subprocess', { spawn() { throw new Error('不得启动 CLI'); } });
   root.provide('profileContext', { home: fixtureHome });
@@ -2181,12 +2182,13 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
       configuredHealth.scheduling === '已配置（仅注入主代理）'
         && configuredHealth.rolePresets.includes('switchboard-role-snapshot')
         && configuredHealth.presetBroken === '（无异常行）', JSON.stringify(configuredHealth));
-    // ⚠️ 组合期字段（instructions / readOnly / allowNestedDispatch）在 0.2.1-rc.1 写在角色 preset
-    //    里、只在挂载时注册一次。本夹具此前改过 instructions，因此现读配置已偏离组合快照，
-    //    自检必须**如实告警**，而不是假装配置已生效。这是提示词与诊断「不谎报能力」的依据。
-    check('R10a：现读配置偏离组合快照时自检如实告警',
-      configuredHealth.warnings.includes('未重新组合') && configuredHealth.health === '可用但告警',
-      JSON.stringify(configuredHealth.warnings));
+    // ⚠️ 组合期字段（instructions / readOnly / allowNestedDispatch / maxDepth）写入角色 preset
+    //    的插件清单。改完**还没派发**时组合仍是旧版，自检必须如实告警，而不是假装配置已生效。
+    save(11);
+    const staleHealth = await root.tools.get('switchboard_selftest', parent).execute({}, { agent: parent });
+    check('R10a：配置已改但组合尚未重建时自检如实告警',
+      staleHealth.warnings.includes('尚未重建组合') && staleHealth.health === '可用但告警',
+      JSON.stringify(staleHealth.warnings));
     // 0.2.1-rc.1 的 standing 组合把委派工具按 **agent 作用域** 安装，因此自检必须按
     // **调用它的那个 agent** 查询；用注册时的 preset 作用域查会一律查不到，把成功的派发
     // 谎报成「工具未注册 / 不健康」。这条断言守住那个修复。
@@ -2194,6 +2196,32 @@ section('派发级快照：真实 ToolRuntime + 路由预检挂起');
       configuredHealth.ok === true && configuredHealth.roleCount === 1
         && configuredHealth.mounted.includes('snapshot=OK') && configuredHealth.fatal === '',
       JSON.stringify(configuredHealth));
+    // --- 组合热同步 -----------------------------------------------------------------
+    // `agentPresets.register()` 对重复 id **硬抛**（`Duplicate agent preset`），所以「组合变了」
+    // 不能原地更新，只能 dispose → register。热同步在**本插件的派发钩子**里同步进行，
+    // 因此自己的派发不会撞上那个极短的「id 未注册」窗口。
+    const roleDefinitions = () => presetService.definitions.filter(d => d.id === rolePresetId('snapshot'));
+    save(9); // 奇数 ⇒ 非只读；maxDepth 9；persona-9-…
+    await run('hot-sync');
+    const synced = roleDefinitions();
+    check('R11：改 instructions 后派发前自动重建角色 preset，无需重启',
+      synced.length === 1 && synced[0].plugins[0].config.prefix === `persona-9-${'x'.repeat(90)}`,
+      JSON.stringify(synced.map(d => d.plugins[0].config)));
+    check('R11b：重建是「替换」而不是「追加」，注册表里不留下重复 id',
+      presetService.definitions.filter(d => d.id === rolePresetId('snapshot')).length === 1
+        && synced[0].plugins.some(p => p.id === 'tool-pwsh'), JSON.stringify(synced[0].plugins.map(p => p.id)));
+    save(8); // 偶数 ⇒ 只读；maxDepth 8
+    await run('hot-sync-readonly');
+    const syncedReadOnly = roleDefinitions()[0];
+    check('R12：readOnly 翻转后重建的 preset 立即改为只读行裁剪',
+      JSON.stringify(syncedReadOnly.plugins.find(p => p.id === 'tool-fs').config)
+        === '{"read":true,"readImage":true,"write":false,"edit":false}'
+        && !syncedReadOnly.plugins.some(p => p.id === 'tool-pwsh' || p.id === 'tool-bash'),
+      JSON.stringify(syncedReadOnly.plugins.map(p => p.id)));
+    const syncedHealth = await root.tools.get('switchboard_selftest', parent).execute({}, { agent: parent });
+    check('R13：热同步后自检不再告警「尚未重建组合」并报告同步时间',
+      !syncedHealth.warnings.includes('尚未重建组合') && syncedHealth.rolePresets.includes('最近热同步'),
+      JSON.stringify({ warnings: syncedHealth.warnings, presets: syncedHealth.rolePresets }));
     // 同名遮蔽工具不得进入本实例快照 hook；结构变化确保泛拦会让此调用失败。
     const alien = { id: 'alien', options: {}, session: { header: {} } };
     const alienCtx = createScope(ctx, alien, { parent: preset }).ctx;
