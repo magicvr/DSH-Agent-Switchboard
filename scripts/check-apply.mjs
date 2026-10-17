@@ -1070,9 +1070,11 @@ section('CLI 逐角色阻塞：未知配置不注册工具、不解析命令、�
   apply(ctx, { mount: true, provider: 'self', cwd: 'C:/w', roles: [legacy, valid, { ...fixtureRole, id: 'builtin' }] });
   await import('@deepseek-ai/dsh-tool-subagent');
   await new Promise(setImmediate);
-  check('未知配置不注册工具且不解析/启动其命令，旧 provider 不再注册',
+  check('未知配置不注册工具且不解析/启动其命令，中继工具整体不再注册',
     providers.length === 0 && resolved.length === 0 && spawned === 0
-      && !ctx.registered.includes('switchboard_cli_run_legacy') && ctx.registered.includes('switchboard_cli_run_valid'));
+      && ctx.registered.every(name => !String(name).startsWith('switchboard_cli_run_'))
+      && ctx.registered.includes('delegate_to_valid'),
+    JSON.stringify({ providers, resolved: resolved.length, spawned, registered: ctx.registered }));
   // ⚠️ CLI 角色的直派工具**按 agent 安装**（与官方 standing 组合一致）：本夹具没有建立
   //    agent 作用域，因此它不在这里出现 —— 这是设计结果，不是漏挂。旧 custom 被阻断、
   //    内置角色仍可用这两条语义不变。
@@ -1088,114 +1090,49 @@ section('CLI 逐角色阻塞：未知配置不注册工具、不解析命令、�
   check('装载后旧 custom 原始配置保持不变', JSON.stringify([legacy, valid]) === before);
 }
 
-section('专属 CLI 工具生命周期：先注册、失败阻断、实时缺失不可冒充健康');
+section('CLI 角色生命周期：直派工具按 agent 安装、无中继、无角色 preset');
 {
   const { cliFieldsFor } = await import('../src/cli/drivers.js');
   const role = { id: 'cli-worker', description: 'd', instructions: 'i', backend: 'cli', model: 'external-model', effort: 'medium',
     cliDriver: 'grok', cliCwd: 'C:/w', ...cliFieldsFor('grok', false) };
-  for (const mode of ['success', 'throw', 'missing', 'delegate-missing']) {
-    const scope = {};
-    const ctx = makeCtx({ scope });
-    const originalRegister = ctx.tools.register;
-    const originalGet = ctx.tools.get.bind(ctx.tools);
-    const configs = [];
-    let boundCliTool;
-    let registeredBeforeDelegate = false;
-    ctx.tools.register = function (def) {
-      if (def.name === 'switchboard_cli_run_cli_worker') {
-        boundCliTool ??= def;
-        if (mode === 'throw') throw new Error('fixture-cli-register-failed');
-        if (mode === 'missing') return () => {};
-      }
-      return originalRegister.call(this, def);
-    };
-    const originalPlugin = ctx.plugin;
-    ctx.plugin = function (module, config) {
-      if (!config) return originalPlugin.call(this, module, config);
-      configs.push(config);
-      registeredBeforeDelegate = originalGet('switchboard_cli_run_cli_worker', scope) != null;
-      return mode === 'delegate-missing' ? { ctx: this, dispose() {} } : originalPlugin.call(this, module, config);
-    };
-    apply(ctx, { mount: true, roles: [role, { ...fixtureRole, id: 'independent' }], provider: 'self' });
-    await import('@deepseek-ai/dsh-tool-subagent');
-    await new Promise(setImmediate);
-    const selftest = ctx.tools.get('switchboard_selftest', scope);
-    const result = await selftest.execute({});
-    if (mode === 'success') {
-      // 新契约：**顶层** CLI 派发不再包中继子代理，直派工具**按 agent 安装**进各 agent 自己的
-      // 作用域（与官方 standing 组合一致）。因此它**不应**出现在 preset 层 —— 这条不只是
-      // 实现细节：`restrict` 只遮蔽继承来的工具，若它落在 preset 层，嵌套子代理就会继承它，
-      // `allowNestedDispatch: false` 便被绕过。中继工具（`switchboard_cli_run_*`）仍在
-      // preset 层注册，供**嵌套**路径的角色 preset 行（`cliToolFor`）使用，这条路径不变。
-      check('直派工具不在 preset 层、中继工具仍在（嵌套不会继承直派工具）',
-        ctx.tools.get('switchboard_cli_run_cli_worker', scope) != null
-        && ctx.tools.get('delegate_to_cli_worker', scope) == null
-        && ctx.tools.get('switchboard_cli_run_cli_worker') == null);
-      // CLI 角色不再经官方 spawn 挂载，也**不再产出 preset** —— 中继子代理与 `cliToolFor`
-      // 承载行一并退役（嵌套可达性改由调用方 preset 的 `cliDispatchFor` 表达）。
-      check('CLI 角色不再经官方 spawn 挂载，也不再产出 preset',
-        !configs.some(c => c.toolName === 'delegate_to_cli_worker')
-          && ctx.presets.definitions.every(definition => definition.id !== rolePresetId('cli-worker')),
-        JSON.stringify({ configs: configs.map(c => c.toolName),
-          presets: ctx.presets.definitions.map(definition => definition.id) }));
-      // 自检的 viewer 默认是本 preset 作用域，看不到按 agent 安装的直派工具 —— 因此 CLI 角色
-      // 在这里如实报「未挂载」而不是伪健康。真机上的可用性由**调用方 agent** 的作用域判定。
-      check('自检如实报告 CLI 角色在本作用域未挂载（直派工具按 agent 安装）',
-        !result.ok && result.roleCount === 1, JSON.stringify({ ok: result.ok, roleCount: result.roleCount }));
-      // 在 apply 后才出现的可选 Jobs 服务也应被工具读取，而非注册时固定快照。
-      const listeners = new Set();
-      const starts = [], removed = [];
-      let jobsAvailable = true;
-      const jobs = {
-        events: { subscribe(_filter, listener) { listeners.add(listener); return () => listeners.delete(listener); } },
-        start(spec) {
-          starts.push(spec);
-          const hooks = spec.run({ append() {} });
-          hooks.done.then(() => {
-            for (const listener of listeners) listener({ type: 'settled', job: { id: 'cli-private-apply' } });
-          });
-          return 'cli-private-apply';
-        },
-        remove(id, owner) { removed.push({ id, owner }); },
-      };
-      const contextGet = ctx.get.bind(ctx);
-      ctx.get = key => key === 'jobs' ? (jobsAvailable ? jobs : undefined) : contextGet(key);
-      ctx.subprocess.spawn = () => ({ done: Promise.resolve({ exitCode: 0 }), collected: {}, waitForExit: async () => true });
-      const exec = { agent: { id: 'fixture-child', session: { header: { origin: 'subagent' } } } };
-      // Jobs/owner 断言执行私有配置快照；公开入口的包裹身份由热重载集成段验证。
-      const cliTool = boundCliTool;
-      const cliResult = await cliTool.execute({ prompt: 'T' }, exec);
-      check('apply 将 ctx 传给专属工具，运行时读取 Jobs 与正确 owner', starts.length === 1
-        && starts[0].kind === 'cli' && starts[0].owner === 'fixture-child' && cliResult.outputFeedback === 'jobs');
-      check('apply 路径不主动 remove，jobId 不进结果且无结算订阅', removed.length === 0
-        && starts[0].owner === 'fixture-child' && listeners.size === 0 && !JSON.stringify(cliResult).includes('cli-private-apply'));
-      jobsAvailable = false;
-      const degraded = await cliTool.execute({ prompt: 'T' }, exec);
-      check('apply 路径 Jobs 卸载后照常执行并报告降级', degraded.status === 'completed'
-        && degraded.outputFeedback === 'unavailable' && starts.length === 1);
-      check('实例 ctx.get 的 safeSpawn 与执行期 resolveExecutable 均可用', degraded.status === 'completed'
-        && (await selftest.execute({})).executables.includes('C:/fake/node.exe'));
-      ctx.subprocess.resolveExecutable = () => { throw new Error('fixture-runtime-resolution-failed'); };
-      const fallback = await cliTool.execute({ prompt: 'T' }, exec);
-      const fallbackHealth = await selftest.execute({});
-      check('运行期解析失败即使裸命令启动成功，自检仍记录本次未解析', fallback.status === 'completed'
-        && fallbackHealth.executables.includes('本次未解析可执行文件')
-        && fallbackHealth.executables.includes('fixture-runtime-resolution-failed'));
-      ctx.tools.get = (name, viewingScope) => name === 'switchboard_cli_run_cli_worker' ? undefined : originalGet(name, viewingScope);
-      const absent = await selftest.execute({});
-      check('CLI 工具后来缺失时自检失败且不计入角色数量', !absent.ok && absent.roleCount === 1);
-      check('委派工具存在也如实报告专属工具缺失', absent.mounted.includes('专属 CLI 工具未注册'));
-    } else {
-      check(`${mode}：角色不可用时自检失败`, !result.ok && !result.mounted.includes('cli-worker=OK'));
-      if (mode !== 'delegate-missing') {
-        check(`${mode}：不挂载依赖失败 CLI 工具的 delegate`, !configs.some(c => c.toolName === 'delegate_to_cli_worker'));
-        check(`${mode}：自检保留注册失败或未注册原因`, result.blocked.includes(mode === 'throw'
-          ? 'fixture-cli-register-failed' : '专属 CLI 工具未注册'));
-        check(`${mode}：失败不阻断无关内置角色`, result.roleCount === 1 && result.mounted.includes('independent=OK'));
-      } else check('CLI 工具存在但委派工具缺失仍失败', ctx.tools.get('switchboard_cli_run_cli_worker', scope)
-        && result.mounted.includes('工具未注册'));
-    }
-  }
+  const scope = {};
+  const ctx = makeCtx({ scope });
+  const configs = [];
+  const originalPlugin = ctx.plugin;
+  ctx.plugin = function (module, config) {
+    if (!config) return originalPlugin.call(this, module, config);
+    configs.push(config);
+    return originalPlugin.call(this, module, config);
+  };
+  apply(ctx, { mount: true, roles: [role, { ...fixtureRole, id: 'independent' }], provider: 'self' });
+  await import('@deepseek-ai/dsh-tool-subagent');
+  await new Promise(setImmediate);
+  const result = await ctx.tools.get('switchboard_selftest', scope).execute({});
+  // ⚠️ 这一节**曾经**用模式循环（success / throw / missing / delegate-missing）覆盖「专属 CLI 工具
+  //    （中继）先注册、注册失败即阻断、实时缺失不可冒充健康」。中继退役后这些模式**不再存在**：
+  //    CLI 角色只有一条路径 —— 按 agent 安装的直派工具，注册失败即「该角色没有工具」，
+  //    不存在「工具注册了但委派挂了」这种半状态。相关等价覆盖见：
+  //      · 直派工具的注册/阻断 → 本节与「旧 custom 阻塞」小节；
+  //      · 执行语义（argv、提示投递、流式、取消、限额）→ check-cli-provider 与 check-cli。
+  check('中继工具不再注册（任何作用域都没有 switchboard_cli_run_*）',
+    ctx.registered.every(name => !String(name).startsWith('switchboard_cli_run_')),
+    JSON.stringify(ctx.registered));
+  check('直派工具不在 preset 层（改由按 agent 安装进调用方作用域）',
+    ctx.tools.get('delegate_to_cli_worker', scope) == null);
+  check('CLI 角色不再经官方 spawn 挂载，也不再产出 preset',
+    !configs.some(c => c.toolName === 'delegate_to_cli_worker')
+      && ctx.presets.definitions.every(definition => definition.id !== rolePresetId('cli-worker')),
+    JSON.stringify({ configs: configs.map(c => c.toolName),
+      presets: ctx.presets.definitions.map(definition => definition.id) }));
+  // 自检的 viewer 默认是本 preset 作用域，看不到按 agent 安装的直派工具 —— 因此如实报「未挂载」
+  // 而不是伪健康；无关的内置角色不受影响。
+  check('自检如实报告 CLI 角色在本作用域未挂载，且内置角色不受影响',
+    !result.ok && result.roleCount === 1 && result.mounted.includes('independent=OK'),
+    JSON.stringify({ ok: result.ok, roleCount: result.roleCount, mounted: result.mounted }));
+  check('自检的 CLI 专属工具一栏改报直派工具（中继工具名彻底消失）',
+    String(result.providers).includes('delegate_to_cli_worker')
+      && !String(result.providers).includes('switchboard_cli_run_'),
+    JSON.stringify(result.providers));
 }
 
 section('契约模拟（真实 Config / 工具插件，startActivation 为桩）：角色 preset 与深度预算');
@@ -2077,7 +2014,18 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
     check('S06：CLI 角色走直派（不产生 spawn 请求；唯一阻塞是夹具未装 jobs）',
       requests.length === beforeS06 && String(s06Error?.message ?? '').includes('jobs 服务不可用'),
       JSON.stringify({ requests: requests.length, error: String(s06Error?.message ?? '') }));
-    const cliTool = getTool('switchboard_cli_run_hot_cli');
+    // ⚠️ 这一段**曾经**拿中继工具（`switchboard_cli_run_hot_cli`）跑 CLI 执行语义。中继退役后
+    //    改指**直派工具**：受理即返回，真正的执行在 `jobs.start` 的 `run` 里。夹具提供一个
+    //    同步执行 run 的 jobs 桩，于是下面这些断言（spawn 记录、解析命令、argv）仍测同一件事。
+    const cliJobSpecs = [];
+    const dispatchGet = ctx.get.bind(ctx);
+    ctx.get = key => (key === 'jobs' ? { start(jobSpec) {
+      cliJobSpecs.push(jobSpec);
+      const handle = { id: `fixture-cli-job-${cliJobSpecs.length}`, append() {}, updateProgress() {} };
+      jobSpec.run(handle);
+      return handle;
+    } } : dispatchGet(key));
+    const cliTool = getTool('delegate_to_hot_cli');
     await cliTool.execute({ prompt: 'TASK & $() ;', cliCommand: 'model-command', model: 'model-override' }, childExec);
     const spec = invocations.at(-1);
     check('S07：CLI 执行时解析当前用户命令，argv 使用绝对解析路径与新模型强度',

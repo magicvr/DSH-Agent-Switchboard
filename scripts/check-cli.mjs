@@ -8,7 +8,7 @@ import {
   validateTemplate,
 } from '../src/cli/argv.js';
 import { classifyRun, formatRunResult, parseRouteFacts } from '../src/cli/output.js';
-import { createCliDispatchTool, createCliTool } from '../src/cli/provider.js';
+import { createCliDispatchTool } from '../src/cli/provider.js';
 import { normalizeRole, rolePresetId, toolConfigFor } from '../src/roles.js';
 import { buildRolePreset } from '../src/role-presets.js';
 
@@ -262,7 +262,6 @@ section('专属 CLI 工具命名一致性（跨模块）');
 
   check('cli 角色规范化成功', role !== null);
   const cfg = toolConfigFor(role, { maxDepth: 3 });
-  const tool = createCliTool({ role, spawn: () => { throw new Error('不应执行'); } });
   const dispatch = createCliDispatchTool({ role, ctx: { get: () => undefined },
     spawn: () => { throw new Error('不应执行'); } });
   // ⚠️ 这里**曾经**断言「专属工具注册名与 preset 的 cliToolFor 一致」「preset 里带有专属工具行
@@ -273,18 +272,20 @@ section('专属 CLI 工具命名一致性（跨模块）');
   check('CLI 角色不再产出 preset（cliToolFor 的承载点已随中继退役）',
     buildRolePreset(role, { platform: process.platform, maxDepth: 3, roles: [role] }) === undefined);
   check('工具 Config 不带 toolFilter（键存在即装载期硬抛错）', !Object.hasOwn(cfg, 'toolFilter'));
-  check('工具名包含与 delegate 相同的角色后缀', tool.name === 'switchboard_cli_run_codex_scout');
   check('CLI 委派后端是 spawn', cfg.provider === 'spawn');
 }
 
 
-section('F3 运行期错误被专属工具包装');
+section('F3 运行期错误由 CLI 执行器包装（不再是工具拒绝）');
 {
   let spawned = false;
   const role = { id: 'missing-effort', model: 'm', instructions: 'i', backend: 'cli',
     cli: { command: 'grok', prefixArgs: [], args: ['--effort', '{effort}'], promptDelivery: 'stdin', cwd: 'C:/w' } };
-  const tool = createCliTool({ role, spawn: () => { spawned = true; throw new Error('不应启动'); } });
-  const result = await tool.execute({ prompt: 'P' }, { agent: { id: 'a', session: { header: { origin: 'subagent' } } } });
+  // ⚠️ 旧断言用阻塞式中继工具直接拿返回值。直派工具「受理即返回」，执行结果在 job 的 done 里 ——
+  //    因此这里显式走**执行核心** `runCli`：缺强度是**执行期**错误，必须以正常结果返回而不是 rejection，
+  //    且**不得启动进程**。这正是本节的命题，与挂载形态无关。
+  const { runCli } = await import('../src/cli/runner.js');
+  const result = await runCli({ role, prompt: 'P', spawn: () => { spawned = true; throw new Error('不应启动'); } });
   check('缺强度返回正常 start-failed 结果，无 rejection', result.status === 'start-failed' && result.stderr.includes('{effort}'));
   check('模板失败不调用 spawn', !spawned);
 }

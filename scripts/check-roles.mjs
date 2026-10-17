@@ -10,7 +10,6 @@ import {
   agentOptionsFor,
   canStartAtDepth,
   carriesDefinition,
-  cliPersonaFor,
   cliToolName,
   dispatchPermissionsFor,
   mergeRoleLayers,
@@ -585,17 +584,15 @@ section('出站权限与三种提示使用同一有效结果（权限仍是纯�
         !Object.hasOwn(config, 'toolFilter') && config.agentPreset === rolePresetId(role.id));
       const description = toolDescriptionFor(role, permissions);
       const guidance = roleGuidanceText([role], options);
-      const persona = cliPersonaFor(role, permissions);
       check(`${tag}：description 与实际权限一致`,
         allowNestedDispatch ? description.includes('可通过受控工具') && description.includes('剩余深度预算')
           : description.includes('不可继续派发') && !description.includes('可通过受控工具'));
       check(`${tag}：guidance 与实际权限一致`,
         guidance.includes('may delegate further') === allowNestedDispatch
           && guidance.includes('cannot delegate further') === !allowNestedDispatch);
-      check(`${tag}：persona 与实际权限一致`, allowNestedDispatch
-        ? persona.includes(delegateToolNames.join('、')) && persona.includes('剩余深度预算')
-          && !persona.includes('不要调用其他角色的工具')
-        : persona.includes('不可继续派发') && !persona.includes('可按任务需要'));
+      // ⚠️ 这里**曾经**断言「persona 与实际权限一致」用 `cliPersonaFor()` —— 那是**中继子代理**的
+      //    转交指令。CLI 角色不再有中继、也不再产出 preset，那份 persona 整体退役；
+      //    spawn 角色的 persona 断言在 buildRolePreset 小节（preset 的 persona 行）。
       // ⚠️ 这里**曾经**在 CLI 分支断言「preset persona 使用同一权限结果」——那验证的是
       //    中继子代理的 persona 落点。CLI 角色不再产出 preset（见上面 buildRolePreset 小节），
       //    该断言随中继退役；CLI 的权限文案只体现在主代理 guidance 里（上行已覆盖）。
@@ -605,10 +602,9 @@ section('出站权限与三种提示使用同一有效结果（权限仍是纯�
         !Object.hasOwn(readOnly, 'toolFilter') && readOnly.agentPreset === rolePresetId(role.id));
       const empty = { ...options, delegateToolNames: [], availableToolNames: ['read'] };
       const unavailable = dispatchPermissionsFor(role, empty);
-      check(`${tag}：无已挂载 delegate 时三种提示都不许宣称可继续派发`,
+      check(`${tag}：无已挂载 delegate 时两种提示都不许宣称可继续派发`,
         !toolDescriptionFor(role, unavailable).includes('可通过受控工具')
-          && !roleGuidanceText([role], empty).includes('may delegate further')
-          && !cliPersonaFor(role, unavailable).includes('可按任务需要'));
+          && !roleGuidanceText([role], empty).includes('may delegate further'));
     }
   }
   const sparse = dispatchPermissionsFor({ backend: 'spawn', readOnly: true, allowNestedDispatch: false }, {

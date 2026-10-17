@@ -30,7 +30,6 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   CLI_BACKEND,
   EFFORT_VALUES,
-  cliToolName,
   mergeRoleLayers,
   normalizeRoles,
   pickOverrideFields,
@@ -39,7 +38,7 @@ import {
   routeSummaryFor,
   toolConfigFor,
 } from './roles.js';
-import { createCliDispatchTool, createCliTool } from './cli/provider.js';
+import { createCliDispatchTool } from './cli/provider.js';
 import { buildRolePresets } from './role-presets.js';
 import { CONFIG_FORMAT_VERSION, configPathFor, readConfigFileDetailed, createConfigFileResolver, writeConfigFile, initialConfig } from './config-file.js';
 
@@ -353,20 +352,18 @@ export function liveRoleTools(ctx, roles, viewer) {
   const scope = viewer ?? scopeOf(ctx);
   return roles.map((role) => {
     let found;
-    let cliFound = true;
     try {
+      // CLI 角色与 spawn 角色一样，可用性就是**角色自己的工具**（`delegate_to_*`）在不在 ——
+      // CLI 角色那份现在由直派工具承载，按 agent 安装。中继时代的「另有一份专属 CLI 工具」
+      // 已经不存在，因此不再有第二个核验条件。
       found = tools.get(role.toolName, scope);
-      // 专属 CLI 工具在**本 preset 作用域**注册（角色 preset 里另有一份给子代理用），
-      // 因此从主代理视角仍可核实；查不到就是真的没注册上。
-      if (role.cliToolName) cliFound = tools.get(role.cliToolName, scope) != null;
     } catch (error) {
       return { id: role.id, ok: false, detail: `查询抛错：${error instanceof Error ? error.message : String(error)}` };
     }
     return {
       id: role.id,
-      ok: found !== undefined && found !== null && cliFound,
-      detail: !cliFound ? `专属 CLI 工具未注册：${role.cliToolName}`
-        : found === undefined || found === null ? '工具未注册' : '已注册',
+      ok: found !== undefined && found !== null,
+      detail: found === undefined || found === null ? '工具未注册' : '已注册',
     };
   });
 }
@@ -432,13 +429,12 @@ export const Config = z.object({
    * 而角色子代理挂载的是**自己的** preset，所以专属 CLI 工具必须挂在它自己的作用域里，
    * 否则子代理看不见它。设了这个字段的作用域**只**注册这些 CLI 工具。
    */
-  cliToolFor: z.array(z.string()).description('仅内部使用：本作用域需要注册专属 CLI 工具的角色 id'),
   /**
    * 仅内部使用：本作用域需要注册 CLI **直派**工具（后台任务）的角色 id。
    *
-   * 与 `cliToolFor` 的分工：那个给**中继子代理**提供阻塞式 CLI 工具（旧路径，将退役）；
-   * 这个让**可嵌套派发的角色**在自己的 preset 作用域里直接拿到 `delegate_to_<cliRole>` ——
-   * 于是嵌套派发也不需要中继子代理。只由 role-presets 按 `allowNestedDispatch` 决定是否声明。
+   * 由**可嵌套派发**的角色 preset 声明 —— 于是嵌套子代理在自己的作用域里直接拿到
+   * `delegate_to_<cliRole>`，嵌套派发同样不需要中继子代理。是否声明由 role-presets
+   * 按调用方角色的 `allowNestedDispatch` 决定（嵌套权限仍在组合期固定）。
    */
   cliDispatchFor: z.array(z.string()).description('仅内部使用：本作用域需要注册 CLI 直派工具的角色 id'),
   /** CLI 角色的默认可执行工作目录；角色自身可用 cliCwd 覆盖。 */
@@ -963,151 +959,6 @@ function resolveDshHome(ctx) {
 }
 
 /**
- * 注册一个角色的专属 CLI 工具。
- *
- * 抽出来是因为它有**两个**挂载点：主代理 preset 作用域（旧路径，保留兼容）与
- * 角色自己的 preset 作用域（0.2.1-rc.1 起子代理能看见专属工具的唯一途径）。
- *
- * @param {object} ctx - Cordis 上下文。
- * @param {object} role - 规范化后的角色。
- * @param {Function} getRole - 执行期现读该角色。
- * @param {object} diagnostics - 诊断记录。
- * @returns {object} 已注册的工具。
- */
-function registerCliTool(ctx, role, getRole, diagnostics) {
-  const executable = { id: role.id, command: role.cli.command, ok: true, resolved: '待执行时解析（尚未验证）' };
-  diagnostics.executables.push(executable);
-  const tool = createCliTool({
-    role,
-    getRole,
-    ctx,
-    spawn: spec => safeSpawn(ctx, spec),
-    resolveExecutable: async (command, env, signal) => {
-      executable.command = command;
-      try {
-        const result = await ctx.get('subprocess').resolveExecutable(command, env, signal);
-        Object.assign(executable, { ok: true, resolved: result, detail: undefined });
-        return result;
-      } catch (error) {
-        Object.assign(executable, { ok: false, resolved: undefined,
-          detail: `本次未解析可执行文件：${error.message ?? error}` });
-        throw error;
-      }
-    },
-  });
-  ctx.get('tools').register(tool);
-  if (!ctx.get('tools').get(tool.name, scopeOf(ctx))) throw new Error('专属 CLI 工具未注册');
-  diagnostics.providers.push({ id: role.id, name: tool.name, ok: true, detail: '已注册专属工具' });
-  return tool;
-}
-
-/**
- * 在角色子代理自己的作用域里注册该角色的专属 CLI 工具。
- *
- * 由角色 preset 里的本插件条目（`cliToolFor`）触发。**只做这一件事**：不注册自检、
- * 不挂角色工具、不做根配置同步 —— 这个作用域属于子代理，不该有主代理的东西。
- *
- * @param {object} ctx - Cordis 上下文。
- * @param {object} options - 选项。
- * @param {string} options.roleConfigPath - 角色配置文件路径。
- * @param {string[]} options.roleIds - 需要在此作用域注册 CLI 工具的角色 id。
- * @param {object} options.diagnostics - 诊断记录。
- */
-function mountCliToolsInThisScope(ctx, { roleConfigPath, roleIds, diagnostics }) {
-  const read = createRoleResolver(roleConfigPath, {});
-  let current;
-  try {
-    current = read();
-  } catch (error) {
-    diagnostics.fatal = `角色配置不可读，专属 CLI 工具未注册：${error instanceof Error ? error.message : String(error)}`;
-    return;
-  }
-  diagnostics.roleConfigRead = `（子代理作用域）${current.source ?? 'preset'} stale=${current.stale === true}`;
-  for (const roleId of roleIds) {
-    const role = current.roles.find(item => item.id === roleId);
-    if (role === undefined) {
-      diagnostics.blocked.push({ id: roleId, reason: '角色配置里找不到该角色，专属 CLI 工具未注册' });
-      continue;
-    }
-    if (role.backend !== CLI_BACKEND) {
-      diagnostics.blocked.push({ id: roleId, reason: `角色 ${roleId} 不是 cli 后端，无需注册专属工具` });
-      continue;
-    }
-    try {
-      registerCliTool(ctx, role, () => {
-        const live = read().roles.find(item => item.id === roleId);
-        if (live?.cliBlockReason) throw new Error(live.cliBlockReason);
-        return live;
-      }, diagnostics);
-    } catch (error) {
-      diagnostics.blocked.push({ id: roleId, reason: error instanceof Error ? error.message : String(error) });
-    }
-  }
-}
-
-/**
- * 在**本作用域**注册 CLI 角色的直派工具（后台任务）。
- *
- * 由角色 preset 里的本插件条目（`cliDispatchFor`）触发：嵌套子代理在自己的 preset 作用域
- * 里直接拿到 `delegate_to_<cliRole>`，因此**嵌套派发也不需要中继子代理**。是否声明该行由
- * role-presets 按调用方角色的 `allowNestedDispatch` 决定 —— 嵌套权限仍在组合期固定。
- *
- * 与 `mountCliToolsInThisScope` 一样**只做这一件事**：不注册自检、不挂角色工具、不做根配置同步。
- *
- * @param {object} ctx - Cordis 上下文。
- * @param {object} options - 选项。
- * @param {string} options.roleConfigPath - 角色配置文件路径。
- * @param {string[]} options.roleIds - 需要在此作用域注册直派工具的角色 id。
- * @param {object} options.diagnostics - 诊断记录。
- */
-function mountCliDispatchInThisScope(ctx, { roleConfigPath, roleIds, diagnostics }) {
-  const read = createRoleResolver(roleConfigPath, {});
-  let current;
-  try {
-    current = read();
-  } catch (error) {
-    diagnostics.fatal = `角色配置不可读，直派工具未注册：${error instanceof Error ? error.message : String(error)}`;
-    return;
-  }
-  diagnostics.roleConfigRead = `（子代理作用域·直派）${current.source ?? 'preset'} stale=${current.stale === true}`;
-  const tools = ctx.get('tools');
-  if (typeof tools?.register !== 'function') {
-    diagnostics.fatal = 'tools 服务不可用，直派工具未注册';
-    return;
-  }
-  for (const roleId of roleIds) {
-    const role = current.roles.find(item => item.id === roleId);
-    if (role === undefined) {
-      diagnostics.blocked.push({ id: roleId, reason: '角色配置里找不到该角色，直派工具未注册' });
-      continue;
-    }
-    if (role.backend !== CLI_BACKEND) {
-      diagnostics.blocked.push({ id: roleId, reason: `角色 ${roleId} 不是 cli 后端，无需直派工具` });
-      continue;
-    }
-    if (role.cliBlockReason) {
-      diagnostics.blocked.push({ id: roleId, reason: role.cliBlockReason });
-      continue;
-    }
-    try {
-      tools.register(createCliDispatchTool({
-        role,
-        getRole: () => {
-          const live = read().roles.find(item => item.id === roleId);
-          if (live?.cliBlockReason) throw new Error(live.cliBlockReason);
-          return live;
-        },
-        ctx,
-        spawn: spec => safeSpawn(ctx, spec),
-        resolveExecutable: async (command, env, signal) =>
-          ctx.get('subprocess').resolveExecutable(command, env, signal),
-      }));
-    } catch (error) {
-      diagnostics.blocked.push({ id: roleId, reason: error instanceof Error ? error.message : String(error) });
-    }
-  }
-}
-
 /**
  * 插件入口。
  *
@@ -1178,12 +1029,6 @@ function applyInner(ctx, config) {
     mountCliDispatchInThisScope(ctx, { roleConfigPath, roleIds: cliDispatchFor, diagnostics });
     return;
   }
-  const cliToolFor = readVolatileField(resolved, 'cliToolFor');
-  if (Array.isArray(cliToolFor) && cliToolFor.length > 0) {
-    mountCliToolsInThisScope(ctx, { roleConfigPath, roleIds: cliToolFor, diagnostics });
-    return;
-  }
-
   // 自检工具总是注册：即使角色配置全错，也要能用它看到错在哪。
   const disposeSelftest = ctx.tools.register(selftestTool(ctx, diagnostics));
 
@@ -1320,8 +1165,7 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
   const { roles, errors } = normalizeRoles(rawRoles,
     (current.ok && current.value.provider) || resolved.provider,
     (current.ok && current.value.cwd) || resolved.cwd);
-  diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName,
-    ...(r.backend === CLI_BACKEND ? { cliToolName: cliToolName(r.id) } : {}) }));
+  diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName }));
   diagnostics.configErrors = errors;
   const depth = syncDepth ? readVolatileField(resolved, 'maxDepth') : undefined;
   const depthChanged = depth !== undefined && current.ok && current.missing !== true && current.value.maxDepth !== depth;
@@ -1399,8 +1243,15 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
  * @param {object} dispatch - 派发快照（ALS）。
  * @returns {{ok: boolean, detail: string}} 结果。
  */
-function mountCliDispatchTools(ctx, cliRoles, resolver, dispatch) {
+function mountCliDispatchTools(ctx, cliRoles, resolver, dispatch, diagnostics) {
   if (cliRoles.length === 0) return { ok: true, detail: '（无 CLI 角色）' };
+  // 自检的「CLI 专属工具 / 可执行文件」两栏据此保持有信息（中继时代由 registerCliTool 登记）。
+  for (const role of cliRoles) {
+    diagnostics?.providers?.push({ id: role.id, name: role.toolName, ok: true,
+      detail: '直派后台任务工具（按 agent 安装）' });
+    diagnostics?.executables?.push({ id: role.id, command: role.cli.command, ok: true,
+      resolved: '待执行时解析（尚未验证）' });
+  }
   const agents = ctx.get('agents');
   if (agents === undefined || typeof agents.list !== 'function') {
     return { ok: false, detail: 'agents 注册表不可用，无法按 agent 安装直派工具' };
@@ -1415,8 +1266,21 @@ function mountCliDispatchTools(ctx, cliRoles, resolver, dispatch) {
     },
     ctx: runtimeCtx,
     spawn: spec => safeSpawn(runtimeCtx, spec),
-    resolveExecutable: async (command, env, signal) =>
-      runtimeCtx.get('subprocess').resolveExecutable(command, env, signal),
+    // 解析结果如实记进自检诊断（命令与实际解析路径）—— 中继时代由 registerCliTool 登记，
+    // 直派路径同样需要，否则自检的「CLI 可执行文件」一栏永远只有一句「待执行时解析」。
+    resolveExecutable: async (command, env, signal) => {
+      const entry = diagnostics?.executables?.find(item => item.id === role.id);
+      if (entry) entry.command = command;
+      try {
+        const resolved = await runtimeCtx.get('subprocess').resolveExecutable(command, env, signal);
+        if (entry) Object.assign(entry, { ok: true, resolved, detail: undefined });
+        return resolved;
+      } catch (error) {
+        if (entry) Object.assign(entry, { ok: false, resolved: undefined,
+          detail: `本次未解析可执行文件：${error?.message ?? error}` });
+        throw error;
+      }
+    },
   });
   if (compositionScope === undefined) {
     // 与官方模块一致：**没有作用域时当场直接安装**（官方在该分支走 `install(ctx, void 0)`）。
@@ -1516,8 +1380,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
   };
   diagnostics.refresh = () => { try { resolver(); } catch {} };
   diagnostics.roleRoutes = initial.routes;
-  diagnostics.configuredRoles = roles.map(role => ({ id: role.id, toolName: role.toolName,
-    ...(role.backend === CLI_BACKEND ? { cliToolName: cliToolName(role.id) } : {}) }));
+  diagnostics.configuredRoles = roles.map(role => ({ id: role.id, toolName: role.toolName }));
   diagnostics.configuredRoleCount = roles.length;
   diagnostics.mountHere = true;
   if (!initial.ok || initial.errors.length > 0) {
@@ -1525,7 +1388,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     diagnostics.fatal = diagnostics.configErrors.join('；');
     return;
   }
-  const { active: activeCliRoles, blocked: blockedCliRoles } = planCliMounts(roles);
+  const { blocked: blockedCliRoles } = planCliMounts(roles);
   // --- 组合期快照 ---------------------------------------------------------------
   //
   // ⚠️ 0.2.1-rc.1 起，`readOnly` / `allowNestedDispatch` / `instructions` 是**组合期**事实：
@@ -1592,17 +1455,6 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     return dispatch.storage.run(current, next);
   });
   diagnostics.blocked = blockedCliRoles;
-  for (const role of activeCliRoles) {
-    try {
-      registerCliTool(ctx, role, () => {
-        const current = resolver().roles.find(item => item.id === role.id);
-        if (current?.cliBlockReason) throw new Error(current.cliBlockReason);
-        return current;
-      }, diagnostics);
-    } catch (error) {
-      diagnostics.blocked.push({ id: role.id, reason: error instanceof Error ? error.message : String(error) });
-    }
-  }
 
   // --- 角色 preset 必须先注册，再挂委派工具 ---------------------------------------
   //
@@ -1715,7 +1567,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     //    否则「阻断」只体现在执行期报错，工具本身却已经出现在清单里。
     const cliDispatch = mountCliDispatchTools(ctx,
       roles.filter(role => role.backend === CLI_BACKEND
-        && !diagnostics.blocked.some(item => item.id === role.id)), resolver, dispatch);
+        && !diagnostics.blocked.some(item => item.id === role.id)), resolver, dispatch, diagnostics);
     for (const role of roles) {
       const blocked = diagnostics.blocked.find(item => item.id === role.id);
       if (blocked) { diagnostics.mounts.push({ id: role.id, ok: false, detail: blocked.reason }); continue; }

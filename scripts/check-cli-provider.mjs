@@ -1,6 +1,6 @@
 // 历史检查入口原位迁移到专属工具与 runner，不调用任何真实 CLI。
 // 用法：node scripts/check-cli-provider.mjs
-import { createCliTool } from '../src/cli/provider.js';
+import { createCliDispatchTool } from '../src/cli/provider.js';
 import { validateArgs, validateJsonSchemaValue } from '@deepseek-ai/dsh-tools';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, openSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,144 @@ import { getEventListeners } from 'node:events';
 import { runCli } from '../src/cli/runner.js';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
+import { defineTool } from '@deepseek-ai/dsh-tools';
+import { StringDecoder } from 'node:string_decoder';
+import { cliToolName, routeSummaryFor } from '../src/roles.js';
+import { validateTemplate } from '../src/cli/argv.js';
+import { validateCliPreset } from '../src/cli/drivers.js';
+
+/**
+ * 本地夹具：**阻塞式** CLI 工具（原 `src/cli/provider.js` 的 `createCliTool`，逐字搬来）。
+ *
+ * ⚠️ 为什么它住在这里而不是 `src/`：CLI 角色改为**直派后台任务**后，生产路径不再挂载这个
+ *    形态（受理即返回 + job 完成通知）。但本文件 36 条断言测的是 **`runCli` 的执行语义**
+ *    —— argv 构造、提示投递、流式回流、取消、限额、安全校验 —— 与**挂载形态无关**。
+ *    与其删掉这些覆盖，不如把「阻塞式包装」降级为测试夹具：它只是 `runCli` 的一层薄壳。
+ *    `src/cli/provider.js` 现在只导出直派工具。
+ */
+/** 按 UTF-8 字节截断，不返回半个字符；tail 用于错误尾部。 */
+function bounded(text, limit, tail = false) {
+  const bytes = Buffer.from(text ?? '');
+  if (bytes.length <= limit) return { text: bytes.toString('utf8'), truncated: false };
+  let start = tail ? bytes.length - limit : 0;
+  // 尾部从完整字符开始，头部通过 StringDecoder 丢弃末尾不完整字符。
+  while (tail && start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++;
+  return { text: new StringDecoder('utf8').write(bytes.subarray(start, tail ? bytes.length : limit)),
+    truncated: true };
+}
+
+function createCliTool({ role, getRole, spawn, resolveExecutable, ctx = { get: () => undefined } }) {
+  const initialRole = role;
+  if (!initialRole?.cli) throw new Error(`角色 "${initialRole?.id}" 使用 cli 后端但缺少 cli 配置`);
+  const currentRole = () => {
+    const value = typeof getRole === 'function' ? getRole() : initialRole;
+    if (!value?.cli) throw new Error(`角色 "${initialRole.id}" 使用 cli 后端但缺少 cli 配置`);
+    const preset = value.cliDriver === undefined
+      ? { errors: validateTemplate(value.cli.args, { promptDelivery: value.cli.promptDelivery }) }
+      : validateCliPreset({
+        cliDriver: value.cliDriver, readOnly: value.readOnly,
+        cliCommand: value.cli.command, cliPrefixArgs: value.cli.prefixArgs,
+        cliArgs: value.cli.args, cliPromptDelivery: value.cli.promptDelivery,
+      });
+    if (preset.errors.length > 0) throw new Error(`CLI 角色 "${value.id}" 配置无效：${preset.errors.join('；')}`);
+    return structuredClone(value);
+  };
+  const cli = initialRole.cli;
+  return defineTool({
+    name: cliToolName(initialRole.id),
+    description: `仅供子代理转交 ${initialRole.id} 角色的完整 CLI 任务；等待结束后返回有界结果。`,
+    parameters: {
+      prompt: { type: 'string', required: true, description: '完整任务正文；不要改写角色规则或命令。' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          status: { type: 'string', required: true },
+          exitCode: { oneOf: [{ type: 'number' }, { type: 'null' }], required: true },
+          signal: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
+          cancelled: { type: 'boolean', required: true },
+          outputFeedback: { type: 'string', required: true },
+          routeSummary: { type: 'string', required: true },
+          routeSummaryTruncated: { type: 'boolean', required: true },
+          stdout: { type: 'string', required: true },
+          stderr: { type: 'string', required: true },
+          stdoutTruncated: { type: 'boolean', required: true },
+          stderrTruncated: { type: 'boolean', required: true },
+          diagnostic: { type: 'string', required: true },
+          diagnosticTruncated: { type: 'boolean', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    async execute(args, exec) {
+      if (exec?.agent?.session?.header?.origin !== 'subagent') {
+        throw new Error('专属 CLI 工具仅供子代理执行；请通过对应 delegate_to_* 工具派发任务');
+      }
+      if (typeof args?.prompt !== 'string') throw new Error('prompt 必须是字符串');
+      const boundRole = currentRole();
+      const currentCli = boundRole.cli;
+      const controller = new AbortController();
+      // 调用方停止、Jobs 面板取消及 owner 销毁共用同一取消入口。
+      const cancel = reason => { if (!controller.signal.aborted) controller.abort(reason); };
+      const onAbort = () => cancel(exec.signal.reason);
+      if (exec.signal?.aborted) onAbort();
+      else exec.signal?.addEventListener('abort', onAbort, { once: true });
+      let execution;
+      let outputFeedback = 'unavailable';
+      let feedbackDiagnostic = '实时输出回流不可用：Jobs 服务未加载';
+      let jobs;
+      let result;
+      // 三个独立完成点：执行器完成、Jobs 结算、客户端读完。
+      const run = onOutput => runCli({ role: boundRole, prompt: args.prompt, spawn,
+        resolveExecutable, signal: controller.signal, onOutput })
+        .finally(() => exec.signal?.removeEventListener('abort', onAbort));
+      try {
+        // 可选服务不进 inject；每次调用读取，以支持运行时装卸。
+        jobs = ctx.get('jobs');
+        if (jobs) {
+          try {
+            jobs.start({
+              kind: 'cli', label: boundRole.title || boundRole.id, owner: exec.agent.id,
+              outputLimitBytes: 4096,
+              run(job) {
+                execution = run(({ stream, text, lossy }) => job.append(text,
+                  { channel: stream, ...(lossy ? { gapBefore: true } : {}) }));
+                return { cancel, done: execution.then(value => ({
+                  status: value.cleanupFailed ? 'failed' : value.status === 'cancelled' ? 'killed'
+                    : value.status === 'completed' ? 'completed' : 'failed',
+                  detail: value.diagnostic || (value.exitCode == null ? value.status : `exit code: ${value.exitCode}`),
+                }), () => ({ status: 'failed', detail: 'CLI 执行器失败；未能确认受管进程范围已清空' })) };
+              },
+            });
+            outputFeedback = 'jobs';
+            feedbackDiagnostic = '';
+          } catch {
+            feedbackDiagnostic = '实时输出回流不可用：Jobs 注册失败';
+          }
+        }
+        execution ??= run();
+        result = await execution;
+      } finally {
+        exec.signal?.removeEventListener('abort', onAbort);
+      }
+      const stdout = bounded(result.stdout, currentCli.maxOutputBytes ?? 1_000_000);
+      const stderr = bounded(result.stderrTail ?? result.stderr, currentCli.maxErrorBytes ?? 100_000, true);
+      const route = bounded(`${routeSummaryFor(boundRole)}；cli-route=${JSON.stringify(result.route)}`, 4096);
+      const diagnostic = bounded([result.diagnostic ?? (result.ok && !result.stdout.trim()
+        ? 'CLI 成功退出但没有输出内容' : ''), feedbackDiagnostic].filter(Boolean).join('\n'), 4096);
+      return {
+        status: result.status, exitCode: result.exitCode, signal: result.signal ?? null,
+        cancelled: result.status === 'cancelled', outputFeedback,
+        routeSummary: route.text, routeSummaryTruncated: route.truncated,
+        stdout: stdout.text, stderr: stderr.text,
+        stdoutTruncated: result.stdoutTruncated === true || stdout.truncated,
+        stderrTruncated: result.stderrTruncated === true || stderr.truncated,
+        diagnostic: diagnostic.text, diagnosticTruncated: result.diagnosticTruncated === true || diagnostic.truncated,
+      };
+    },
+  });
+}
 
 let pass = 0;
 let fail = 0;
