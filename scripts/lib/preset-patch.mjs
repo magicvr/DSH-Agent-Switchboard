@@ -3,6 +3,104 @@ import { parse, parseDocument, LineCounter, isMap, isSeq, isScalar, isAlias } fr
 import { readFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 
+/**
+ * 旋钮字段：收尾迁移后住进设置的那一组（与 `src/roles.js` 的 ROLE_SETTING_FIELDS 一致）。
+ *
+ * ⚠️ 这里是**文本级**迁移，不经过 YAML round-trip：profile patch 里含 `!!js` 表达式标签，
+ *    round-trip 会把它们降级成普通字符串（`disabled` 恒为真），那是会改变行为的数据损坏。
+ *    历史教训同源：`stripInjectedPreset` 早期用宽泛匹配，剥离区间一路吃到文件末尾，
+ *    **删掉近 900 行（含全部角色配置）**。因此本函数只认缩进确定的块边界。
+ */
+const MIGRATION_KNOB_FIELDS = Object.freeze([
+  'backend', 'model', 'effort', 'provider', 'readOnly', 'allowNestedDispatch',
+]);
+
+/** 按需加引号：安全裸标量原样输出，其余用 JSON 双引号形式，避免破坏 YAML。 */
+function yamlScalar(value) {
+  if (typeof value === 'boolean' || typeof value === 'number') return String(value);
+  const text = String(value);
+  return /^[A-Za-z0-9_./@+-]+$/.test(text) && !/^(true|false|null|yes|no|on|off)$/i.test(text)
+    ? text : JSON.stringify(text);
+}
+
+/**
+ * 把根条目里的完整 `roles` 块收尾迁移成 `roleSettings` 旋钮块（**文本级**）。
+ *
+ * 迁移的前提是角色**定义**已经住在插件自己的 `roles.json` 里（它由根实例同步而来），
+ * 所以设置层不必再承载 persona 与 CLI 契约。本函数据此把设置层裁成旋钮，并在裁剪前
+ * 用「设置里的角色 id 集合 == 文件里的角色 id 集合」做**安全闸门**：不一致就拒绝迁移，
+ * 宁可不迁移也不丢角色。
+ *
+ * @param {string} text - profile patch 全文。
+ * @param {object[]} definitions - `roles.json` 里的角色定义。
+ * @returns {{ok: boolean, changed: boolean, text: string, reason?: string, error?: string, knobs?: object[]}} 计划。
+ */
+export function planRolesMigration(text, definitions) {
+  const lines = String(text).split('\n');
+  const entryAt = lines.findIndex(line => /^-\s*id:\s*agent-switchboard\s*$/.test(line));
+  if (entryAt < 0) return { ok: true, changed: false, text, reason: 'profile patch 里没有根条目；无需迁移' };
+  // 根条目内缩进 4 的 `roles:`；遇到下一个顶层操作（列 0 非空）即停止查找。
+  let rolesAt = -1;
+  for (let i = entryAt + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === '') continue;
+    if (/^\S/.test(line)) break;
+    if (/^ {4}roles:\s*$/.test(line)) { rolesAt = i; break; }
+  }
+  if (rolesAt < 0) {
+    const hasSettings = lines.some(line => /^ {4}roleSettings:/.test(line));
+    return { ok: true, changed: false, text,
+      reason: hasSettings ? '根条目已是 roleSettings 形态；无需迁移' : '根条目里没有完整 roles 块；无需迁移' };
+  }
+  // 块边界：第一个非空且缩进 ≤ 4 的行为止（保持严格，绝不越过根条目）。
+  let end = lines.length;
+  for (let i = rolesAt + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === '') continue;
+    if (/^ {0,4}\S/.test(line)) { end = i; break; }
+  }
+  let roles;
+  try {
+    // 片段化解析：去掉统一的一级缩进后交给真实解析器，仍只读这一块。
+    roles = parse(lines.slice(rolesAt, end).map(line => line.replace(/^ {4}/, '')).join('\n'))?.roles;
+  } catch (error) {
+    return { ok: false, changed: false, text, error: `角色块无法解析，拒绝迁移：${error.message}` };
+  }
+  // `roles:` 后面什么都没有（值为 null/undefined）是**退化但合法**的状态：没有角色可迁移，
+  // 不是损坏。只有「非数组且有值」（例如字符串）才算结构错误。
+  if (roles === null || roles === undefined) {
+    return { ok: true, changed: false, text, reason: '根条目的 roles 为空；无需迁移' };
+  }
+  if (!Array.isArray(roles)) return { ok: false, changed: false, text, error: '角色块不是数组，拒绝迁移' };
+  const movedIds = roles.map(role => role?.id).filter(id => typeof id === 'string').sort();
+  const fileIds = (Array.isArray(definitions) ? definitions : [])
+    .map(role => role?.id).filter(id => typeof id === 'string').sort();
+  if (movedIds.length === 0) return { ok: true, changed: false, text, reason: '设置里的 roles 为空；无需迁移' };
+  if (fileIds.length === 0) {
+    return { ok: false, changed: false, text,
+      error: '角色文件里没有角色定义；先把定义迁移进文件，否则收尾会丢角色' };
+  }
+  if (!isDeepStrictEqual(movedIds, fileIds)) {
+    return { ok: false, changed: false, text,
+      error: `设置里的角色与文件不一致（设置=[${movedIds.join(', ')}]，文件=[${fileIds.join(', ')}]）；`
+        + '拒绝迁移以免丢角色' };
+  }
+  const knobs = roles.map(role => {
+    const out = { id: role?.id };
+    for (const field of MIGRATION_KNOB_FIELDS) if (role?.[field] !== undefined) out[field] = role[field];
+    return out;
+  });
+  const emitted = ['    roleSettings:'];
+  for (const knob of knobs) {
+    emitted.push(`      - id: ${yamlScalar(knob.id)}`);
+    for (const field of MIGRATION_KNOB_FIELDS) {
+      if (knob[field] !== undefined) emitted.push(`        ${field}: ${yamlScalar(knob[field])}`);
+    }
+  }
+  return { ok: true, changed: true, knobs,
+    text: [...lines.slice(0, rolesAt), ...emitted, ...lines.slice(end)].join('\n') };
+}
+
 // 生命周期只接受独立且带生成器标记的块；剥离仍唯一委托给历史 guard。
 // 同时比较解析后的其它操作，防止剥离误吞相邻用户配置。
 export function planInjectedPreset(original, block, { remove = false } = {}) {

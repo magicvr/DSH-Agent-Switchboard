@@ -6,7 +6,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { resolvePaths, printPaths } from '../lib/paths.mjs';
 import { collectLifecycle } from '../lib/lifecycle.mjs';
 import { captureSync } from '../lib/capture.mjs';
-import { planInjectedPreset, readPatch, presetConfig, pluginsWithoutName, scanPackageReferences } from '../lib/preset-patch.mjs';
+import { planInjectedPreset, planRolesMigration, readPatch, presetConfig, pluginsWithoutName, scanPackageReferences } from '../lib/preset-patch.mjs';
 import { initialConfig, migrateConfigFileOnDisk, readConfigFileDetailed } from '../../src/config-file.js';
 
 const HELP = `用法：node scripts/ops/plugin-lifecycle.mjs <status|verify|install|upgrade|uninstall> [路径参数] [--json]
@@ -101,6 +101,29 @@ function converge(command, s, { apply, purge, collect, env, log }) {
   //    顶层 `insert` 是纯追加、不按 id 去重，而 `dsh-agent-preset` 注册重复 id 会硬抛，
   //    所以内联的那份既是多余的、又会装载失败。这里统一**剥离**残留副本。
   let next = planInjectedPreset(original, block, { remove: true });
+  // 收尾迁移：把根条目里完整的 `roles` 块裁成 `roleSettings` 旋钮块（定义已住在文件里）。
+  //
+  // ⚠️ 安全闸门在 `planRolesMigration` 里：设置与文件的角色 id 集合不一致、或文件里没有
+  //    定义时**拒绝迁移**（宁可不迁移也不丢角色）。这里是**文本级**改写 —— profile patch
+  //    含 `!!js` 标签，YAML round-trip 会把它们降级成字符串。
+  let rolesMigration;
+  if (command === 'uninstall') {
+    rolesMigration = { ok: true, changed: false, text: next, reason: '卸载不迁移' };
+  } else {
+    // 定义从文件**原文**读，不用快照的汇总字段（快照不含原始 roles）。
+    const rolesRead = readConfigFileDetailed(s.paths.roles);
+    const definitions = rolesRead.ok && Array.isArray(rolesRead.config?.roles) ? rolesRead.config.roles : [];
+    const planned = planRolesMigration(next, definitions);
+    if (!planned.ok) {
+      // ⚠️ 拒绝是**跳过**，不是失败：闸门拦住时设置层仍是完整的 `roles`，legacy 路径照常工作。
+      //    让 install/upgrade 因此中止，等于用一次「本可选的收尾」阻断一件用户真正要做的事。
+      log(`跳过角色设置收尾迁移（不阻断本次操作）：${planned.error}`);
+      rolesMigration = { ok: true, changed: false, text: next, reason: planned.error };
+    } else {
+      rolesMigration = planned;
+      if (planned.changed) next = planned.text;
+    }
+  }
   if (command !== 'uninstall') {
     if (s.preset.generatedDrift.status === 'unknown')
       log(`仓库生成物漂移未验证；无法自动再生成：${s.preset.generatedDrift.reason}；手工回退：npm run gen:preset；继续收敛可验证制品。`);
@@ -145,7 +168,14 @@ function converge(command, s, { apply, purge, collect, env, log }) {
     if (patchChanged) writableParent(s.paths.patch);
     if (seed || migrate || purgeRoles) writableParent(s.paths.roles);
   }
-  log(`${apply ? 'apply' : 'dry-run'}：preset ${patchChanged ? command === 'uninstall' ? '将剥离' : '将剥离残留注入副本' : '无需改动'}；roles ${seed ? '将播种空角色列表' : migrate ? '将迁移格式' : purgeRoles ? '将删除' : '保留原始字节'}。`);
+  // 文案必须分别反映两件可能同时发生的事：剥离残留副本、收尾迁移。
+  const willStrip = planInjectedPreset(original, block, { remove: true }) !== original;
+  const parts = [willStrip ? '将剥离残留注入副本' : '', rolesMigration.changed ? '将收尾角色设置迁移' : '']
+    .filter(Boolean);
+  const presetPlan = parts.length > 0 ? parts.join('并') : '无需改动';
+  log(`${apply ? 'apply' : 'dry-run'}：preset ${presetPlan}`
+    + `${rolesMigration.changed ? `（roles → roleSettings：${rolesMigration.knobs.length} 个角色，定义已住在文件里）` : ''}`
+    + `；roles ${seed ? '将播种空角色列表' : migrate ? '将迁移格式' : purgeRoles ? '将删除' : '保留原始字节'}。`);
   if (patchChanged && apply) backedChange(s.paths.patch, next, log, patchOriginal);
   if (command === 'uninstall') {
     // 强制屏障：复读确认引用已消失，才能输出包移除指令。

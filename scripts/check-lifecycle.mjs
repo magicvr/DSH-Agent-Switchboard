@@ -10,7 +10,7 @@ import { captureSync } from './lib/capture.mjs';
 import { REPO_ROOT, resolvePaths } from './lib/paths.mjs';
 import { collectLifecycle, satisfiesDshRange, evaluateDshPeers, evaluateDshRequirements, isExactDshVersion, isExactDshVersionList, isExactDshExemptionKey } from './lib/lifecycle.mjs';
 import { generatePreset } from './lib/preset-generator.mjs';
-import { readPatch, presetConfig, stripInjectedPreset, isOurBlockLine, assertNoStrayOperations, planInjectedPreset, scanPackageReferences } from './lib/preset-patch.mjs';
+import { readPatch, presetConfig, stripInjectedPreset, isOurBlockLine, assertNoStrayOperations, planInjectedPreset, planRolesMigration, scanPackageReferences } from './lib/preset-patch.mjs';
 import { runLifecycle } from './ops/plugin-lifecycle.mjs';
 import { CONFIG_FORMAT_VERSION } from '../src/config-file.js';
 
@@ -753,5 +753,95 @@ fs.writeFileSync = (...args) => {
   const driftReason = JSON.parse(drift.stdout).verification.issues.find(i => i.code === 'preset.injectedInProfile')?.reason;
   console.log(`\n一致 verify exit=${verify.status}；漂移 verify exit=${drift.status}，${driftReason}`);
 } finally { rmSync(temp, { recursive: true, force: true }); }
+  section('收尾迁移：roles 块 → roleSettings 旋钮块（文本级）');
+  {
+    // ⚠️ 这是**文本级**改写，因为 profile patch 含 `!!js` 表达式标签，YAML round-trip 会把
+    //    它们降级成普通字符串。历史同源教训：剥离早期用宽泛匹配，一路吃到文件末尾，
+    //    删掉近 900 行（含全部角色配置）。所以这里逐条钉住「什么都不许少」。
+    const migrationPatch = [
+      '# 用户注释必须逐字保留',
+      '- id: unrelated-entry',
+      '  name: unrelated',
+      '  config:',
+      '    keep: yes',
+      '- id: agent-switchboard',
+      '  name: "@magicvr/dsh-agent-switchboard"',
+      '  config:',
+      '    mount: false',
+      '    provider: self',
+      '    cwd: DSH-Agent-Switchboard',
+      '    volatile:',
+      '      wrapperModel: keep-me',
+      '    roles:',
+      '      - id: scout',
+      '        title: 侦察',
+      '        description: d',
+      '        instructions: |',
+      '          多行 persona 原文',
+      '        backend: spawn',
+      '        model: m-scout',
+      '        effort: high',
+      '        readOnly: true',
+      '      - id: worker',
+      '        description: d',
+      '        instructions: i',
+      '        backend: cli',
+      '        model: m-worker',
+      '        cliArgs:',
+      '          - exec',
+      '          - "{prompt}"',
+      '- id: after-entry',
+      '  name: after',
+      '  config:',
+      "    disabled: !!js process.platform === 'win32'",
+      '',
+    ].join('\n');
+    const definitions = [
+      { id: 'scout', description: 'd', instructions: '多行 persona 原文', backend: 'spawn', model: 'm-scout' },
+      { id: 'worker', description: 'd', instructions: 'i', backend: 'cli', model: 'm-worker' },
+    ];
+    const plan = planRolesMigration(migrationPatch, definitions);
+    check('迁移计划成立且报告被裁剪的角色数',
+      plan.ok && plan.changed && plan.knobs.length === 2, JSON.stringify(plan.error ?? plan.reason));
+    const migrated = plan.text;
+    const settingsAt = migrated.indexOf('    roleSettings:');
+    const afterAt = migrated.indexOf('- id: after-entry');
+    check('迁移后 roleSettings 只带旋钮，persona / CLI argv / title 一律不进设置',
+      settingsAt >= 0 && afterAt > settingsAt
+        && !/instructions:|cliArgs:|title:/.test(migrated.slice(settingsAt, afterAt)));
+    check('迁移后旋钮值逐字保留',
+      migrated.includes('      - id: scout') && migrated.includes('        backend: spawn')
+        && migrated.includes('        model: m-scout') && migrated.includes('        effort: high')
+        && migrated.includes('        readOnly: true') && migrated.includes('        backend: cli')
+        && migrated.includes('        model: m-worker'));
+    // 最重要的三条：块外的一切必须逐字原样。
+    check('迁移不吞相邻条目、注释与 !!js 标签（历史险情的直接守卫）',
+      migrated.includes('# 用户注释必须逐字保留')
+        && migrated.includes('    keep: yes')
+        && migrated.includes("    disabled: !!js process.platform === 'win32'")
+        && migrated.includes('- id: after-entry') && migrated.includes('- id: unrelated-entry'));
+    check('根条目自己的其它设置原样保留（mount / provider / cwd / volatile）',
+      migrated.includes('    mount: false') && migrated.includes('    provider: self')
+        && migrated.includes('    cwd: DSH-Agent-Switchboard')
+        && migrated.includes('      wrapperModel: keep-me'));
+    check('迁移后仍是合法 YAML 且条目数不变',
+      (() => { try { return parse(migrated).length === 3; } catch { return false; } })());
+    check('迁移是幂等的：再跑一次无需改动',
+      (() => { const again = planRolesMigration(migrated, definitions); return again.ok && !again.changed; })());
+    // 安全闸门：宁可不迁移，也不丢角色。
+    check('文件里没有定义时拒绝迁移',
+      planRolesMigration(migrationPatch, []).ok === false
+        && /没有角色定义/.test(planRolesMigration(migrationPatch, []).error));
+    check('设置与文件的角色 id 集合不一致时拒绝迁移',
+      planRolesMigration(migrationPatch, [...definitions, { id: 'extra' }]).ok === false
+        && /不一致/.test(planRolesMigration(migrationPatch, [...definitions, { id: 'extra' }]).error));
+    check('没有 roles 块时无需迁移（不误报）',
+      (() => { const r = planRolesMigration('- id: agent-switchboard\n  config:\n    mount: false\n', definitions);
+        return r.ok && !r.changed; })());
+    check('roles 为空块时无需迁移',
+      (() => { const r = planRolesMigration('- id: agent-switchboard\n  config:\n    roles:\n', definitions);
+        return r.ok && !r.changed; })());
+  }
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);
