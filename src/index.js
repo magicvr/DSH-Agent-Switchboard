@@ -31,6 +31,7 @@ import {
   CLI_BACKEND,
   EFFORT_VALUES,
   cliToolName,
+  mergeRoleLayers,
   normalizeRoles,
   planCliMounts,
   roleGuidanceText,
@@ -473,6 +474,36 @@ export const Config = z.object({
         cliGraceMs: z.number().step(1).min(0),
         cliMaxOutputBytes: z.number().step(1).min(1),
         cliMaxErrorBytes: z.number().step(1).min(1),
+      }),
+    )
+    .default(undefined)
+    .volatile(),
+  /**
+   * **旋钮层**：每角色的 `id` + 设置字段（backend / model / effort / provider /
+   * readOnly / allowNestedDispatch）。split 模式下这是设置页唯一承载的东西。
+   *
+   * ⚠️ 为什么需要它：DSH 的设置页只能读写**根条目 config 的 volatile 字段**，而设置变更
+   *    会被 DSH 持久化进系统配置文件。角色**定义**（persona、工具构成、CLI argv 契约）
+   *    是长篇、少改、且安全敏感的内容，不该住在 DSH 的系统配置里 —— 定义归插件自己的
+   *    `roles.json`，系统配置里只留这几个旋钮。
+   *
+   * 判据是**显式**的：本字段一旦出现即为 split 模式，与 legacy 的 `roles`（完整列表，
+   * 显式即替换）语义不同。起因是一次实测教训：靠「设置里有没有定义字段」推断模式，
+   * 会把 `{ id, model }` 这类最小合法定义误判成旋钮。
+   *
+   * `readOnly` / `allowNestedDispatch` 属**组合期**事实（写进角色 preset 的插件清单），
+   * 改动后由派发前热同步重建 preset；面板提示「不确定时完全重启 DSH」。
+   */
+  roleSettings: z
+    .array(
+      z.object({
+        id: z.string().required(),
+        backend: z.union(['spawn', 'cli']),
+        model: z.string(),
+        effort: z.union(EFFORT_VALUES),
+        provider: z.string(),
+        readOnly: z.boolean(),
+        allowNestedDispatch: z.boolean(),
       }),
     )
     .default(undefined)
@@ -1477,8 +1508,23 @@ function createRoleResolver(roleConfigPath, resolved) {
   return () => {
     const fromFile = file.read();
     const value = fromFile.ok && fromFile.value ? fromFile.value : {};
+    // ⚠️ 模式是**显式**的，不靠猜字段：
+    //    - 设置层提供 `roleSettings`（旋钮层）→ split 模式：它是**覆盖层**，
+    //      与文件里的定义/覆盖逐字段合并（定义归文件所有）；
+    //    - 否则用 legacy 的 `roles`：它是**完整列表**，语义是「显式即替换」——
+    //      `[]` 清空、`null` 报错，文件完全不参与（含非法的 `null`，必须原样交给
+    //      字段级校验去报错，不能被文件内容静默顶掉）。
+    const configuredRoleSettings = readVolatileField(resolved, 'roleSettings');
     const configuredRoles = readVolatileField(resolved, 'roles');
-    const raw = configuredRoles !== undefined ? configuredRoles : Array.isArray(value.roles) ? value.roles : [];
+    const fileLayers = {
+      definitions: Array.isArray(value.roles) ? value.roles : [],
+      overrides: Array.isArray(value.overrides) ? value.overrides : [],
+    };
+    const raw = configuredRoleSettings === undefined
+      ? configuredRoles !== undefined ? configuredRoles : Array.isArray(value.roles) ? value.roles : []
+      : Array.isArray(configuredRoleSettings)
+        ? mergeRoleLayers({ ...fileLayers, configured: configuredRoleSettings })
+        : configuredRoleSettings;
     const defaults = { provider: value.provider || resolved.provider, cwd: value.cwd || resolved.cwd };
     const normalized = raw !== undefined && !Array.isArray(raw)
       ? { roles: [], errors: ['roles 必须是数组'] } : normalizeRoles(raw, defaults.provider, defaults.cwd);

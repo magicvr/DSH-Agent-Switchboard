@@ -33,6 +33,112 @@ export const CLI_BACKEND = 'cli';
 export const ROLE_PRESET_PREFIX = 'switchboard-role-';
 
 /**
+ * 角色的**设置**字段：用户会调、经常调的旋钮。
+ *
+ * 这一组是「应该出现在 DSH 设置页、并因此被 DSH 持久化进系统配置文件」的最小集合。
+ *
+ * ⚠️ `readOnly` / `allowNestedDispatch` 属**组合期**事实（写进角色 preset 的插件清单），
+ *    改动后由派发前热同步重建 preset；面板提示「不确定时完全重启 DSH」。
+ */
+export const ROLE_SETTING_FIELDS = Object.freeze([
+  'backend', 'model', 'effort', 'provider', 'readOnly', 'allowNestedDispatch',
+]);
+
+/**
+ * 角色的**定义**字段：作者维护的身份、persona 与 CLI argv 契约。
+ *
+ * 这些**不该**住在 DSH 的系统配置文件里：它们是长篇的、很少改的，而 `cli*` 更是安全敏感
+ * （「命令与参数来自用户配置、模型只能填受限占位符」的落点），不该变成一个网页表单里
+ * 可以逐字段随手改的表面。它们住在插件自己的 `roles.json` 里。
+ */
+export const ROLE_DEFINITION_FIELDS = Object.freeze([
+  'title', 'description', 'instructions',
+  'cliDriver', 'cliCommand', 'cliPrefixArgs', 'cliArgs', 'cliPromptDelivery', 'cliCwd',
+]);
+
+/**
+ * 该角色条目是否**携带定义字段**——即它是「定义」，而不只是「旋钮覆盖」。
+ *
+ * ⚠️ **不要用它推断「当前是哪种模式」**：`{ id, model }` 这种最小条目既可能是一份
+ *    （其余字段走默认值的）**定义**，也可能是一条**旋钮覆盖**，字段有无分不出来。
+ *    实测教训：按它推断会把 fixture 里 `[{ id: 'worker' }]` 这类合法定义误判成旋钮。
+ *    模式由**显式**判据决定 —— 设置层是否提供了 `roleSettings`（见 `src/index.js`）。
+ *
+ * @param {unknown} role - 角色条目。
+ * @returns {boolean} 是否携带定义字段。
+ */
+export function carriesDefinition(role) {
+  return role !== null && typeof role === 'object' && !Array.isArray(role)
+    && ROLE_DEFINITION_FIELDS.some(field => Object.hasOwn(role, field));
+}
+
+/**
+ * 取一个角色条目的**旋钮投影**（`id` + 实际出现的设置字段）。
+ *
+ * @param {object} role - 角色条目。
+ * @returns {object|undefined} 投影；条目无有效 id 时返回 undefined。
+ */
+export function pickOverrideFields(role) {
+  if (role === null || typeof role !== 'object' || typeof role.id !== 'string') return undefined;
+  const out = { id: role.id };
+  for (const field of ROLE_SETTING_FIELDS) if (Object.hasOwn(role, field)) out[field] = role[field];
+  return out;
+}
+
+/**
+ * 合并三层角色数据：**文件定义 < 文件覆盖层 < 旋钮层**。
+ *
+ * ⚠️ 调用点必须**先判模式**：只有 split 模式（设置层提供 `roleSettings`）才走这里。
+ *    legacy 的 `roles` 是**完整列表**，语义是「显式即替换」：`[]` 清空、`null` 报错，
+ *    文件完全不参与。把 legacy 也塞进本函数会让 `[]`/`null` 被文件内容静默顶掉 ——
+ *    实测正是 `check-apply` 的 `R2`（显式 `[]` 应清空）与 `M2`（`null` 应报错）两条。
+ *
+ * 为什么需要合并：preset 作用域看不到根条目的设置，只能读文件，所以文件必须携带定义；
+ * 而设置层只该携带旋钮。生效角色 = 定义 ⨝ 覆盖 ⨝ 旋钮，逐字段合并、后者胜出，`id` 为合入键。
+ *
+ * @param {object} layers - 各层数据。
+ * @param {object[]} [layers.definitions] - 文件里的角色定义。
+ * @param {object[]} [layers.overrides] - 文件里的旋钮覆盖层。
+ * @param {unknown} layers.configured - 旋钮层（`roleSettings`）。
+ * @returns {unknown} 合并结果；文件侧无信息时原样返回旋钮层（或 `[]`）。
+ */
+export function mergeRoleLayers({ definitions, overrides, configured } = {}) {
+  const defs = Array.isArray(definitions) ? definitions : [];
+  const ovrs = Array.isArray(overrides) ? overrides : [];
+  // 文件侧没有信息 → 没有可合并的对象，原样返回旋钮层（未提供则空数组）。
+  if (defs.length === 0 && ovrs.length === 0) return configured !== undefined ? configured : [];
+  const confList = Array.isArray(configured) ? configured : [];
+  const index = (rows) => {
+    const map = new Map();
+    for (const row of rows) {
+      if (row !== null && typeof row === 'object' && !Array.isArray(row) && typeof row.id === 'string') {
+        map.set(row.id, row);
+      }
+    }
+    return map;
+  };
+  const defMap = index(defs);
+  const ovrMap = index(ovrs);
+  const confMap = index(confList);
+  const order = [];
+  const seen = new Set();
+  const push = (id) => { if (!seen.has(id)) { seen.add(id); order.push(id); } };
+  // 顺序：旋钮层给什么顺序就用什么（设置页是用户视图），然后是只在文件里出现的角色
+  // （定义顺序），最后是只在覆盖层里出现的。
+  for (const row of confList) if (typeof row?.id === 'string') push(row.id);
+  for (const row of defs) if (typeof row?.id === 'string') push(row.id);
+  for (const row of ovrs) if (typeof row?.id === 'string') push(row.id);
+  const merged = order.map(id => ({
+    ...(defMap.get(id) ?? {}), ...(ovrMap.get(id) ?? {}), ...(confMap.get(id) ?? {}),
+  }));
+  // 没有合法 id 的条目原样带上，让字段级校验去报错，而不是在这里静默丢弃。
+  for (const row of [...confList, ...defs, ...ovrs]) {
+    if (row === null || typeof row !== 'object' || typeof row.id !== 'string') merged.push(row);
+  }
+  return merged;
+}
+
+/**
  * 角色 id 对应的独立 Agent Preset id。
  *
  * 角色子代理通过它选中「自己的」preset，从而拿到 persona 与工具构成。

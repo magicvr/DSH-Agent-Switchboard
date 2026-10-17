@@ -2,16 +2,21 @@
 // 用法：node scripts/check-roles.mjs
 import {
   EFFORT_VALUES,
+  ROLE_DEFINITION_FIELDS,
+  ROLE_SETTING_FIELDS,
   WRITE_TOOLS,
   UNCONTROLLED_DISPATCH_TOOLS,
   absoluteDepthLimit,
   agentOptionsFor,
   canStartAtDepth,
+  carriesDefinition,
   cliPersonaFor,
   cliToolName,
   dispatchPermissionsFor,
+  mergeRoleLayers,
   normalizeRole,
   normalizeRoles,
+  pickOverrideFields,
   planCliMounts,
   roleGuidanceText,
   rolePresetId,
@@ -974,6 +979,71 @@ section('F2 / F3 回归');
     const cwd = normalizeRole({ ...custom, cliCwd: undefined, cliArgs: ['exec', '{cwd}'] }, 0);
     check('引用 cwd 却不可得在装载期报错', cwd.errors.some(e => e.includes('{cwd}')));
   }
+}
+
+// --- 设置层与定义层的划分、以及三层合并 ---------------------------------------
+//
+// 设计：角色的**定义**（身份 / persona / CLI argv 契约）住在插件自己的 roles.json；
+// DSH 设置页只承载**旋钮**（backend / model / effort / provider / readOnly /
+// allowNestedDispatch）。split 模式下生效角色 = 文件定义 ⨝ 文件覆盖层 ⨝ 旋钮层。
+{
+  section('设置层与定义层的字段划分');
+  check('两个字段集不相交',
+    ROLE_SETTING_FIELDS.filter(field => ROLE_DEFINITION_FIELDS.includes(field)).length === 0);
+  check('定义集含 persona 与 CLI 契约',
+    ['instructions', 'description', 'cliArgs', 'cliCommand'].every(f => ROLE_DEFINITION_FIELDS.includes(f)));
+  check('旋钮集含 backend / model / effort / readOnly / allowNestedDispatch',
+    ['backend', 'model', 'effort', 'readOnly', 'allowNestedDispatch'].every(f => ROLE_SETTING_FIELDS.includes(f)));
+  // `cli*` 是安全敏感面（模型只能填受限占位符、命令与参数来自用户配置），
+  // 明确断言它属于定义、不进设置表单。
+  check('cli* 全部属定义、不在旋钮集',
+    ROLE_DEFINITION_FIELDS.filter(f => f.startsWith('cli')).length === 6
+      && ROLE_SETTING_FIELDS.every(f => !f.startsWith('cli')));
+
+  section('carriesDefinition / pickOverrideFields');
+  check('带 persona 的条目算定义', carriesDefinition({ id: 'a', instructions: 'i' }) === true);
+  check('只带旋钮的条目不算定义',
+    carriesDefinition({ id: 'a', model: 'm', backend: 'cli', readOnly: true }) === false);
+  check('非对象不算定义', carriesDefinition(null) === false && carriesDefinition('a') === false);
+  check('投影只保留 id 与旋钮，丢掉定义字段',
+    isDeepStrictEqual(pickOverrideFields({ id: 'a', title: 't', instructions: 'i', model: 'm',
+      cliArgs: ['x'], readOnly: true }), { id: 'a', model: 'm', readOnly: true }));
+  check('投影对无 id 条目返回 undefined', pickOverrideFields({ model: 'm' }) === undefined);
+
+  section('mergeRoleLayers 三层合并（仅 split 模式调用）');
+  const definitions = [{ id: 'a', title: 'A', description: 'd', instructions: 'i', model: 'm0',
+    backend: 'spawn', readOnly: false }];
+  const overrides = [{ id: 'a', model: 'm1', readOnly: true }];
+  const configured = [{ id: 'a', effort: 'high' }];
+  const mergedOne = mergeRoleLayers({ definitions, overrides, configured });
+  check('文件定义 < 文件覆盖 < 旋钮，逐字段合并',
+    mergedOne.length === 1 && mergedOne[0].model === 'm1' && mergedOne[0].readOnly === true
+      && mergedOne[0].effort === 'high' && mergedOne[0].instructions === 'i'
+      && mergedOne[0].title === 'A' && mergedOne[0].backend === 'spawn', JSON.stringify(mergedOne));
+  check('文件侧无信息时原样返回旋钮层',
+    mergeRoleLayers({ definitions: [], overrides: [], configured }) === configured);
+  check('文件侧与旋钮层都空时返回空数组',
+    isDeepStrictEqual(mergeRoleLayers({ definitions: [], overrides: [], configured: undefined }), []));
+  check('旋钮层字段级胜出定义与覆盖',
+    mergeRoleLayers({ definitions, overrides, configured: [{ id: 'a', model: 'mx', instructions: 'ix' }] })[0]
+      .instructions === 'ix');
+  check('旋钮层未提及的角色由文件定义补上',
+    mergeRoleLayers({ definitions: [...definitions, { id: 'b', instructions: 'ib' }], overrides: [], configured })
+      .map(r => r.id).join(',') === 'a,b');
+  check('顺序以旋钮层为准，文件侧新增追加在后',
+    mergeRoleLayers({ definitions: [{ id: 'b' }, { id: 'a' }], overrides: [], configured: [{ id: 'a' }] })
+      .map(r => r.id).join(',') === 'a,b');
+  check('只在覆盖层出现的角色也并入',
+    mergeRoleLayers({ definitions: [], overrides: [{ id: 'c', model: 'm' }], configured: [] })
+      .map(r => r.id).join(',') === 'c');
+  check('无 id 的条目原样保留，交给字段级校验报错而不是静默丢弃',
+    mergeRoleLayers({ definitions: [{ title: 'x' }], overrides: [], configured: [] }).length === 1);
+  // ⚠️ 这条锁住 R2 / M2 的根因：本函数**只**服务 split 模式。legacy 的 `roles` 是完整
+  //    列表，显式 `[]` 必须清空、非法值必须报错，**不能**被文件内容顶掉。调用点在
+  //    `createRoleResolver` 里先判模式，所以这里只需保证函数本身不越权。
+  check('非数组旋钮层不参与合并（非法值由调用点原样交给字段级校验）',
+    isDeepStrictEqual(mergeRoleLayers({ definitions: [{ id: 'a' }], overrides: [], configured: null })
+      .map(r => r.id), ['a']));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
