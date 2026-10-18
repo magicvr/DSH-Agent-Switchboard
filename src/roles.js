@@ -9,7 +9,7 @@
  * @module @magicvr/dsh-agent-switchboard/roles
  */
 import { validateTemplate } from './cli/argv.js';
-import { resolveDriverPlaceholders, validateCliPreset } from './cli/drivers.js';
+import { cliFieldsFor, inferCliDriver, resolveDriverPlaceholders, validateCliPreset } from './cli/drivers.js';
 
 /** 思考强度的统一枚举。与 DSH 的 `ReasoningEffortId` 取值一致。 */
 export const EFFORT_VALUES = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']);
@@ -82,6 +82,9 @@ export function pickOverrideFields(role) {
   if (role === null || typeof role !== 'object' || typeof role.id !== 'string') return undefined;
   const out = { id: role.id };
   for (const field of ROLE_SETTING_FIELDS) if (Object.hasOwn(role, field)) out[field] = role[field];
+  // `cliDriver` 是**唯一的定义字段例外**：它是一次「选哪个外部 CLI」的选择，不是 argv。
+  // 它必须随覆盖层落进文件（否则重启后设置里的选择会丢），但 argv 仍由策展表派生。
+  if (typeof role.cliDriver === 'string' && role.cliDriver !== '') out.cliDriver = role.cliDriver;
   return out;
 }
 
@@ -128,7 +131,7 @@ export function mergeRoleLayers({ definitions, overrides, configured } = {}) {
   for (const row of confList) if (typeof row?.id === 'string') push(row.id);
   for (const row of defs) if (typeof row?.id === 'string') push(row.id);
   for (const row of ovrs) if (typeof row?.id === 'string') push(row.id);
-  const merged = order.map(id => ({
+  const merged = order.map(id => materializeDriver({
     ...(defMap.get(id) ?? {}), ...(ovrMap.get(id) ?? {}), ...(confMap.get(id) ?? {}),
   }));
   // 没有合法 id 的条目原样带上，让字段级校验去报错，而不是在这里静默丢弃。
@@ -136,6 +139,29 @@ export function mergeRoleLayers({ definitions, overrides, configured } = {}) {
     if (row === null || typeof row !== 'object' || typeof row.id !== 'string') merged.push(row);
   }
   return merged;
+}
+
+/**
+ * 把「选了哪个外部 CLI」物化成策展的 argv。
+ *
+ * 面板只写 `cliDriver`（一次**选择**），命令与参数仍来自 `src/cli/drivers.js` 的策展表 ——
+ * 这正是「argv 来自用户配置、模型只能填受限占位符」那条安全约束的落点，面板没有变成
+ * 可以逐字段手写命令的表面。
+ *
+ * 只在**确实需要**时物化：`inferCliDriver(entry) === entry.cliDriver` 说明这份配置的
+ * argv 已经与该驱动一致（例如 roles.json 里的定义本来就写全了），此时**原样返回**，
+ * 不改动任何既有角色；`custom` / 未知驱动也原样返回（它们的 argv 由定义自己负责）。
+ *
+ * @param {object} entry - 合并后的角色条目。
+ * @returns {object} 可能被物化的条目（不修改入参）。
+ */
+function materializeDriver(entry) {
+  if (entry === null || typeof entry !== 'object') return entry;
+  const selected = entry.cliDriver;
+  if (typeof selected !== 'string' || selected === '' || selected === 'custom') return entry;
+  if (inferCliDriver(entry) === selected) return entry;
+  const fields = cliFieldsFor(selected, entry.readOnly === true);
+  return fields === undefined ? entry : { ...entry, cliDriver: selected, ...fields };
 }
 
 /**

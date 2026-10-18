@@ -463,6 +463,17 @@ export const Config = z.object({
         provider: z.string(),
         readOnly: z.boolean(),
         allowNestedDispatch: z.boolean(),
+        /**
+         * 选择哪个外部 CLI（codex / grok / custom）。
+         *
+         * ⚠️ 这是**选择**而不是 argv 编辑：命令与参数仍由 `src/cli/drivers.js` 的策展表
+         * （`cliFieldsFor(driver, readOnly)`）决定，面板只填驱动 id。选择落在设置里，
+         * 由 Host 派生 argv —— 因此「argv 来自用户配置、模型只能填受限占位符」这条安全
+         * 约束不受影响，面板也没有变成可以逐字段手写命令的表面。
+         *
+         * 只在 `backend: 'cli'` 时有意义；`spawn` 角色的该值会被忽略。
+         */
+        cliDriver: z.string(),
       }),
     )
     .default(undefined)

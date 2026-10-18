@@ -985,6 +985,44 @@ section('F2 / F3 回归');
   check('非数组旋钮层不参与合并（非法值由调用点原样交给字段级校验）',
     isDeepStrictEqual(mergeRoleLayers({ definitions: [{ id: 'a' }], overrides: [], configured: null })
       .map(r => r.id), ['a']));
+
+  section('选择外部 CLI：面板只写驱动 id，argv 由策展表派生');
+  {
+    const { cliFieldsFor } = await import('../src/cli/drivers.js');
+    // roles.json 里写全了 codex 的 argv —— 这是既有部署的形态。
+    const codexDefinition = { id: 'w', description: 'd', instructions: 'i', backend: 'cli',
+      model: 'm', cliDriver: 'codex', readOnly: false, ...cliFieldsFor('codex', false) };
+    const same = mergeRoleLayers({ definitions: [codexDefinition], overrides: [], configured: [{ id: 'w' }] })[0];
+    check('定义与所选驱动一致时**原样保留**（不重写既有角色的 argv）',
+      isDeepStrictEqual(same, codexDefinition), JSON.stringify(same));
+    // 用户在设置页把驱动从 codex 改成 grok：argv 必须换成 grok 的策展值。
+    const switched = mergeRoleLayers({ definitions: [codexDefinition], overrides: [],
+      configured: [{ id: 'w', cliDriver: 'grok' }] })[0];
+    check('设置里换驱动后 argv 物化为该驱动的策展值', switched.cliDriver === 'grok'
+      && switched.cliCommand === cliFieldsFor('grok', false).cliCommand
+      && isDeepStrictEqual(switched.cliArgs, cliFieldsFor('grok', false).cliArgs)
+      && switched.cliPromptDelivery === cliFieldsFor('grok', false).cliPromptDelivery,
+    JSON.stringify({ driver: switched.cliDriver, command: switched.cliCommand }));
+    check('物化时 readOnly 决定 --read-only 之类的沙箱参数',
+      isDeepStrictEqual(cliFieldsFor('grok', false).cliArgs, switched.cliArgs)
+        && isDeepStrictEqual(mergeRoleLayers({ definitions: [{ ...codexDefinition, readOnly: true }],
+          overrides: [], configured: [{ id: 'w', cliDriver: 'grok' }] })[0].cliArgs,
+        cliFieldsFor('grok', true).cliArgs));
+    check('custom / 未知驱动不物化（argv 由定义自己负责）',
+      mergeRoleLayers({ definitions: [codexDefinition], overrides: [],
+        configured: [{ id: 'w', cliDriver: 'custom' }] })[0].cliCommand === codexDefinition.cliCommand
+        && mergeRoleLayers({ definitions: [codexDefinition], overrides: [],
+          configured: [{ id: 'w', cliDriver: 'nope' }] })[0].cliCommand === codexDefinition.cliCommand);
+    check('覆盖层里的驱动选择同样生效（面板写指令 → 同步进文件 overrides）',
+      mergeRoleLayers({ definitions: [codexDefinition], overrides: [{ id: 'w', cliDriver: 'grok' }],
+        configured: [{ id: 'w' }] })[0].cliDriver === 'grok');
+    check('投影携带 cliDriver，但**只**是驱动 id（argv 一律不进设置）',
+      isDeepStrictEqual(pickOverrideFields({ id: 'w', cliDriver: 'grok', ...cliFieldsFor('grok', false) }),
+        { id: 'w', cliDriver: 'grok' }));
+    check('空驱动 id 不进投影（避免把「沿用定义」写成显式空值）',
+      pickOverrideFields({ id: 'w', cliDriver: '' }) === undefined
+        ? false : isDeepStrictEqual(pickOverrideFields({ id: 'w', cliDriver: '', model: 'm' }), { id: 'w', model: 'm' }));
+  }
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

@@ -1248,6 +1248,23 @@ window.__ModuleLoader__.load({
               onChange: (event) => patch(index, 'backend', event?.target?.value || undefined) },
             h('option', { value: '' }, '（默认 spawn）'),
             BACKENDS.map((value) => h('option', { key: value, value }, BACKEND_LABEL[value] ?? value)))),
+          // 「用哪个外部 CLI」——**只在 backend 是 cli 时出现**。
+          //
+          // ⚠️ 这里只写**驱动 id**（一次选择）；命令与参数由 Host 按 `src/cli/drivers.js` 的
+          //    策展表派生（`cliFieldsFor`）。面板刻意不提供逐字段编辑 argv 的入口：
+          //    「argv 来自用户配置、模型只能填受限占位符」这条约束不该被一个网页表单打开缺口。
+          entry.backend === 'cli'
+            ? h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
+              h('span', { style: { fontSize: '11px', width: '56px' } }, '外部 CLI'),
+              h('select', { value: entry.cliDriver ?? '', disabled: busy, style: selectStyle(),
+                onChange: (event) => patch(index, 'cliDriver', event?.target?.value || undefined) },
+              h('option', { value: '' }, '（沿用角色定义）'),
+              CLI_DRIVER_OPTIONS.map((driver) => h('option', { key: driver.id, value: driver.id },
+                driver.label ?? driver.id)),
+              // 现有值不在策展表里（例如手写过 custom）时原样显示，避免下拉框「锁死」成别的驱动。
+              entry.cliDriver !== undefined && !CLI_DRIVER_OPTIONS.some(d => d.id === entry.cliDriver)
+                ? h('option', { value: entry.cliDriver }, entry.cliDriver) : null))
+            : null,
           h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
             h('span', { style: { fontSize: '11px', width: '56px' } }, '模型'),
             h('input', { type: 'text', value: entry.model ?? '', disabled: busy, style: inputStyle(),

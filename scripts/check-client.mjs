@@ -757,6 +757,19 @@ section('统一包裹小节：真实控件、读取与原子写入');
   await splitStore.write([], splitRead.revision, {});
   check('split 模式下 write 不产生任何 roles 写入（store 自保，不依赖界面）',
     splitCalls.every(args => !JSON.stringify(args).includes('"roles"')), JSON.stringify(splitCalls));
+  // 「用哪个外部 CLI」必须在旋钮表单里可选，且**只在 backend=cli 时出现**；值只写驱动 id ——
+  // 命令与参数由 Host 按策展表派生，面板不提供 argv 编辑入口。
+  {
+    const splitForm = CLIENT_SRC.slice(CLIENT_SRC.indexOf("if (status === 'split')"),
+      CLIENT_SRC.indexOf("if (status.startsWith('error:'))"));
+    check('split 旋钮表单：外部 CLI 选择只在 backend=cli 时渲染',
+      splitForm.includes("entry.backend === 'cli'") && splitForm.includes("'外部 CLI'"));
+    check('split 旋钮表单：选择只写 cliDriver（不写 argv），并保留「沿用角色定义」项',
+      splitForm.includes("patch(index, 'cliDriver'") && splitForm.includes("'（沿用角色定义）'")
+        && !/patch\(index, 'cli(Command|Args|PrefixArgs|PromptDelivery)'/.test(splitForm));
+    check('split 旋钮表单：驱动选项来自与 Host 对齐的策展表',
+      splitForm.includes('CLI_DRIVER_OPTIONS.map') && !splitForm.includes('cliCommand'));
+  }
   const splitSaved = await splitStore.writeSettings([{ id: 'scout', backend: 'cli' }], splitRead.revision);
   check('split 模式下 writeSettings 只写 roleSettings，绝不写 roles',
     splitSaved.ok && JSON.stringify(splitCalls.at(-1)) === JSON.stringify(['agent-switchboard',
