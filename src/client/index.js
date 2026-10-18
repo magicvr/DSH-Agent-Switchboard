@@ -1118,6 +1118,8 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (catalog === undefined || typeof catalog.subscribe !== 'function') return undefined;
         const sync = () => setProviders(catalog.getProviders());
+        // ⚠️ 这里才去解析 `remote.llm`（apply 那一刻它还拿不到，真机实测为空）。
+        void catalog.ensureBound?.().then(sync).catch(() => {});
         sync();
         return catalog.subscribe(sync);
       }, [catalog]);
@@ -1439,14 +1441,17 @@ window.__ModuleLoader__.load({
           button(dirty ? '保存 *' : '保存', () => save(), { disabled: busy || !readSucceeded || !dirty, primary: dirty, className: 'pageActionSave' }))));
     }
 
-    // 「模型供应商」目录：尽力而为地绑定 `remote.llm`（内核提供；官方「模型」设置页也用它）。
+    // 「模型供应商」目录：从 `remote.llm`（内核提供的通道；官方「模型」页也声明它）读供应商与模型。
     //
-    // ⚠️ 刻意**不**写进插件的 `inject`：那里是**必需**依赖，缺一个整页起不来（历史事故：
-    //    注入过我们自己延迟注册的 `remote.roleConfig`，页面直接不激活）。这里在 `apply` 里用
-    //    `ctx.inject(['remote'], …)` 拿到网关后再取 `.llm`，拿不到或调用失败就退化成文本框 ——
-    //    供应商下拉是**增强**，不该有能力把设置页拖垮。
-    function makeModelCatalog() {
+    // ⚠️ **必须延迟解析**：真机实测在 `apply` 里立刻读 `ctx.remote.llm` 得到的是**空**
+    //    （诊断原文：「remote.llm 不可用（注入未生效，或 ctx.remote 为空）」）——
+    //    通道在 apply 那一刻还没挂上。官方模型页的做法正是不在 apply 时读：它把 `ctx` 存下来，
+    //    等到真正要用时才 `ctx.remote.llm.x()`（注释原文：*"the Remote namespaces stay in the
+    //    apply world"*）。所以这里收一个 **getter**，在设置页首次渲染（effect）时才去取。
+    //    拿不到/调用失败一律退化成文本框 —— 供应商下拉是**增强**，不该拖垮设置页。
+    function makeModelCatalog(getLlm) {
       let llm = null;
+      let bound = false;
       let providers = [];
       // 拿不到目录时把**原因**摆到界面上：前两次我靠猜 API 形状，连错两轮。
       // ⚠️ 只描述形状、不回显内容 —— 供应商条目里可能带凭据线索，界面上不该出现值。
@@ -1489,15 +1494,25 @@ window.__ModuleLoader__.load({
           .then((list) => { models.set(provider.id, list); emit(); return list; });
       };
       return {
+        // 幂等：绑定成功过就直接返回；**失败不置位** —— 这样下一次 `ensureBound()` 还能重试
+        // （通道可能在 apply 之后才挂上，这正是真机踩到的那次）。
+        ensureBound() {
+          if (bound) return Promise.resolve(providers);
+          let next = null;
+          try { next = typeof getLlm === 'function' ? getLlm() : null; } catch { next = null; }
+          return this.bind(next);
+        },
         bind(next) {
           llm = next === undefined || next === null || typeof next.listProviders !== 'function' ? null : next;
           models.clear();
           if (llm === null) {
+            bound = false;
             providers = [];
-            diagnostic = 'remote.llm 不可用（注入未生效，或 ctx.remote 为空）';
+            diagnostic = 'remote.llm 不可用（注入未生效，或调用时 ctx.remote 仍为空）';
             emit();
             return Promise.resolve([]);
           }
+          bound = true;
           diagnostic = '正在读取供应商目录…';
           return Promise.resolve()
             .then(() => llm.listProviders())
@@ -1557,8 +1572,7 @@ window.__ModuleLoader__.load({
         // ⚠️ 这里**曾经**用 `ctx.inject(['remote'], scope => …scope.remote.llm)` 运行时去"取网关"
         //    —— 真机实测**通道接不上**（目录永远是空的，面板一直退回文本框，连续两次踩到）。
         //    教训：通道必须像官方那样**静态声明**；判据是「官方那个页面的 inject 里有没有它」。
-        const catalog = makeModelCatalog();
-        try { void catalog.bind(ctx.remote?.llm ?? null); } catch { void catalog.bind(null); }
+        const catalog = makeModelCatalog(() => ctx.remote?.llm ?? null);
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(
             {

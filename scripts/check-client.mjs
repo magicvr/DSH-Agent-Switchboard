@@ -851,6 +851,20 @@ section('模型供应商目录：remote.llm 的信封、失败降级与同步读
   await strings.bind({ listProviders: () => ['self', 'llm-pi-ai'] });
   check('供应商目录：字符串数组形态也收', JSON.stringify(strings.getProviders().map(item => item.id))
     === JSON.stringify(['self', 'llm-pi-ai']));
+  // ⚠️ 真机踩到的那条路：`apply` 那一刻 `ctx.remote.llm` 还拿不到（诊断原文「remote.llm 不可用」），
+  //    所以必须**延迟到用时再解析**；且拿不到时**不能**把自己标记成"已绑定"，否则永远没有第二次机会。
+  let late = null;
+  const lazy = makeModelCatalog(() => late);
+  const first = await lazy.ensureBound();
+  check('延迟解析：通道未就绪时留空，且**不**把自己锁死（可重试）',
+    first.length === 0 && lazy.getProviders().length === 0 && lazy.getDiagnostic().includes('remote.llm'),
+    lazy.getDiagnostic());
+  late = { listProviders: () => ({ ok: true, value: [{ provider: 'self', settingsNs: 'ns' }] }) };
+  await lazy.ensureBound();
+  await new Promise(setImmediate);
+  check('延迟解析：通道就绪后重试即成功（供应商到货、诊断清空）',
+    lazy.getProviders().length === 1 && lazy.getProviders()[0].id === 'self' && lazy.getDiagnostic() === '',
+    JSON.stringify({ providers: lazy.getProviders(), diagnostic: lazy.getDiagnostic() }));
 }
 
 section('split 旋钮表单：供应商/模型下拉（spawn）与目录缺失时的退化');
