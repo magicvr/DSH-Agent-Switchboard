@@ -563,6 +563,26 @@ preset 的会话里对 `worker`（`backend=cli(codex)`）派发一次真实任�
 > （那时 depth=2 的子代理还是 `[running]`）。**把不存在的缺陷写进文档，比漏写更有害** ——
 > 观测没结束就不要下结论，先标「未确认」。现已更正。
 
+**真机取证（2026-10-18，GUI 手动取消一个直派 CLI 任务）：** 在界面上停止 `reviewer`
+（`cli(grok)`）的后台任务，完成通知为：
+
+```text
+background job cli-dedf627a1c664b6f (cli: 审查员) finished [status: killed, exit code: 1; cancelled by the user]
+```
+
+三条要点：
+
+- **状态语义正确**：不是 `failed`。`killed` 是**我们刻意映射**的（`src/cli/provider.js`：
+  内部 `cancelled` → job 状态 `killed`；只有清理失败才映射为 `failed`），
+  而 `; cancelled by the user` 是官方 Jobs 框架对**用户主动 kill** 的渲染。
+- **中断前的输出保留**：`job_output` 仍能读到已产生的行 + 状态收口行 —— 有界环不因取消而清空。
+- **任务保留在列表里**：`cli-… [cli] killed — 审查员`，符合「终态不主动 remove，交给 Jobs 的
+  保留策略」。
+
+仍未验收：客户端任务面板的**视觉**（stdout 正文 / stderr 默认折叠 / 失败自动展开），以及
+「直派场景下那个面板出现在哪种会话」—— 后者是 D33 改直派之后**很可能被漏掉的界面副作用**
+（面板原先服务于「一次性子代理会话」，而直派时 owner 是主代理）。
+
 **真机取证（2026-10-03，`worker=cli(codex)` 实测）：** 一次 `node -v` 任务中，当时的阻塞式工具 `switchboard_cli_run_worker`（**该工具已随 D33 删除**）返回的 `stdout` 只有 172 字符（最终答案），`stderr` 有 5723 字符 —— 含 codex banner 与路由事实、**角色指令回显**、`exec "<powershell>" -Command 'node -v; Get-Location' … succeeded in 132ms` 的**工具轨迹**、`tokens used` 计数与重连告警。这正是用户报告「工具调用等消息被当成文本显示」的内容来源，也证明通道分区的前提成立。同一份结果的 `routeSummary` 自报 `model=gpt-6.1-sol`、`effort=medium`、`sandbox=workspace-write`，与角色配置一致 —— 把 stderr 折起来并没有丢掉「配置真的生效」的证据。**折叠交互与失败自动展开仍待人工查看（GUI 视觉），不能以离线断言代替。** ⚠️ 直派后同样的分区原则不变，只是数据源从「工具返回值」变成「job 的输出环」（`job.append(text, { channel })`）。
 
 调用外部 CLI 至少要考虑：
