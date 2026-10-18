@@ -91,9 +91,12 @@ Jobs 不可用时 CLI 照常执行，结果标注回流不可用。CLI 没有运
 设置页按**模式**渲染两种形态：
 
 - **split 模式**（设置层提供 `roleSettings`；迁移后的默认形态）——每个角色一行**旋钮**：
-  后端（spawn / cli）、模型、思考强度、只读、允许嵌套派发。`backend: cli` 的行**额外**出现
+  派发方式（spawn / cli）、模型、思考强度。`backend: cli` 的行**额外**出现
   「外部 CLI」下拉（codex / grok；已有的 `custom` 或未知 id 原样显示，不锁死）。
-  它只写驱动 **id**：命令与参数由 Host 按 `src/cli/drivers.js` 的策展表派生
+  页面底部是操作区（**取消在左、保存在最右**）。
+  ⚠️ **只读**与**能否继续派发**不在这里 —— 它们决定角色 preset 的构成（组合期事实），
+  属**角色定义**、住在 `roles.json`；面板只如实显示当前值。
+  驱动选择只写 **id**：命令与参数由 Host 按 `src/cli/drivers.js` 的策展表派生
   （`cliFieldsFor(driver, readOnly)`），面板**没有**逐字段编辑 argv 的入口 ——
   「argv 来自用户配置、模型只能填受限占位符」这条约束不该被一个网页表单打开缺口。
 - **legacy 模式**（设置里仍是完整 `roles`，尚未迁移）——保留卡片式编辑器（每条卡片的
@@ -104,7 +107,7 @@ Jobs 不可用时 CLI 照常执行，结果标注回流不可用。CLI 没有运
 | 内容 | 住哪 |
 | --- | --- |
 | **定义**：title / description / instructions / CLI argv 契约 | `$DSH_HOME/agent-switchboard/roles.json` 的 `roles`（**权威**） |
-| **旋钮**：backend / model / effort / provider / readOnly / allowNestedDispatch / cliDriver | 根条目 `agent-switchboard` 的 `config.roleSettings`（设置页唯一可写的命名空间） |
+| **旋钮**：backend / model / effort / provider / cliDriver（只放**执行期**事实） | 根条目 `agent-switchboard` 的 `config.roleSettings`（设置页唯一可写的命名空间） |
 
 生效角色 = `roles`（定义）⨝ 文件 `overrides` ⨝ 设置 `roleSettings`，逐字段合并、后者胜出。
 根实例在 `loader/volatile-update` 返回前把**旋钮覆盖**同步进文件的 `overrides` ——

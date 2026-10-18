@@ -693,6 +693,9 @@ window.__ModuleLoader__.load({
           onClick,
           disabled: opts.disabled === true,
           ...(opts.expanded === undefined ? {} : { 'aria-expanded': opts.expanded }),
+          // ⚠️ 可选的 className：页面级操作区的按钮靠它定位（`pageActionSave` / `pageActionCancel`）。
+          //    不加会让「取消」与卡片内编辑器的「取消」在测试与可访问性上无法区分。
+          ...(opts.className === undefined ? {} : { className: opts.className }),
           style: {
             padding: '4px 12px',
             fontSize: '12px',
@@ -1112,7 +1115,7 @@ window.__ModuleLoader__.load({
       /** 保存角色列表。 */
       const save = async (nextRoles = roles, forceRoles = false) => {
         if (!readSucceeded) {
-          setNotice({ kind: 'error', text: '读取失败，不能写入。点「放弃改动」可重试。' });
+          setNotice({ kind: 'error', text: '读取失败，不能写入。点「取消」可重试。' });
           return;
         }
         if (store === undefined || typeof store.write !== 'function' || busy) return;
@@ -1156,8 +1159,8 @@ window.__ModuleLoader__.load({
           },
           '每个角色可独立选择走 DSH 内置子代理，还是走本机外部 CLI。',
         ),
-        button(dirty ? '保存 *' : '保存', () => save(), { disabled: busy || !readSucceeded || !dirty, primary: dirty }),
-        button('放弃改动', refresh, { disabled: busy || (readSucceeded && !dirty) }),
+        // ⚠️ 顶部**曾经**还有一对「保存 / 放弃改动」。操作区统一收到底部（取消在左、保存在最右），
+        //    避免同一页出现两套语义相同的按钮。
       );
 
       // 说明性的页脚。原先这里是一个 `allowCrossCli` 总开关，现已移除：
@@ -1228,7 +1231,7 @@ window.__ModuleLoader__.load({
           try {
             const result = await store.writeSettings(entries, revision);
             setNotice({ kind: result.ok ? 'info' : 'error',
-              text: result.ok ? '已保存旋钮设置。组合期字段（只读 / 嵌套派发）会在下次派发前重建。' : result.message });
+              text: result.ok ? '已保存旋钮设置。模型、强度与外部 CLI 选择下次派发即生效；只读与能否嵌套派发属角色定义（roles.json），本页不改。' : result.message });
           } finally { setBusy(false); }
         };
         const checkbox = (entry, index, field, label) => {
@@ -1245,8 +1248,8 @@ window.__ModuleLoader__.load({
         return wrap(h('div', null,
           h('div', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '8px' } },
             '角色定义（persona、工具构成、CLI 参数）住在 $DSH_HOME/agent-switchboard/roles.json，'
-            + '本页只调每个角色的旋钮。改动保存后：模型与强度立即生效；'
-            + '只读与嵌套派发属组合期，会在下次派发前自动重建 —— 不确定时完全退出并重启 DSH 可确保生效。'),
+            + '本页只调每个角色的旋钮（派发方式 / 模型 / 强度 / 外部 CLI）。'
+            + '只读与能否嵌套派发属**角色定义**，不在本页编辑 —— 它们决定角色 preset 的构成，改了要重建组合。'),
           h('ul', { style: { margin: 0, padding: 0, listStyle: 'none', display: 'flex',
             flexDirection: 'column', gap: '10px' } },
           entries.map((entry, index) => h('li', { key: String(entry.id ?? index),
@@ -1285,33 +1288,42 @@ window.__ModuleLoader__.load({
               onChange: (event) => patch(index, 'effort', event?.target?.value || undefined) },
             h('option', { value: '' }, '（不指定）'),
             EFFORTS.map((value) => h('option', { key: value, value }, value)))),
-          h('div', { style: { display: 'flex', gap: '12px', alignItems: 'center' } },
-            checkbox(entry, index, 'readOnly', '只读（组合期）'),
-            checkbox(entry, index, 'allowNestedDispatch', '允许嵌套派发（组合期）'),
-            // ⚠️ CLI 角色的这个旋钮**没有效果**，必须当场说清，否则它会骗人：
-            //    CLI 角色不产出角色 preset（没有地方承载嵌套行），而 CLI 进程本身也只有它自己的
-            //    工具（实测 codex 只有 13 个自家工具，没有任何 DSH 工具）——它根本无法调用
-            //    delegate_to_*。置灰而不是清值：不悄悄改用户的数据，只解释它为什么不生效。
-            entry.backend === 'cli'
-              ? h('span', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
-                '（对 CLI 角色无效：CLI 角色没有 preset，其进程也没有 DSH 工具）')
-              : null)))),
-          h('div', { style: { marginTop: '10px' } }, button('保存旋钮', saveSettings, { disabled: busy }))));
+          // ⚠️ 「只读」与「允许嵌套派发」**不再出现在这里**（D34）：它们是组合期事实、属于
+          //    角色的固有属性，住在 roles.json 的定义层。做成旋钮既让人以为「改了立刻生效」，
+          //    又让每次保存都要重建组合 —— 那是设计，不是调参。这里只**如实显示**当前值。
+          h('div', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
+            `${entry.readOnly === true ? '只读角色' : '可写角色'} · `
+            + `${entry.allowNestedDispatch === true ? '可继续派发' : '不再派发'}`
+            + '（属角色定义，改动请编辑 roles.json）')))),
+          // 底部操作区：靠右，取消在左、保存在最右。
+          h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '10px' } },
+            button('取消', refresh, { disabled: busy || !dirty, className: 'pageActionCancel' }),
+            button(dirty ? '保存 *' : '保存', saveSettings, { disabled: busy, primary: dirty, className: 'pageActionSave' }))));
       }
       if (status.startsWith('error:')) {
         // 读取失败必须显式呈现原因，而不是显示成「尚未配置」——后者会让用户以为配置丢了。
         // ⚠️ 这里只显示 `fetchRoles` 给出的**具体**原因，不再附一句猜测性的通用建议：
         //    曾经写死「这通常是配置文件损坏」，而真实原因是远程通道取不到，把排查方向
         //    完全带偏（实测教训）。宁可少说，也不要说不符合实际的话。
-        return wrap(
+        return wrap(h('div', null,
           h(
             'div',
             { style: { color: 'var(--dsw-alias-state-error-primary, var(--dsw-alias-label-secondary))' } },
             `读取角色配置失败：${status.slice('error:'.length)}`,
             h('br'),
-            '点「放弃改动」可重试。',
+            '点「取消」可重试。',
           ),
-        );
+          // ⚠️ 错误态**必须**也有那条操作区：操作区原先在页头（对所有状态可见），收到底部后
+          //    如果这里不补，错误页就会显示「点「取消」可重试」却**没有那个按钮**（实测踩到）。
+          //    ⚠️ `wrap()` 只接收**一个**子节点（不是变参）—— 直接多传一个参数会被静默丢掉，
+          //    这正是第一版没生效的原因（渲染出错误文字却没有按钮）。
+          //    保存保持 disabled —— 读取失败时不允许写入（F1 的硬闸门）。
+          h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '10px' } },
+            button('取消', refresh, { disabled: busy, className: 'pageActionCancel' }),
+            // 按钮虽 disabled，回调仍走**真实的** save()（它自己会因 !readSucceeded 早退并给出
+            // 「读取失败，不能写入」）—— 保留那道硬闸门的可验证性，而不是留一个空回调。
+            button('保存', () => save(), { disabled: true, className: 'pageActionSave' })),
+        ));
       }
       const cardProps = (role, index) => ({
         key: String(index) + ':' + (editingId === index), role, index, roles,
@@ -1329,7 +1341,13 @@ window.__ModuleLoader__.load({
         h('div', { className: 'addBlock', style: { marginTop: '10px' } },
           editingId === 'new'
             ? h('ul', { style: { padding: 0 } }, h(RoleCard, cardProps(newRole, 'new')))
-            : button('+ 新增角色', addRole, { disabled: busy || draft === null }))));
+            : button('+ 新增角色', addRole, { disabled: busy || draft === null })),
+        // 底部操作区：与 split 表单同一形态（靠右、取消在左、保存在最右）。
+        // ⚠️ 这里是 legacy 模式下**唯一**的整表保存入口 —— 顶部那对按钮已移除，
+        //    不加这一行就会让 legacy 用户无法保存列表级改动。
+        h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '10px' } },
+          button('取消', refresh, { disabled: busy || !dirty, className: 'pageActionCancel' }),
+          button(dirty ? '保存 *' : '保存', () => save(), { disabled: busy || !readSucceeded || !dirty, primary: dirty, className: 'pageActionSave' }))));
     }
 
     // 与官方选择器一致，仅明确的一次性子会话；未知/continuable 不接管。

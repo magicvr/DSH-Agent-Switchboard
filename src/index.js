@@ -383,7 +383,9 @@ export const Config = z.object({
    * `delegate_to_<cliRole>`，嵌套派发同样不需要中继子代理。是否声明由 role-presets
    * 按调用方角色的 `allowNestedDispatch` 决定（嵌套权限仍在组合期固定）。
    */
-  cliDispatchFor: z.array(z.string()).description('仅内部使用：本作用域需要注册 CLI 直派工具的角色 id'),
+  // ⚠️ 这里**曾经**有 `cliDispatchFor`（角色 preset 声明「本作用域要注册哪些 CLI 直派工具」，
+  //    用于让 spawn 子代理嵌套派发给 CLI 角色）。它已随 D34 整体删除：CLI 角色是叶子，
+  //    嵌套目标只可能是 spawn 角色，由官方委派行承载。留下这个字段只会让人以为那条路还在。
   /** CLI 角色的默认可执行工作目录；角色自身可用 cliCwd 覆盖。 */
   cwd: z.string().description('CLI 角色的默认工作目录'),
   /** 角色列表。 */
@@ -461,8 +463,6 @@ export const Config = z.object({
         model: z.string(),
         effort: z.union(EFFORT_VALUES),
         provider: z.string(),
-        readOnly: z.boolean(),
-        allowNestedDispatch: z.boolean(),
         /**
          * 选择哪个外部 CLI（codex / grok / custom）。
          *
@@ -474,6 +474,8 @@ export const Config = z.object({
          * 只在 `backend: 'cli'` 时有意义；`spawn` 角色的该值会被忽略。
          */
         cliDriver: z.string(),
+        // ⚠️ `readOnly` / `allowNestedDispatch` **不再在这里**（D34）：它们是组合期事实、
+         //    属于角色的固有属性，已移入 `roles.json` 的定义层，面板也不再提供旋钮。
       }),
     )
     .default(undefined)
@@ -984,18 +986,16 @@ function applyInner(ctx, config) {
   const roleConfigPath = configPathFor(dshHome);
   diagnostics.roleConfigPath = roleConfigPath;
 
-  // --- 角色子代理作用域：只注册该角色的专属 CLI 工具 -------------------------------
-  //
-  // DSH 0.2.1-rc.1 起，角色子代理挂载的是**自己的**独立 preset（见 src/role-presets.js），
-  // 而工具按作用域可见、不跨 preset 继承。所以专属 CLI 工具必须由角色 preset 自己
-  // 声明一行本插件条目、在**子代理的作用域里**注册，否则子代理看不见它。
-  //
-  // 这条路径刻意什么都不做别的：不注册自检、不挂角色工具、不做根配置同步。
-  const cliDispatchFor = readVolatileField(resolved, 'cliDispatchFor');
-  if (Array.isArray(cliDispatchFor) && cliDispatchFor.length > 0) {
-    mountCliDispatchInThisScope(ctx, { roleConfigPath, roleIds: cliDispatchFor, diagnostics });
-    return;
-  }
+  // ⚠️ 这里**曾经**有一条「角色 preset 自带 `cliDispatchFor`，在本作用域注册 CLI 直派工具」的
+  //    分支（让 spawn 子代理也能嵌套派发给 CLI 角色）。它已**整体删除**（D34）：
+  //      - 设计上审计/评审属于**主代理**的职责，让实现者自己去叫审计违背设计直觉；
+  //      - CLI 角色因此是**叶子**：嵌套目标只可能是 spawn 角色，而那条路由由角色 preset 里
+  //        官方 `dsh-tool-subagent` 的委派行承载，不需要本插件插手。
+  //    删除的直接动因是一次真机故障：那个分支调用了一个**从未定义**的函数
+  //    （`mountCliDispatchInThisScope`，改名时漏下的悬空引用），于是「spawn 角色 + 任一 CLI
+  //    嵌套目标」的 preset 条目**整条抛错失效**，子代理里一个 `delegate_to_*` 都没有。
+  //    夹具当时只断言了宿主行的**生成**，从没 apply 过带 `cliDispatchFor` 的配置 —— 生成侧绿、
+  //    应用侧从没跑过。教训：接缝两侧都要有断言。
   // 自检工具总是注册：即使角色配置全错，也要能用它看到错在哪。
   const disposeSelftest = ctx.tools.register(selftestTool(ctx, diagnostics));
 

@@ -769,14 +769,15 @@ section('统一包裹小节：真实控件、读取与原子写入');
         && !/patch\(index, 'cli(Command|Args|PrefixArgs|PromptDelivery)'/.test(splitForm));
     check('split 旋钮表单：驱动选项来自与 Host 对齐的策展表',
       splitForm.includes('CLI_DRIVER_OPTIONS.map') && !splitForm.includes('cliCommand'));
-    // ⚠️ 「会骗人的旋钮」：CLI 角色的「允许嵌套派发」没有效果（CLI 角色不产出 preset，其进程
-    //    也没有 DSH 工具），必须置灰 + 就地说明，否则用户会以为打开它就能嵌套派发。
-    check('split 旋钮表单：CLI 角色的嵌套开关置灰并说明原因，且不静默清值',
-      /const inert = field === 'allowNestedDispatch' && entry\.backend === 'cli'/.test(splitForm)
-        && /disabled: busy \|\| inert/.test(splitForm)
-        && splitForm.includes('对 CLI 角色无效')
-        && !splitForm.includes("patch(index, 'allowNestedDispatch', false)"),
-      'inert 判定或说明文案缺失');
+    // ⚠️ 「只读」与「允许嵌套派发」已**整体移出面板**（D34）：它们是组合期事实、属于角色的
+    //    固有属性，住在 roles.json 的定义层。这里断言它们**不再**是旋钮（没有任何 patch 路径），
+    //    但当前值仍如实**显示**出来（只读/可写、可继续派发/不再派发）。
+    check('split 旋钮表单：只读与嵌套派发不再是旋钮（只在文案里如实显示当前值）',
+      !splitForm.includes("patch(index, 'readOnly'")
+        && !splitForm.includes("patch(index, 'allowNestedDispatch'")
+        && splitForm.includes('属角色定义，改动请编辑 roles.json')
+        && /只读角色|可写角色/.test(splitForm),
+      '只读/嵌套仍在表单里，或当前值没有显示');
   }
   const splitSaved = await splitStore.writeSettings([{ id: 'scout', backend: 'cli' }], splitRead.revision);
   check('split 模式下 writeSettings 只写 roleSettings，绝不写 roles',
@@ -844,6 +845,9 @@ section('角色卡片：真实编辑、草稿、校验、并发与增删回调')
   const allOf = tree => { const nodes = []; const walk = n => { if (Array.isArray(n)) return n.forEach(walk); if (!n || typeof n !== 'object') return; nodes.push(n); n.children?.forEach(walk); }; walk(tree); return nodes; };
   const cards = nodes => nodes.filter(n => n.props?.className === 'rowCard');
   const buttonOf = (nodes, label) => nodes.find(n => n.type === 'button' && n.children.includes(label));
+  // ⚠️ 页面级操作区的按钮按 className 定位（D34 起操作区统一移到底部，且标签与卡片内的「保存/取消」重名）。
+  const pageButton = (nodes, which) => nodes.find(n => n.type === 'button'
+    && n.props?.className === ['pageAction', which].join(''));
   const inCard = (nodes, id) => allOf(cards(nodes).find(n => n.props['data-role-id'] === id));
   const fieldOf = (nodes, label) => nodes.find(n => n.type === 'label' && n.children[0]?.children.includes(label))?.children[1];
   const settle = () => new Promise(setImmediate);
@@ -892,10 +896,10 @@ section('角色卡片：真实编辑、草稿、校验、并发与增删回调')
   await buttonOf(inCard(nodes, 'new-role'), '确认删除').props.onClick(); await settle(); nodes = render();
   check('卡片删除：第二步恰好一次提交并使用新 revision', calls.length === 4 && mirror.roles.length === 2 && calls[3].rev === 73);
   mirror.roles = [{ ...good, instructions: '' }, { ...cli, cliArgs: ['unknown'] }];
-  buttonOf(nodes, '放弃改动').props.onClick(); await settle(); nodes = render();
+  pageButton(nodes, 'Cancel').props.onClick(); await settle(); nodes = render();
   check('卡片状态：缺必填与未知 CLI 预设均为错误态及可读原因', nodes.filter(n => n.props?.['data-state']).every(n => n.props['data-state'] === 'error' && n.props['aria-label'].startsWith('配置错误：') && n.props.style.background === 'var(--dsw-alias-state-error-primary)') && nodes.some(n => n.props?.['aria-label']?.includes('需重选预设')));
   mirror.roles[0] = good;
-  buttonOf(nodes, '放弃改动').props.onClick(); await settle(); nodes = render();
+  pageButton(nodes, 'Cancel').props.onClick(); await settle(); nodes = render();
   buttonOf(inCard(nodes, 'worker'), '编辑').props.onClick(); nodes = render();
   await buttonOf(inCard(nodes, 'worker'), '保存').props.onClick(); nodes = render();
   check('卡片校验：未识别预设独立阻止提交并显示需重选预设', calls.length === 4 && inCard(nodes, 'worker').some(n => n.props?.role === 'alert' && n.children.some(t => typeof t === 'string' && t.includes('需重选预设'))));
@@ -903,7 +907,7 @@ section('角色卡片：真实编辑、草稿、校验、并发与增删回调')
 
   // 批次 2：使用同一组件实例与按 key 复用的卡片，覆盖实际用户回调。
   mirror.roles = [{ ...good, title: '' }, cli, { ...good, id: 'last', title: '末行' }];
-  buttonOf(nodes, '放弃改动').props.onClick(); await settle(); nodes = render();
+  pageButton(nodes, 'Cancel').props.onClick(); await settle(); nodes = render();
   check('F9：空标题的卡片头部回退显示角色 id',
     inCard(nodes, 'scout').find(n => n.props?.className === 'rowName')?.children.includes('scout'));
   buttonOf(inCard(nodes, 'worker'), '删除').props.onClick(); nodes = render();
@@ -926,7 +930,7 @@ section('角色卡片：真实编辑、草稿、校验、并发与增删回调')
   check('F4：cancelEdit 清除删除确认', !buttonOf(nodes, '确认删除'));
 
   mirror.roles = [cli];
-  buttonOf(nodes, '放弃改动').props.onClick(); await settle(); nodes = render();
+  pageButton(nodes, 'Cancel').props.onClick(); await settle(); nodes = render();
   buttonOf(inCard(nodes, 'worker'), '编辑').props.onClick(); nodes = render();
   const roleEffortOf = nodes => nodes.filter(n => n.type === 'label' && n.children[0]?.children.includes('思考强度')).at(-1)?.children[1];
   const effortSelect = roleEffortOf(nodes);
@@ -948,17 +952,18 @@ section('角色卡片：真实编辑、草稿、校验、并发与增删回调')
 
   buttonOf(inCard(nodes, 'worker'), '删除').props.onClick(); nodes = render();
   readFails = true;
-  buttonOf(nodes, '放弃改动').props.onClick(); nodes = render();
-  check('F1：重读进行中禁止保存', buttonOf(nodes, '保存')?.props.disabled === true);
+  pageButton(nodes, 'Cancel').props.onClick(); nodes = render();
+  check('F1：重读进行中禁止保存', pageButton(nodes, 'Save')?.props.disabled === true);
   await settle(); nodes = render();
   check('F1：读取失败保存按钮 disabled，dirty 为 false（无保存 *）',
-    buttonOf(nodes, '保存')?.props.disabled === true && !buttonOf(nodes, '保存 *'));
+    pageButton(nodes, 'Save')?.props.disabled === true
+      && !pageButton(nodes, 'Save')?.children.includes('保存 *'));
   check('F4：refresh 清除删除确认', !buttonOf(nodes, '确认删除'));
-  check('F1：读取失败放弃改动可用以重试', buttonOf(nodes, '放弃改动')?.props.disabled === false);
+  check('F1：读取失败放弃改动可用以重试', pageButton(nodes, 'Cancel')?.props.disabled === false);
   const beforeFailedRead = calls.length;
-  await buttonOf(nodes, '保存').props.onClick(); nodes = render();
+  await pageButton(nodes, 'Save').props.onClick(); nodes = render();
   check('F1：绕过 disabled 直接保存也不调用 store.write，提示不能写入',
-    calls.length === beforeFailedRead && nodes.some(n => n.children.includes('读取失败，不能写入。点「放弃改动」可重试。')));
+    calls.length === beforeFailedRead && nodes.some(n => n.children.includes('读取失败，不能写入。点「取消」可重试。')));
   // 控制两次重读的完成顺序，执行真实 refresh 回调而非仅检查源码守卫。
   const originalRead = store.read;
   const pendingReads = [];
@@ -971,8 +976,8 @@ section('角色卡片：真实编辑、草稿、校验、并发与增删回调')
     ['新成功后旧成功', successfulRead('latest', 902), successfulRead('stale', 801)],
     ['新失败后旧成功', { ok: false, error: 'latest failure' }, successfulRead('stale', 802)],
   ]) {
-    buttonOf(nodes, '放弃改动').props.onClick(); nodes = render();
-    buttonOf(nodes, '放弃改动').props.onClick(); nodes = render();
+    pageButton(nodes, 'Cancel').props.onClick(); nodes = render();
+    pageButton(nodes, 'Cancel').props.onClick(); nodes = render();
     const [resolveOld, resolveLatest] = pendingReads.splice(0);
     resolveLatest(latest); await settle(); nodes = render();
     const latestSnapshot = rootSnapshot();
@@ -982,20 +987,20 @@ section('角色卡片：真实编辑、草稿、校验、并发与增删回调')
     const readSucceeded = contexts.get('root').states[3];
     check(`F1-并发：${label}，旧响应不覆盖最新状态且读取闸门自洽`,
       rootSnapshot() === latestSnapshot && readSucceeded === latest.ok && errorVisible === !latest.ok &&
-      buttonOf(nodes, '保存')?.props.disabled === true &&
-      buttonOf(nodes, '放弃改动')?.props.disabled === latest.ok &&
+      pageButton(nodes, 'Save')?.props.disabled === true &&
+      pageButton(nodes, 'Cancel')?.props.disabled === latest.ok &&
       (latest.ok ? cards(nodes).length === 1 && cards(nodes)[0].props['data-role-id'] === 'latest' : cards(nodes).length === 0));
   }
   const beforeConcurrentFailureSave = calls.length;
-  await buttonOf(nodes, '保存').props.onClick(); nodes = render();
+  await pageButton(nodes, 'Save').props.onClick(); nodes = render();
   check('F1-并发：最新读取失败后直接保存仍不写入，放弃改动可重试',
-    calls.length === beforeConcurrentFailureSave && buttonOf(nodes, '放弃改动')?.props.disabled === false);
+    calls.length === beforeConcurrentFailureSave && pageButton(nodes, 'Cancel')?.props.disabled === false);
   store.read = originalRead;
   // 验证失败后的成功读取空数组仍允许新增，且新角色默认 medium 不变。
   readFails = false;
   for (const missing of [false, true]) {
     if (missing) delete mirror.roles; else mirror.roles = [];
-    buttonOf(nodes, '放弃改动').props.onClick(); await settle(); nodes = render();
+    pageButton(nodes, 'Cancel').props.onClick(); await settle(); nodes = render();
     buttonOf(nodes, '+ 新增角色').props.onClick(); nodes = render();
     check(`F1/F3-GUI：${missing ? 'missing' : 'empty'} 成功读取可新增，默认强度 medium`,
       roleEffortOf(nodes)?.props.value === 'medium');

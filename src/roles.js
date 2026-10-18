@@ -37,22 +37,28 @@ export const ROLE_PRESET_PREFIX = 'switchboard-role-';
  *
  * 这一组是「应该出现在 DSH 设置页、并因此被 DSH 持久化进系统配置文件」的最小集合。
  *
- * ⚠️ `readOnly` / `allowNestedDispatch` 属**组合期**事实（写进角色 preset 的插件清单），
- *    改动后由派发前热同步重建 preset；面板提示「不确定时完全重启 DSH」。
+ * ⚠️ **这里只放执行期事实**（改完下次派发即生效，不需要重建组合）。
+ *    `readOnly` / `allowNestedDispatch` 已**移出**本组（见 `ROLE_DEFINITION_FIELDS`）：
+ *    它们是角色 preset 插件清单的一部分（组合期事实），本就不该是「随手可调的旋钮」——
+ *    它们决定一个角色**是**什么，而不是它这次跑多强。
  */
 export const ROLE_SETTING_FIELDS = Object.freeze([
-  'backend', 'model', 'effort', 'provider', 'readOnly', 'allowNestedDispatch',
+  'backend', 'model', 'effort', 'provider',
 ]);
 
 /**
- * 角色的**定义**字段：作者维护的身份、persona 与 CLI argv 契约。
+ * 角色的**定义**字段：作者维护的身份、persona、权限边界与 CLI argv 契约。
  *
  * 这些**不该**住在 DSH 的系统配置文件里：它们是长篇的、很少改的，而 `cli*` 更是安全敏感
  * （「命令与参数来自用户配置、模型只能填受限占位符」的落点），不该变成一个网页表单里
  * 可以逐字段随手改的表面。它们住在插件自己的 `roles.json` 里。
+ *
+ * ⚠️ `readOnly` / `allowNestedDispatch` 也在这里：它们是**组合期**事实（写进角色 preset 的
+ *    插件清单），等于角色的固有属性 —— 只读边界和「能不能再往下派」属于设计，不属于调参。
+ *    历史教训：把它们做成面板旋钮，既让用户以为「改了立刻生效」，又让每次保存都要重建组合。
  */
 export const ROLE_DEFINITION_FIELDS = Object.freeze([
-  'title', 'description', 'instructions',
+  'title', 'description', 'instructions', 'readOnly', 'allowNestedDispatch',
   'cliDriver', 'cliCommand', 'cliPrefixArgs', 'cliArgs', 'cliPromptDelivery', 'cliCwd',
 ]);
 

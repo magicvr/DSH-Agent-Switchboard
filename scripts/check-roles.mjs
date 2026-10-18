@@ -747,11 +747,15 @@ section('buildRolePreset：角色 persona 与工具构成的唯一承载点');
           && plugin.config.agentPreset
             === rolePresetId(spawnTargets.find((role) => role.toolName === plugin.config.toolName).id))
         && delegates.every((plugin) => plugin.config.maxDepth === 4));
-    // CLI 目标不再产生 spawn 行（那正是中继子代理），改由本插件的宿主行直派。
-    check(`${platform}：CLI 目标改用直派宿主行，不产生 spawn 行`,
-      JSON.stringify(rowById(definition, `switchboard-cli-dispatch-${builtin.id}`)?.config?.cliDispatchFor)
-        === JSON.stringify(cliTargets.map((role) => role.id))
-        && !delegates.some((plugin) => cliTargets.some((role) => role.toolName === plugin.config.toolName)));
+    // ⚠️ 这里**曾经**断言「CLI 目标改用 `switchboard-cli-dispatch-<role>` 宿主行直派」。D34 把
+    //    那条路**整体删除**（审计/评审属于主代理的职责，CLI 角色是叶子；而且它调用了一个从未
+    //    定义的函数，真机上整条 preset 条目都会抛错）。现在断言的是**反面**：
+    //    CLI 目标既没有宿主行、也不产生 spawn 行 —— 它们对嵌套派发完全不可达。
+    check(`${platform}：CLI 目标是叶子（既无宿主行，也不产生 spawn 行）`,
+      rowById(definition, `switchboard-cli-dispatch-${builtin.id}`) === undefined
+        && definition.plugins.every((plugin) => plugin.config?.cliDispatchFor === undefined)
+        && !delegates.some((plugin) => cliTargets.some((role) => role.toolName === plugin.config.toolName)),
+      JSON.stringify(definition.plugins.map((plugin) => plugin.id)));
   }
 
   {
@@ -933,16 +937,23 @@ section('F2 / F3 回归');
 // --- 设置层与定义层的划分、以及三层合并 ---------------------------------------
 //
 // 设计：角色的**定义**（身份 / persona / CLI argv 契约）住在插件自己的 roles.json；
-// DSH 设置页只承载**旋钮**（backend / model / effort / provider / readOnly /
-// allowNestedDispatch）。split 模式下生效角色 = 文件定义 ⨝ 文件覆盖层 ⨝ 旋钮层。
+// DSH 设置页只承载**执行期旋钮**（backend / model / effort / provider）。split 模式下
+// 生效角色 = 文件定义 ⨝ 文件覆盖层 ⨝ 旋钮层。
 {
   section('设置层与定义层的字段划分');
   check('两个字段集不相交',
     ROLE_SETTING_FIELDS.filter(field => ROLE_DEFINITION_FIELDS.includes(field)).length === 0);
   check('定义集含 persona 与 CLI 契约',
     ['instructions', 'description', 'cliArgs', 'cliCommand'].every(f => ROLE_DEFINITION_FIELDS.includes(f)));
-  check('旋钮集含 backend / model / effort / readOnly / allowNestedDispatch',
-    ['backend', 'model', 'effort', 'readOnly', 'allowNestedDispatch'].every(f => ROLE_SETTING_FIELDS.includes(f)));
+  // ⚠️ `readOnly` / `allowNestedDispatch` 原本在旋钮集里，D34 起**移入定义集**：它们是组合期
+  //    事实（决定角色 preset 的插件清单），等于角色的固有属性 —— 只读边界与「能不能再往下派」
+  //    属于设计，不属于调参。做成旋钮既让人以为改了立刻生效，又让每次保存都要重建组合。
+  check('旋钮集只剩执行期字段（backend / model / effort / provider）',
+    JSON.stringify([...ROLE_SETTING_FIELDS].sort())
+      === JSON.stringify(['backend', 'effort', 'model', 'provider'].sort()));
+  check('readOnly / allowNestedDispatch 属定义、不再属旋钮',
+    ['readOnly', 'allowNestedDispatch'].every(f => ROLE_DEFINITION_FIELDS.includes(f))
+      && ['readOnly', 'allowNestedDispatch'].every(f => !ROLE_SETTING_FIELDS.includes(f)));
   // `cli*` 是安全敏感面（模型只能填受限占位符、命令与参数来自用户配置），
   // 明确断言它属于定义、不进设置表单。
   check('cli* 全部属定义、不在旋钮集',
@@ -951,12 +962,16 @@ section('F2 / F3 回归');
 
   section('carriesDefinition / pickOverrideFields');
   check('带 persona 的条目算定义', carriesDefinition({ id: 'a', instructions: 'i' }) === true);
-  check('只带旋钮的条目不算定义',
-    carriesDefinition({ id: 'a', model: 'm', backend: 'cli', readOnly: true }) === false);
+  // ⚠️ 这条的判据随 D34 变了：`readOnly` 现在是**定义**字段，所以带它的条目**算**定义。
+  //    仍要用「只有执行期旋钮」的条目来验证反面。
+  check('只带执行期旋钮的条目不算定义',
+    carriesDefinition({ id: 'a', model: 'm', backend: 'cli', effort: 'high' }) === false);
+  check('带只读边界的条目算定义（readOnly 已属定义层）',
+    carriesDefinition({ id: 'a', readOnly: true }) === true);
   check('非对象不算定义', carriesDefinition(null) === false && carriesDefinition('a') === false);
-  check('投影只保留 id 与旋钮，丢掉定义字段',
+  check('投影只保留 id 与执行期旋钮，丢掉定义字段（含 readOnly）',
     isDeepStrictEqual(pickOverrideFields({ id: 'a', title: 't', instructions: 'i', model: 'm',
-      cliArgs: ['x'], readOnly: true }), { id: 'a', model: 'm', readOnly: true }));
+      cliArgs: ['x'], readOnly: true, allowNestedDispatch: true }), { id: 'a', model: 'm' }));
   check('投影对无 id 条目返回 undefined', pickOverrideFields({ model: 'm' }) === undefined);
 
   section('mergeRoleLayers 三层合并（仅 split 模式调用）');

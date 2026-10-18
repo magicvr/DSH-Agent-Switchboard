@@ -1092,3 +1092,49 @@ bundle（`presets/switchboard.patch.yml`，`package.json` 的 `dsh.bundle.patch`
 
 
 ---
+
+## D34 · CLI 角色是叶子；只读与嵌套派发降为角色定义；面板只留执行期旋钮
+
+**决策：** 三件事一起改，它们互相支撑。
+
+1. **删除「嵌套直派 CLI 角色」机制**（D33 的 ③）：不再产出
+   `switchboard-cli-dispatch-<role>` 宿主行，删除 `config.cliDispatchFor`，删除那个分支。
+   **CLI 角色是叶子** —— 嵌套派发的目标只可能是 spawn 角色，由官方 `dsh-tool-subagent`
+   的委派行承载。
+2. **`readOnly` / `allowNestedDispatch` 从「旋钮」降为「定义」**：移出 `ROLE_SETTING_FIELDS`、
+   进入 `ROLE_DEFINITION_FIELDS`，因此不再进设置页、不再进文件的 `overrides` 投影，
+   由 `roles.json` 的定义层拥有。
+3. **面板操作区收到底部**：删除页头的「保存 / 放弃改动」；两个分支（split 旋钮表单 / legacy
+   卡片列表）底部统一为**取消在左、保存在最右**的靠右操作区，并给它们稳定的
+   `pageActionCancel` / `pageActionSave` 类名。⚠️ 页头按钮原先对**所有状态**可见，收到底部后
+   **错误态也必须补一条**，否则错误页会说「点取消可重试」却没有那个按钮（实测踩到）。
+
+**依据（已核实）：**
+
+- **设计直觉**：审计 / 评审属于**主代理**的职责，让实现者自己去叫审计不符合角色分工 —— 用户裁决。
+- **那条路从未在真机上工作过**：它调用的 `mountCliDispatchInThisScope` **根本没有定义**
+  （改名时漏下的悬空引用），于是「spawn 角色 + 任一 CLI 嵌套目标」的 preset 条目**整条抛错
+  失效**，子代理里一个 `delegate_to_*` 都没有。真机三次实验的观测逐条自洽：目标全 CLI →
+  什么都没有；混合（scout=spawn + 两个 CLI）→ 只有 `delegate_to_scout`；目标全 spawn →
+  三个全在 ⇒ **只有 spawn 委派行走得通**。
+- **夹具的盲区**：断言只覆盖宿主行的**生成**，从没 apply 过带 `cliDispatchFor` 的配置 ——
+  生成侧绿、应用侧从没跑过；`node --check` 也抓不到悬空引用（运行时才 ReferenceError）。
+- **两个字段本来就是组合期事实**（D32 补记一、`architecture.md` 3.1g 第 42 条）：它们决定
+  角色 preset 的插件清单，改一次要重建一次组合。做成旋钮既让人以为「改了立刻生效」，
+  又让每次保存都触发重建 —— 那是**设计**，不是调参。
+- **降级是零行为变化**：现有四角色的这两项在定义层与覆盖层**逐字段相同**（已逐个核对），
+  因此停止投影它们不改变任何生效值。
+
+**代价与边界：**
+
+- 失去「spawn 子代理 → CLI 角色」的嵌套能力。要跨模型独立验证时，把审计角色改成 spawn 即可
+  （`worker → reviewer` 走官方委派行）；CLI 角色始终由主代理直接派发。
+- 这两个字段现在只能改 `roles.json` 的**定义层**；若定义与覆盖层不一致，覆盖层仍会胜出
+  （合并是字段无关的），调整时要一起看。
+- 面板只剩执行期旋钮（backend / model / effort / provider / cliDriver）。
+- **未验收且未解决**：嵌套派发的完成通知归属 —— 实测 depth=2 的子代理 `[running]`、其调用方
+  已 `[inactive]`、主代理收不到任何通知、调用方也**没有**被唤醒（见 `architecture.md` §6）。
+  这与本次删除无关，是独立缺口。
+
+
+---

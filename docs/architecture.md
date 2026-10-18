@@ -299,6 +299,7 @@
     - 角色指令写入 `@deepseek-ai/dsh-persona` 行的 `config.prefix`，并**替换**模板里那一行 persona，而不是另加一行：同一 preset 内两行会向同一作用域重复注册 `deployment:persona-prefix`，而 `dsh-system-prompt` 对同作用域重名段落是抛错的（`prompt section "…" is already registered in this scope`）。
 41. **CLI 角色没有 preset；它的工具按 agent 安装（D33）。** 工具按作用域可见、不跨 preset 继承，所以**直派工具**不能注册在 preset 作用域：`restrict` 只遮蔽继承来的工具，落在 preset 层会被嵌套子代理继承，`allowNestedDispatch: false` 就被绕过。做法与官方 standing 组合同构 —— `agent.ctx.inject(['tools'], …)` 按 agent 注册，`scopeChainOf(scopeOf(agent.ctx)).includes(compositionScope)` 判归属，配 `agent/created` / `agent/disposed` / `tools/change` 三钩子与启动 reconcile（`src/index.js` 的 `mountCliDispatchTools`）。**嵌套**可达性由调用方 preset 里的一行本插件条目承载（`config.cliDispatchFor: [目标 id]`，`src/index.js` 的 `mountCliDispatchInThisScope`），它只在本 preset 作用域注册这些直派工具。
     - 继承的代价是显式的：CLI 角色因此**不再产出角色 preset**（`buildRolePreset` 返回 `undefined`），`switchboard-role-<cliId>` 不再出现在 preset roster 里 —— 这一点在真机自检里可直接核对。
+    - ⚠️ **嵌套目标只可能是 spawn 角色**（D34）：CLI 角色是叶子，由主代理直接派发。曾经的「宿主行 + `cliDispatchFor`」那条路**整体删除** —— 它调用的 `mountCliDispatchInThisScope` 根本没有定义（悬空引用），整条 preset 条目会抛错；而且设计上审计 / 评审本就属于主代理的职责。
 42. **顺序与热更新边界（必须如实标注的代价）。** 先 `agentPresets.register(definition)`，再挂 `dsh-tool-subagent`（装载期校验预设已声明）。由此得到一个后果：`instructions`（persona）、`readOnly`、`allowNestedDispatch` 现在是**组合期**事实，改它们需要重新注册 preset——当前实现由**派发前热同步**重建（`ensureCompositionCurrent`），失败时退回上一版组合并在自检里报告；不确定时完全重启 DSH。`model` / `effort` / `cliDriver` 仍是执行期读取，下次派发即生效。自检新增 `角色 preset（persona 与工具构成的承载点）` 一行，报告已注册 preset 的 id 与行数（`src/index.js`）。
 43. **`fork` 后端已移除。** `dsh-subagent-fork-in-process` 声明 `capabilities.agentPreset: false` 且 `inheritsParentContext: true`；`dsh-subagent` 的 `assertCapabilities` 与 `dsh-tool-subagent` 的 `SubagentPresetSelection.assertProvider`（`tool-subagent: provider "..." does not support independent agent preset selection`）都会对此抛错。也就是说 fork 子代理**无法**拥有自己的角色指令与工具限制，保留它只会留下一个静默失效的选项。`src/roles.js` 的 `BUILTIN_PROVIDERS` 现为 `['spawn']`，`backend: 'fork'` 被角色校验拒绝。
 44. **派发语义：一律异步受理。** 工具的输出 schema 固定为 `{kind: 'activation', subagentId}`（`const: "activation"`），`execute` 在 `subagents.startActivation({..., delivery: 'parent'})` 后立即返回；没有前台 / 后台模式，子代理结果稍后以完成通知送达。旧的「delegate 阻塞并返回子输出」描述已不成立；注入的调度规则与路由指引（`scripts/lib/preset-generator.mjs` 的 `selfEntry`、`src/roles.js` 的 `roleGuidanceText`）已按此改写。
@@ -542,7 +543,7 @@ preset 的会话里对 `worker`（`backend=cli(codex)`）派发一次真实任�
 读到了这份工作副本」，**不依赖被派发方是否诚实**——比让它自述"我做到了"可靠得多。本次两项均一致。
 证据文件留在 `raw/p2-cli-dispatch-verify.md`（`raw/` 不提交）。
 
-**仍未验收：** 嵌套 CLI 派发（调用方 preset 里的 `cliDispatchFor` 宿主行）、GUI 取消/停止沿
+**仍未验收：** GUI 取消/停止沿
 `exec.signal` 的传播、以及客户端任务面板的视觉表现（折叠与失败自动展开）。
 
 **真机取证（2026-10-03，`worker=cli(codex)` 实测）：** 一次 `node -v` 任务中，当时的阻塞式工具 `switchboard_cli_run_worker`（**该工具已随 D33 删除**）返回的 `stdout` 只有 172 字符（最终答案），`stderr` 有 5723 字符 —— 含 codex banner 与路由事实、**角色指令回显**、`exec "<powershell>" -Command 'node -v; Get-Location' … succeeded in 132ms` 的**工具轨迹**、`tokens used` 计数与重连告警。这正是用户报告「工具调用等消息被当成文本显示」的内容来源，也证明通道分区的前提成立。同一份结果的 `routeSummary` 自报 `model=gpt-6.1-sol`、`effort=medium`、`sandbox=workspace-write`，与角色配置一致 —— 把 stderr 折起来并没有丢掉「配置真的生效」的证据。**折叠交互与失败自动展开仍待人工查看（GUI 视觉），不能以离线断言代替。** ⚠️ 直派后同样的分区原则不变，只是数据源从「工具返回值」变成「job 的输出环」（`job.append(text, { channel })`）。

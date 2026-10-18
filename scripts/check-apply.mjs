@@ -1367,13 +1367,13 @@ section('契约模拟（真实 Config / 工具插件，startActivation 为桩）
           && delegateRows.every(row => row.config.provider === 'spawn'
             && row.config.agentPreset === presetIdOfToolName[row.config.toolName])
         : delegateRows.length === 0);
-    // CLI 目标不产生 spawn 行（那正是中继子代理），改由本插件的宿主行直派。
-    check(`${id} preset：CLI 目标走 cliDispatchFor 直派宿主行（allowNestedDispatch=${nested}）`,
-      nested
-        ? JSON.stringify(definition.plugins.find(plugin => plugin.id === `switchboard-cli-dispatch-${id}`)
-          ?.config?.cliDispatchFor) === JSON.stringify(cliTargets)
-          && !delegateRows.some(row => cliTargets.some(target => toolNameOf(target) === row.config.toolName))
-        : definition.plugins.every(plugin => plugin.config?.cliDispatchFor === undefined),
+    // ⚠️ 这里**曾经**断言「CLI 目标走 `cliDispatchFor` 直派宿主行」。D34 把那条路**整体删除**：
+    //    审计/评审属于**主代理**的职责，CLI 角色是**叶子**，嵌套目标只可能是 spawn 角色，
+    //    由官方委派行承载。于是现在断言的是**反面**：任何 preset 都不得再出现 `cliDispatchFor`，
+    //    且 CLI 目标不得出现在 spawn 委派行里（那会是旧的中继子代理）。
+    check(`${id} preset：不再有 cliDispatchFor 宿主行，CLI 目标只是叶子（allowNestedDispatch=${nested}）`,
+      definition.plugins.every(plugin => plugin.config?.cliDispatchFor === undefined)
+        && !delegateRows.some(row => cliTargets.some(target => toolNameOf(target) === row.config.toolName)),
       JSON.stringify(definition.plugins.map(plugin => plugin.id)));
   }
   // ⚠️ 这里**曾经**断言 CLI 角色 preset（`leaf`/`organizer`）的行构成：包裹 persona、自身
@@ -1539,8 +1539,12 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
     check('split：文件里的角色定义逐字未被覆盖',
       JSON.stringify(splitAfter.roles) === JSON.stringify(splitBefore.roles),
       JSON.stringify({ before: splitBefore.roles, after: splitAfter.roles }));
-    check('split：旋钮覆盖写进文件的 overrides 层',
-      JSON.stringify(splitAfter.overrides) === JSON.stringify([{ id: 'worker', model: 'from-settings', readOnly: true }]),
+    // ⚠️ `readOnly` 与 `allowNestedDispatch` 已**移出旋钮层**（D34）：它们是组合期事实、属于
+    //    角色的固有属性，住在 roles.json 的定义层。于是它们在 Config 的 `roleSettings` 里
+    //    既不被 schema 声明、也不进文件的 `overrides` 投影 —— 夹具里传了也只会被丢掉。
+    check('split：旋钮覆盖写进文件的 overrides 层（只含执行期字段）',
+      JSON.stringify(splitAfter.overrides) === JSON.stringify([{ id: 'worker', model: 'from-settings' }])
+        && !splitAfter.overrides.some(entry => 'readOnly' in entry || 'allowNestedDispatch' in entry),
       JSON.stringify(splitAfter.overrides));
     check('split：定义与旋钮之外的顶层字段仍原样保留',
       splitAfter.formatVersion === splitBefore.formatVersion && splitAfter.provider === splitBefore.provider);

@@ -183,21 +183,14 @@ export function buildRolePreset(role, options = {}) {
     if (entry) plugins.push(entry);
   }
 
-  // ③ 宿主行：让**本角色**在自己的作用域里拿到需要的工具。
+  // ③ **已删除（D34）**：这里曾经还有一条 `switchboard-cli-dispatch-<role>` 宿主行，声明
+  //    `config.cliDispatchFor: [CLI 目标 id…]`，让 spawn 子代理也能嵌套派发给 CLI 角色。
+  //    设计上审计/评审属于**主代理**的职责，让实现者自己去叫审计违背设计直觉；CLI 角色
+  //    因此是**叶子**。而且那条路从未在真机上工作过 —— 它调用的
+  //    `mountCliDispatchInThisScope` 根本没有定义（悬空引用），整条 preset 条目会抛错。
   //
-  //    - `cliDispatchFor`：可嵌套派发的 CLI 目标 —— 直派后台任务，**不需要**中继子代理。
-  //      只列 CLI 目标：spawn 目标仍由 ④ 的官方委派行承载。
-  const cliTargets = nested.filter(item => item.backend === CLI_BACKEND).map(item => item.id);
-  if (cliTargets.length > 0) {
-    plugins.push({
-      id: `switchboard-cli-dispatch-${role.id}`,
-      name: '@magicvr/dsh-agent-switchboard',
-      config: { cliDispatchFor: cliTargets },
-    });
-  }
-
   // ④ 嵌套派发入口：**spawn** 目标各一行受控委派，指向对方的角色 preset。
-  //    CLI 目标已在 ③ 直派，不再产生 spawn 行 —— 那正是旧的中继子代理。
+  //    （CLI 目标不在其中：它们是叶子，由主代理直接派发。）
   for (const target of nested.filter(item => item.backend !== CLI_BACKEND)) {
     plugins.push({
       id: `switchboard-delegate-${target.id}`,
