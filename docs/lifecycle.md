@@ -152,7 +152,7 @@ desktop CLI 硬拒绝、CLI 必须带 profile 及带 profile 的 `--help` 会初
 
 ### 6.3 仍未验证
 
-`0.2.1-rc.1` 迁移已通过一次**真实重启**验收（见 §6.4）：插件正常装载、`plugin:verify` 报 consistent、角色 preset 在运行期注册成功。⚠️ **D33 之后 preset 数量是「spawn 角色数」而非角色总数**：CLI 角色直派后台任务，不再产出 preset —— 真机自检的 `preset roster` 已印证（`worker` 这个 `cli` 角色不在其中，其余三个 spawn 角色在）。**仍未验证的只剩一项**：`delegate_to_*` 在**选中 Switchboard preset 的会话**里的实际挂载与一次真实派发——本轮根实例自检如实报告「本作用域不挂载角色工具」（根条目只注册自检并同步配置），因此 `agentPreset` 装载期校验通过后子代理**实际拿到的**工具构成与只读裁剪仍只有离线证据（D32）。`fork` 后端移除后的角色校验属该批；`cliToolFor` 子作用域注册已随 D33 删除，改为 `cliDispatchFor` 的直派宿主行（离线断言覆盖，真机未验收）。客户端半边本轮**仅静态核实**，未做真实 GUI 往返（含 split 旋钮表单与「外部 CLI」下拉）。GUI 安装、启用、卸载及兼容豁免按钮的确切文案未验证；本轮未执行包安装 / 移除或版本写入。客户端拒绝保存的错误展示仍是已知限制。
+`0.2.1-rc.1` 迁移已通过一次**真实重启**验收（见 §6.4）：插件正常装载、`plugin:verify` 报 consistent、角色 preset 在运行期注册成功。⚠️ **D33 之后 preset 数量是「spawn 角色数」而非角色总数**：CLI 角色直派后台任务，不再产出 preset —— 真机自检的 `preset roster` 已印证（`worker` 这个 `cli` 角色不在其中，其余三个 spawn 角色在）。**「实际挂载 + 一次真实派发」已于 2026-10-18 补齐**：在选中 Switchboard preset 的会话里对 `worker`（`cli(codex)`）派发真实任务，工具**立即**返回 `{status:'accepted', jobId}`，随后收到独立完成通知（jobId 一致），`job_output` 读到有界输出；并用「让 CLI 回报 `sha256(src/roles.js)` 与 HEAD、取证方在仓库侧独立重算」的手法排除了自述水分 —— 两项逐字一致（详见 [`architecture.md`](./architecture.md) §6 真机取证）。**仍未验收**：嵌套 CLI 派发（`cliDispatchFor` 宿主行，仅离线断言）、GUI 取消/停止沿 `exec.signal` 的传播、客户端任务面板的视觉表现。`fork` 后端移除后的角色校验属该批；`cliToolFor` 子作用域注册已随 D33 删除。客户端半边**仅静态核实**，未做真实 GUI 往返（含 split 旋钮表单与「外部 CLI」下拉 —— 其中「下拉出现、选择落进设置并同步进文件」已由用户真机确认）。GUI 安装、启用、卸载及兼容豁免按钮的确切文案未验证；本轮未执行包安装 / 移除或版本写入。客户端拒绝保存的错误展示仍是已知限制。
 
 ### 6.4 当前本机状态（真机实测）
 

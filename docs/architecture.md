@@ -515,6 +515,36 @@ jobId 由 Jobs 管理，schema、返回值与 render 均不暴露它；客户端
 
 **通道分区呈现：** 早先面板把 `job.chunks` 在**同一个 `<pre>` 里顺序拼接**成 `[stdout] …` / `[stderr] …`，于是外部 CLI 的**过程与工具轨迹被当作正文**一起平铺 —— 用户要观察的是 CLI 的结论，不是它的工具调用流水。真因不在数据源，而在**通道未被区分**：codex 非 `--json` 模式下 stdout 只有最终消息，路由事实头与过程/工具轨迹都在 stderr（`docs/cli-backends.md` §2.4 的对照组实测；同节用例 8 证明 `--json` 会把事件流改到 stdout 并让 stderr 变空，从而牺牲可读路由事实）。因此修法是**按通道分区**，而不是猜 stderr 里哪一行像工具调用：正文区只显示 stdout（流式、贴底，运行中默认展开）；stderr 归入独立 `<details>`「过程与诊断」，**默认折叠**，失败（`failed` / `killed`）且**用户未手动干预**时自动展开并改用错误色（手动折叠优先，不被后续失败状态覆盖）；从 stderr 头部按 `ROUTE_FACT_KEYS` 抽出的路由事实以单独一行显示在折叠区**之外**，保证「CLI 真的接受了本次模型/沙箱/强度参数」这条证据不随折叠隐藏。折叠只是展示层：chunks 原样保留，有界与 gap 语义不变，因此「不美化、不丢弃」（D8）未被削弱。客户端无法 import Host 的抽取实现，故镜像一份（`logic.js` 为权威，内联进 `src/client/index.js`），由 `scripts/check-client.mjs` 断言键表与抽取行为与 Host 一致。
 
+**真机取证（2026-10-18，直派受理 → 完成通知 → `job_output` 全链路）：** 在选中 Switchboard
+preset 的会话里对 `worker`（`backend=cli(codex)`）派发一次真实任务，工具**立即**返回：
+
+```json
+{"status":"accepted","jobId":"cli-c2861020613d4ac3","role":"worker",
+ "summary":"backend=cli(codex) model=gpt-6-luna effort=high",
+ "diagnostic":"已作为后台任务受理；完成后会收到完成通知，用 job_output 读取输出"}
+```
+
+随后收到独立事件 `background job cli-c2861020613d4ac3 (cli: 实现者) finished
+[status: completed, exit code: 0]` —— **jobId 与受理回执逐字一致**（闭环），`job_output` 读到
+有界输出（头部被环容量截断，符合 `gapBefore` 语义）。三条旁证：
+
+- **没有中继子代理**：让 CLI 自报它可见的工具名，得到的是 codex **自己的**工具集
+  （`functions.exec` / `functions.wait` / `functions.request_user_input*` / `collaboration.*` /
+  `clock.sleep` / `mcp__cua_repl.*`），**不含任何 DSH 角色工具**。
+- **提示词投递形态正确**：任务要求 CLI 逐字回抄「它实际收到的正文」，结果正是
+  `角色 instructions` + `\n\n---\n\n` + 任务包（persona 前置、任务在后）。
+- **覆盖层在 preset 作用域生效**：回执 `summary` 报 `model=gpt-6-luna`（设置层与 `overrides`
+  的值），而**定义层**仍是 `gpt-6.1-sol` —— 这正是「preset 作用域必须合并 `overrides`」
+  那条修复在真实派发上的证据。
+
+**方法论（值得复用的取证手法）：** 让被派发方记录 `sha256(src/roles.js)` 与
+`git rev-parse --short HEAD`，取证方在仓库侧**独立重算**两者。两项逐字一致即证明「它确实在本机
+读到了这份工作副本」，**不依赖被派发方是否诚实**——比让它自述"我做到了"可靠得多。本次两项均一致。
+证据文件留在 `raw/p2-cli-dispatch-verify.md`（`raw/` 不提交）。
+
+**仍未验收：** 嵌套 CLI 派发（调用方 preset 里的 `cliDispatchFor` 宿主行）、GUI 取消/停止沿
+`exec.signal` 的传播、以及客户端任务面板的视觉表现（折叠与失败自动展开）。
+
 **真机取证（2026-10-03，`worker=cli(codex)` 实测）：** 一次 `node -v` 任务中，当时的阻塞式工具 `switchboard_cli_run_worker`（**该工具已随 D33 删除**）返回的 `stdout` 只有 172 字符（最终答案），`stderr` 有 5723 字符 —— 含 codex banner 与路由事实、**角色指令回显**、`exec "<powershell>" -Command 'node -v; Get-Location' … succeeded in 132ms` 的**工具轨迹**、`tokens used` 计数与重连告警。这正是用户报告「工具调用等消息被当成文本显示」的内容来源，也证明通道分区的前提成立。同一份结果的 `routeSummary` 自报 `model=gpt-6.1-sol`、`effort=medium`、`sandbox=workspace-write`，与角色配置一致 —— 把 stderr 折起来并没有丢掉「配置真的生效」的证据。**折叠交互与失败自动展开仍待人工查看（GUI 视觉），不能以离线断言代替。** ⚠️ 直派后同样的分区原则不变，只是数据源从「工具返回值」变成「job 的输出环」（`job.append(text, { channel })`）。
 
 调用外部 CLI 至少要考虑：

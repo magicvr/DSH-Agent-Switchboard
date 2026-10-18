@@ -1068,8 +1068,15 @@ for (const field of ["persona", "toolFilter"])
 - 注入块已被删除的设置层字段（`wrapper*`）若残留在 profile patch 或 `roles.json` 的 `volatile` 里，
   现在是**死配置**：无害，但应清理。
 - 客户端只能静态验证：面板的 split 旋钮表单（含「外部 CLI」下拉）需要真机往返确认。
-- 真机验收边界：CLI 直派的后台任务链路（受理 → 完成通知 → `job_output`）已在自检层面确认
-  新代码生效（roster 与 roleConfig 两处），完整派发链路仍待一次真实 CLI 任务验收。
+- 真机验收：CLI 直派的后台任务链路（受理 → 完成通知 → `job_output`）**已于 2026-10-18 验收通过**
+  —— 受理回执 `{status:'accepted', jobId:'cli-c2861020613d4ac3', summary:'backend=cli(codex)
+  model=gpt-6-luna effort=high'}`，随后完成通知的 jobId 与之一致（闭环）；CLI 自报的工具清单里
+  **没有任何 DSH 角色工具**（旁证「没有中继子代理」）；任务回抄的「实际收到正文」证实投递形态是
+  `instructions + --- + 任务包`；回执 `summary` 报的是**覆盖层**的 model（定义层仍是旧值），
+  即本决策第 3 条「preset 作用域必须合并 `overrides`」在真实派发上成立。取证手法与证据见
+  [`architecture.md`](./architecture.md) §6 真机取证。
+- **仍未验收**：嵌套 CLI 派发（`cliDispatchFor` 宿主行，仅离线断言）、GUI 取消 / 停止沿
+  `exec.signal` 的传播、客户端任务面板的视觉表现。
 
 #### D32 补记三：profile 里的重复 preset 声明已不存在（结案）
 
