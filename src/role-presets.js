@@ -151,10 +151,16 @@ export function buildRolePreset(role, options = {}) {
   //    中继子代理退役后，这份 preset（包裹 persona + 专属 CLI 工具行）整体失去意义。
   if (isCli) return undefined;
 
-  // 该角色可以继续派发出去的角色（只有允许嵌套时才有）。
-  const nested = role.allowNestedDispatch
-    ? (options.roles ?? []).filter(item => item.id !== role.id)
-    : [];
+  // 该角色可以继续派发出去的角色。
+  //
+  // ⚠️ 目标是**显式清单** `canDispatch`（D35）：只有列在里面的角色才可能被嵌套派发。
+  //    旧的布尔 `allowNestedDispatch: true` 仍被兼容，语义是「除自己以外**全部**角色」——
+  //    它的问题正是"太宽"：新增一个角色就会自动获得派发入口。自检会提示改用显式清单。
+  const others = (options.roles ?? []).filter(item => item.id !== role.id);
+  const allowedIds = role.canDispatch?.length > 0
+    ? role.canDispatch
+    : role.nestedDispatchLegacy ? others.map(item => item.id) : [];
+  const nested = others.filter(item => allowedIds.includes(item.id));
   const delegateToolNames = nested.map(item => item.toolName);
 
   const permissions = dispatchPermissionsFor(role, {

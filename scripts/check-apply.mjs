@@ -1663,19 +1663,36 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
     //    其进程也没有 DSH 工具 —— 实测 codex 只有 13 个自家工具）。旧架构下它有意义（中继子代理的
     //    preset 靠它挂嵌套行），D33 之后必须让用户看见它已经失效，否则会以为打开就能嵌套派发。
     // ⚠️ 夹具必须**完全合法**：`normalizeRole` 在有任何错误时返回 `role: null`，角色会被整条丢掉，
-    //    那样这条告警根本无从触发（第一版就是这么写的，断言报空告警 —— 夹具问题，不是产品问题）。
+    //    那样告警根本无从触发（第一版就是这么写的，断言报空告警 —— 夹具问题，不是产品问题）。
     //    codex 的 argv 含 {effort}，因此 effort 是必填的。
+    //
+    // ⚠️ 这里现在是**嵌套派发的配置体检**（D35）：四种情况都必须让用户看见，否则它们会静默无效。
+    const cliRoleDefaults = { description: 'd', instructions: 'i', backend: 'cli', model: 'm',
+      effort: 'medium', cliDriver: 'codex', cliCwd: 'C:/w', ...cliFieldsFor('codex', false) };
     const inertCtx = makeCtx();
     apply(inertCtx, Config({ provider: 'self', roles: [
-      { id: 'cli-worker', description: 'd', instructions: 'i', backend: 'cli', model: 'm',
-        effort: 'medium', cliDriver: 'codex', cliCwd: 'C:/w', ...cliFieldsFor('codex', false),
-        allowNestedDispatch: true }] }));
+      { id: 'cli-worker', ...cliRoleDefaults, allowNestedDispatch: true }] }));
     const inert = await inertCtx.tools.get('switchboard_selftest').execute({});
-    check('CLI 角色打开嵌套开关时自检明确告警（该旋钮对 CLI 角色无效）',
-      inert.warnings.includes('cli-worker') && inert.warnings.includes('对 CLI 角色无效')
-        // 面板已不提供这个旋钮（D34），所以告警必须**指路文件**，否则用户无处可改。
-        && inert.warnings.includes('roles.json'),
+    check('CLI 角色配了嵌套目标时告警：CLI 是叶子，目标会被忽略',
+      inert.warnings.includes('cli-worker') && inert.warnings.includes('叶子'),
       JSON.stringify({ warnings: inert.warnings, errors: inert.configErrors }));
+    // 旧布尔在 spawn 角色上仍然生效，但要提示改用显式清单（语义「除自己以外全部」太宽）。
+    const legacyCtx = makeCtx();
+    apply(legacyCtx, Config({ provider: 'self', roles: [
+      { id: 'legacy-worker', description: 'd', instructions: 'i', model: 'm', effort: 'medium',
+        allowNestedDispatch: true }] }));
+    const legacyNested = await legacyCtx.tools.get('switchboard_selftest').execute({});
+    check('旧布尔 allowNestedDispatch 仍生效，但自检提示改用显式清单 canDispatch',
+      legacyNested.warnings.includes('allowNestedDispatch') && legacyNested.warnings.includes('canDispatch'),
+      JSON.stringify({ warnings: legacyNested.warnings }));
+    // 自指：会被过滤，必须看得见。
+    const selfRefCtx = makeCtx();
+    apply(selfRefCtx, Config({ provider: 'self', roles: [
+      { id: 'self-ref', description: 'd', instructions: 'i', model: 'm', effort: 'medium',
+        canDispatch: ['self-ref'] }] }));
+    const selfRef = await selfRefCtx.tools.get('switchboard_selftest').execute({});
+    check('canDispatch 列自己时明确告警（该条目会被忽略）',
+      selfRef.warnings.includes('列了自己'), JSON.stringify({ warnings: selfRef.warnings }));
     const spawnNestedCtx = makeCtx();
     apply(spawnNestedCtx, Config({ provider: 'self', roles: [
       { id: 'spawn-worker', description: 'd', instructions: 'i', model: 'm', effort: 'medium',

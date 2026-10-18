@@ -62,7 +62,11 @@ section('合法角色：规范化结果');
   check('工具名由 id 推导', role?.toolName === 'delegate_to_scout');
   check('readOnly 透传', role?.readOnly === true);
   check('backend 默认 spawn', role?.backend === 'spawn');
-  check('allowNestedDispatch 默认 false', role?.allowNestedDispatch === false);
+  // ⚠️ D35 起行为由**派生字段** `mayDispatch` 表达（旧的布尔 allowNestedDispatch 仍被兼容读取）：
+  //    没给目标清单也没给布尔 ⇒ 不可继续派发。
+  check('canDispatch 默认为空、mayDispatch 默认 false',
+    Array.isArray(role?.canDispatch) && role.canDispatch.length === 0
+      && role.mayDispatch === false && role.nestedDispatchLegacy === false);
 }
 
 section('toolConfigFor：新契约（persona/toolFilter 已移入角色 preset）');
@@ -756,6 +760,23 @@ section('buildRolePreset：角色 persona 与工具构成的唯一承载点');
         && definition.plugins.every((plugin) => plugin.config?.cliDispatchFor === undefined)
         && !delegates.some((plugin) => cliTargets.some((role) => role.toolName === plugin.config.toolName)),
       JSON.stringify(definition.plugins.map((plugin) => plugin.id)));
+    // ⚠️ 本节最关键的一条（D35）：目标是**显式清单**，不是「除自己以外全部」。
+    //    没有它，"只给探子"这类设计意图只能靠"目标恰好是 CLI 角色"这种巧合维持 ——
+    //    一旦新增一个 spawn 角色，调用方就会**自动**获得派发入口。
+    const only = buildRolePreset({ ...builtin, canDispatch: [spawnTargets[0].id] },
+      { platform, maxDepth: 3, roles });
+    const onlyDelegates = only.plugins.filter((plugin) => plugin.name === '@deepseek-ai/dsh-tool-subagent');
+    check(`${platform}：canDispatch 只列出 scout 时，只生成 scout 一行（其余目标不可达）`,
+      JSON.stringify(onlyDelegates.map((plugin) => plugin.config.toolName))
+        === JSON.stringify([spawnTargets[0].toolName]),
+      JSON.stringify(onlyDelegates.map((plugin) => plugin.config.toolName)));
+    check(`${platform}：canDispatch 列出的 CLI 角色是叶子，不生成任何行`,
+      buildRolePreset({ ...builtin, canDispatch: [cliTargets[0].id] }, { platform, maxDepth: 3, roles })
+        .plugins.every((plugin) => plugin.name !== '@deepseek-ai/dsh-tool-subagent'),
+      JSON.stringify({ cli: cliTargets[0]?.id }));
+    check(`${platform}：canDispatch 列自己会被过滤（无自指行）`,
+      buildRolePreset({ ...builtin, canDispatch: [builtin.id] }, { platform, maxDepth: 3, roles })
+        .plugins.every((plugin) => plugin.name !== '@deepseek-ai/dsh-tool-subagent'));
   }
 
   {
@@ -951,9 +972,14 @@ section('F2 / F3 回归');
   check('旋钮集只剩执行期字段（backend / model / effort / provider）',
     JSON.stringify([...ROLE_SETTING_FIELDS].sort())
       === JSON.stringify(['backend', 'effort', 'model', 'provider'].sort()));
-  check('readOnly / allowNestedDispatch 属定义、不再属旋钮',
-    ['readOnly', 'allowNestedDispatch'].every(f => ROLE_DEFINITION_FIELDS.includes(f))
-      && ['readOnly', 'allowNestedDispatch'].every(f => !ROLE_SETTING_FIELDS.includes(f)));
+  check('readOnly / canDispatch 属定义、不再属旋钮',
+    ['readOnly', 'canDispatch'].every(f => ROLE_DEFINITION_FIELDS.includes(f))
+      && ['readOnly', 'canDispatch'].every(f => !ROLE_SETTING_FIELDS.includes(f)));
+  // ⚠️ 旧的布尔 `allowNestedDispatch` **不在**定义集里：它只是被兼容读取的遗留输入
+  //    （D35 用显式目标清单 `canDispatch` 取代它），出现在定义集里会让人以为还能用它配置。
+  check('旧的布尔 allowNestedDispatch 不再出现在定义字段清单里',
+    !ROLE_DEFINITION_FIELDS.includes('allowNestedDispatch')
+      && !ROLE_SETTING_FIELDS.includes('allowNestedDispatch'));
   // `cli*` 是安全敏感面（模型只能填受限占位符、命令与参数来自用户配置），
   // 明确断言它属于定义、不进设置表单。
   check('cli* 全部属定义、不在旋钮集',

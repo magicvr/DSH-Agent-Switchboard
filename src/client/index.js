@@ -824,9 +824,9 @@ window.__ModuleLoader__.load({
           h('input', {
             type: 'checkbox',
             checked: role[key] === true,
-            // ⚠️ CLI 角色的「允许再派发」无效（CLI 角色没有 preset，其进程也没有 DSH 工具），
-            //    置灰但保留已存的值 —— 不悄悄改用户数据。
-            disabled: disabled || (key === 'allowNestedDispatch' && isCli),
+            // ⚠️ 这里**曾经**对 CLI 角色的「允许再派发」置灰 —— 那个复选框已由显式目标清单
+            //    （`canDispatch`）取代（D35），现在只剩 `readOnly` 一个复选框，不需要特例。
+            disabled,
             onChange: (e) => {
               const checked = e.target.checked;
               if (key === 'readOnly' && isCli) {
@@ -835,8 +835,7 @@ window.__ModuleLoader__.load({
               } else set(key, checked);
             },
           }),
-          h('span', { style: { color: 'var(--dsw-alias-label-secondary)' } },
-            key === 'allowNestedDispatch' && isCli ? `${label}（对 CLI 角色无效）` : label),
+          h('span', { style: { color: 'var(--dsw-alias-label-secondary)' } }, label),
         );
 
       return h(
@@ -879,9 +878,17 @@ window.__ModuleLoader__.load({
         ),
         h(
           'div',
-          { style: { display: 'flex', gap: '16px', marginBottom: '8px' } },
+          { style: { display: 'flex', gap: '16px', marginBottom: '8px', alignItems: 'center' } },
           checkbox('readOnly', '只读'),
-          checkbox('allowNestedDispatch', '允许再派发'),
+          // ⚠️ 旧的布尔「允许再派发」已由**显式目标清单**取代（D35）：布尔的语义是「除自己以外
+          //    全部」，新增角色会自动获得派发入口。这里改为逗号分隔的角色 id 清单。
+          field('可派发给（角色 id，逗号分隔；留空 = 不可继续派发）',
+            h('input', {
+              type: 'text', disabled, style: inputStyle(),
+              value: (role.canDispatch ?? []).join(', '),
+              onChange: (e) => set('canDispatch', String(e.target.value ?? '')
+                .split(',').map(item => item.trim()).filter(item => item.length > 0)),
+            })),
         ),
         field('描述（主代理据此判断何时派给谁）', text('description', '这个角色负责什么')),
         field(
@@ -989,7 +996,7 @@ window.__ModuleLoader__.load({
             h('strong', { className: 'rowName' }, role.title?.trim() || role.id || '(未命名)'),
             h('code', { style: { fontSize: '11px' } }, role.id || '(待填写 id)'),
             badge(mechanism), role.model ? badge(role.model) : null,
-            role.readOnly ? badge('只读') : null, role.allowNestedDispatch ? badge('允许再派发') : null),
+            role.readOnly ? badge('只读') : null, (role.canDispatch ?? []).length > 0 ? badge('可继续派发') : null),
           h('div', { className: 'rowActions', style: { display: 'flex', gap: '6px' } },
             button(editing ? '收起' : '编辑', editing ? onCancel : onEdit, { disabled, expanded: editing }),
             index !== 'new' ? button('删除', onConfirmDelete, { disabled, danger: true }) : null)),
@@ -1107,7 +1114,7 @@ window.__ModuleLoader__.load({
       const beginEdit = id => { setConfirmingIndex(null); setEditingId(id); setCardProblem(null); };
       const cancelEdit = () => { setConfirmingIndex(null); setEditingId(null); setCardProblem(null); };
       const newRole = { id: '', description: '', instructions: '', backend: 'spawn', model: '',
-        effort: 'medium', readOnly: false, allowNestedDispatch: false };
+        effort: 'medium', readOnly: false, canDispatch: [] };
       const addRole = () => beginEdit('new');
 
       /**
@@ -1253,17 +1260,9 @@ window.__ModuleLoader__.load({
               text: result.ok ? '已保存旋钮设置。模型、强度与外部 CLI 选择下次派发即生效；只读与能否嵌套派发属角色定义（roles.json），本页不改。' : result.message });
           } finally { setBusy(false); }
         };
-        const checkbox = (entry, index, field, label) => {
-          // ⚠️ CLI 角色的「允许嵌套派发」**无效**：CLI 角色不产出角色 preset，没有地方承载嵌套行；
-          //    而 CLI 进程本身也只有它自己的工具（实测 codex 只有 13 个自家工具、无任何 DSH 工具），
-          //    根本无法调用 delegate_to_*。置灰 + 说明，但**不清值** —— 不悄悄改用户的数据。
-          const inert = field === 'allowNestedDispatch' && entry.backend === 'cli';
-          return h('label', {
-            style: { display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px',
-              color: inert ? 'var(--dsw-alias-label-secondary)' : undefined },
-          }, h('input', { type: 'checkbox', checked: entry[field] === true, disabled: busy || inert,
-            onChange: (event) => patch(index, field, event?.target?.checked === true) }), label);
-        };
+        // ⚠️ 这里**曾经**有一个 `checkbox` 助手，用来渲染「只读 / 允许嵌套派发」两个旋钮
+        //    （还带一段「CLI 角色的嵌套开关无效」的置灰逻辑）。两者都已移出旋钮层（D34/D35），
+        //    该助手随之删除 —— 留着会让人以为面板还能改这两件事。
         return wrap(h('div', null,
           h('div', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '8px' } },
             '角色定义（persona、工具构成、CLI 参数）住在 $DSH_HOME/agent-switchboard/roles.json，'
@@ -1307,12 +1306,15 @@ window.__ModuleLoader__.load({
               onChange: (event) => patch(index, 'effort', event?.target?.value || undefined) },
             h('option', { value: '' }, '（不指定）'),
             EFFORTS.map((value) => h('option', { key: value, value }, value)))),
-          // ⚠️ 「只读」与「允许嵌套派发」**不再出现在这里**（D34）：它们是组合期事实、属于
+          // ⚠️ 「只读」与「能否继续派发」**不再出现在这里**（D34）：它们是组合期事实、属于
           //    角色的固有属性，住在 roles.json 的定义层。做成旋钮既让人以为「改了立刻生效」，
           //    又让每次保存都要重建组合 —— 那是设计，不是调参。这里只**如实显示**当前值。
+          //    D35 起可派发目标是**显式清单**（`canDispatch`），所以这里把目标逐个列出来 ——
+          //    「除自己以外全部」那种隐式语义正是要消灭的东西。
           h('div', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
             `${entry.readOnly === true ? '只读角色' : '可写角色'} · `
-            + `${entry.allowNestedDispatch === true ? '可继续派发' : '不再派发'}`
+            + `${Array.isArray(entry.canDispatch) && entry.canDispatch.length > 0
+              ? `可派发给：${entry.canDispatch.join(' / ')}` : '不可继续派发'}`
             + '（属角色定义，改动请编辑 roles.json）')))),
           // 底部操作区：靠右，取消在左、保存在最右。
           // ⚠️ 禁用判据必须用**旋钮层自己的** `settingsDirty`（不是 roles 列表的 dirty）——

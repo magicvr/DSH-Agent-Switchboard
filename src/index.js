@@ -418,6 +418,10 @@ export const Config = z.object({
         instructions: z.string().required(),
         readOnly: z.boolean().default(false),
         backend: z.union(['spawn', 'cli']),
+        // canDispatch 是现行字段：显式列出「本角色可以再派发给谁」。
+        // 下面那个 allowNestedDispatch 是旧的布尔（语义「除自己以外全部」），仅作兼容读取；
+        // 两者同时出现时以显式清单为准。
+        canDispatch: z.array(z.string()).default([]),
         allowNestedDispatch: z.boolean().default(false),
         // --- cli 后端需要：可执行文件与参数模板 ---
         // 放在角色**顶层**而非嵌套对象，是为了让设置面板把每一项当普通标量字段渲染。
@@ -708,20 +712,29 @@ export function selftestTool(ctx, diagnostics) {
         : diagnostics.readSupervisorRules?.() ? '已配置（仅注入主代理）'
           : '未配置（profile 可能未同步 preset：需 gen:preset → inject:preset → 重启）';
       const format = diagnostics.roleConfigPath ? readConfigFileDetailed(diagnostics.roleConfigPath).format : null;
-      // ⚠️ CLI 角色的 `allowNestedDispatch` 是**无效旋钮**：CLI 角色不产出角色 preset（没有地方
-      //    承载嵌套行），CLI 进程本身也只有它自己的工具（实测 codex 只有 13 个自家工具，没有任何
-      //    DSH 工具），根本无法调用 delegate_to_*。打开它不会有任何效果 —— 必须让用户看见，
-      //    否则这个开关会骗人（旧架构下它有意义：中继子代理的 preset 靠它挂嵌套行）。
-      const inertNesting = (diagnostics.configuredRoles ?? [])
-        .filter(role => role?.backend === CLI_BACKEND && role.allowNestedDispatch === true)
-        .map(role => role.id);
+      // ⚠️ 嵌套派发的配置体检（D35）。四条都**必须让用户看见**：
+      //    ① 仍靠旧布尔 `allowNestedDispatch: true` 生效 —— 它的语义是「除自己以外**全部**」，
+      //       新增角色会**自动**获得派发入口，与「只给探子」这类意图不符；提示改用显式清单。
+      //    ② `canDispatch` 列了 CLI 角色 —— CLI 角色是叶子（D34），该条目会被忽略。
+      //    ③ 列了不存在的角色 id —— 拼错时静默无效是最坏的结果。
+      //    ④ 列了自己 —— 无意义，会被过滤掉。
+      const nestedWarnings = [];
+      for (const role of diagnostics.configuredRoles ?? []) {
+        const targets = Array.isArray(role.canDispatch) ? role.canDispatch : [];
+        if (role.backend === CLI_BACKEND && (targets.length > 0 || role.nestedDispatchLegacy === true)) {
+          nestedWarnings.push(`CLI 角色 ${role.id} 配置了嵌套派发目标，但 CLI 角色是**叶子**`
+            + '（它没有 preset，其进程也没有 DSH 工具），这些目标会被忽略');
+        } else if (role.nestedDispatchLegacy === true) {
+          nestedWarnings.push(`${role.id} 仍靠旧的 allowNestedDispatch: true 生效（等价于「除自己以外全部」）`
+            + `；建议在 $DSH_HOME/agent-switchboard/roles.json 的定义层显式写成 canDispatch: ["…"]`);
+        }
+        if (targets.includes(role.id)) {
+          nestedWarnings.push(`${role.id} 的 canDispatch 列了自己，该条目会被忽略`);
+        }
+      }
       const warnings = [packageWarning, diagnostics.mountHere && !diagnostics.readSupervisorRules?.() ? `调度规则：${scheduling}` : '',
         format?.status === 'migrated' ? format.reason : '',
-        inertNesting.length > 0
-          ? `CLI 角色 ${inertNesting.join(' / ')} 打开了「允许嵌套派发」，但对 CLI 角色无效`
-            + '（CLI 角色没有 preset，其进程也没有 DSH 工具）；该开关只对内置（spawn）角色有效 —— '
-            + '面板已不提供它，请到 $DSH_HOME/agent-switchboard/roles.json 的定义层修改'
-          : '',
+        ...nestedWarnings,
         // 组合期字段改了但组合还没跟上：提示词与自检都按**已注册的**快照如实描述，
         // 但子代理实际拿到的仍是那一版。热同步会在下次派发前重建；若重建失败，
         // 下面那条错误会顶上来，必须让用户看见。
@@ -1129,10 +1142,10 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
   const { roles, errors } = normalizeRoles(rawRoles,
     (current.ok && current.value.provider) || resolved.provider,
     (current.ok && current.value.cwd) || resolved.cwd);
-  // 这里必须带上 backend 与 allowNestedDispatch：自检那条「CLI 角色的嵌套开关无效」的告警
-  // 就是靠这两个字段判断的。只投影 { id, toolName } 会让它永远不触发 —— 实测踩到。
+  // 这里必须带上 backend 与 canDispatch：自检那几条「嵌套派发配置体检」的告警
+  // 就是靠它们判断的。只投影 { id, toolName } 会让告警永远不触发 —— 实测踩到。
   diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName,
-    backend: r.backend, allowNestedDispatch: r.allowNestedDispatch === true }));
+    backend: r.backend, canDispatch: r.canDispatch, nestedDispatchLegacy: r.nestedDispatchLegacy }));
   diagnostics.configErrors = errors;
   const depth = syncDepth ? readVolatileField(resolved, 'maxDepth') : undefined;
   const depthChanged = depth !== undefined && current.ok && current.missing !== true && current.value.maxDepth !== depth;
@@ -1355,7 +1368,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
   diagnostics.refresh = () => { try { resolver(); } catch {} };
   diagnostics.roleRoutes = initial.routes;
   diagnostics.configuredRoles = roles.map(role => ({ id: role.id, toolName: role.toolName,
-    backend: role.backend, allowNestedDispatch: role.allowNestedDispatch === true }));
+    backend: role.backend, canDispatch: role.canDispatch, nestedDispatchLegacy: role.nestedDispatchLegacy }));
   diagnostics.configuredRoleCount = roles.length;
   diagnostics.mountHere = true;
   if (!initial.ok || initial.errors.length > 0) {
@@ -1379,7 +1392,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     for (const role of currentRoles) {
       mountedFacts.set(role.id, {
         readOnly: role.readOnly === true,
-        allowNestedDispatch: role.allowNestedDispatch === true,
+        canDispatch: [...(role.canDispatch ?? [])],
         instructions: role.instructions,
       });
     }
@@ -1391,7 +1404,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
     return currentRoles.some((role) => {
       const fact = mountedFacts.get(role.id);
       return fact === undefined || fact.readOnly !== (role.readOnly === true)
-        || fact.allowNestedDispatch !== (role.allowNestedDispatch === true)
+        || JSON.stringify(fact.canDispatch) !== JSON.stringify([...(role.canDispatch ?? [])])
         || fact.instructions !== role.instructions;
     });
   };
@@ -1563,7 +1576,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
       // 能力描述用**组合期快照**，不用现读配置：见 mountedFacts 的说明。
       const guidanceRoles = current.roles.map((role) => {
         const fact = mountedFacts.get(role.id);
-        return fact === undefined ? role : { ...role, readOnly: fact.readOnly, allowNestedDispatch: fact.allowNestedDispatch };
+        return fact === undefined ? role : { ...role, readOnly: fact.readOnly, canDispatch: fact.canDispatch };
       });
       diagnostics.compositionStale = compositionDrift(current.roles);
       return roleGuidanceText(guidanceRoles, {

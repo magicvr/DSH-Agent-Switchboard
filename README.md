@@ -106,7 +106,7 @@ Jobs 不可用时 CLI 照常执行，结果标注回流不可用。CLI 没有运
 
 | 内容 | 住哪 |
 | --- | --- |
-| **定义**：title / description / instructions / CLI argv 契约 | `$DSH_HOME/agent-switchboard/roles.json` 的 `roles`（**权威**） |
+| **定义**：title / description / instructions / **只读** / **可派发目标 `canDispatch`** / CLI argv 契约 | `$DSH_HOME/agent-switchboard/roles.json` 的 `roles`（**权威**） |
 | **旋钮**：backend / model / effort / provider / cliDriver（只放**执行期**事实） | 根条目 `agent-switchboard` 的 `config.roleSettings`（设置页唯一可写的命名空间） |
 
 生效角色 = `roles`（定义）⨝ 文件 `overrides` ⨝ 设置 `roleSettings`，逐字段合并、后者胜出。

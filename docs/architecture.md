@@ -352,7 +352,7 @@
 - `id` / `title` / `description`
 - `instructions` — 子代理的角色提示词；`0.2.1-rc.1` 起写入角色 preset 的 `dsh-persona.config.prefix`
 - `readOnly` — 是否允许修改文件；由角色 preset 的行裁剪 + `dsh-tool-fs` 的 `write/edit` 开关落地
-- `allowNestedDispatch` — 该角色创建的 DSH 子代理能否调用受控委派工具（**默认 `false`**）；不决定能否被调用，继续派发仍受剩余深度预算约束，见 `decisions.md` D21
+- `canDispatch` — 允许本角色嵌套派发的**目标角色 id 清单**（默认空 = 不可继续派发）；D35 取代了旧的布尔 `allowNestedDispatch`（其语义「除自己以外全部」太宽，仍兼容读取并提示改用清单）。不决定能否被调用，继续派发仍受剩余深度预算约束，见 `decisions.md` D21
 - `backend` — `spawn`（内置）或 `cli`（`fork` 已被角色校验拒绝）
 - `model` / `effort` — 角色顶层的模型与思考强度
 - `cliCommand` / `cliPrefixArgs` / `cliArgs` / `cliPromptDelivery` / `cliCwd` — CLI 角色的扁平配置；归一化后生成内部 `cli` 对象。提示词传递支持 `stdin` / `argv` / `promptFile`；不设置运行期限。旧 `cliTimeoutSec` 不再声明或执行，残留值不阻止加载。

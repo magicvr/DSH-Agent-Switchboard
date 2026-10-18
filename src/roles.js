@@ -53,12 +53,17 @@ export const ROLE_SETTING_FIELDS = Object.freeze([
  * （「命令与参数来自用户配置、模型只能填受限占位符」的落点），不该变成一个网页表单里
  * 可以逐字段随手改的表面。它们住在插件自己的 `roles.json` 里。
  *
- * ⚠️ `readOnly` / `allowNestedDispatch` 也在这里：它们是**组合期**事实（写进角色 preset 的
- *    插件清单），等于角色的固有属性 —— 只读边界和「能不能再往下派」属于设计，不属于调参。
- *    历史教训：把它们做成面板旋钮，既让用户以为「改了立刻生效」，又让每次保存都要重建组合。
+ * ⚠️ `readOnly` / `canDispatch` 也在这里：它们是**组合期**事实（写进角色 preset 的
+ *    插件清单），等于角色的固有属性 —— 只读边界和「能不能再往下派、能派给谁」属于设计，
+ *    不属于调参。历史教训：把它们做成面板旋钮，既让用户以为「改了立刻生效」，又让每次保存
+ *    都要重建组合。
+ *
+ * ⚠️ `canDispatch` **取代**了旧的布尔 `allowNestedDispatch`：布尔的语义是「除我以外**全部**
+ *    角色」，一旦新增角色就会**自动**获得派发入口，与"只给探子"这类设计意图不符。
+ *    旧布尔仍被兼容读取（等价于「除自己以外全部」），但自检会提示改用显式清单。
  */
 export const ROLE_DEFINITION_FIELDS = Object.freeze([
-  'title', 'description', 'instructions', 'readOnly', 'allowNestedDispatch',
+  'title', 'description', 'instructions', 'readOnly', 'canDispatch',
   'cliDriver', 'cliCommand', 'cliPrefixArgs', 'cliArgs', 'cliPromptDelivery', 'cliCwd',
 ]);
 
@@ -247,7 +252,7 @@ export function canStartAtDepth(parentDepth, absoluteLimit) {
  * `run_code` 是 DSH 的保留传输，不能出现在任何掩码里；其 SDK 同样受工具过滤约束。
  */
 export function dispatchPermissionsFor(role, { delegateToolNames = [], availableToolNames = [] } = {}) {
-  const delegates = role.allowNestedDispatch ? [...new Set(delegateToolNames)] : [];
+  const delegates = role.mayDispatch ? [...new Set(delegateToolNames)] : [];
   // 三部分：非受控入口、关闭嵌套时的受控委派、只读写工具。
   // 另保留对可见但未纳入角色清单的 delegate_to_* 入口的拒绝，避免白名单改 deny 后放行。
   //
@@ -257,7 +262,7 @@ export function dispatchPermissionsFor(role, { delegateToolNames = [], available
   //    于是这两段永远不会有输入：现在两种后端返回同一个 deny 形态（CLI 角色根本用不到它）。
   const deny = [
     ...UNCONTROLLED_DISPATCH_TOOLS.filter((name) => availableToolNames.includes(name)),
-    ...(role.allowNestedDispatch ? [] : delegateToolNames),
+    ...(role.mayDispatch ? [] : delegateToolNames),
     ...(role.readOnly ? WRITE_TOOLS.filter((name) => availableToolNames.includes(name)) : []),
     ...availableToolNames.filter((name) => name.startsWith('delegate_to_') && !delegateToolNames.includes(name)),
   ];
@@ -284,7 +289,8 @@ const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
  * @property {string} instructions 给子代理看的开发者指令（persona）
  * @property {boolean} readOnly    是否只读
  * @property {string} backend      子代理后端 provider 名
- * @property {boolean} allowNestedDispatch 是否允许该子代理继续派发
+ * @property {string[]} canDispatch 允许本角色嵌套派发的目标角色 id（空 = 不允许继续派发）
+ * @property {boolean} mayDispatch 派生：能否继续派发（canDispatch 非空，或旧布尔 allowNestedDispatch 为 true）
  * @property {string} toolName     主代理可见的委派工具名
  */
 
@@ -445,7 +451,20 @@ export function normalizeRole(raw, index, defaultProvider, defaultCwd) {
       instructions,
       readOnly: raw.readOnly === true,
       backend,
-      allowNestedDispatch: raw.allowNestedDispatch === true,
+      // 显式目标清单：只有列在这里的角色才可能被本角色嵌套派发。
+      canDispatch: Array.isArray(raw.canDispatch)
+        ? [...new Set(raw.canDispatch.filter(item => typeof item === 'string' && item.length > 0))] : [],
+      // 派生：本角色能否继续派发（显式清单非空，或旧布尔为 true）。
+      mayDispatch: (Array.isArray(raw.canDispatch)
+        && raw.canDispatch.some(item => typeof item === 'string' && item.length > 0))
+        || raw.allowNestedDispatch === true,
+      // 兼容标记：仍靠旧布尔生效（自检据此提示改用显式清单）。
+      //
+      // ⚠️ 判据是「**显式清单为空**」，不是「canDispatch 不是数组」：Config 给 `canDispatch`
+      //    设了默认值 `[]`，`Array.isArray` 因此恒为真 —— 第一版就是这么写的，结果旧布尔
+      //    永远不被识别成 legacy，提示告警永远不触发（断言当场报空告警）。
+      nestedDispatchLegacy: raw.allowNestedDispatch === true
+        && (!Array.isArray(raw.canDispatch) || raw.canDispatch.length === 0),
       ...(cli ? { cli, cliDriver: preset.driver, cliBlockReason: preset.errors.join('；') || undefined } : {}),
       toolName: `delegate_to_${id.replace(/-/g, '_')}`,
     },
