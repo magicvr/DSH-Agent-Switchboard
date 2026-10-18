@@ -229,6 +229,7 @@ minimal | low | medium | high | xhigh | max
 ## D9 · 配置分两层，且必须区分 volatile
 
 > **被取代范围：** 运行时 cliTimeoutSec 已由 D17 移除；包裹路由、Jobs 回流与清理生命周期分别见 D18 / D19 / D20。本节表格保留历史，不代表当前字段。
+> ⚠️ **后续修正（D33）：** 本节与 D18 / D22 涉及的「包裹路由」与「中继（转交）子代理」**整体删除** —— CLI 角色改为直派后台任务，见 [D33](#d33--cli-角色直派后台任务角色定义与旋钮分家)。
 
 > **历史方案已被后续决策取代：** 下文「第一期角色列表来自 `cordis.patch.yml`」及复杂数组编辑器不可行的取舍，已被 D13 / D14 的自建设置页覆盖；原文保留。
 > 当前角色文件为 `$DSH_HOME/agent-switchboard/roles.json`，设置页仍经根配置桥接并由 Host 同步文件，preset 携带 `mount: true` 与 `supervisorRules`（D29 修订）、不得携带 `roles`。依据见 D14 的当前实现补记。
@@ -547,6 +548,7 @@ npm 入口、文档及脚本用法与运行时命令同步更新。离线 `check
 ## D16 · CLI 收敛为两种预设与每角色包裹路由
 
 > **后续修正：** 每角色包裹路由已由 D22 的插件级统一设置取代；本节保留历史裁决与实现阶段记录。
+> ⚠️ **再修正（D33）：** 连「包裹路由」这个概念本身也删除了 —— CLI 角色改为直派后台任务，没有转交代理、没有包裹 LLM 路由，CLI 角色也不再需要 Agent Preset。见 [D33](#d33--cli-角色直派后台任务角色定义与旋钮分家)。
 
 **决策：** 当前只支持 `codex` / `grok`，移除 `custom` 兜底。可执行文件与参数仍来自用户配置，
 沿用已验证的预设模板；Host 必须核对实际 command / prefixArgs / args / delivery，不能只信
@@ -611,6 +613,7 @@ subagent 与 subprocess 不强制默认期限。用户用现有会话停止取�
 ## D18 · CLI 改为内置 spawn 包裹与角色专属工具（批次 3a）
 
 > **后续修正：** 本节每角色 agentProvider / agentModel 的路由来源已由 D22 取代；spawn 包裹与专属工具架构保留。
+> ⚠️ **再修正（D33）：** 「spawn 包裹 + 角色专属工具（`switchboard_cli_run_<角色>`）」这套架构**整体删除** —— CLI 角色改为直派后台任务，中继子代理与阻塞式专属工具都不存在了。本节保留为历史裁决。见 [D33](#d33--cli-角色直派后台任务角色定义与旋钮分家)。
 
 > **后续修正：** 本节「allow 仅本角色专属工具」已由 [D21](#d21--入站深度预算与出站委派权限分离) 的出站开关规则扩展；角色指令确定性前置限于 stdin / promptFile 模式，argv 保持任务参数原值。
 
@@ -742,6 +745,12 @@ CLI 自身工具与受控委派白名单、只读 deny、`allow: []` 拒绝继�
 叶子可被调用、组织角色受剩余预算拒绝、子代理不可调用 workflow 或其他角色底层 CLI 工具。
 
 ## D22 · CLI 包裹路由改为插件级统一设置
+
+> ⚠️ **已废止（D33）：** 本节的全部内容（`volatile.wrapperProvider` / `wrapperModel` /
+> `wrapperEffort`、转交代理、包裹路由的文件优先规则、桥接空 roles 文件）**已随中继子代理一起
+> 删除**。CLI 角色现在直接作为后台任务派发，没有转交代理、没有包裹 LLM 路由，也没有那份
+> 「文件含任一 wrapper 字段即整个对象优先」的优先级规则。本节保留为历史裁决记录；
+> 现行设计见 [D33](#d33--cli-角色直派后台任务角色定义与旋钮分家)。
 
 **决策：** 按用户新裁决，包裹子代理的 provider、model、effort 统一放在插件 Config 的
 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`，取代 D16 / D18 的每角色
@@ -1012,7 +1021,55 @@ for (const field of ["persona", "toolFilter"])
 
 **尚未确认的一环：**「第二个条目确实装载失败」是由上述代码**推断**的，还没有在运行进程上直接观察到（启动期的 stderr 才看得到，而 `switchboard_selftest` 的 `presetBroken` 枚举的是 **preset 组合内的行**，看不到顶层条目的失败）。重启后看启动 stderr 即可判定。
 
-**拟改（待定）：** 让 `--inject` 不再往 profile 写 preset 声明（只保留 bundle 的贡献），`plugin:verify` 的 `preset.rules` 改为校验仓库 preset 与 bundle 装配、而不是 profile 里那份副本。改动会动到用户的 profile，且必须重启验证，故先记录不改。
+**拟改（待定）：** 让 `--inject` 不再往 profile 写 preset 声明（只保留 bundle 的贡献），`plugin:verify` 的 `preset.rules` 改为校验仓库 prese
+
+
+---
+
+## D33 · CLI 角色直派后台任务；角色「定义」与「旋钮」分家
+
+**决策：** 三件事一起改，因为它们互为前提。
+
+1. **CLI 角色不再包中继（转交）子代理**：`delegate_to_<cliRole>` 由本插件**按 agent 安装**
+   （与官方 standing 组合同构，`agent.ctx.inject(['tools'], …)` + `scopeChainOf` 归属判定），
+   受理即返回 `{ status: 'accepted', jobId }`；CLI 进程由 `dsh-tool-jobs` 托管，完成通知送达后
+   用 `job_output` 读输出。**嵌套**派发同样直派：调用方角色的 preset 里声明一行本插件条目
+   （`cliDispatchFor: [目标 id]`），在该 preset 作用域内注册同样的工具。
+2. **包裹路由（`volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`）删除**：它唯一的
+   消费者就是那个中继子代理 —— 中继没了，字段就没有语义。
+3. **角色数据分家**：**定义**（title / description / instructions / CLI argv 契约）住在
+   `$DSH_HOME/agent-switchboard/roles.json` 的 `roles`（权威）；**旋钮**住在根条目
+   `config.roleSettings`（设置页唯一可写的命名空间）。生效角色 = 定义 ⨝ 文件 `overrides` ⨝
+   `roleSettings`，逐字段合并、后者胜出。根实例同步时**只写 `overrides`，永不覆盖 `roles`**。
+
+**依据（已核实）：**
+
+- `dsh-tool-jobs` 已能把外部进程输出显示成后台任务，并**对 owner 投递完成通知**（忙的 agent
+  下一步注入、闲的 agent 唤醒一轮）。中继子代理存在的唯一理由（让 CLI 输出可见）因此消失，
+  它只多花一轮 LLM 往返与一份上下文。
+- 官方 standing 组合的按 agent 安装方式可直接照抄：`scopeChainOf(scopeOf(agent.ctx)).includes(compositionScope)`
+  判归属，配 `agent/created` / `agent/disposed` / `tools/change` 三钩子 + 启动 reconcile。
+  **必须**按 agent 装：`restrict` 只遮蔽继承来的工具，若落在 preset 层，嵌套子代理会继承它，
+  `allowNestedDispatch: false` 便被绕过。真机自检的 preset roster 印证了这条（CLI 角色的
+  `switchboard-role-<id>` 已不再出现）。
+- 预设作用域看不到根条目的 config，所以定义必须住在文件里；而设置页只能写根条目的
+  volatile 字段 —— 两份数据因此天然分家，桥接方向只能是「设置 → 文件」。
+
+**代价与边界：**
+
+- 顶层与嵌套都直派之后，**CLI 角色不再需要 Agent Preset**，`switchboard_cli_run_*`、
+  `cliToolFor`、`cliPersonaFor()` 一并退役（`0fc1733`）；`preset roster` 因此变短。
+- `cliDriver` 是三层合并里**唯一**会触发派生的字段：所选驱动与定义不一致时用
+  `cliFieldsFor(driver, readOnly)` 物化策展 argv。面板只写**选择**，永远不写 argv ——
+  「argv 来自用户配置、模型只能填受限占位符」这条安全约束不因面板而松动。
+- 迁移是**文本级**的（profile patch 含 `!!js` 标签，YAML round-trip 会把它们降级成普通字符串）：
+  `planRolesMigration` 只认缩进确定的块边界，并有「id 集合不一致 / 文件无定义即拒绝」的安全闸门；
+  拒绝时**跳过而不中断**安装（legacy 路径本就能跑）。实测：用户 profile patch 从 1842 行降到 194 行。
+- 注入块已被删除的设置层字段（`wrapper*`）若残留在 profile patch 或 `roles.json` 的 `volatile` 里，
+  现在是**死配置**：无害，但应清理。
+- 客户端只能静态验证：面板的 split 旋钮表单（含「外部 CLI」下拉）需要真机往返确认。
+- 真机验收边界：CLI 直派的后台任务链路（受理 → 完成通知 → `job_output`）已在自检层面确认
+  新代码生效（roster 与 roleConfig 两处），完整派发链路仍待一次真实 CLI 任务验收。t 与 bundle 装配、而不是 profile 里那份副本。改动会动到用户的 profile，且必须重启验证，故先记录不改。
 
 
 ---

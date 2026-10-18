@@ -297,8 +297,9 @@
     - `readOnly`：额外丢弃 shell / goal / todo / plugin 行，保留 `tool-fs` 但写入 `write:false, edit:false`（否则连 `read` 也没了）。
     - 内置角色拿裁剪后的 standard 工具清单；`cli` 角色刻意保持最小：persona + 自己的专属 CLI 工具行 +（允许嵌套时）嵌套委派行。
     - 角色指令写入 `@deepseek-ai/dsh-persona` 行的 `config.prefix`，并**替换**模板里那一行 persona，而不是另加一行：同一 preset 内两行会向同一作用域重复注册 `deployment:persona-prefix`，而 `dsh-system-prompt` 对同作用域重名段落是抛错的（`prompt section "…" is already registered in this scope`）。
-41. **作用域可见性决定专属 CLI 工具必须挂在角色自己的 preset 里。** 工具按作用域可见、不跨 preset 继承，因此角色 preset 内声明一行本插件条目 `config.cliToolFor: [roleId]`；该作用域的 `apply` **只**注册这些 CLI 工具（不注册自检、不挂角色工具、不做根配置同步）。主代理作用域的注册路径保留，但子代理能看见专属工具的唯一途径是前者（`src/index.js`）。
-42. **顺序与热更新边界（必须如实标注的代价）。** 先 `agentPresets.register(definition)`，再挂 `dsh-tool-subagent`（装载期校验预设已声明）。由此得到一个后果：`instructions`（persona）、`readOnly`、`allowNestedDispatch` 现在是**组合期**事实，改它们需要重新注册 preset——当前实现只在本作用域挂载时注册一次，所以实际代价是重新挂载 / 完整重启；`model` / `effort` 仍是执行期 getter，保持热更新。自检新增 `角色 preset（persona 与工具构成的承载点）` 一行，报告已注册 preset 的 id 与行数（`src/index.js`）。
+41. **CLI 角色没有 preset；它的工具按 agent 安装（D33）。** 工具按作用域可见、不跨 preset 继承，所以**直派工具**不能注册在 preset 作用域：`restrict` 只遮蔽继承来的工具，落在 preset 层会被嵌套子代理继承，`allowNestedDispatch: false` 就被绕过。做法与官方 standing 组合同构 —— `agent.ctx.inject(['tools'], …)` 按 agent 注册，`scopeChainOf(scopeOf(agent.ctx)).includes(compositionScope)` 判归属，配 `agent/created` / `agent/disposed` / `tools/change` 三钩子与启动 reconcile（`src/index.js` 的 `mountCliDispatchTools`）。**嵌套**可达性由调用方 preset 里的一行本插件条目承载（`config.cliDispatchFor: [目标 id]`，`src/index.js` 的 `mountCliDispatchInThisScope`），它只在本 preset 作用域注册这些直派工具。
+    - 继承的代价是显式的：CLI 角色因此**不再产出角色 preset**（`buildRolePreset` 返回 `undefined`），`switchboard-role-<cliId>` 不再出现在 preset roster 里 —— 这一点在真机自检里可直接核对。
+42. **顺序与热更新边界（必须如实标注的代价）。** 先 `agentPresets.register(definition)`，再挂 `dsh-tool-subagent`（装载期校验预设已声明）。由此得到一个后果：`instructions`（persona）、`readOnly`、`allowNestedDispatch` 现在是**组合期**事实，改它们需要重新注册 preset——当前实现由**派发前热同步**重建（`ensureCompositionCurrent`），失败时退回上一版组合并在自检里报告；不确定时完全重启 DSH。`model` / `effort` / `cliDriver` 仍是执行期读取，下次派发即生效。自检新增 `角色 preset（persona 与工具构成的承载点）` 一行，报告已注册 preset 的 id 与行数（`src/index.js`）。
 43. **`fork` 后端已移除。** `dsh-subagent-fork-in-process` 声明 `capabilities.agentPreset: false` 且 `inheritsParentContext: true`；`dsh-subagent` 的 `assertCapabilities` 与 `dsh-tool-subagent` 的 `SubagentPresetSelection.assertProvider`（`tool-subagent: provider "..." does not support independent agent preset selection`）都会对此抛错。也就是说 fork 子代理**无法**拥有自己的角色指令与工具限制，保留它只会留下一个静默失效的选项。`src/roles.js` 的 `BUILTIN_PROVIDERS` 现为 `['spawn']`，`backend: 'fork'` 被角色校验拒绝。
 44. **派发语义：一律异步受理。** 工具的输出 schema 固定为 `{kind: 'activation', subagentId}`（`const: "activation"`），`execute` 在 `subagents.startActivation({..., delivery: 'parent'})` 后立即返回；没有前台 / 后台模式，子代理结果稍后以完成通知送达。旧的「delegate 阻塞并返回子输出」描述已不成立；注入的调度规则与路由指引（`scripts/lib/preset-generator.mjs` 的 `selfEntry`、`src/roles.js` 的 `roleGuidanceText`）已按此改写。
 45. **上游 standard 漂移与被整体移除的行。** `0.2.1-rc.1` 的 standard 新增 `dsh-time-context` / `dsh-tool-schedule` / `dsh-plugin-market/tools`，persona 行去掉 `suffix`，delegation 组的 subagent 行去掉 `backgroundMode`，并**整体移除** `tool-subagent-codex` / `tool-subagent-claude-code` / `tool-ralph` 行。仓库 preset 与行模板已重新生成（`npm run gen:preset`）。`npm run check:preset` 覆盖两个生成物；它在升级落地时**不在** `npm run check` 主链内，这是漂移长期未被发现的原因，现已加入主链末尾。
@@ -363,44 +364,55 @@
 
 ## 6. CLI 派发后端（已实现，保留设计约束）
 
-当前 CLI 数据流（批次 3b，D18 / D19）：
+当前 CLI 数据流（D33；旧的「中继子代理」链路已删除）：
 
 ```text
-主代理 → delegate_to_<角色> → 立即返回 {kind:'activation', subagentId}
-                              （角色 preset：内置 spawn 子代理 + 自己的工具清单）
-                              → switchboard_cli_run_<角色>（仅 prompt）
-                              → runCli → ctx.subprocess.spawn → 外部 codex / grok
-                                           ↓ stdout / stderr 增量 sink
-                                    ctx.get('jobs') → job.append → 输出环 → 客户端任务面板
-主代理 ← 完成通知（子代理的简洁汇报：交付物、证据、错误、未完成项）← 子代理 ← 有界 CLI 结果
+主代理 → delegate_to_<cli角色> → 立即返回 {status:'accepted', jobId}
+                                （直派工具按 agent 安装；无中继子代理、无 CLI 角色 preset）
+                                → jobs.start({ kind:'cli', owner: 调用方 agent, run(job) })
+                                → runCli → ctx.subprocess.spawn → 外部 codex / grok
+                                             ↓ stdout / stderr 增量 sink
+                                      job.append → 输出环 → 客户端任务面板 / job_output
+主代理 ← 完成通知（后台任务结算：status + detail）← jobs ← runCli 结果
 ```
 
-有效 CLI 角色的专属工具注册在**该角色自己的 preset 作用域**（`cliToolFor`，见 3.1g 第 41 条），再挂载对应 delegate；主代理作用域的注册路径保留但不再是子代理可见性的来源。旧 `switchboard-cli-*`
-provider 已移除；历史文件 `src/cli/provider.js` 原位承载 `createCliTool`，没有第二条可执行派发路径。
-自检同时查询两个工具，专属工具注册失败会阻止对应 delegate 挂载，任一工具缺失都报告角色不可用。
+`spawn` 角色仍是另一条链路（官方 `dsh-tool-subagent` 委派 → `{kind:'activation', subagentId}`
+→ 子代理在自己的 preset 里工作 → 完成通知）。
 
-包裹路由取插件级 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`（D22）。
-根实例通过既有 `$DSH_HOME/agent-switchboard/roles.json` 的 `volatile` 同步三字段；不新增服务、文件类型或路径。
-根实例在 apply 时同步初值，直接监听 owning Fiber 的 `loader/volatile-update` 同步保存值。载荷是路径数组的数组；Loader 先提交 Volatile 再普通 emit，通过发送侧 `Context.filter` 只投递 owning Fiber。监听器不使用 next、prepend 或 receiver 过滤，也无需额外 effect 包装。
-工具骨架只注册一次，官方 `dsh-tool-subagent` 在 execute 内读取 getter；每次派发入口现读 model/effort/maxDepth 与包裹路由，同次执行的 getter 优先读取派发级快照。⚠️ `instructions` / `readOnly` / `allowNestedDispatch` **不在这条热路径上**：它们决定角色 preset 的插件清单，属组合期（3.1g 第 42 条）。提示组装也现读角色与可见工具。
-文件 resolver 用 mtimeMs+size 缓存：未变不重读，改变重读；损坏保留上一有效快照并标 stale，无有效缓存拒绝挂载/派发且自检不健康。显式 preset roles（含 []）优先，undefined 才回落文件，source 区分 preset/file。
+CLI 角色**直接作为后台任务派发**：`delegate_to_<role>` 由本插件**按 agent 安装**（与官方
+standing 组合同构，见 3.1g 第 41 条），受理即返回 `{ status: 'accepted', jobId }`，CLI 进程由
+`dsh-tool-jobs` 托管，完成通知送达后用 `job_output` 读输出。没有中继（转交）子代理，因此
+**也没有 CLI 角色的 preset**，更没有阻塞式专属工具：`src/cli/provider.js` 现在只导出直派工具
+（`createCliDispatchTool`），唯一的执行核心是 `src/cli/runner.js` 的 `runCli`。
+自检的角色可用性判据因此与 spawn 角色同构 —— 角色自己的 `delegate_to_*` 在不在。
+
+**角色数据的权威是分开的两份**：定义（persona / 工具构成 / CLI argv 契约）住在
+`$DSH_HOME/agent-switchboard/roles.json` 的 `roles`；旋钮（backend / model / effort / provider /
+readOnly / allowNestedDispatch / cliDriver）住在根条目 `config.roleSettings`。生效角色 =
+`roles` ⨝ 文件 `overrides` ⨝ `roleSettings`，逐字段合并、后者胜出。根实例在 apply 时同步初值，
+直接监听 owning Fiber 的 `loader/volatile-update` 同步保存值；同步**只写 `overrides`，永不覆盖
+`roles`**（手改定义不会被设置顶掉）。`cliDriver` 是三层合并里**唯一**会触发派生的字段：
+所选驱动与定义不一致时用 `cliFieldsFor(driver, readOnly)` 物化策展 argv —— 面板只写选择。
+载荷是路径数组的数组；Loader 先提交 Volatile 再普通 emit，通过发送侧 `Context.filter` 只投递
+owning Fiber。监听器不使用 next、prepend 或 receiver 过滤，也无需额外 effect 包装。
+工具骨架只注册一次，官方 `dsh-tool-subagent` 在 execute 内读取 getter；每次派发入口现读
+model/effort/maxDepth，同次执行的 getter 优先读取派发级快照。⚠️ `instructions` / `readOnly` /
+`allowNestedDispatch` **不在这条热路径上**：它们决定角色 preset 的插件清单，属组合期
+（3.1g 第 42 条）。提示组装也现读角色与可见工具。
+文件 resolver 用 mtimeMs+size 缓存：未变不重读，改变重读；损坏保留上一有效快照并标 stale，无有效缓存拒绝挂载/派发且自检不健康。legacy 模式下显式 preset `roles`（含 `[]`）优先、`undefined` 才回落文件；split 模式下由 `roleSettings` 与文件三层合并（见上），source 区分 preset/file。
 CLI 工具每次执行先复验当前角色的 driver、模板与 readOnly 兼容性，再复制执行快照；命令通过 `ctx.get('subprocess').resolveExecutable` 执行期解析，spawn 使用 argv 数组与 shell:false。装载自检标记“待执行时解析（尚未验证）”，执行后报告解析结果或本次解析失败，不冒充无 CLI 角色。runner 原有解析失败回落字面命令的行为保留，失败会进入可执行文件诊断。
-已开始的内置请求和 CLI 执行保留起始快照；工具返回、Jobs 结算、客户端读取分离，owner 仍为子会话，无主动 remove 或运行期限。实例卸载使用官方插件生命周期，不再管理私有代际或租约。
+已开始的内置请求和 CLI 执行保留起始快照；工具返回、Jobs 结算、客户端读取分离，**任务 owner 是发起派发的 agent**（顶层派发即主代理，嵌套派发即那个子代理），无主动 remove 或运行期限。实例卸载使用官方插件生命周期，不再管理私有代际或租约。
 增删角色/改 id/toolName/backend 仍会改变工具集（阶段 3，未实现）；当前实例拒绝结构变化的派发并明确报告需重新挂载，不能宣称已热更新。改 `instructions` / `readOnly` / `allowNestedDispatch` 同样需要重新注册 preset（当前实现即重新挂载 / 完整重启），见 3.1g。Host 源码改动仍需重启一次加载。
-有效文件 `maxDepth` 优先，缺失或无效时回落 preset，最后默认 3；根就地更新会同步已有文件的 maxDepth。角色配置、CLI 预设/参数和包裹路由用于后续派发；历史模型上下文、正在执行的子代理/CLI/后台 Job 不被改写。
-`switchboard_selftest` 的 `roleRoutes` 报告当前 resolver 每个角色的后端、角色 model/effort、source=preset/file 与 stale；CLI 的角色模型/强度指外部 CLI，包裹路由由独立 getter 提供给派发请求，当前 roleRoutes 不单列包裹 LLM 路由。
+有效文件 `maxDepth` 优先，缺失或无效时回落 preset，最后默认 3；根就地更新会同步已有文件的 maxDepth。角色配置、CLI 预设/参数（含所选驱动物化出的 argv）用于后续派发；历史模型上下文、正在执行的子代理/CLI/后台 Job 不被改写。
+`switchboard_selftest` 的 `roleRoutes` 报告当前 resolver 每个角色的后端、角色 model/effort、source=preset/file 与 stale；CLI 的角色模型/强度指**外部 CLI 自己的**模型与强度（不是任何包裹 LLM 路由 —— 那个概念已随中继子代理删除）。
 文件损坏时继续报告上一有效缓存并标 stale=true，工具不可用时标注未挂载；根实例提示在 Switchboard preset 内查看生效路由。
-挂载实例只校验有效路由来源：文件含任一 wrapper 字段即整个路由对象优先（包含显式空值），不逐字段补入 preset；
-被覆盖的非法 preset 路由忽略。文件没有任何 wrapper 字段时才回落当前实例配置。
-这与角色列表的优先级不同——角色列表是「本作用域**未提供** roles 时才回落读文件；显式空数组表示清空，不得复活文件里的旧角色」，而包裹路由是文件优先：preset 可独立选择角色，不能覆盖已经同步的统一包裹路由。
-根字段留空或移除会把已保存的统一设置清为空字符串，避免回落到 preset 的旧值。
-包裹同步以 `{ ...existing, volatile }` 写回，并保留 volatile 中其它字段；roles 与顶层其它字段均保留，不是整份配置替换。
-文件缺失且根含任一合法包裹字段时创建 `{ formatVersion: 1, roles: [], volatile }` 桥接文件（三个 wrapper 字段均写入）；空角色不表示已播种，迁移脚本仍将缺文件或空 roles 视为需播种并保留现有字段。成功创建清除 pending；根没有任何包裹字段时不创建空桥接文件，首次安装缺文件是正常健康空状态。
-若创建因权限、锁定或 IO 失败，preset 无法从自身上下文得知根设置存在，仍可能回落自身路由；根自检必须以同步错误及 pending 判为不健康，不得宣称根设置已生效。pending 仅表示根有待桥接设置而文件尚未成功建立，并独立进入 `ok` 门禁。
-包裹同步失败进入当前配置错误诊断并去重，相同失败不重复打印日志，失败内容变化时打印；恢复同步即清除旧错误。
-仅 CLI 角色把非空 provider / model / effort 映射为 agentOptions.provider / model / reasoningEffort；
-三者全空完全不设 `agentOptions`，空白字段直接省略，遵循宿主的路由继承规则，不保证无条件继承父强度。
-留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。
+挂载实例只校验**有效来源**：split 模式下三层合并给出唯一结果，文件 `overrides` 与设置 `roleSettings` 逐字段覆盖定义，非法值在字段级校验里报错（不静默回落）。
+legacy 模式下角色列表的优先级是「本作用域**未提供** `roles` 时才回落读文件；显式空数组表示清空，不得复活文件里的旧角色」。
+同步以 `{ ...existing, overrides }` 写回，保留 `roles`、顶层其它字段与 volatile 其它字段；不是整份配置替换。
+同步失败进入当前配置错误诊断（恢复即清除），并由自检的 `roleConfigStatus` 如实报告。
+`agentOptions` 由**角色自己**的 provider / model / effort 决定，两种后端同构 —— 历史方案里
+「CLI 角色改用插件级包裹路由（`volatile.wrapperProvider/wrapperModel/wrapperEffort`）」的分支
+已随中继子代理删除，那三个字段也不复存在。
 「父代理当前强度」指最近一次请求配置；尚无请求时取创建配置。已有请求配置但无 effort 时，不恢复创建时的 effort。
 `resolveChildAgentOptions` 精确比较 provider / model 标识；显式填写与父相同的两项不算切换，仅改其中一项也算切换，别名不会按指向的模型等价处理。
 `dsh-tool-subagent` 预检采用同一原则，但在有 `subagentProvider.agentRouteDefaults` 时合入该默认路由并关闭预检的父强度继承；本机内置 spawn 是否声明该属性未核实。
@@ -503,7 +515,7 @@ jobId 由 Jobs 管理，schema、返回值与 render 均不暴露它；客户端
 
 **通道分区呈现：** 早先面板把 `job.chunks` 在**同一个 `<pre>` 里顺序拼接**成 `[stdout] …` / `[stderr] …`，于是外部 CLI 的**过程与工具轨迹被当作正文**一起平铺 —— 用户要观察的是 CLI 的结论，不是它的工具调用流水。真因不在数据源，而在**通道未被区分**：codex 非 `--json` 模式下 stdout 只有最终消息，路由事实头与过程/工具轨迹都在 stderr（`docs/cli-backends.md` §2.4 的对照组实测；同节用例 8 证明 `--json` 会把事件流改到 stdout 并让 stderr 变空，从而牺牲可读路由事实）。因此修法是**按通道分区**，而不是猜 stderr 里哪一行像工具调用：正文区只显示 stdout（流式、贴底，运行中默认展开）；stderr 归入独立 `<details>`「过程与诊断」，**默认折叠**，失败（`failed` / `killed`）且**用户未手动干预**时自动展开并改用错误色（手动折叠优先，不被后续失败状态覆盖）；从 stderr 头部按 `ROUTE_FACT_KEYS` 抽出的路由事实以单独一行显示在折叠区**之外**，保证「CLI 真的接受了本次模型/沙箱/强度参数」这条证据不随折叠隐藏。折叠只是展示层：chunks 原样保留，有界与 gap 语义不变，因此「不美化、不丢弃」（D8）未被削弱。客户端无法 import Host 的抽取实现，故镜像一份（`logic.js` 为权威，内联进 `src/client/index.js`），由 `scripts/check-client.mjs` 断言键表与抽取行为与 Host 一致。
 
-**真机取证（2026-10-03，`worker=cli(codex)` 实测）：** 一次 `node -v` 任务中，`switchboard_cli_run_worker` 的结果里 `stdout` 只有 172 字符（最终答案），`stderr` 有 5723 字符 —— 含 codex banner 与路由事实、**角色指令回显**、`exec "<powershell>" -Command 'node -v; Get-Location' … succeeded in 132ms` 的**工具轨迹**、`tokens used` 计数与重连告警。这正是用户报告「工具调用等消息被当成文本显示」的内容来源，也证明通道分区的前提成立。同一份结果的 `routeSummary` 自报 `model=gpt-6.1-sol`、`effort=medium`、`sandbox=workspace-write`，与角色配置一致 —— 把 stderr 折起来并没有丢掉「配置真的生效」的证据。**折叠交互与失败自动展开仍待人工查看（GUI 视觉），不能以离线断言代替。**
+**真机取证（2026-10-03，`worker=cli(codex)` 实测）：** 一次 `node -v` 任务中，当时的阻塞式工具 `switchboard_cli_run_worker`（**该工具已随 D33 删除**）返回的 `stdout` 只有 172 字符（最终答案），`stderr` 有 5723 字符 —— 含 codex banner 与路由事实、**角色指令回显**、`exec "<powershell>" -Command 'node -v; Get-Location' … succeeded in 132ms` 的**工具轨迹**、`tokens used` 计数与重连告警。这正是用户报告「工具调用等消息被当成文本显示」的内容来源，也证明通道分区的前提成立。同一份结果的 `routeSummary` 自报 `model=gpt-6.1-sol`、`effort=medium`、`sandbox=workspace-write`，与角色配置一致 —— 把 stderr 折起来并没有丢掉「配置真的生效」的证据。**折叠交互与失败自动展开仍待人工查看（GUI 视觉），不能以离线断言代替。** ⚠️ 直派后同样的分区原则不变，只是数据源从「工具返回值」变成「job 的输出环」（`job.append(text, { channel })`）。
 
 调用外部 CLI 至少要考虑：
 
@@ -520,7 +532,10 @@ jobId 由 Jobs 管理，schema、返回值与 render 均不暴露它；客户端
 
 ## 7. 可观测性
 
-当前角色路由在派发前注入提示词；委派工具**立即**返回受理确认（`{kind:'activation', subagentId}`），CLI 有界结果留在包裹子代理上下文，由该子代理在完成通知里汇报证据与状态。历史原始日志回传见下节。统一记录任务标识、起止时间与结果摘要仍是观测目标。
+当前角色路由在派发前注入提示词；委派工具**立即**返回受理确认，两种后端形态不同：`spawn`
+角色返回 `{kind:'activation', subagentId}`（结果由子代理在完成通知里汇报），`cli` 角色返回
+`{status:'accepted', jobId}`（CLI 输出留在该后台 job 的有界环里，模型用 `job_output` 读）。
+历史原始日志回传见下节。统一记录任务标识、起止时间与结果摘要仍是观测目标。
 
 ### 7.1 「调度日志进主代理可见输出」的现状（已实现，含一处固有限制）
 
@@ -597,9 +612,9 @@ DSH GUI 的完整按钮链与 codex/grok 进程树清理仍需真机验收，本
 
 现行数据流是：根条目提交 Volatile -> owning Fiber 收到 `loader/volatile-update` -> 原子写入 `roles.json` -> 静态工具在下一次执行时通过 mtime/size resolver 读取。`internal/update`、generation、租约、影子服务、跨作用域广播和 `ctx.root.fiber` 归属均为历史失败路径，不是当前机制。Host 源码改动仍需重启一次加载。
 
-**派发级快照（D27）：** preset 作用域注册公开 `tools/execute` around-dispatch hook；角色插件独立的 tools 服务视图在实际 register 时收集定义对象，hook 用调用代理 scope 下实际可见的定义对象与本实例 WeakSet 比对，仅拦本实例角色委派工具，包括 provider 延迟出现或重注册。同名的其他工具和底层 CLI 执行工具不拦截。进入 hook 时同步调用 resolver，并捕获完整角色、maxDepth、wrapperRoute 与可见/受控委派工具清单，以 `AsyncLocalStorage.run(snapshot, next)` 包裹主体。getter 优先读 ALS，取不到时回落现读；并发执行各有上下文。Cordis Config 校验会物化 getter，因此官方 apply 保留原 liveConfig，而不是使用校验产物的启动快照。
+**派发级快照（D27）：** preset 作用域注册公开 `tools/execute` around-dispatch hook；角色插件独立的 tools 服务视图在实际 register 时收集定义对象，hook 用调用代理 scope 下实际可见的定义对象与本实例 WeakSet 比对，仅拦本实例角色委派工具，包括 provider 延迟出现或重注册。同名的其他工具和底层 CLI 执行工具不拦截。进入 hook 时同步调用 resolver，并捕获完整角色、maxDepth 与可见/受控委派工具清单，以 `AsyncLocalStorage.run(snapshot, next)` 包裹主体。getter 优先读 ALS，取不到时回落现读；并发执行各有上下文。Cordis Config 校验会物化 getter，因此官方 apply 保留原 liveConfig，而不是使用校验产物的启动快照。
 
-**如实边界：** 冻结点是 `tools/execute` 入口（路由预检之前），不包含模型生成工具调用的时刻。CLI 角色只保证委派阶段的包裹请求同快照；真正执行在 `src/cli/provider.js` 的 execute 中另行捕获当前角色，不能保证整个“委派 → 包裹 LLM → CLI 进程”跨两个生命周期绝对同配置。直接调用裸工具 `.execute()` 会跳过 runtime hook；离线派发快照判据必须经真实 ToolRuntime。文件仍按 mtime+size 缓存，未加强相同时间戳和大小的外部写入检测，也不改权限模型或 CLI 无运行时间上限语义。
+**如实边界：** 冻结点是 `tools/execute` 入口（路由预检之前），不包含模型生成工具调用的时刻。CLI 角色只保证**派发受理**阶段同快照（受理时读到的角色即该次派发的 argv 契约）；CLI 进程本身在 `jobs.start` 的 `run` 里长跑，属于另一个生命周期，不能保证整段绝对同配置。直接调用裸工具 `.execute()` 会跳过 runtime hook；离线派发快照判据必须经真实 ToolRuntime。文件仍按 mtime+size 缓存，未加强相同时间戳和大小的外部写入检测，也不改权限模型或 CLI 无运行时间上限语义。
 
 **调度指引仅主代理（D28）：** 已安装包的 `assembleContextFor` 传入 `{ agent, scope: agent }`，section text provider 接收原 assembly context。仅在可靠代理上下文存在、会话头 origin 不是 subagent、持久化 delegationDepth 与运行时 options.subagentDepth 都为零（缺省为零）时输出调度指引。子代理与身份未知的组装返回空串，子代理保留自身 persona；继承 preset 不会再被告知“You are the switchboard”。依据为本地包源码与真实 SystemPrompt 组装测试；本轮无可用 cordis_inspect_query，未宣称实时接口查询或真机验收。
 

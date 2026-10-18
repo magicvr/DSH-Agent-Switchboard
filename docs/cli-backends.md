@@ -189,7 +189,13 @@ reasoning effort: ...
 完整形态，并独立核对 `readOnly` 与沙箱参数。切换只读会原子更新预设参数。
 旧 `custom` 是历史配置：仅完整匹配模板或本机解析后形态时无损识别；否则保留原数据，
 在自检「未挂载的角色」及主代理指引中显示待迁移、禁止派发，其他有效角色仍可挂载。
-CLI 包裹路由当前见 [D22](./decisions.md#d22--cli-包裹路由改为插件级统一设置)：统一使用插件级 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`，仅应用到外部 CLI 角色的内置 spawn 转交代理，不改变外部 CLI 的角色 `model` / `effort`。每角色 `agentProvider` / `agentModel` 属于历史方案，兼容加载但已忽略，并给弃用诊断；不能再作为现行包裹路由配置指引。
+CLI 角色**直接作为后台任务派发**（受理即返回 `{ status: 'accepted', jobId }`，输出由
+`dsh-tool-jobs` 显示、完成通知送达后用 `job_output` 读）。它**没有**中继（转交）子代理，
+因此也**没有** Agent Preset —— 设置页只让你**选一个 CLI**（写驱动 id），命令与参数由 Host
+按本文件上方那张策展表派生（`cliFieldsFor(driver, readOnly)`），面板没有编辑 argv 的入口。
+> ⚠️ 历史方案 [D22](./decisions.md) 的「插件级包裹路由」（`volatile.wrapperProvider` /
+> `wrapperModel` / `wrapperEffort`）**已删除**：它唯一的消费者就是那个中继子代理。
+> 每角色 `agentProvider` / `agentModel` 同样属历史方案，兼容加载但已忽略并给弃用诊断。
 命令控件已隐藏，完整配置仍参与挂载前一致性校验。
 
 > ⚠️ **曾经**还需要第二步「打开总开关 `volatile.allowCrossCli: true`」，**该开关已移除**。
@@ -224,11 +230,14 @@ CLI 包裹路由当前见 [D22](./decisions.md#d22--cli-包裹路由改为插件
 - **`ctx.plugin()` 的抛错抓不到**（它只是启动 fiber），因此挂载成功必须**核实**工具是否真的出现，
   不能假设。详见 `architecture.md` 3.1d 第 20c 条。
 - **CLI 无运行期限**：已移除单次派发时长上限与 `cliTimeoutSec`。旧值仍可加载，忽略并给出弃用诊断。
-  用户可通过现有会话停止入口取消；取消沿包裹子代理 → 工具 `exec.signal` → 子进程传递（`0.2.1-rc.1` 起没有前台 / 后台模式，取消仍走同一条 signal；工具在子代理侧返回 `status: cancelled` 与 `cancelled: true`）。
-  旧 provider 的 aborted 映射已移除；角色 preset 的 persona 要求取消或失败后不得自动重试。GUI 停止传播与进程树终止仍需真机验证。
+  用户可通过现有会话停止入口取消；取消沿**直派工具的 `exec.signal` → 子进程**传递
+  （直派工具受理后立即返回，取消入口是调用方停止、Jobs 面板取消与 owner 销毁这三条，
+  它们共用同一个 `AbortController`）。旧 provider 的 aborted 映射已移除。
+  GUI 停止传播与进程树终止仍需真机验证。
   `cliGraceMs` 仍是取消后的终止宽限；`cliMaxOutputBytes` / `cliMaxErrorBytes` 仍限制收集容量，
-  截断在专属工具结果中明确标记；已通过可选 ctx.get('jobs') 接入输出回流。工具只等执行器完成，
-  不依赖 settled 通知、不主动 remove；记录交由 Jobs 的保留策略处理（未核实）。清理失败进入有界诊断，详见 D20。
+  截断在 job 输出环里明确标记（`gapBefore`）；输出经 `ctx.get('jobs')` 回流。
+  任务结算由 `jobs.start` 的 `run(handle).done` 给出 `{status, detail}`；jobId **不进**工具返回值，
+  记录交由 Jobs 的保留策略处理（未核实）。清理失败进入有界诊断，详见 D20。
 
 ## 3. claude
 

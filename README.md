@@ -59,64 +59,108 @@
 
 **角色的 persona 与工具构成由一个独立 Agent Preset 承载（`0.2.1-rc.1` 起）。** 该版本删除了 `dsh-tool-subagent` 的 `persona` / `toolFilter` 两个配置字段，并对仍带这两个键的配置**在装载期直接抛错**（`backgroundMode` / `enableRunInBackground` 同样已从 Config 删除）；官方给出的迁移路径是「把 persona 与工具插件写进 Agent Preset，再用 `agentPreset` 选中」。本插件据此为**每个角色**注册一个 preset（`src/role-presets.js`，id 形如 `switchboard-role-<roleId>`）：角色指令成为该 preset 里 `@deepseek-ai/dsh-persona` 行的 `config.prefix`，工具清单由生成物 `presets/standard-plugins.json` 按角色裁剪而来。子代理不再「继承父 preset 再过滤」，而是挂载一个自带完整工具清单的独立 preset。`instructions` / `readOnly` / `allowNestedDispatch` 因此属于组合期，`model` / `effort` 仍是执行期 getter。理由、代价与被否决的替代方案见 [D32](./docs/decisions.md)。
 
-**派发一律是异步受理。** 每个 `delegate_to_*` 返回 `{ kind: 'activation', subagentId }` 后立即返回，子代理结果稍后以完成通知送达；没有前台/后台模式，主代理不应轮询或空转。
+**派发一律是异步受理，但两种后端的受理形态不同。**
 
-CLI 运行中的 stdout / stderr 已通过内置 Jobs 回流；任务归属 CLI 包裹子会话，所有终态均不主动删除记录，交由 Jobs 的保留策略处理（未核实）。
-在一次性子代理侧边栏输入区上方即可实时查看本子会话的 CLI 输出，有界只读面板不依赖 `turn/end`，默认自动滚到底，上滚暂停、可一键回到底部；始终保留官方一次性子智能体记录文案，不提供输入或取消任务能力。侧边栏没有顶部任务列表所需的 header，不能依赖该列表呈现；具体接入与真机验收见 [`docs/architecture.md`](./docs/architecture.md#62-cli-实时输出在一次性子会话输入区的呈现用户要求)。
-Jobs 不可用时 CLI 照常执行，结果标注回流不可用。CLI 没有运行时长上限，实时日志不逐块进入包裹模型上下文；既有调用方停止、任务取消及 owner 销毁链路保持不变。
+- `spawn` 角色（官方 `dsh-tool-subagent` 委派）：返回 `{ kind: 'activation', subagentId }`，
+  子代理结果稍后以完成通知送达。
+- `cli` 角色（**直派后台任务**）：返回 `{ status: 'accepted', jobId }`，CLI 进程由
+  `dsh-tool-jobs` 托管，完成通知送达后用 `job_output` 读输出。
 
-> ⚠️ **`cli` 后端会真的在你的机器上执行本地命令。** 可控性来自两点：角色的 `backend` 必须被**显式**设为 `cli`，且该角色只在选中了 Switchboard preset 的会话里挂载。面板从 CLI 预设填入命令与参数，Host 校验其完整形态，插件不会去猜、也不会自动发现你装了哪些 CLI。
+两者都不阻塞等待结果；没有前台/后台模式，主代理不应轮询或空转。
+
+CLI 运行中的 stdout / stderr 通过内置 Jobs 回流；**任务 owner 是发起派发的那个 agent**
+（顶层派发即主代理，嵌套派发即那个子代理）。所有终态均不主动删除记录，交由 Jobs 的保
+留策略处理（未核实）。
+在一次性子代理侧边栏输入区上方可实时查看**该子会话**的 CLI 输出，有界只读面板不依赖
+`turn/end`，默认自动滚到底，上滚暂停、可一键回到底部；始终保留官方一次性子智能体记录文案，
+不提供输入或取消任务能力。侧边栏没有顶部任务列表所需的 header，不能依赖该列表呈现；
+具体接入与真机验收见 [`docs/architecture.md`](./docs/architecture.md#62-cli-实时输出在一次性子会话输入区的呈现用户要求)。
+Jobs 不可用时 CLI 照常执行，结果标注回流不可用。CLI 没有运行时长上限，实时日志不逐块进入
+任何模型的上下文；既有调用方停止、任务取消及 owner 销毁链路保持不变。
+
+> ⚠️ **`cli` 后端会真的在你的机器上执行本地命令。** 可控性来自两点：角色的 `backend` 必须被**显式**设为 `cli`，且该角色只在选中了 Switchboard preset 的会话里挂载。面板只让你**选一个 CLI**（codex / grok），命令与参数由 Host 按策展表（`src/cli/drivers.js`）填入并校验其完整形态；插件不会去猜、也不会自动发现你装了哪些 CLI。
 >
 > 安全上有一道结构性保障：调用走的是 **argv 数组 + 显式工作目录**（`ctx.subprocess.spawn`），全程没有 shell 参与，模型只能填充受限占位符，无法拼接出任意命令。
 
 ### 3. 配置（Plugin Panel）
 
-「角色与派发」设置页采用官方「模型」页的卡片式交互：每角色一张折叠卡片，卡片头展示标题、id、机制徽标（内置 spawn 或外部 codex / grok）、模型与权限徽标，以及带可读 aria-label 的 8×8 状态圆点。绿点表示客户端配置校验通过，红点表示必填缺失、重复 id 或 CLI 预设需重选；不代表本机 CLI 已实测可用。点击「编辑」仅在该卡片原位展开，本地草稿须显式保存；取消、收起或切换编辑对象均丢弃未保存改动。列表底部「+ 新增角色」原位展开添加卡片，删除采用卡片内「确认删除 / 取消」两步确认。保存校验沿用原有规则与预设识别，并携带读取 revision；包裹小节仍按各字段 dirty 提交，只改包裹不提交 roles。该卡片改版已通过离线检查，真实 GUI 观感与保存往返待验收。
+「角色与派发」设置页在**legacy 模式**下采用官方「模型」页的卡片式交互：每角色一张折叠卡片，卡片头展示标题、id、机制徽标（内置 spawn 或外部 codex / grok）、模型与权限徽标，以及带可读 aria-label 的 8×8 状态圆点。绿点表示客户端配置校验通过，红点表示必填缺失、重复 id 或 CLI 预设需重选；不代表本机 CLI 已实测可用。点击「编辑」仅在该卡片原位展开，本地草稿须显式保存；取消、收起或切换编辑对象均丢弃未保存改动。列表底部「+ 新增角色」原位展开添加卡片，删除采用卡片内「确认删除 / 取消」两步确认。保存校验沿用原有规则与预设识别，并携带读取 revision。该卡片改版已通过离线检查，真实 GUI 观感与保存往返待验收。**split 模式**下同一位置渲染旋钮表单（见下）。
 
 官方页面同样自绘：平台自动表单只支持标量字段，无法编辑变长对象数组。外部客户端插件禁止引入 Harness Client 包，因此本插件不复用官方 Modal/Button 等 UI 包，全部用手写 `h()` 和主题 token 实现，删除确认使用卡片内控件。
 
-内置 `spawn` 显示角色级 **Provider** 文本输入，留空使用插件默认 provider；CLI 模式仍隐藏该角色输入。角色列表前始终显示「包裹子代理」小节，插件级统一配置 `volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`，仅用于外部 CLI 角色的内置 spawn 转交代理。Provider / 模型留空遵循宿主的路由继承规则；思考强度的空选项为「留空：不指定强度」。留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。「父代理当前强度」指最近一次请求配置；尚无请求时取创建配置。包裹模型与外部 CLI 的角色 `model` 分开标注；内置角色仍使用自身的 provider / model / effort。根设置经 `loader/volatile-update` 原子同步到角色文件；静态工具骨架只注册一次，后续派发执行期现读文件缓存。文件已保存的统一设置优先于 preset 自身设置（包含空值）；增删角色或改变工具标识仍需工具集变化。所有后端都有必填的多行「角色指令」输入，描述不会代填指令。`instructions` / `readOnly` / `allowNestedDispatch` 自 `0.2.1-rc.1` 起写入角色 preset，属**组合期**事实：改这三项需要重新注册 preset（当前实现：重新挂载 / 完整重启）；`model` / `effort` 仍是执行期 getter，保持热更新。Host 源码改动仍需重启一次加载。
+设置页按**模式**渲染两种形态：
 
-角色的**耐久真源是根条目 `agent-switchboard` 的 `config.roles`**（设置页唯一可写的命名空间，DSH 把它持久化在 profile patch 里）。根实例在 `loader/volatile-update` 返回前把它**同步进** `$DSH_HOME/agent-switchboard/roles.json`，常驻 Switchboard preset 再读那个文件——因为 preset 作用域看不到根条目的 config。⚠️ 因此 **`roles.json` 是派生副本，不是权威**：解析优先级是「本作用域 config 的 `roles` 优先，为空才回退到文件」，**手改 `roles.json` 会在下次同步时被 config 覆盖**；要改角色请走设置页。既有 Switchboard 会话的工具骨架不重挂，后续委派和下次提示组装执行期读取新配置；`instructions` / `readOnly` / `allowNestedDispatch` 属组合期，改后由**派发前热同步**重建角色 preset（无需重启）。文件损坏时保留上一份有效缓存并标记陈旧；无有效缓存时拒绝派发。
-设置面板读 `configForms` 镜像、写根命名空间 `agent-switchboard` 的 `remote.settings.mutate`，
-Host 根实例将配置同步到文件。根条目保持启用，但只在 `mount: true` 的作用域挂载角色工具；
-文件含任一 wrapper 字段即整个包裹路由对象优先（包含空值），不逐字段补入 preset；只校验有效来源，被覆盖的非法 preset 路由忽略。
-包裹同步以 `{ ...existing, volatile }` 写回，保留现有角色、顶层其它字段与 volatile 其它字段。
-仅保存合法包裹设置且文件缺失时创建 `roles: []` 桥接文件；空角色仍等待用户配置或迁移播种。
-根条目直接注册 owning Fiber 的 `loader/volatile-update` 监听；事件载荷只含路径，监听器从 Volatile 引用读取已提交新值。
-包裹同步错误与失败日志去重，恢复后清除旧错误。CLI 可执行文件在执行期解析；自检装载时明确标“尚未验证”，执行后报告解析结果或失败。迁移脚本也会播种空 roles 文件，并在删除源角色前复读验证（详见 D22）。
-**preset 不再携带 `config.roles`**。preset 仍是常驻单例，新会话只继承它，不重新执行 `apply`；配置更新由文件 resolver 驱动。增删角色/改 id/toolName/backend 仍会改变工具集（阶段 3，未实现）；当前实例拒绝结构变化的派发并在自检中明确提示需重新挂载。model/effort/instructions/readOnly/maxDepth 与 CLI 参数用于后续派发；已进入 subagents.start 的请求和已开始的 CLI 执行保持起始快照。delegate 的 LLM 预检等待期间仍可能混用旧模型和新指令，该边界尚待调用级快照设计，详见架构文档末节。Host 源码改动仍需重启一次加载。文件形状如下（**示意**）：
+- **split 模式**（设置层提供 `roleSettings`；迁移后的默认形态）——每个角色一行**旋钮**：
+  后端（spawn / cli）、模型、思考强度、只读、允许嵌套派发。`backend: cli` 的行**额外**出现
+  「外部 CLI」下拉（codex / grok；已有的 `custom` 或未知 id 原样显示，不锁死）。
+  它只写驱动 **id**：命令与参数由 Host 按 `src/cli/drivers.js` 的策展表派生
+  （`cliFieldsFor(driver, readOnly)`），面板**没有**逐字段编辑 argv 的入口 ——
+  「argv 来自用户配置、模型只能填受限占位符」这条约束不该被一个网页表单打开缺口。
+- **legacy 模式**（设置里仍是完整 `roles`，尚未迁移）——保留卡片式编辑器（每条卡片的
+  展开 / 草稿 / 保存语义不变）。
+
+角色的**真源是分开的两份**：
+
+| 内容 | 住哪 |
+| --- | --- |
+| **定义**：title / description / instructions / CLI argv 契约 | `$DSH_HOME/agent-switchboard/roles.json` 的 `roles`（**权威**） |
+| **旋钮**：backend / model / effort / provider / readOnly / allowNestedDispatch / cliDriver | 根条目 `agent-switchboard` 的 `config.roleSettings`（设置页唯一可写的命名空间） |
+
+生效角色 = `roles`（定义）⨝ 文件 `overrides` ⨝ 设置 `roleSettings`，逐字段合并、后者胜出。
+根实例在 `loader/volatile-update` 返回前把**旋钮覆盖**同步进文件的 `overrides` ——
+它**永不覆盖 `roles`**，所以手改 `roles.json` 的定义不会被设置顶掉；反过来，面板也不提供
+定义字段的编辑入口（要改 persona 或 argv 就编辑文件）。
+
+`backend: cli` 的角色**直接作为后台任务派发**：受理即返回 job 句柄，输出由 `dsh-tool-jobs`
+显示，完成后由完成通知送达，模型用 `job_output` 读输出。它**没有**中继（转交）子代理，
+因此**也没有** Agent Preset —— `switchboard-role-<cliId>` 不会出现在预设列表里。
+`spawn` 角色仍走官方 `dsh-tool-subagent` 委派。直派工具**按 agent 安装**（与官方 standing
+组合同构），嵌套子代理不会继承它 —— `allowNestedDispatch: false` 因此不会被绕过。
+
+`instructions` / `readOnly` / `allowNestedDispatch` 属**组合期**事实：改这三项会重建角色
+preset（当前实现：派发前热同步；不确定时完整重启 DSH）。`model` / `effort` / `cliDriver`
+在执行期读取，下次派发即生效。Host 源码改动必须**完全退出并重启**（Node 模块缓存不能驱逐）。
+文件损坏时保留上一份有效缓存并标记陈旧；无有效缓存时拒绝派发。
+根条目直接注册 owning Fiber 的 `loader/volatile-update` 监听；事件载荷只含路径，监听器从
+Volatile 引用读取已提交新值。同步失败会进入当前健康诊断（恢复后清除旧错误）。
+CLI 可执行文件在**执行期**解析：自检装载时明确标「尚未验证」，执行后报告解析结果或失败。
+**preset 不再携带 `config.roles`**：preset 是常驻单例，新会话只继承它，不重新 `apply`；
+配置更新由文件 resolver 驱动。增删角色 / 改 id / toolName / backend 仍会改变工具集
+（阶段 3，未实现）——当前实例拒绝结构变化的派发，并在自检中提示需重新挂载。
 
 ```jsonc
+// ① 旋钮层：根条目 agent-switchboard 的 config（DSH 持久化在 profile patch 里）。
+//    只放「会变的旋钮」，不含 persona / argv —— 面板写的就这一份。
 {
+  "mount": true,
   "provider": "self",
-  "cwd": "C:\\path\\to\\workspace",
+  "roleSettings": [
+    { "id": "scout", "backend": "spawn", "model": "<DSH LLM route 的模型名>",
+      "effort": "medium", "readOnly": true, "allowNestedDispatch": false },
+    { "id": "architect", "backend": "cli", "cliDriver": "codex",
+      "model": "gpt-6-luna", "effort": "max", "readOnly": false }
+  ]
+}
+```
+
+```jsonc
+// ② 定义层：$DSH_HOME/agent-switchboard/roles.json —— **权威**，面板不编辑它。
+{
   "roles": [
     {
       "id": "scout",
       "title": "侦察员",
       "description": "只读调研：定位相关代码、给出证据路径，不做任何修改。",
-      "instructions": "只读调研，返回结论与证据路径。",
-      // 派发机制：内置 spawn 或外部 CLI（fork 后端已移除）。
-      "backend": "spawn",
-      "model": "<DSH LLM route 的模型名>",
-      "effort": "medium",
-      "readOnly": true,
-      // 是否允许该角色再往下派发子代理。默认 false，防无限递归。
-      "allowNestedDispatch": false
+      "instructions": "只读调研，返回结论与证据路径。"
+      // 定义层**可以**省略旋钮字段；缺的由 ① 与下面的 overrides 补。
     },
     {
       "id": "architect",
       "title": "架构师",
       "description": "产出实现方案与接口约定，不写实现代码。",
       "instructions": "分析方案取舍并给出接口约定，不修改文件。",
-      // 走外部 CLI 的角色：cli* 字段仍在配置中，面板隐藏命令细节。
-      // 在面板里更简单：把「派发机制」选成「外部 CLI」，再从 CLI 下拉框选具体 CLI，
-      // 下面这组参数会被一键填好。
-      "backend": "cli",
+      // 走外部 CLI 的角色：argv 契约住在**定义**里（安全敏感面，面板不给编辑入口）。
       "cliDriver": "codex",
-      "model": "gpt-6-luna",
-      "effort": "max",
       "cliCommand": "{node}",
       "cliPrefixArgs": ["{npmRoot}/@openai/codex/bin/codex.js"],
       // 参数模板：只允许 {prompt} / {cwd} / {model} / {effort} 四个受限占位符。
@@ -126,17 +170,13 @@ Host 根实例将配置同步到文件。根条目保持启用，但只在 `moun
       ],
       "cliPromptDelivery": "stdin",
       "cliCwd": "C:\\path\\to\\workspace"
-    },
-    {
-      "id": "worker",
-      "title": "实现者",
-      "description": "在指定文件范围内落地实现并保证可运行。",
-      "instructions": "只在指定范围实现并验证，汇报改动与验证结果。",
-      "backend": "spawn",
-      "model": "<DSH LLM route 的模型名>",
-      "effort": "high",
-      "readOnly": false
     }
+  ],
+  // ③ 覆盖层：根实例把 ① 的旋钮同步到这里。**只写旋钮**（外加驱动选择），永不覆盖 ② 的定义。
+  //    在面板把 architect 换成 grok 之后，这里会出现 { "id": "architect", "cliDriver": "grok" }，
+  //    其 argv 由 Host 按策展表物化 —— 设置里不会出现任何命令或参数。
+  "overrides": [
+    { "id": "architect", "cliDriver": "grok", "model": "grok-4.7" }
   ]
 }
 ```
