@@ -17,6 +17,7 @@ import { ToolRuntime } from '@deepseek-ai/dsh-tools';
 import { delegationDepthOf, resolveChildDepth } from '@deepseek-ai/dsh-subagent';
 import { apply, Config, liveRoleTools, selftestTool } from '../src/index.js';
 import { normalizeRole, rolePresetId, toolConfigFor } from '../src/roles.js';
+import { cliFieldsFor } from '../src/cli/drivers.js';
 import { parse } from 'yaml';
 import { captureSync } from './lib/capture.mjs';
 import { configPathFor, initialConfig, readConfigFile, writeConfigFile } from '../src/config-file.js';
@@ -1654,6 +1655,28 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
     check('清掉旧 roles 后回退陷阱告警消失',
       !migrated.warnings.includes('回退并覆盖你的改动') && migrated.mounted.includes('配置中有 1 个角色'),
       JSON.stringify({ warnings: migrated.warnings, mounted: migrated.mounted }));
+    // ⚠️ 「会骗人的旋钮」：CLI 角色的 `allowNestedDispatch` 没有效果（CLI 角色不产出 preset，
+    //    其进程也没有 DSH 工具 —— 实测 codex 只有 13 个自家工具）。旧架构下它有意义（中继子代理的
+    //    preset 靠它挂嵌套行），D33 之后必须让用户看见它已经失效，否则会以为打开就能嵌套派发。
+    // ⚠️ 夹具必须**完全合法**：`normalizeRole` 在有任何错误时返回 `role: null`，角色会被整条丢掉，
+    //    那样这条告警根本无从触发（第一版就是这么写的，断言报空告警 —— 夹具问题，不是产品问题）。
+    //    codex 的 argv 含 {effort}，因此 effort 是必填的。
+    const inertCtx = makeCtx();
+    apply(inertCtx, Config({ provider: 'self', roles: [
+      { id: 'cli-worker', description: 'd', instructions: 'i', backend: 'cli', model: 'm',
+        effort: 'medium', cliDriver: 'codex', cliCwd: 'C:/w', ...cliFieldsFor('codex', false),
+        allowNestedDispatch: true }] }));
+    const inert = await inertCtx.tools.get('switchboard_selftest').execute({});
+    check('CLI 角色打开嵌套开关时自检明确告警（该旋钮对 CLI 角色无效）',
+      inert.warnings.includes('cli-worker') && inert.warnings.includes('对 CLI 角色无效'),
+      JSON.stringify({ warnings: inert.warnings, errors: inert.configErrors }));
+    const spawnNestedCtx = makeCtx();
+    apply(spawnNestedCtx, Config({ provider: 'self', roles: [
+      { id: 'spawn-worker', description: 'd', instructions: 'i', model: 'm', effort: 'medium',
+        allowNestedDispatch: true }] }));
+    const spawnNested = await spawnNestedCtx.tools.get('switchboard_selftest').execute({});
+    check('spawn 角色打开同一个开关**不**告警（它对内置角色是有效的）',
+      !spawnNested.warnings.includes('对 CLI 角色无效'), JSON.stringify(spawnNested.warnings));
   } finally {
     writeFileSync(path, splitFileBytes);
   }

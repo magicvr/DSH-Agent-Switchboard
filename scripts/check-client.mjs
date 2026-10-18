@@ -769,6 +769,14 @@ section('统一包裹小节：真实控件、读取与原子写入');
         && !/patch\(index, 'cli(Command|Args|PrefixArgs|PromptDelivery)'/.test(splitForm));
     check('split 旋钮表单：驱动选项来自与 Host 对齐的策展表',
       splitForm.includes('CLI_DRIVER_OPTIONS.map') && !splitForm.includes('cliCommand'));
+    // ⚠️ 「会骗人的旋钮」：CLI 角色的「允许嵌套派发」没有效果（CLI 角色不产出 preset，其进程
+    //    也没有 DSH 工具），必须置灰 + 就地说明，否则用户会以为打开它就能嵌套派发。
+    check('split 旋钮表单：CLI 角色的嵌套开关置灰并说明原因，且不静默清值',
+      /const inert = field === 'allowNestedDispatch' && entry\.backend === 'cli'/.test(splitForm)
+        && /disabled: busy \|\| inert/.test(splitForm)
+        && splitForm.includes('对 CLI 角色无效')
+        && !splitForm.includes("patch(index, 'allowNestedDispatch', false)"),
+      'inert 判定或说明文案缺失');
   }
   const splitSaved = await splitStore.writeSettings([{ id: 'scout', backend: 'cli' }], splitRead.revision);
   check('split 模式下 writeSettings 只写 roleSettings，绝不写 roles',

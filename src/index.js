@@ -706,8 +706,19 @@ export function selftestTool(ctx, diagnostics) {
         : diagnostics.readSupervisorRules?.() ? '已配置（仅注入主代理）'
           : '未配置（profile 可能未同步 preset：需 gen:preset → inject:preset → 重启）';
       const format = diagnostics.roleConfigPath ? readConfigFileDetailed(diagnostics.roleConfigPath).format : null;
+      // ⚠️ CLI 角色的 `allowNestedDispatch` 是**无效旋钮**：CLI 角色不产出角色 preset（没有地方
+      //    承载嵌套行），CLI 进程本身也只有它自己的工具（实测 codex 只有 13 个自家工具，没有任何
+      //    DSH 工具），根本无法调用 delegate_to_*。打开它不会有任何效果 —— 必须让用户看见，
+      //    否则这个开关会骗人（旧架构下它有意义：中继子代理的 preset 靠它挂嵌套行）。
+      const inertNesting = (diagnostics.configuredRoles ?? [])
+        .filter(role => role?.backend === CLI_BACKEND && role.allowNestedDispatch === true)
+        .map(role => role.id);
       const warnings = [packageWarning, diagnostics.mountHere && !diagnostics.readSupervisorRules?.() ? `调度规则：${scheduling}` : '',
         format?.status === 'migrated' ? format.reason : '',
+        inertNesting.length > 0
+          ? `CLI 角色 ${inertNesting.join(' / ')} 打开了「允许嵌套派发」，但对 CLI 角色无效`
+            + '（CLI 角色没有 preset，其进程也没有 DSH 工具）；可关闭'
+          : '',
         // 组合期字段改了但组合还没跟上：提示词与自检都按**已注册的**快照如实描述，
         // 但子代理实际拿到的仍是那一版。热同步会在下次派发前重建；若重建失败，
         // 下面那条错误会顶上来，必须让用户看见。
@@ -1117,7 +1128,10 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
   const { roles, errors } = normalizeRoles(rawRoles,
     (current.ok && current.value.provider) || resolved.provider,
     (current.ok && current.value.cwd) || resolved.cwd);
-  diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName }));
+  // 这里必须带上 backend 与 allowNestedDispatch：自检那条「CLI 角色的嵌套开关无效」的告警
+  // 就是靠这两个字段判断的。只投影 { id, toolName } 会让它永远不触发 —— 实测踩到。
+  diagnostics.configuredRoles = roles.map((r) => ({ id: r.id, toolName: r.toolName,
+    backend: r.backend, allowNestedDispatch: r.allowNestedDispatch === true }));
   diagnostics.configErrors = errors;
   const depth = syncDepth ? readVolatileField(resolved, 'maxDepth') : undefined;
   const depthChanged = depth !== undefined && current.ok && current.missing !== true && current.value.maxDepth !== depth;
@@ -1339,7 +1353,8 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
   };
   diagnostics.refresh = () => { try { resolver(); } catch {} };
   diagnostics.roleRoutes = initial.routes;
-  diagnostics.configuredRoles = roles.map(role => ({ id: role.id, toolName: role.toolName }));
+  diagnostics.configuredRoles = roles.map(role => ({ id: role.id, toolName: role.toolName,
+    backend: role.backend, allowNestedDispatch: role.allowNestedDispatch === true }));
   diagnostics.configuredRoleCount = roles.length;
   diagnostics.mountHere = true;
   if (!initial.ok || initial.errors.length > 0) {

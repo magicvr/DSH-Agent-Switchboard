@@ -821,7 +821,9 @@ window.__ModuleLoader__.load({
           h('input', {
             type: 'checkbox',
             checked: role[key] === true,
-            disabled,
+            // ⚠️ CLI 角色的「允许再派发」无效（CLI 角色没有 preset，其进程也没有 DSH 工具），
+            //    置灰但保留已存的值 —— 不悄悄改用户数据。
+            disabled: disabled || (key === 'allowNestedDispatch' && isCli),
             onChange: (e) => {
               const checked = e.target.checked;
               if (key === 'readOnly' && isCli) {
@@ -830,7 +832,8 @@ window.__ModuleLoader__.load({
               } else set(key, checked);
             },
           }),
-          h('span', { style: { color: 'var(--dsw-alias-label-secondary)' } }, label),
+          h('span', { style: { color: 'var(--dsw-alias-label-secondary)' } },
+            key === 'allowNestedDispatch' && isCli ? `${label}（对 CLI 角色无效）` : label),
         );
 
       return h(
@@ -1228,10 +1231,17 @@ window.__ModuleLoader__.load({
               text: result.ok ? '已保存旋钮设置。组合期字段（只读 / 嵌套派发）会在下次派发前重建。' : result.message });
           } finally { setBusy(false); }
         };
-        const checkbox = (entry, index, field, label) => h('label', {
-          style: { display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px' },
-        }, h('input', { type: 'checkbox', checked: entry[field] === true, disabled: busy,
-          onChange: (event) => patch(index, field, event?.target?.checked === true) }), label);
+        const checkbox = (entry, index, field, label) => {
+          // ⚠️ CLI 角色的「允许嵌套派发」**无效**：CLI 角色不产出角色 preset，没有地方承载嵌套行；
+          //    而 CLI 进程本身也只有它自己的工具（实测 codex 只有 13 个自家工具、无任何 DSH 工具），
+          //    根本无法调用 delegate_to_*。置灰 + 说明，但**不清值** —— 不悄悄改用户的数据。
+          const inert = field === 'allowNestedDispatch' && entry.backend === 'cli';
+          return h('label', {
+            style: { display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px',
+              color: inert ? 'var(--dsw-alias-label-secondary)' : undefined },
+          }, h('input', { type: 'checkbox', checked: entry[field] === true, disabled: busy || inert,
+            onChange: (event) => patch(index, field, event?.target?.checked === true) }), label);
+        };
         return wrap(h('div', null,
           h('div', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '8px' } },
             '角色定义（persona、工具构成、CLI 参数）住在 $DSH_HOME/agent-switchboard/roles.json，'
@@ -1275,9 +1285,17 @@ window.__ModuleLoader__.load({
               onChange: (event) => patch(index, 'effort', event?.target?.value || undefined) },
             h('option', { value: '' }, '（不指定）'),
             EFFORTS.map((value) => h('option', { key: value, value }, value)))),
-          h('div', { style: { display: 'flex', gap: '12px' } },
+          h('div', { style: { display: 'flex', gap: '12px', alignItems: 'center' } },
             checkbox(entry, index, 'readOnly', '只读（组合期）'),
-            checkbox(entry, index, 'allowNestedDispatch', '允许嵌套派发（组合期）'))))),
+            checkbox(entry, index, 'allowNestedDispatch', '允许嵌套派发（组合期）'),
+            // ⚠️ CLI 角色的这个旋钮**没有效果**，必须当场说清，否则它会骗人：
+            //    CLI 角色不产出角色 preset（没有地方承载嵌套行），而 CLI 进程本身也只有它自己的
+            //    工具（实测 codex 只有 13 个自家工具，没有任何 DSH 工具）——它根本无法调用
+            //    delegate_to_*。置灰而不是清值：不悄悄改用户的数据，只解释它为什么不生效。
+            entry.backend === 'cli'
+              ? h('span', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' } },
+                '（对 CLI 角色无效：CLI 角色没有 preset，其进程也没有 DSH 工具）')
+              : null)))),
           h('div', { style: { marginTop: '10px' } }, button('保存旋钮', saveSettings, { disabled: busy }))));
       }
       if (status.startsWith('error:')) {
