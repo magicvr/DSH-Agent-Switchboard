@@ -234,7 +234,12 @@ section('模块可被真跑：桩化 window/require 后 factory 返回合法插�
       } catch (error) {
         check('apply 不抛错', false, error.message);
       }
-      check('父 inject 保持三个内核依赖，不含 remote/job', JSON.stringify(plugin.inject) === JSON.stringify(['slots', 'configForms', 'remote.settings']));
+      // ⚠️ `remote.llm` 必须**静态声明**：真机实测用 `ctx.inject(['remote'], …)` 运行时取网关
+      //    是接不上通道的（供应商目录永远为空 ⇒ 面板一直退回文本框）。官方「模型」页也把
+      //    `remote.llm` 写在自己的 inject 里 —— 断言写死四个，防有人"顺手"把它挪回运行时取。
+      check('父 inject = 四个内核依赖（remote.llm 必须在，且不含 remote/job）',
+        JSON.stringify(plugin.inject) === JSON.stringify(['slots', 'configForms', 'remote.settings', 'remote.llm']),
+        JSON.stringify(plugin.inject));
       // ⚠️ 面板槽位（`conversation.composer`）已随 CLI 输出面板一起删除，因此现在只剩 1 个：
       //    设置页那一格。这条断言原先数的是 2。
       check('apply 注册了恰好 1 个 slot（只剩设置页）', registered.length === 1, `实际 ${registered.length}`);
@@ -846,6 +851,73 @@ section('模型供应商目录：remote.llm 的信封、失败降级与同步读
   await strings.bind({ listProviders: () => ['self', 'llm-pi-ai'] });
   check('供应商目录：字符串数组形态也收', JSON.stringify(strings.getProviders().map(item => item.id))
     === JSON.stringify(['self', 'llm-pi-ai']));
+}
+
+section('split 旋钮表单：供应商/模型下拉（spawn）与目录缺失时的退化');
+{
+  const contexts = new Map(); let active, used;
+  const react = { ...rowReact,
+    useState(initial) { const at = active.index++; if (!(at in active.states)) active.states[at] = typeof initial === 'function' ? initial() : initial;
+      const current = active; return [current.states[at], value => { current.states[at] = typeof value === 'function' ? value(current.states[at]) : value; }]; },
+    useRef(initial) { const at = active.refIndex++; return active.refs[at] ?? (active.refs[at] = { current: initial }); },
+    useCallback: fn => fn, useEffect: effect => { active.effects.push(effect); },
+  };
+  const api = clientWindow.spec.factory(() => react);
+  // 两条 spawn 角色：worker 的供应商在目录里（→ 模型下拉），other 的供应商不在目录里
+  // （→ 供应商多一个"原样保留"的额外选项，模型退回文本框）。
+  const settings = [
+    { id: 'worker', backend: 'spawn', provider: 'deepseek-official', model: 'gpt-6.1-sol' },
+    { id: 'other', backend: 'spawn', provider: 'legacy-provider', model: 'manual-model' },
+  ];
+  const store = makeRoleStore({ configForms: { describe: () => ({ ensure: async () => {}, getSnapshot: () => ({ view: { namespaces: [
+    { ns: 'agent-switchboard', value: { roleSettings: structuredClone(settings) }, revision: 5 },
+  ] } }) }) }, remote: { settings: { mutate: async () => ({ ok: true }) } } });
+  const catalog = {
+    getProviders: () => [{ id: 'deepseek-official', label: 'DeepSeek' }],
+    getModels: (providerId) => (providerId === 'deepseek-official'
+      ? [{ id: 'gpt-6.1-sol', label: 'gpt-6.1-sol' }, { id: 'gemini-3.8-flash-high', label: 'Gemini' }] : []),
+    subscribe: () => () => {},
+  };
+  function component(fn, props, key) {
+    used.add(key); const prior = active;
+    active = contexts.get(key) ?? { states: [], refs: [], effects: [] }; contexts.set(key, active);
+    active.index = 0; active.refIndex = 0; active.effects = [];
+    const tree = fn(props); active = prior; return tree;
+  }
+  const allNodes = () => {
+    used = new Set(); const nodes = [];
+    const walk = node => {
+      if (Array.isArray(node)) return node.forEach(walk);
+      if (!node || typeof node !== 'object') return;
+      if (typeof node.type === 'function') return walk(component(node.type, node.props, node.type.name + ':' + (node.props.key ?? 'singleton')));
+      nodes.push(node); node.children?.forEach(walk);
+    };
+    walk(component(api.SwitchboardSettings, { store, catalog }, 'root'));
+    for (const key of contexts.keys()) if (!used.has(key)) contexts.delete(key);
+    return nodes;
+  };
+  allNodes();
+  contexts.get('root').effects[0]();
+  await new Promise(setImmediate);
+  const nodes = allNodes();
+  const selects = nodes.filter(n => n.type === 'select');
+  const providerSelect = selects.find(sel => allOfSel(sel).some(o => o.props?.value === 'deepseek-official'));
+  const modelSelect = selects.find(sel => sel.props?.value === 'gpt-6.1-sol');
+  function allOfSel(sel) { const out = []; const walk = n => { if (Array.isArray(n)) return n.forEach(walk); if (!n || typeof n !== 'object') return; out.push(n); n.children?.forEach(walk); }; walk(sel); return out; }
+  check('spawn：供应商是下拉，选项来自目录（含"跟随默认"与目录里的供应商）',
+    providerSelect !== undefined
+      && allOfSel(providerSelect).some(o => o.type === 'option' && o.props?.value === '')
+      && allOfSel(providerSelect).some(o => o.type === 'option' && o.props?.value === 'deepseek-official'),
+    JSON.stringify(selects.length));
+  check('spawn：模型是该供应商的模型下拉（值与原选项都在）',
+    modelSelect !== undefined
+      && allOfSel(modelSelect).some(o => o.props?.value === 'gemini-3.8-flash-high'),
+    JSON.stringify(selects.map(sel => sel.props?.value)));
+  check('spawn：现值不在目录里时，供应商仍把它**原样保留**为额外选项（不锁死、不丢值）',
+    selects.some(sel => allOfSel(sel).some(o => o.props?.value === 'legacy-provider')),
+    JSON.stringify(selects.map(sel => sel.props?.value)));
+  check('spawn：供应商不在目录里时模型退回文本框（`manual-model` 是个 input）',
+    nodes.some(n => n.type === 'input' && n.props?.value === 'manual-model'));
 }
 
 section('split 旋钮表单：操作区的启用/取消是真实行为');{

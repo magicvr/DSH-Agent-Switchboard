@@ -1033,16 +1033,17 @@ window.__ModuleLoader__.load({
       //    原因：slot 的组件侧上下文与插件上下文不是同一个，直接读 `props.ctx.remote`
       //    会拿不到远程命名空间（实测：读得到 configForms、写不到 remote.settings）。
       const store = props.store;
-      // 供应商目录（可能为 undefined：拿不到 `remote.llm` —— 那时供应商退回文本框）。
-      // ⚠️ 同步读一次快照、不订阅：目录在 `apply` 阶段就已开始加载，设置页总在这之后打开，
-      //    到渲染时通常已就绪；真为空也只是退化成文本框（功能不丢），不值得再加一个 effect
-      //    与一轮订阅（那会打乱钩子顺序、牵连既有断言）。
-      const catalog = props.catalog;
-      const providers = catalog?.getProviders?.() ?? [];
+      // ⚠️ 既有的前四个 state **顺序不要动**：测试用绝对下标（`states[3]` = readSucceeded）
+      //    做白盒断言，插到前面会把它们整体右移。新增 state 一律追加在后面。
       const [draft, setDraft] = useState(null);
       const [editingId, setEditingId] = useState(null);
       const [confirmingIndex, setConfirmingIndex] = useState(null);
       const [readSucceeded, setReadSucceeded] = useState(false);
+      // 供应商目录（可能为 undefined：拿不到 `remote.llm` —— 那时供应商退回文本框）。
+      const catalog = props.catalog;
+      // 目录在 `apply` 之后**异步**到位（`listProviders()` 是一次远程调用），所以列表要进 state：
+      // 到货时由订阅（见下面的 effect）触发重渲染，否则用户会一直看到文本框（真机踩过）。
+      const [providers, setProviders] = useState(() => catalog?.getProviders?.() ?? []);
       const [cardProblem, setCardProblem] = useState(null);
       const [status, setStatus] = useState('loading');
       // split 模式（设置里只有旋钮层 `roleSettings`，角色定义住在 roles.json）的旋钮草稿。
@@ -1111,6 +1112,15 @@ window.__ModuleLoader__.load({
         refresh();
         return undefined;
       }, [store, refresh]);
+
+      // ⚠️ 必须放在**既有 effect 之后**：测试用 `effects[0]` 触发首次读取，插到前面会打乱顺序。
+      //    供应商目录异步到货 ⇒ 同步进 state ⇒ 重渲染（模型目录同理，它在同一轮 emit 里）。
+      useEffect(() => {
+        if (catalog === undefined || typeof catalog.subscribe !== 'function') return undefined;
+        const sync = () => setProviders(catalog.getProviders());
+        sync();
+        return catalog.subscribe(sync);
+      }, [catalog]);
 
       const roles = draft ?? [];
       const saved = savedRef.current === null ? {} : JSON.parse(savedRef.current);
@@ -1505,19 +1515,21 @@ window.__ModuleLoader__.load({
       //    曾经注入的 `remote.roleConfig` 是我们自己延迟注册的服务，声明成必需依赖后
       //    永远等不到，导致整页起不来（`web boot: 1 entry did not activate`）。
       //    判据是「由谁保证它在装载期存在」，而不是名字里有没有 `remote.`。
-      inject: ['slots', 'configForms', 'remote.settings'],
+      // ⚠️ `remote.llm` 与它俩**同类**：内核提供的通道，官方「模型」页也把它写在自己的静态
+      //    `inject` 里。判据是「官方那个页面的 inject 里有没有它」，不是「由谁注册」。
+      inject: ['slots', 'configForms', 'remote.settings', 'remote.llm'],
       apply(ctx) {
         // ⚠️ 在**插件上下文**里绑定读写操作，再把操作注入给组件 —— 与官方「模型」页
         //    （`createModelsOperations(ctx)`）一致。不要把 `ctx` 本身注入给组件：
         //    slot 的组件侧上下文与插件上下文不是同一个，实测表现为「读得到、写不到」。
         const store = makeRoleStore(ctx);
-        // 供应商目录（可能一直为空：拿不到 `remote.llm`、或调用失败 —— 面板会退回文本框）。
+        // 供应商目录：`remote.llm` 与 `remote.settings` **同类**（内核提供的通道）。
+        //
+        // ⚠️ 这里**曾经**用 `ctx.inject(['remote'], scope => …scope.remote.llm)` 运行时去"取网关"
+        //    —— 真机实测**通道接不上**（目录永远是空的，面板一直退回文本框，连续两次踩到）。
+        //    教训：通道必须像官方那样**静态声明**；判据是「官方那个页面的 inject 里有没有它」。
         const catalog = makeModelCatalog();
-        if (typeof ctx.inject === 'function') {
-          ctx.inject(['remote'], (scope) => {
-            try { return catalog.bind(scope?.remote?.llm); } catch { return catalog.bind(null); }
-          });
-        }
+        try { void catalog.bind(ctx.remote?.llm ?? null); } catch { void catalog.bind(null); }
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(
             {
