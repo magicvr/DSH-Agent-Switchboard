@@ -1033,17 +1033,10 @@ window.__ModuleLoader__.load({
       //    原因：slot 的组件侧上下文与插件上下文不是同一个，直接读 `props.ctx.remote`
       //    会拿不到远程命名空间（实测：读得到 configForms、写不到 remote.settings）。
       const store = props.store;
-      // ⚠️ 既有的前四个 state **顺序不要动**：测试用绝对下标（`states[3]` = readSucceeded）
-      //    做白盒断言，插到前面会把它们整体右移。新增 state 一律追加在后面。
       const [draft, setDraft] = useState(null);
       const [editingId, setEditingId] = useState(null);
       const [confirmingIndex, setConfirmingIndex] = useState(null);
       const [readSucceeded, setReadSucceeded] = useState(false);
-      // 供应商目录（可能为 undefined：拿不到 `remote.llm` —— 那时供应商退回文本框）。
-      const catalog = props.catalog;
-      // 目录在 `apply` 之后**异步**到位（`listProviders()` 是一次远程调用），所以列表要进 state：
-      // 到货时由订阅（见下面的 effect）触发重渲染，否则用户会一直看到文本框（真机踩过）。
-      const [providers, setProviders] = useState(() => catalog?.getProviders?.() ?? []);
       const [cardProblem, setCardProblem] = useState(null);
       const [status, setStatus] = useState('loading');
       // split 模式（设置里只有旋钮层 `roleSettings`，角色定义住在 roles.json）的旋钮草稿。
@@ -1112,17 +1105,6 @@ window.__ModuleLoader__.load({
         refresh();
         return undefined;
       }, [store, refresh]);
-
-      // ⚠️ 必须放在**既有 effect 之后**：测试用 `effects[0]` 触发首次读取，插到前面会打乱顺序。
-      //    供应商目录异步到货 ⇒ 同步进 state ⇒ 重渲染（模型目录同理，它在同一轮 emit 里）。
-      useEffect(() => {
-        if (catalog === undefined || typeof catalog.subscribe !== 'function') return undefined;
-        const sync = () => setProviders(catalog.getProviders());
-        // ⚠️ 这里才去解析 `remote.llm`（apply 那一刻它还拿不到，真机实测为空）。
-        void catalog.ensureBound?.().then(sync).catch(() => {});
-        sync();
-        return catalog.subscribe(sync);
-      }, [catalog]);
 
       const roles = draft ?? [];
       const saved = savedRef.current === null ? {} : JSON.parse(savedRef.current);
@@ -1284,15 +1266,8 @@ window.__ModuleLoader__.load({
         return wrap(h('div', null,
           h('div', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '8px' } },
             '角色定义（persona、工具构成、CLI 参数）住在 $DSH_HOME/agent-switchboard/roles.json，'
-            + '本页只调每个角色的旋钮（派发方式 / 供应商 / 模型 / 强度 / 外部 CLI）。'
+            + '本页只调每个角色的旋钮（派发方式 / 模型 / 强度 / 外部 CLI）。'
             + '只读与能否嵌套派发属**角色定义**，不在本页编辑 —— 它们决定角色 preset 的构成，改了要重建组合。'),
-          // 拿不到供应商目录时把**原因**摆出来（只报形状与错误消息，不回显值）：
-          // 这个下拉连错两轮都是"猜 API 形状"导致的，界面上直接说清比再猜一次便宜得多。
-          providers.length === 0 && (catalog?.getDiagnostic?.() ?? '') !== ''
-            ? h('div', { style: { fontSize: '11px', marginBottom: '8px',
-              color: 'var(--dsw-alias-state-error-primary, var(--dsw-alias-label-secondary))' } },
-            `供应商目录不可用：${catalog.getDiagnostic()}`)
-            : null,
           h('ul', { style: { margin: 0, padding: 0, listStyle: 'none', display: 'flex',
             flexDirection: 'column', gap: '10px' } },
           entries.map((entry, index) => h('li', { key: String(entry.id ?? index),
@@ -1331,42 +1306,14 @@ window.__ModuleLoader__.load({
             ? null
             : h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
               h('span', { style: { fontSize: '11px', width: '56px' } }, '供应商'),
-              // 目录可用 → 下拉；不可用 → 文本框（**绝不**因为读不到目录就让人没法填）。
-              providers.length > 0
-                ? h('select', { value: entry.provider ?? '', disabled: busy, style: selectStyle(),
-                  onChange: (event) => patch(index, 'provider', event?.target?.value || undefined) },
-                  h('option', { value: '' }, '（跟随默认 provider）'),
-                  providers.map((item) => h('option', { key: item.id, value: item.id }, item.label)),
-                  // 现值不在目录里（手写过、或在别处配的）时原样保留 —— 不锁死、不静默改值。
-                  entry.provider !== undefined && entry.provider !== ''
-                    && !providers.some((item) => item.id === entry.provider)
-                    ? h('option', { value: entry.provider }, entry.provider) : null)
-                : h('input', { type: 'text', value: entry.provider ?? '', disabled: busy, style: inputStyle(),
-                  placeholder: '留空则跟随默认 provider（未读到供应商目录，可手填）',
-                  // 空串写 `undefined`：让这个键**消失**，而不是在配置里留一个空字符串。
-                  onChange: (event) => patch(index, 'provider', event?.target?.value || undefined) })),
-          // 「模型」：**只有**在「本地派发 + 已选供应商 + 已读到该供应商的模型」时才是下拉。
-          // 其余情况（外部 CLI、未选供应商、目录读不到）一律退回自由文本 ——
-          // 外部 CLI 的模型 id 来自驱动自己的世界（如 `gpt-6.1-sol`），DSH 目录里根本没有。
-          (() => {
-            const models = entry.backend !== 'cli' && entry.provider !== undefined && entry.provider !== ''
-              ? (catalog?.getModels?.(entry.provider) ?? []) : [];
-            return h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
-              h('span', { style: { fontSize: '11px', width: '56px' } }, '模型'),
-              models.length > 0
-                ? h('select', { value: entry.model ?? '', disabled: busy, style: selectStyle(),
-                  onChange: (event) => patch(index, 'model', event?.target?.value || undefined) },
-                  h('option', { value: '' }, '（跟随默认模型）'),
-                  models.map((model) => h('option', { key: model.id, value: model.id }, model.label)),
-                  // 现值不在目录里（手写过、或驱动侧特有）时原样保留 —— 不锁死、不静默改值。
-                  entry.model !== undefined && entry.model !== ''
-                    && !models.some((model) => model.id === entry.model)
-                    ? h('option', { value: entry.model }, entry.model) : null)
-                : h('input', { type: 'text', value: entry.model ?? '', disabled: busy, style: inputStyle(),
-                  placeholder: entry.backend === 'cli' ? '外部 CLI 自己的模型 id（如 gpt-6.1-sol）'
-                    : '留空则跟随默认（未读到模型目录时会话可手填）',
-                  onChange: (event) => patch(index, 'model', event?.target?.value ?? '') }));
-          })(),
+              h('input', { type: 'text', value: entry.provider ?? '', disabled: busy, style: inputStyle(),
+                placeholder: '留空则跟随默认 provider',
+                // 空串写 `undefined`：让这个键**消失**，而不是在配置里留一个空字符串。
+                onChange: (event) => patch(index, 'provider', event?.target?.value || undefined) })),
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
+            h('span', { style: { fontSize: '11px', width: '56px' } }, '模型'),
+            h('input', { type: 'text', value: entry.model ?? '', disabled: busy, style: inputStyle(),
+              placeholder: '留空则跟随默认', onChange: (event) => patch(index, 'model', event?.target?.value ?? '') })),
           h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
             h('span', { style: { fontSize: '11px', width: '56px' } }, '思考强度'),
             h('select', { value: entry.effort ?? '', disabled: busy, style: selectStyle(),
@@ -1441,110 +1388,6 @@ window.__ModuleLoader__.load({
           button(dirty ? '保存 *' : '保存', () => save(), { disabled: busy || !readSucceeded || !dirty, primary: dirty, className: 'pageActionSave' }))));
     }
 
-    // 「模型供应商」目录：从 `remote.llm`（内核提供的通道；官方「模型」页也声明它）读供应商与模型。
-    //
-    // ⚠️ **必须延迟解析**：真机实测在 `apply` 里立刻读 `ctx.remote.llm` 得到的是**空**
-    //    （诊断原文：「remote.llm 不可用（注入未生效，或 ctx.remote 为空）」）——
-    //    通道在 apply 那一刻还没挂上。官方模型页的做法正是不在 apply 时读：它把 `ctx` 存下来，
-    //    等到真正要用时才 `ctx.remote.llm.x()`（注释原文：*"the Remote namespaces stay in the
-    //    apply world"*）。所以这里收一个 **getter**，在设置页首次渲染（effect）时才去取。
-    //    拿不到/调用失败一律退化成文本框 —— 供应商下拉是**增强**，不该拖垮设置页。
-    function makeModelCatalog(getLlm) {
-      let llm = null;
-      let bound = false;
-      let providers = [];
-      // 拿不到目录时把**原因**摆到界面上：前两次我靠猜 API 形状，连错两轮。
-      // ⚠️ 只描述形状、不回显内容 —— 供应商条目里可能带凭据线索，界面上不该出现值。
-      let diagnostic = '尚未绑定 remote.llm（注入未生效或 ctx.remote 为空）';
-      const listeners = new Set();
-      const models = new Map();
-      const emit = () => { for (const fn of [...listeners]) { try { fn(); } catch { /* 单个订阅者出错不影响其它 */ } } };
-      const shapeOf = (value) => (Array.isArray(value) ? `数组(${value.length})`
-        : value === null ? 'null'
-          : typeof value === 'object' ? `对象{${Object.keys(value).slice(0, 6).join(',')}}` : typeof value);
-      // 目录形态按「信封 / 裸数组、字符串或对象」都收 —— 真机核对结果（2026-10-19）：
-      //   · `listProviders()` 返回**信封** `{ok:true, value} | {ok:false, error:{message}}`；
-      //     官方模型页的写法就是 `if (!registered.ok) failLoad(registered.error.message)`。
-      //     ⚠️ 第一版把整个信封当数组 ⇒ 永远得到空目录 ⇒ 面板一直退回文本框（真机踩到）。
-      //   · 条目里的 **id 叫 `provider`**（如 `deepseek-official`），`name` 是显示名
-      //     —— id 必须优先取 `provider`，否则会拿到「DeepSeek」这种显示名当 id。
-      //   · 必须**保留 `settingsNs`**：模型发现按各供应商自己的命名空间做
-      //     （`discoverModels(probe.settingsNs, { provider })`），丢了它就没有模型清单的钥匙。
-      const toList = (value) => (Array.isArray(value) ? value : [])
-        .map((item) => (typeof item === 'string'
-          ? { id: item, label: item }
-          : { id: String(item?.provider ?? item?.id ?? item?.name ?? ''),
-            label: String(item?.label ?? item?.name ?? item?.provider ?? item?.id ?? ''),
-            settingsNs: typeof item?.settingsNs === 'string' ? item.settingsNs : undefined }))
-        .filter((item) => item.id !== '');
-      // 模型可能是字符串数组、也可能是对象数组 —— 同样两种都收。
-      const toModels = (value) => (Array.isArray(value) ? value : [])
-        .map((item) => (typeof item === 'string'
-          ? { id: item, label: item }
-          : { id: String(item?.id ?? item?.name ?? ''), label: String(item?.label ?? item?.name ?? item?.id ?? '') }))
-        .filter((item) => item.id !== '');
-      // 某供应商的模型：没有 ns / 调用失败 / 信封 ok=false 一律记空数组（面板据此退回文本框）。
-      const loadModels = (provider) => {
-        if (llm === null || typeof llm.discoverModels !== 'function') return Promise.resolve([]);
-        if (provider.settingsNs === undefined) return Promise.resolve([]);
-        return Promise.resolve()
-          .then(() => llm.discoverModels(provider.settingsNs, { provider: provider.id }))
-          .then((answer) => (answer?.ok === true ? toModels(answer.value) : []))
-          .catch(() => [])
-          .then((list) => { models.set(provider.id, list); emit(); return list; });
-      };
-      return {
-        // 幂等：绑定成功过就直接返回；**失败不置位** —— 这样下一次 `ensureBound()` 还能重试
-        // （通道可能在 apply 之后才挂上，这正是真机踩到的那次）。
-        ensureBound() {
-          if (bound) return Promise.resolve(providers);
-          let next = null;
-          try { next = typeof getLlm === 'function' ? getLlm() : null; } catch { next = null; }
-          return this.bind(next);
-        },
-        bind(next) {
-          llm = next === undefined || next === null || typeof next.listProviders !== 'function' ? null : next;
-          models.clear();
-          if (llm === null) {
-            bound = false;
-            providers = [];
-            diagnostic = 'remote.llm 不可用（注入未生效，或调用时 ctx.remote 仍为空）';
-            emit();
-            return Promise.resolve([]);
-          }
-          bound = true;
-          diagnostic = '正在读取供应商目录…';
-          return Promise.resolve()
-            .then(() => llm.listProviders())
-            .then((answer) => {
-              // ⚠️ 先拆**信封**再取目录（`{ok:true, value}` / `{ok:false, error}`）；
-              //    裸数组也容忍，但绝不把信封本身当成列表（那会让目录永远为空）。
-              providers = answer?.ok === true ? toList(answer.value)
-                : Array.isArray(answer) ? toList(answer) : [];
-              diagnostic = providers.length > 0 ? ''
-                : answer?.ok === false ? `listProviders 被拒绝：${String(answer?.error?.message ?? '（无消息）')}`
-                  : `listProviders 返回了无法识别的形状：${shapeOf(answer)}`
-                    + (answer?.ok === true ? `（value 是 ${shapeOf(answer.value)}）` : '') + diagnostic;
-              emit();
-              // 预取：设置页总在 `apply` 之后才打开，预取完成后面板就能**同步**读到模型清单
-              // —— 不必为一个下拉再加 effect 与订阅（那会打乱钩子顺序、牵连既有断言）。
-              for (const provider of providers) void loadModels(provider);
-              return providers;
-            })
-            .catch((error) => {
-              providers = [];
-              diagnostic = `listProviders 调用抛错：${String(error?.message ?? error)}`;
-              emit();
-              return providers;
-            });
-        },
-        getProviders: () => providers,
-        getModels: (providerId) => models.get(providerId) ?? [],
-        getDiagnostic: () => diagnostic,
-        subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
-      };
-    }
-
     return {
       // **读**走 `configForms` 镜像，**写**走 `remote.settings` —— 这是官方「模型」设置页
       // （`dsh-client-ui-settings-models`）的分工，其 inject 里两者都在：
@@ -1559,20 +1402,12 @@ window.__ModuleLoader__.load({
       //    曾经注入的 `remote.roleConfig` 是我们自己延迟注册的服务，声明成必需依赖后
       //    永远等不到，导致整页起不来（`web boot: 1 entry did not activate`）。
       //    判据是「由谁保证它在装载期存在」，而不是名字里有没有 `remote.`。
-      // ⚠️ `remote.llm` 与它俩**同类**：内核提供的通道，官方「模型」页也把它写在自己的静态
-      //    `inject` 里。判据是「官方那个页面的 inject 里有没有它」，不是「由谁注册」。
-      inject: ['slots', 'configForms', 'remote.settings', 'remote.llm'],
+      inject: ['slots', 'configForms', 'remote.settings'],
       apply(ctx) {
         // ⚠️ 在**插件上下文**里绑定读写操作，再把操作注入给组件 —— 与官方「模型」页
         //    （`createModelsOperations(ctx)`）一致。不要把 `ctx` 本身注入给组件：
         //    slot 的组件侧上下文与插件上下文不是同一个，实测表现为「读得到、写不到」。
         const store = makeRoleStore(ctx);
-        // 供应商目录：`remote.llm` 与 `remote.settings` **同类**（内核提供的通道）。
-        //
-        // ⚠️ 这里**曾经**用 `ctx.inject(['remote'], scope => …scope.remote.llm)` 运行时去"取网关"
-        //    —— 真机实测**通道接不上**（目录永远是空的，面板一直退回文本框，连续两次踩到）。
-        //    教训：通道必须像官方那样**静态声明**；判据是「官方那个页面的 inject 里有没有它」。
-        const catalog = makeModelCatalog(() => ctx.remote?.llm ?? null);
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(
             {
@@ -1581,7 +1416,7 @@ window.__ModuleLoader__.load({
               id: 'agent-switchboard',
               order: 25,
               label: '角色与派发',
-              inject: () => ({ store, catalog }),
+              inject: () => ({ store }),
             },
             SwitchboardSettings,
           ),

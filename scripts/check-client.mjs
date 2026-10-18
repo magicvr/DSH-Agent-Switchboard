@@ -56,7 +56,7 @@ function section(title) {
 const CLIENT_SRC = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
 // 执行真实客户端源码，仅在测试副本中暴露内部函数；生产模块不增加测试导出。
 const clientWindow = { __ModuleLoader__: { load: (spec) => { clientWindow.spec = spec; } } };
-new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleCard, RoleRow, makeRoleStore, SwitchboardSettings, makeModelCatalog, // **读**走'))(clientWindow);
+new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleCard, RoleRow, makeRoleStore, SwitchboardSettings, // **读**走'))(clientWindow);
 const clientData = new Function(`${CLIENT_SRC.slice(0, CLIENT_SRC.indexOf('\nwindow.__ModuleLoader__.load'))}\nreturn { CLI_DRIVER_OPTIONS, DEFAULT_CLI_DRIVER, cliFieldsFor, inferCliDriver };`)();
 const rowReact = { createElement: (type, props, ...children) => ({ type, props, children }) };
 const { RoleRow, makeRoleStore } = clientWindow.spec.factory(() => rowReact);
@@ -234,12 +234,7 @@ section('模块可被真跑：桩化 window/require 后 factory 返回合法插�
       } catch (error) {
         check('apply 不抛错', false, error.message);
       }
-      // ⚠️ `remote.llm` 必须**静态声明**：真机实测用 `ctx.inject(['remote'], …)` 运行时取网关
-      //    是接不上通道的（供应商目录永远为空 ⇒ 面板一直退回文本框）。官方「模型」页也把
-      //    `remote.llm` 写在自己的 inject 里 —— 断言写死四个，防有人"顺手"把它挪回运行时取。
-      check('父 inject = 四个内核依赖（remote.llm 必须在，且不含 remote/job）',
-        JSON.stringify(plugin.inject) === JSON.stringify(['slots', 'configForms', 'remote.settings', 'remote.llm']),
-        JSON.stringify(plugin.inject));
+      check('父 inject 保持三个内核依赖，不含 remote/job', JSON.stringify(plugin.inject) === JSON.stringify(['slots', 'configForms', 'remote.settings']));
       // ⚠️ 面板槽位（`conversation.composer`）已随 CLI 输出面板一起删除，因此现在只剩 1 个：
       //    设置页那一格。这条断言原先数的是 2。
       check('apply 注册了恰好 1 个 slot（只剩设置页）', registered.length === 1, `实际 ${registered.length}`);
@@ -802,139 +797,8 @@ section('统一包裹小节：真实控件、读取与原子写入');
 //    包裹路由（中继子代理的 LLM 路由）已随中继一起删除，那节 UI 与判据都不复存在。
 //    等价的「dirty → 只提交改动」覆盖仍在：见上面 store.write 的 roles 断言与角色卡片小节。
 
-section('模型供应商目录：remote.llm 的信封、失败降级与同步读取');
+section('split 旋钮表单：操作区的启用/取消是真实行为');
 {
-  const { makeModelCatalog } = clientWindow.spec.factory(() => rowReact);
-  const calls = [];
-  const catalog = makeModelCatalog();
-  await catalog.bind({
-    // ⚠️ 用**真机形状**：`listProviders()` 返回信封，且条目里 id 叫 `provider`、`name` 是显示名。
-    //    第一版按「裸数组 + id」写，真机目录永远是空的（面板一直退回文本框 ✗）。
-    //    这条断言就是防复发：不拆信封 ⇒ providers 为空 ⇒ 下面第一条立刻红。
-    listProviders: () => ({ ok: true, value: [
-      { provider: 'deepseek-official', name: 'DeepSeek', settingsNs: 'llm-deepseek' },
-    ] }),
-    discoverModels: (ns, request) => {
-      calls.push({ ns, request });
-      return Promise.resolve({ ok: true, value: ['gpt-6.1-sol', { id: 'grok-4.7', label: 'Grok 4.7' }] });
-    },
-  });
-  await new Promise(setImmediate);
-  check('供应商目录：信封 ok=true 才取 value；条目 id 取 `provider`（不是显示名 name）',
-    catalog.getProviders().length === 1 && catalog.getProviders()[0].id === 'deepseek-official'
-      && catalog.getProviders()[0].settingsNs === 'llm-deepseek',
-    JSON.stringify(catalog.getProviders()));
-  check('模型目录：按该供应商自己的 settingsNs 发现，请求是 `{provider}`（与官方模型页一致）',
-    calls.length === 1 && calls[0].ns === 'llm-deepseek' && calls[0].request.provider === 'deepseek-official',
-    JSON.stringify(calls));
-  check('模型目录：信封 ok=true 才取 value，字符串与对象两种形态都收',
-    JSON.stringify(catalog.getModels('deepseek-official').map(model => model.id))
-      === JSON.stringify(['gpt-6.1-sol', 'grok-4.7']));
-  // 失败/缺失一律记空数组 —— 面板据此退回文本框，而不是抛错或往下拉框里塞空值。
-  const failing = makeModelCatalog();
-  await failing.bind({ listProviders: () => [{ id: 'p1', settingsNs: 'ns1' }, { id: 'p2' }],
-    discoverModels: () => Promise.reject(new Error('boom')) });
-  await new Promise(setImmediate);
-  check('模型目录：发现失败记空数组、缺 settingsNs 不发请求',
-    failing.getModels('p1').length === 0 && failing.getModels('p2').length === 0);
-  const refused = makeModelCatalog();
-  await refused.bind({ listProviders: () => ['p1'],
-    discoverModels: () => Promise.resolve({ ok: false, error: { message: 'refused' } }) });
-  await new Promise(setImmediate);
-  check('模型目录：信封 ok=false 不取 value（拒绝时也退回文本框）', refused.getModels('p1').length === 0);
-  // 拿不到 `remote.llm`、或 `listProviders` 直接抛错 ⇒ 空目录，绝不把设置页拖垮。
-  const none = makeModelCatalog();
-  await none.bind(null);
-  await none.bind({ listProviders: () => { throw new Error('unavailable'); } });
-  check('供应商目录：没有 remote.llm / 调用抛错时为空且不抛错', none.getProviders().length === 0);
-  const strings = makeModelCatalog();
-  await strings.bind({ listProviders: () => ['self', 'llm-pi-ai'] });
-  check('供应商目录：字符串数组形态也收', JSON.stringify(strings.getProviders().map(item => item.id))
-    === JSON.stringify(['self', 'llm-pi-ai']));
-  // ⚠️ 真机踩到的那条路：`apply` 那一刻 `ctx.remote.llm` 还拿不到（诊断原文「remote.llm 不可用」），
-  //    所以必须**延迟到用时再解析**；且拿不到时**不能**把自己标记成"已绑定"，否则永远没有第二次机会。
-  let late = null;
-  const lazy = makeModelCatalog(() => late);
-  const first = await lazy.ensureBound();
-  check('延迟解析：通道未就绪时留空，且**不**把自己锁死（可重试）',
-    first.length === 0 && lazy.getProviders().length === 0 && lazy.getDiagnostic().includes('remote.llm'),
-    lazy.getDiagnostic());
-  late = { listProviders: () => ({ ok: true, value: [{ provider: 'self', settingsNs: 'ns' }] }) };
-  await lazy.ensureBound();
-  await new Promise(setImmediate);
-  check('延迟解析：通道就绪后重试即成功（供应商到货、诊断清空）',
-    lazy.getProviders().length === 1 && lazy.getProviders()[0].id === 'self' && lazy.getDiagnostic() === '',
-    JSON.stringify({ providers: lazy.getProviders(), diagnostic: lazy.getDiagnostic() }));
-}
-
-section('split 旋钮表单：供应商/模型下拉（spawn）与目录缺失时的退化');
-{
-  const contexts = new Map(); let active, used;
-  const react = { ...rowReact,
-    useState(initial) { const at = active.index++; if (!(at in active.states)) active.states[at] = typeof initial === 'function' ? initial() : initial;
-      const current = active; return [current.states[at], value => { current.states[at] = typeof value === 'function' ? value(current.states[at]) : value; }]; },
-    useRef(initial) { const at = active.refIndex++; return active.refs[at] ?? (active.refs[at] = { current: initial }); },
-    useCallback: fn => fn, useEffect: effect => { active.effects.push(effect); },
-  };
-  const api = clientWindow.spec.factory(() => react);
-  // 两条 spawn 角色：worker 的供应商在目录里（→ 模型下拉），other 的供应商不在目录里
-  // （→ 供应商多一个"原样保留"的额外选项，模型退回文本框）。
-  const settings = [
-    { id: 'worker', backend: 'spawn', provider: 'deepseek-official', model: 'gpt-6.1-sol' },
-    { id: 'other', backend: 'spawn', provider: 'legacy-provider', model: 'manual-model' },
-  ];
-  const store = makeRoleStore({ configForms: { describe: () => ({ ensure: async () => {}, getSnapshot: () => ({ view: { namespaces: [
-    { ns: 'agent-switchboard', value: { roleSettings: structuredClone(settings) }, revision: 5 },
-  ] } }) }) }, remote: { settings: { mutate: async () => ({ ok: true }) } } });
-  const catalog = {
-    getProviders: () => [{ id: 'deepseek-official', label: 'DeepSeek' }],
-    getModels: (providerId) => (providerId === 'deepseek-official'
-      ? [{ id: 'gpt-6.1-sol', label: 'gpt-6.1-sol' }, { id: 'gemini-3.8-flash-high', label: 'Gemini' }] : []),
-    subscribe: () => () => {},
-  };
-  function component(fn, props, key) {
-    used.add(key); const prior = active;
-    active = contexts.get(key) ?? { states: [], refs: [], effects: [] }; contexts.set(key, active);
-    active.index = 0; active.refIndex = 0; active.effects = [];
-    const tree = fn(props); active = prior; return tree;
-  }
-  const allNodes = () => {
-    used = new Set(); const nodes = [];
-    const walk = node => {
-      if (Array.isArray(node)) return node.forEach(walk);
-      if (!node || typeof node !== 'object') return;
-      if (typeof node.type === 'function') return walk(component(node.type, node.props, node.type.name + ':' + (node.props.key ?? 'singleton')));
-      nodes.push(node); node.children?.forEach(walk);
-    };
-    walk(component(api.SwitchboardSettings, { store, catalog }, 'root'));
-    for (const key of contexts.keys()) if (!used.has(key)) contexts.delete(key);
-    return nodes;
-  };
-  allNodes();
-  contexts.get('root').effects[0]();
-  await new Promise(setImmediate);
-  const nodes = allNodes();
-  const selects = nodes.filter(n => n.type === 'select');
-  const providerSelect = selects.find(sel => allOfSel(sel).some(o => o.props?.value === 'deepseek-official'));
-  const modelSelect = selects.find(sel => sel.props?.value === 'gpt-6.1-sol');
-  function allOfSel(sel) { const out = []; const walk = n => { if (Array.isArray(n)) return n.forEach(walk); if (!n || typeof n !== 'object') return; out.push(n); n.children?.forEach(walk); }; walk(sel); return out; }
-  check('spawn：供应商是下拉，选项来自目录（含"跟随默认"与目录里的供应商）',
-    providerSelect !== undefined
-      && allOfSel(providerSelect).some(o => o.type === 'option' && o.props?.value === '')
-      && allOfSel(providerSelect).some(o => o.type === 'option' && o.props?.value === 'deepseek-official'),
-    JSON.stringify(selects.length));
-  check('spawn：模型是该供应商的模型下拉（值与原选项都在）',
-    modelSelect !== undefined
-      && allOfSel(modelSelect).some(o => o.props?.value === 'gemini-3.8-flash-high'),
-    JSON.stringify(selects.map(sel => sel.props?.value)));
-  check('spawn：现值不在目录里时，供应商仍把它**原样保留**为额外选项（不锁死、不丢值）',
-    selects.some(sel => allOfSel(sel).some(o => o.props?.value === 'legacy-provider')),
-    JSON.stringify(selects.map(sel => sel.props?.value)));
-  check('spawn：供应商不在目录里时模型退回文本框（`manual-model` 是个 input）',
-    nodes.some(n => n.type === 'input' && n.props?.value === 'manual-model'));
-}
-
-section('split 旋钮表单：操作区的启用/取消是真实行为');{
   // ⚠️ 这一节的存在本身就是教训：split 分支原先**没有自己的 dirty 判据**，我给它接上了
   //    roles 列表的 `dirty`（split 下恒为 false），于是「取消 / 保存」**永久禁用** ——
   //    真机上表现为「点取消毫无反应」。只断言源码形状挡不住这类 bug，所以这里**渲染真组件**：
@@ -997,17 +861,6 @@ section('split 旋钮表单：操作区的启用/取消是真实行为');{
       && !nodes.some(n => n.type === 'input' && n.props.value === 'changed-model')
       && writes.length === 0,
     JSON.stringify({ writes: writes.length }));
-  // 夹具里那条是 **cli** 角色：按用户明确要求，外部 CLI **不指定供应商** ——
-  // 既没有「供应商」这一行，模型也保持自由文本（CLI 的模型 id 不在 DSH 目录里）。
-  const cliEntrySpans = nodes.filter(n => n.type === 'span'
-    && n.children.some(t => typeof t === 'string' && (t === '供应商' || t === '外部 CLI')));
-  check('split：cli 角色不显示「供应商」（只显示「外部 CLI」）',
-    !cliEntrySpans.some(span => span.children.includes('供应商'))
-      && cliEntrySpans.some(span => span.children.includes('外部 CLI')),
-    JSON.stringify(cliEntrySpans.map(span => span.children)));
-  check('split：cli 角色的模型仍是自由文本（不是下拉）',
-    nodes.some(n => n.type === 'input' && n.props.value === 'gpt-6-luna')
-      && !nodes.some(n => n.type === 'select' && n.props.value === 'gpt-6-luna'));
 }
 
 section('角色卡片：真实编辑、草稿、校验、并发与增删回调');
