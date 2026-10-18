@@ -1287,6 +1287,16 @@ function mountCliDispatchTools(ctx, cliRoles, resolver, dispatch, diagnostics) {
     return { ok: false, detail: '作用域链查询不可用，拒绝在不判定归属的情况下按 agent 安装' };
   }
   const installed = new WeakMap();
+  // ⚠️ 归属判据是 **preset 作用域**，不是调用方角色的权限 —— 这一点容易被误读成漏洞，
+  //    实测（2026-10-18 真机）已排除：
+  //      · 主代理（switchboard preset 作用域）拿到 4 个：architect / reviewer（CLI 直派）
+  //        + scout / worker（官方 spawn 委派行）；
+  //      · scout 子代理（`switchboard-role-scout` 作用域）拿到 **0 个** `delegate_to_*`。
+  //    原因：子代理跑在**自己的角色 preset** 作用域里，其作用域链**不含** switchboard preset
+  //    的 compositionScope ⇒ 这里按 agent 安装的工具它一个都继承不到。于是 `canDispatch` /
+  //    `readOnly` 之外的「子代理不许直派」这层边界由**作用域隔离**兜住，与官方同构。
+  //    唯一例外：若有人把子代理显式指定为 `switchboard` preset，它在作用域上就是主代理，
+  //    会拿到这些工具 —— 那正是它该有的身份，可接受。
   const belongsToComposition = (candidate) => {
     try { return scopeChainOf(scopeOf(candidate.ctx)).includes(compositionScope); } catch { return false; }
   };
