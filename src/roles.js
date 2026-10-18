@@ -131,9 +131,11 @@ export function mergeRoleLayers({ definitions, overrides, configured } = {}) {
   for (const row of confList) if (typeof row?.id === 'string') push(row.id);
   for (const row of defs) if (typeof row?.id === 'string') push(row.id);
   for (const row of ovrs) if (typeof row?.id === 'string') push(row.id);
-  const merged = order.map(id => materializeDriver({
-    ...(defMap.get(id) ?? {}), ...(ovrMap.get(id) ?? {}), ...(confMap.get(id) ?? {}),
-  }));
+  const merged = order.map(id => materializeDriver(
+    { ...(defMap.get(id) ?? {}), ...(ovrMap.get(id) ?? {}), ...(confMap.get(id) ?? {}) },
+    defMap.get(id),
+    { ...(ovrMap.get(id) ?? {}), ...(confMap.get(id) ?? {}) },
+  ));
   // 没有合法 id 的条目原样带上，让字段级校验去报错，而不是在这里静默丢弃。
   for (const row of [...confList, ...defs, ...ovrs]) {
     if (row === null || typeof row !== 'object' || typeof row.id !== 'string') merged.push(row);
@@ -148,18 +150,29 @@ export function mergeRoleLayers({ definitions, overrides, configured } = {}) {
  * 这正是「argv 来自用户配置、模型只能填受限占位符」那条安全约束的落点，面板没有变成
  * 可以逐字段手写命令的表面。
  *
- * 只在**确实需要**时物化：`inferCliDriver(entry) === entry.cliDriver` 说明这份配置的
- * argv 已经与该驱动一致（例如 roles.json 里的定义本来就写全了），此时**原样返回**，
- * 不改动任何既有角色；`custom` / 未知驱动也原样返回（它们的 argv 由定义自己负责）。
+ * ⚠️ **只在「上层明确改过驱动或只读」时物化**，这是本函数最要紧的一条纪律：
+ *    它绝不能顺手把一份坏配置「修好」。定义里手写的 `cliArgs`（含非法占位符、非数组、
+ *    或与驱动不符）必须**原样送到字段级校验去报错**，否则「执行前安全校验」会被静默绕过
+ *    —— 实测正是如此：两条安全断言（未知占位符 / 非法 argv）因为 argv 被物化回策展值
+ *    而全部失效，拒绝变成了照常执行。
+ *
+ * 三种情况原样返回：`custom` / 未知驱动（argv 由定义自负）、定义自己就写着该驱动
+ * （`definition.cliDriver === selected`，含定义写错的情形）、上层没动过驱动与只读。
  *
  * @param {object} entry - 合并后的角色条目。
+ * @param {object|undefined} definition - 文件里的定义层条目（用于判断「是否换过驱动」）。
+ * @param {object} upper - 覆盖层与旋钮层的合并（用于判断「上层动过什么」）。
  * @returns {object} 可能被物化的条目（不修改入参）。
  */
-function materializeDriver(entry) {
+function materializeDriver(entry, definition, upper = {}) {
   if (entry === null || typeof entry !== 'object') return entry;
   const selected = entry.cliDriver;
   if (typeof selected !== 'string' || selected === '' || selected === 'custom') return entry;
-  if (inferCliDriver(entry) === selected) return entry;
+  const switchedDriver = upper.cliDriver !== undefined && upper.cliDriver !== definition?.cliDriver;
+  const switchedReadOnly = upper.readOnly !== undefined && upper.readOnly !== definition?.readOnly;
+  if (!switchedDriver && !switchedReadOnly) return entry;
+  // 改过的部分已经与目标一致（例如定义本来就写全了这份驱动的 argv）→ 不必重写。
+  if (inferCliDriver(entry) === selected && !switchedReadOnly) return entry;
   const fields = cliFieldsFor(selected, entry.readOnly === true);
   return fields === undefined ? entry : { ...entry, cliDriver: selected, ...fields };
 }

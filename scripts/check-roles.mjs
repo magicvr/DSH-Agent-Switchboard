@@ -1016,6 +1016,15 @@ section('F2 / F3 回归');
     check('覆盖层里的驱动选择同样生效（面板写指令 → 同步进文件 overrides）',
       mergeRoleLayers({ definitions: [codexDefinition], overrides: [{ id: 'w', cliDriver: 'grok' }],
         configured: [{ id: 'w' }] })[0].cliDriver === 'grok');
+    // ⚠️ 物化纪律的核心：**它绝不能顺手把一份坏配置「修好」**。定义里手写的 `cliArgs`
+    //    （非法占位符 / 非数组）必须原样送到字段级校验去报错，否则「执行前安全校验」会被
+    //    静默绕过 —— 实测正是如此：两条安全断言因为 argv 被物化回策展值而失效，
+    //    本该「拒绝执行」变成了照常执行。
+    check('上层没动过驱动/只读时，定义里写坏的 argv 原样保留（不静默修好）',
+      isDeepStrictEqual(mergeRoleLayers({ definitions: [{ ...codexDefinition, cliArgs: ['{unsafe}'] }],
+        overrides: [], configured: [] })[0].cliArgs, ['{unsafe}'])
+      && mergeRoleLayers({ definitions: [{ ...codexDefinition, cliArgs: 'shell command' }],
+        overrides: [], configured: [] })[0].cliArgs === 'shell command');
     check('投影携带 cliDriver，但**只**是驱动 id（argv 一律不进设置）',
       isDeepStrictEqual(pickOverrideFields({ id: 'w', cliDriver: 'grok', ...cliFieldsFor('grok', false) }),
         { id: 'w', cliDriver: 'grok' }));

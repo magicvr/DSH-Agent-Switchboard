@@ -1154,6 +1154,12 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
   //
   // ⚠️ split 模式下这里**只写 overrides，绝不碰 roles** —— 定义归文件所有，
   //    这正是「手改 `roles.json` 不会被设置覆盖」的实现点。
+  //
+  // ⚠️ **legacy 模式必须同时清掉 `overrides`**：它是上一段 split 时期的遗留覆盖层，
+  //    而 preset 作用域看不到根条目的模式，只能按「文件里有 overrides 就参与合并」来读。
+  //    留着它会让**旧旋钮盖住用户刚存的完整 `roles`** —— 实测：三条「执行前安全校验」
+  //    因此全部失效（非法 driver / 占位符 / argv 被旧覆盖层改回合法值）。
+  //    不变量：`overrides` 存在 ⇔ 当前是 split 模式。
   const layer = splitMode ? { overrides: overrideProjection } : { roles: rawRoles };
   const writtenValue = current.ok && current.missing !== true
     ? { ...existing, ...layer, ...(depth === undefined ? {} : { maxDepth: depth }) }
@@ -1164,6 +1170,7 @@ function syncRolesToFile({ resolved, roleConfigPath, diagnostics, syncDepth = fa
       // 首次播种时一并落一份旋钮覆盖层，之后即可只维护这一层。
       ...(overrideProjection.length > 0 ? { overrides: overrideProjection } : {}),
     });
+  if (!splitMode) delete writtenValue.overrides;
   const written = writeConfigFile(roleConfigPath, writtenValue);
   diagnostics.roleConfigSync = written.ok
     ? splitMode
@@ -1578,8 +1585,16 @@ function createRoleResolver(roleConfigPath, resolved) {
       definitions: Array.isArray(value.roles) ? value.roles : [],
       overrides: Array.isArray(value.overrides) ? value.overrides : [],
     };
+    // ⚠️ **文件的两层必须一起用**，即使调用方自己没提供 `roleSettings`：
+    //    preset 作用域读的是**自己那条 preset 条目**的 config，永远看不到根条目的
+    //    `roleSettings`。若在这里退回「只取 `value.roles`」，就等于把 `overrides` 层
+    //    整层丢掉 —— 表现是设置页改的旋钮（后端 / 模型 / 强度 / 只读 / 驱动）**全部
+    //    对派发无效**，而且 roster 里会留下按**定义**（而非生效值）建出来的陈旧 preset。
+    //    实测踩到：把审计员改成 grok 后，preset 侧仍按定义读成 spawn 并继续注册它的 preset。
     const raw = configuredRoleSettings === undefined
-      ? configuredRoles !== undefined ? configuredRoles : Array.isArray(value.roles) ? value.roles : []
+      ? configuredRoles !== undefined
+        ? configuredRoles
+        : mergeRoleLayers({ ...fileLayers, configured: undefined })
       : Array.isArray(configuredRoleSettings)
         ? mergeRoleLayers({ ...fileLayers, configured: configuredRoleSettings })
         : configuredRoleSettings;

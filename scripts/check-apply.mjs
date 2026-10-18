@@ -1584,6 +1584,34 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
       JSON.stringify({ count: splitMounted.result.roleCount, routes: splitMounted.result.roleRoutes }));
     check('split：合并后仍挂载角色工具（不是空壳）',
       splitMounted.configs.length === 1, JSON.stringify(splitMounted.configs.length));
+    // ⚠️ 回归：**preset 作用域看不到根条目的 `roleSettings`**（它读的是自己那条 preset 条目的
+    //    config）。若解析器在这种情况下退回「只取文件 `roles`」，`overrides` 层就被**整层丢掉**：
+    //    设置页改的旋钮对派发全部无效，而且 roster 里会留下按**定义**（而非生效值）建出来的
+    //    陈旧 preset。实测踩到：把审计员改成 grok 后，preset 侧仍按定义读成 spawn。
+    {
+      // 不写死期望值：读**当时**文件里的覆盖层，再要求生效值来自它而不是定义层。
+      const overrideModel = JSON.parse(readFileSync(path, 'utf8')).overrides?.[0]?.model;
+      const presetScope = await mount({});
+      check('preset 作用域（自己不带 roleSettings）依然吃到文件的 overrides 层',
+        presetScope.result.roleCount === 1 && typeof overrideModel === 'string'
+          && presetScope.result.roleRoutes.includes(overrideModel)
+          && !presetScope.result.roleRoutes.includes('from-definition')
+          && presetScope.result.roleRoutes.includes('source=file'),
+        JSON.stringify({ overrideModel, routes: presetScope.result.roleRoutes }));
+    }
+    // ⚠️ 不变量：`overrides` 存在 ⇔ 当前是 split 模式。legacy 模式同步必须**清掉**遗留的
+    //    overrides 层，否则旧旋钮会盖住用户刚存的完整 `roles`（实测让三条「执行前安全校验」
+    //    全部失效：非法 driver / 占位符 / argv 被旧覆盖层改回合法值）。
+    {
+      const staleFile = JSON.parse(readFileSync(path, 'utf8'));
+      writeConfigFile(path, { ...staleFile, overrides: [{ id: 'worker', model: 'stale-knob' }] });
+      apply(makeCtx(), Config({ provider: 'self',
+        roles: [{ id: 'worker', description: 'd', instructions: 'i', model: 'legacy-model', backend: 'spawn' }] }));
+      const legacyAfter = JSON.parse(readFileSync(path, 'utf8'));
+      check('legacy 同步清掉遗留的 overrides 层（否则旧旋钮会盖住完整 roles）',
+        legacyAfter.overrides === undefined && legacyAfter.roles[0]?.model === 'legacy-model',
+        JSON.stringify({ overrides: legacyAfter.overrides, roles: legacyAfter.roles }));
+    }
     // 定义缺失：根作用域明确拒绝同步（而不是派发一批空壳角色）。
     writeConfigFile(path, initialConfig([], { provider: 'self' }));
     const splitGuardCtx = makeCtx();
