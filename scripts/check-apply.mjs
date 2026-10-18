@@ -1548,6 +1548,34 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
       roleSettings: [{ id: 'worker', model: 'from-settings', readOnly: true }] }));
     check('split：旋钮未变时第二次同步不重写文件',
       JSON.stringify(JSON.parse(readFileSync(path, 'utf8'))) === JSON.stringify(splitAfter));
+    // ⚠️ 回归：**保存旋钮必须触发同步**。触发条件曾经只认 `roles` / `maxDepth`，于是 split 模式下
+    //    设置页保存「看起来成功、实际不生效」—— 旋钮停在系统配置里，文件 `overrides` 保持旧值，
+    //    直到下一次插件激活才被追上。真机实测踩到：把审计员改成 grok 并保存后 `roleSettings` 已更新
+    //    而 `overrides` 仍是旧值（preset 作用域只读文件，所以那次改动当时是**惰性的**）。
+    //    这里用真实监听器验证路径判据本身，而不是只看 apply 时的那一次同步。
+    {
+      const knobCtx = makeCtx();
+      let knobListener;
+      knobCtx.on = (event, listener) => {
+        if (event === 'loader/volatile-update') knobListener = listener;
+        return () => {};
+      };
+      knobCtx.effect = execute => execute();
+      const knobConfig = Config({ provider: 'self', roleSettings: [{ id: 'worker', model: 'from-settings' }] });
+      apply(knobCtx, knobConfig);
+      const knobBefore = JSON.parse(readFileSync(path, 'utf8')).overrides;
+      commitVolatile(knobConfig.roleSettings, [{ id: 'worker', model: 'second' }]);
+      knobListener([['roleSettings']]);
+      const knobAfter = JSON.parse(readFileSync(path, 'utf8')).overrides;
+      check('split：保存 roleSettings 即刻同步到文件（只认 roles/maxDepth 会让改动静默不生效）',
+        JSON.stringify(knobBefore) === JSON.stringify([{ id: 'worker', model: 'from-settings' }])
+          && JSON.stringify(knobAfter) === JSON.stringify([{ id: 'worker', model: 'second' }]),
+        JSON.stringify({ before: knobBefore, after: knobAfter }));
+      const knobBytes = readFileSync(path);
+      knobListener([['maxDepthX']]);
+      knobListener([['volatile', 'somethingElse']]);
+      check('split：无关路径仍然不触发同步', readFileSync(path).equals(knobBytes));
+    }
     // preset 作用域读文件：生效角色必须是「定义 ⨝ 旋钮」。
     const splitMounted = await mount({ roleSettings: [{ id: 'worker', model: 'from-settings', readOnly: true }] });
     check('split：生效角色由定义与旋钮合并而来（model 取旋钮、persona 取定义）',

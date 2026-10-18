@@ -1028,8 +1028,12 @@ function applyInner(ctx, config) {
     };
     if (ctx.on) ctx.on('loader/volatile-update', paths => {
       if (!Array.isArray(paths)) return;
+      // ⚠️ **`roleSettings` 必须在这里**：split 模式下设置页保存的是旋钮层，而 preset 作用域
+      //    只读文件（它看不到根条目的 config）。漏掉它 = 面板保存**看起来成功、实际不生效**：
+      //    旋钮停在系统配置里，文件 `overrides` 保持旧值，直到下一次插件激活才被追上。
+      //    实测踩到：把审计员改成 grok 并保存后，`roleSettings` 已更新而 `overrides` 仍是旧值。
       const relevant = paths.some(path => Array.isArray(path) && (
-        path.length === 1 && ['roles', 'maxDepth'].includes(path[0])
+        path.length === 1 && ['roles', 'roleSettings', 'maxDepth'].includes(path[0])
       ));
       if (!relevant) return;
       try { sync(resolved, true); }
