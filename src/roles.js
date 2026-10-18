@@ -189,11 +189,6 @@ export function rolePresetId(roleId) {
   return `${ROLE_PRESET_PREFIX}${roleId}`;
 }
 
-/** 专属 CLI 工具与 delegate_to_* 使用同一角色后缀规则。 */
-export function cliToolName(roleId) {
-  return `switchboard_cli_run_${roleId.replace(/-/g, '_')}`;
-}
-
 /**
  * 写入类工具名。`readOnly` 角色靠**角色 preset 的行级裁剪**从机制上挡住它们。
  *
@@ -247,11 +242,15 @@ export function canStartAtDepth(parentDepth, absoluteLimit) {
  */
 export function dispatchPermissionsFor(role, { delegateToolNames = [], availableToolNames = [] } = {}) {
   const delegates = role.allowNestedDispatch ? [...new Set(delegateToolNames)] : [];
-  // 四部分：非受控入口、全部底层 CLI 工具、关闭嵌套时的受控委派、只读写工具。
+  // 三部分：非受控入口、关闭嵌套时的受控委派、只读写工具。
   // 另保留对可见但未纳入角色清单的 delegate_to_* 入口的拒绝，避免白名单改 deny 后放行。
+  //
+  // ⚠️ 这里**曾经**还有两段只服务 CLI 包裹的代码：deny 里排除 `switchboard_cli_run_*`、
+  //    以及 `backend === 'cli'` 时改用 allow 白名单（只留自身专属工具 + 受控委派）。
+  //    那个专属工具已随中继子代理删除（D33），而 CLI 角色也不再产出 preset ——
+  //    于是这两段永远不会有输入：现在两种后端返回同一个 deny 形态（CLI 角色根本用不到它）。
   const deny = [
     ...UNCONTROLLED_DISPATCH_TOOLS.filter((name) => availableToolNames.includes(name)),
-    ...availableToolNames.filter((name) => name.startsWith('switchboard_cli_run_')),
     ...(role.allowNestedDispatch ? [] : delegateToolNames),
     ...(role.readOnly ? WRITE_TOOLS.filter((name) => availableToolNames.includes(name)) : []),
     ...availableToolNames.filter((name) => name.startsWith('delegate_to_') && !delegateToolNames.includes(name)),
@@ -259,9 +258,7 @@ export function dispatchPermissionsFor(role, { delegateToolNames = [], available
   return {
     delegateToolNames: delegates,
     canDelegate: delegates.length > 0,
-    toolFilter: role.backend === CLI_BACKEND
-      ? { allow: [...new Set([cliToolName(role.id), ...delegates])] }
-      : { deny: [...new Set(deny)] },
+    toolFilter: { deny: [...new Set(deny)] },
   };
 }
 

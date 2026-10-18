@@ -1069,7 +1069,19 @@ for (const field of ["persona", "toolFilter"])
   现在是**死配置**：无害，但应清理。
 - 客户端只能静态验证：面板的 split 旋钮表单（含「外部 CLI」下拉）需要真机往返确认。
 - 真机验收边界：CLI 直派的后台任务链路（受理 → 完成通知 → `job_output`）已在自检层面确认
-  新代码生效（roster 与 roleConfig 两处），完整派发链路仍待一次真实 CLI 任务验收。t 与 bundle 装配、而不是 profile 里那份副本。改动会动到用户的 profile，且必须重启验证，故先记录不改。
+  新代码生效（roster 与 roleConfig 两处），完整派发链路仍待一次真实 CLI 任务验收。
+
+#### D32 补记三：profile 里的重复 preset 声明已不存在（结案）
+
+**核实（真机复查）：** 遍历 `$DSH_HOME/profiles/desktop/`（排除 `node_modules`）中的
+`*.yml` / `*.yaml` / `*.json`，**没有任何 `preset-switchboard` 声明** —— 该 preset 只由
+bundle（`presets/switchboard.patch.yml`，`package.json` 的 `dsh.bundle.patch` 声明）贡献。
+补记二设想的改动（「让 `--inject` 不再往 profile 写 preset 声明，`plugin:verify` 的
+`preset.rules` 改为校验仓库 preset 与 bundle 装配」）因此**已无对象**：现状即是目标状态，
+不需要再动 tooling，也不需要改用户的 profile。
+
+**保留的排查线索：** 若将来又看到重复声明，按补记二的结论查 —— `applyEntryPatches` 的顶层
+`insert`（无 `id`）是 `data.push(...insert)`，**纯追加、不按 id 去重**。
 
 
 ---

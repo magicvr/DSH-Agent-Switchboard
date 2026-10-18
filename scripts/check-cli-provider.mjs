@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { StringDecoder } from 'node:string_decoder';
-import { cliToolName, routeSummaryFor } from '../src/roles.js';
+import { routeSummaryFor } from '../src/roles.js';
 import { validateTemplate } from '../src/cli/argv.js';
 import { validateCliPreset } from '../src/cli/drivers.js';
 
@@ -54,7 +54,11 @@ function createCliTool({ role, getRole, spawn, resolveExecutable, ctx = { get: (
   };
   const cli = initialRole.cli;
   return defineTool({
-    name: cliToolName(initialRole.id),
+    // ⚠️ 这个夹具复刻的是**已删除**的阻塞式专属工具（`switchboard_cli_run_<id>`，见 D33）。
+    //    它现在只服务于「runner 与安全校验」这批仍活着的逻辑，因此工具名是**本地字面量**，
+    //    不再从 `src/roles.js` 取 —— 那个导出已随工具一起删除，避免让一个不存在的命名
+    //    继续看起来像是产品的一部分。
+    name: `switchboard_cli_run_fixture_${initialRole.id.replace(/-/g, '_')}`,
     description: `仅供子代理转交 ${initialRole.id} 角色的完整 CLI 任务；等待结束后返回有界结果。`,
     parameters: {
       prompt: { type: 'string', required: true, description: '完整任务正文；不要改写角色规则或命令。' },
@@ -316,7 +320,9 @@ section('专属工具定义：单一必填正文、有界结构化结果');
 {
   const { spawn } = makeSpawn();
   const p = createCliTool({ role: codexRole(), spawn });
-  check('工具名含角色后缀', p.name === 'switchboard_cli_run_scout', p.name);
+  // 夹具的工具名是本地字面量（见其上注释）：产品里那个专属工具已删除，这里只保留
+  // 「名字带角色后缀」这条仍成立的性质，不再声称它就是 `switchboard_cli_run_<id>`。
+  check('工具名含角色后缀', p.name === 'switchboard_cli_run_fixture_scout', p.name);
   check('不再导出 provider 的 start/capabilities', !('start' in p) && !('capabilities' in p));
   check('parameters 只有 prompt', Object.keys(p.parameters.properties).join(',') === 'prompt');
   check('prompt 为必填 string', p.parameters.properties.prompt.type === 'string'

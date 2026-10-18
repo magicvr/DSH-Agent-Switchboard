@@ -10,7 +10,6 @@ import {
   agentOptionsFor,
   canStartAtDepth,
   carriesDefinition,
-  cliToolName,
   dispatchPermissionsFor,
   mergeRoleLayers,
   normalizeRole,
@@ -522,8 +521,12 @@ section('回归：入站深度独立于目标出站权限');
 section('出站权限与三种提示使用同一有效结果（权限仍是纯函数，只是不再进工具 Config）');
 {
   const delegateToolNames = ['delegate_to_self', 'delegate_to_other'];
+  // ⚠️ 这里**曾经**还塞了 `switchboard_cli_run_self` / `_other`，用来验证「CLI 用 allow 白名单、
+  //    其他角色的底层 CLI 工具被排除」。那个专属工具已随中继子代理删除（D33），CLI 角色也不再
+  //    产出 preset，于是掩码对两种后端**同形**（统一 deny）。留着那两个名字反而会让「按名字前缀
+  //    deny」这种已删除的做法看起来仍然必需。
   const availableToolNames = ['read', ...WRITE_TOOLS, 'run_code', ...delegateToolNames, 'delegate_to_unmanaged',
-    'switchboard_cli_run_self', 'switchboard_cli_run_other', ...UNCONTROLLED_DISPATCH_TOOLS];
+    ...UNCONTROLLED_DISPATCH_TOOLS];
   for (const backend of ['cli', 'spawn']) {
     for (const allowNestedDispatch of [false, true]) {
       const role = normalizeRole({ id: 'self', backend, instructions: 'i', description: 'd', model: 'm', allowNestedDispatch,
@@ -536,13 +539,14 @@ section('出站权限与三种提示使用同一有效结果（权限仍是纯�
       const tag = `${backend} ${allowNestedDispatch}`;
       check(`${tag}：受控 delegate 权限精确符合开关`,
         delegateToolNames.every((name) => allowed.has(name) === allowNestedDispatch));
-      check(`${tag}：不开放其他角色底层 CLI 工具`, !allowed.has('switchboard_cli_run_other'));
-      check(`${tag}：自身 CLI 工具仅 CLI 包裹可用`, allowed.has(cliToolName(role.id)) === (backend === 'cli'));
+      // ⚠️ 两条 CLI 专属断言（「不开放其他角色底层 CLI 工具」「自身 CLI 工具仅 CLI 包裹可用」）
+      //    随按名字前缀 deny / allow 白名单一起删除：那个专属工具已不存在，CLI 角色也没有 preset。
       check(`${tag}：全部非受控派发入口与未知 delegate 被排除`,
         [...UNCONTROLLED_DISPATCH_TOOLS, 'delegate_to_unmanaged'].every((name) => !allowed.has(name)));
-      check(`${tag}：普通工具保留在内置角色，保留传输不写入过滤`,
-        allowed.has('read') === (backend !== 'cli')
-          && ![...(permissions.toolFilter.allow ?? []), ...(permissions.toolFilter.deny ?? [])].includes('run_code'));
+      check(`${tag}：掩码不再区分后端（CLI 角色也没有 preset），保留传输不写入过滤`,
+        allowed.has('read') && allowed.has('bash') === !role.readOnly
+          && ![...(permissions.toolFilter.deny ?? [])].includes('run_code')
+          && permissions.toolFilter.allow === undefined);
       // ⚠️ 旧断言在这里比对 `config.toolFilter === permissions.toolFilter`。0.2.1-rc.1 起
       //    权限过滤不再进入工具 Config（字段已删除）；它现在的落点是角色 preset 的插件行，
       //    由 buildRolePreset 小节完整覆盖。这里只确认 Config 已改用 agentPreset 选中角色组合。
@@ -575,13 +579,17 @@ section('出站权限与三种提示使用同一有效结果（权限仍是纯�
   }
   const sparse = dispatchPermissionsFor({ backend: 'spawn', readOnly: true, allowNestedDispatch: false }, {
     delegateToolNames: ['delegate_to_self'],
-    availableToolNames: ['read', 'write', 'workflow', 'switchboard_cli_run_other', 'delegate_to_self'],
+    availableToolNames: ['read', 'write', 'workflow', 'delegate_to_self'],
   }).toolFilter;
   check('内置 deny 只列可用名，不加入未注册的写工具与非受控入口',
     !sparse.deny.includes('pwsh') && !sparse.deny.includes('subagent')
-      && sparse.deny.every(name => ['write', 'workflow', 'switchboard_cli_run_other', 'delegate_to_self'].includes(name)));
-  check('内置 deny 四部分合成且 workflow 重叠去重', sparse.deny.length === 4
-    && ['write', 'workflow', 'switchboard_cli_run_other', 'delegate_to_self'].every(name => sparse.deny.includes(name)));
+      && sparse.deny.every(name => ['write', 'workflow', 'delegate_to_self'].includes(name)),
+    JSON.stringify(sparse.deny));
+  // ⚠️ 曾经是「四部分合成」，其中一部分是按 `switchboard_cli_run_` 前缀排除底层 CLI 工具；
+  //    那个工具已删除（D33），现在只剩三部分（未注册名不列 / 只读写工具 / 未纳管的 delegate）。
+  check('内置 deny 三部分合成且 workflow 重叠去重', sparse.deny.length === 3
+    && ['write', 'workflow', 'delegate_to_self'].every(name => sparse.deny.includes(name)),
+    JSON.stringify(sparse.deny));
 }
 
 section('backend 取值校验');
