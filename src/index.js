@@ -719,7 +719,8 @@ export function selftestTool(ctx, diagnostics) {
         format?.status === 'migrated' ? format.reason : '',
         inertNesting.length > 0
           ? `CLI 角色 ${inertNesting.join(' / ')} 打开了「允许嵌套派发」，但对 CLI 角色无效`
-            + '（CLI 角色没有 preset，其进程也没有 DSH 工具）；可关闭'
+            + '（CLI 角色没有 preset，其进程也没有 DSH 工具）；该开关只对内置（spawn）角色有效 —— '
+            + '面板已不提供它，请到 $DSH_HOME/agent-switchboard/roles.json 的定义层修改'
           : '',
         // 组合期字段改了但组合还没跟上：提示词与自检都按**已注册的**快照如实描述，
         // 但子代理实际拿到的仍是那一版。热同步会在下次派发前重建；若重建失败，

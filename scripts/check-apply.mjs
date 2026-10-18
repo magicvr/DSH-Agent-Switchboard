@@ -1672,7 +1672,9 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
         allowNestedDispatch: true }] }));
     const inert = await inertCtx.tools.get('switchboard_selftest').execute({});
     check('CLI 角色打开嵌套开关时自检明确告警（该旋钮对 CLI 角色无效）',
-      inert.warnings.includes('cli-worker') && inert.warnings.includes('对 CLI 角色无效'),
+      inert.warnings.includes('cli-worker') && inert.warnings.includes('对 CLI 角色无效')
+        // 面板已不提供这个旋钮（D34），所以告警必须**指路文件**，否则用户无处可改。
+        && inert.warnings.includes('roles.json'),
       JSON.stringify({ warnings: inert.warnings, errors: inert.configErrors }));
     const spawnNestedCtx = makeCtx();
     apply(spawnNestedCtx, Config({ provider: 'self', roles: [

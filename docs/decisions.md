@@ -1033,8 +1033,11 @@ for (const field of ["persona", "toolFilter"])
 1. **CLI 角色不再包中继（转交）子代理**：`delegate_to_<cliRole>` 由本插件**按 agent 安装**
    （与官方 standing 组合同构，`agent.ctx.inject(['tools'], …)` + `scopeChainOf` 归属判定），
    受理即返回 `{ status: 'accepted', jobId }`；CLI 进程由 `dsh-tool-jobs` 托管，完成通知送达后
-   用 `job_output` 读输出。**嵌套**派发同样直派：调用方角色的 preset 里声明一行本插件条目
-   （`cliDispatchFor: [目标 id]`），在该 preset 作用域内注册同样的工具。
+   用 `job_output` 读输出。~~**嵌套**派发同样直派：调用方角色的 preset 里声明一行本插件条目
+   （`cliDispatchFor: [目标 id]`），在该 preset 作用域内注册同样的工具。~~
+   > ⚠️ **已由 D34 删除**：上面这句划掉的是 D33 当时对**嵌套**直派的设想。它后来被发现
+   > 调用了不存在的函数（悬空引用），从未在真机上工作过；D34 决定 CLI 角色是**叶子**，
+   > 整条路删除。**顶层**直派（本段前半）不受影响，已真机验收。
 2. **包裹路由（`volatile.wrapperProvider` / `wrapperModel` / `wrapperEffort`）删除**：它唯一的
    消费者就是那个中继子代理 —— 中继没了，字段就没有语义。
 3. **角色数据分家**：**定义**（title / description / instructions / CLI argv 契约）住在
@@ -1075,8 +1078,9 @@ for (const field of ["persona", "toolFilter"])
   `instructions + --- + 任务包`；回执 `summary` 报的是**覆盖层**的 model（定义层仍是旧值），
   即本决策第 3 条「preset 作用域必须合并 `overrides`」在真实派发上成立。取证手法与证据见
   [`architecture.md`](./architecture.md) §6 真机取证。
-- **仍未验收**：嵌套 CLI 派发（`cliDispatchFor` 宿主行，仅离线断言）、GUI 取消 / 停止沿
-  `exec.signal` 的传播、客户端任务面板的视觉表现。
+- **仍未验收**：GUI 取消 / 停止沿 `exec.signal` 的传播、客户端任务面板的视觉表现。
+  ~~嵌套 CLI 派发（`cliDispatchFor` 宿主行，仅离线断言）~~ —— ⚠️ 该项已**无对象**：D34 把那条路
+  整体删除（CLI 角色是叶子）；取而代之的**嵌套 spawn 派发**仍是未验收项。
 
 #### D32 补记三：profile 里的重复 preset 声明已不存在（结案）
 
