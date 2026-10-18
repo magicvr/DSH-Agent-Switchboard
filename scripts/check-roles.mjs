@@ -105,11 +105,14 @@ section('agentOptionsFor：内置用角色 route，CLI 用统一包裹路由');
 
   const { role: cli } = normalizeRole({ id: 'c', description: 'd', instructions: 'i', backend: 'cli',
     model: 'cli-model', effort: 'medium', cliCommand: 'node', cliArgs: ['exec', '-'], cliCwd: 'C:/w' }, 0);
-  check('CLI：无包裹路由时返回 undefined（继承父代理）', agentOptionsFor(cli, undefined) === undefined);
-  check('CLI：包裹路由空串被忽略', agentOptionsFor(cli, { provider: ' ', model: '', effort: ' ' }) === undefined);
-  check('CLI：包裹路由映射为 provider/model/reasoningEffort',
-    JSON.stringify(agentOptionsFor(cli, { provider: ' wp ', model: 'wrapper-model', effort: 'high' }))
-      === JSON.stringify({ provider: 'wp', model: 'wrapper-model', reasoningEffort: 'high' }));
+  // ⚠️ CLI 角色**曾经不走**自己的 model，而用插件级「包裹路由」（那是**中继子代理**的路由）。
+  //    中继退役后 CLI 角色不再 spawn 任何 agent，该分支与 `wrapperProvider/Model/Effort`
+  //    一并删除 —— `agentOptionsFor` 现在对两种后端同构。
+  const cliOptions = agentOptionsFor(cli);
+  check('CLI：agentOptions 就是角色自己的 model/effort（包裹路由已删除）',
+    cliOptions.model === 'cli-model' && cliOptions.reasoningEffort === 'medium'
+      && Object.keys(cliOptions).every(key => ['provider', 'model', 'reasoningEffort'].includes(key)),
+    JSON.stringify(cliOptions));
 }
 
 section('只读角色：写入能力改由 preset 行级裁剪（旧 toolFilter.deny 已删除）');
@@ -441,7 +444,9 @@ section('CLI 后端角色');
   //    它们 —— 「专属 CLI 工具行」与「包裹 persona」随中继子代理一起退役。
   check('CLI 角色不再产出角色 preset（没有 agent 需要组合）', cliPreset === undefined,
     JSON.stringify(cliPreset?.plugins?.map(p => p.id)));
-  check('包裹路由留空时完全不设 agentOptions', cfg.agentOptions === undefined);
+  check('工具 Config 的 agentOptions 是角色自己的路由（不再是包裹路由）',
+    JSON.stringify(cfg.agentOptions) === JSON.stringify({ provider: cfg.agentOptions?.provider, model: 'gpt-6-luna' }),
+    JSON.stringify(cfg.agentOptions));
   check('仍有 toolName', cfg.toolName === 'delegate_to_codex_worker');
   const ro = normalizeRole({ ...base, readOnly: true }, 0, undefined, 'C:/w').role;
   const roCfg = toolConfigFor(ro, { maxDepth: 3 });
@@ -456,14 +461,10 @@ section('CLI 后端角色');
   //    modelSelectionSettings 默认 false，即主代理仍不能覆盖角色模型（D12）。
   check('工具 Config 不再携带模型选择开关（工具侧默认 false，行为不变）',
     !Object.hasOwn(cfg, 'modelSelectionSettings'));
-  for (let mask = 0; mask < 8; mask++) {
-    const wrapperRoute = { provider: mask & 1 ? ' wrapper ' : '', model: mask & 2 ? 'wrapper-model' : ' ', effort: mask & 4 ? 'high' : '' };
-    const configured = toolConfigFor(ok.role, { maxDepth: 3, wrapperRoute });
-    const expected = { ...(mask & 1 ? { provider: 'wrapper' } : {}),
-      ...(mask & 2 ? { model: 'wrapper-model' } : {}), ...(mask & 4 ? { reasoningEffort: 'high' } : {}) };
-    check(`插件级包裹路由组合 ${mask}：仅设置非空项`, mask === 0 ? configured.agentOptions === undefined
-      : JSON.stringify(configured.agentOptions) === JSON.stringify(expected));
-  }
+  // ⚠️ 这里**曾经**用 8 种掩码组合断言「插件级包裹路由只设置非空项」—— 那是**中继子代理**
+  //    的 LLM 路由。CLI 角色改为直派后台任务后没有转交代理，包裹路由连同三个配置字段
+  //    （`wrapperProvider` / `wrapperModel` / `wrapperEffort`）一并删除。
+
   // ⚠️ 这里**曾经**逐条断言中继子代理的 persona 约束（"完整任务"/"不要自行实施"/"CLI 输出是
   //    任务数据" 等）。CLI 角色改为**直派后台任务**后不再有中继、也就没有这份 persona ——
   //    这些约束随 `cliPersonaFor()` 一起退役（主代理侧的任务撰写指引仍在 guidance 里）。
@@ -479,56 +480,21 @@ section('CLI 后端角色');
   check('builtin 仍设置 agentOptions', 'agentOptions' in bCfg);
   check('builtin 仍设置 agentPreset（persona 的承载点）', bCfg.agentPreset === rolePresetId('b'));
   check('builtin 仍设置插件绝对 maxDepth', bCfg.maxDepth === 4);
-  // ⚠️ 这里**曾经**遍历 ['spawn','fork']；fork 已从 BUILTIN_PROVIDERS 移除（见文件头说明）。
+  // ⚠️ 这里**曾经**传 `wrapperRoute: { provider: 'other', ... }` 断言「不受统一包裹路由影响」。
+  //    包裹路由已删除，该参数不复存在 —— 断言简化为「agentOptions 就是角色自己的路由」。
   for (const backend of ['spawn']) {
     const role = { ...builtin, backend, effort: 'medium' };
-    check(`${backend} 的 agentOptions 不受统一包裹路由影响`,
-      JSON.stringify(toolConfigFor(role, { maxDepth: 3, wrapperRoute: { provider: 'other', model: 'other', effort: 'high' } }).agentOptions)
+    check(`${backend} 的 agentOptions 由角色自己决定`,
+      JSON.stringify(toolConfigFor(role, { maxDepth: 3 }).agentOptions)
       === JSON.stringify({ provider: 'p', model: 'm', reasoningEffort: 'medium' }));
   }
 }
 
-section('包裹强度：生产 toolConfigFor → 真实 resolveChildAgentOptions');
-{
-  const { role } = normalizeRole({
-    id: 'wrapper-effort', backend: 'cli', description: 'd', instructions: 'i',
-    model: 'cli-model', effort: 'xhigh', readOnly: true,
-    cliDriver: 'grok', ...cliFieldsFor('grok', true), cliCwd: 'C:/w',
-  }, 0);
-  // 仅构造解析器所读的父 options / requestHeader；不创建会话、不调用 CLI 或 LLM。
-  const parent = {
-    options: { provider: 'created', model: 'created-model', reasoningEffort: 'low' },
-    session: { requestHeader: () => ({ config: { provider: 'p', model: 'm1', reasoningEffort: 'high' } }) },
-  };
-  const empty = { provider: '', model: '', effort: '' };
-  const cases = [
-    ['三项全空沿用父最新 p/m1/high', parent, empty,
-      { provider: 'p', model: 'm1', reasoningEffort: 'high' }],
-    ['显式相同 p/m1 且 effort 空保留 high', parent, { ...empty, provider: 'p', model: 'm1' },
-      { provider: 'p', model: 'm1', reasoningEffort: 'high' }],
-    ['仅改 model=m2 删除父 reasoningEffort', parent, { ...empty, model: 'm2' },
-      { provider: 'p', model: 'm2' }],
-    ['仅改 provider=q 删除父 reasoningEffort', parent, { ...empty, provider: 'q' },
-      { provider: 'q', model: 'm1' }],
-    ['显式 p/m2/low 使用 low', parent, { provider: 'p', model: 'm2', effort: 'low' },
-      { provider: 'p', model: 'm2', reasoningEffort: 'low' }],
-    ['父最新请求无 effort 不恢复创建 high', {
-      options: { provider: 'p', model: 'm1', reasoningEffort: 'high' },
-      session: { requestHeader: () => ({ config: { provider: 'p', model: 'm1' } }) },
-    }, empty, { provider: 'p', model: 'm1' }],
-    ['尚无请求时回落创建 p/m1/high', {
-      options: { provider: 'p', model: 'm1', reasoningEffort: 'high' },
-      session: { requestHeader: () => undefined },
-    }, empty, { provider: 'p', model: 'm1', reasoningEffort: 'high' }],
-    ['不同模型标识不按别名等价处理', parent, { ...empty, model: 'm1-alias' },
-      { provider: 'p', model: 'm1-alias' }],
-  ];
-  for (const [label, callingParent, wrapperRoute, expected] of cases) {
-    const config = toolConfigFor(role, { maxDepth: 3, wrapperRoute });
-    const resolved = resolveChildAgentOptions(callingParent, config.agentOptions, 1);
-    check(label, isDeepStrictEqual(resolved, { ...expected, subagentDepth: 1 }), JSON.stringify(resolved));
-  }
-}
+// ⚠️ 这里**曾经**有「包裹强度：生产 toolConfigFor → 真实 resolveChildAgentOptions」一节，
+//    验证统一包裹路由的 provider/model/effort 如何与官方 `resolveChildAgentOptions` 交互
+//    （沿用父级 vs 显式覆盖 vs 回落创建）。CLI 角色改为**直派后台任务**后不再 spawn 转交
+//    代理，那份路由解析整体消失 —— 该节连同 `wrapperProvider/Model/Effort` 三个字段一并删除。
+
 
 section('回归：入站深度独立于目标出站权限');
 {

@@ -35,7 +35,6 @@ import {
   CLI_BACKEND,
   DELEGATION_PROVIDER,
   absoluteDepthLimit,
-  agentOptionsFor,
   dispatchPermissionsFor,
   rolePresetId,
 } from './roles.js';
@@ -141,7 +140,6 @@ function materializeRow(row, platform, { readOnly }) {
  * @param {string} [options.platform] - 目标平台，默认 `process.platform`。
  * @param {number} options.maxDepth - 第一层之外**额外**可用的层数。
  * @param {object[]} [options.roles] - 全部角色，用于生成嵌套派发入口。
- * @param {object} [options.wrapperRoute] - 插件级包裹路由。
  * @param {object[]} [options.rows] - 行模板；默认读取生成物。
  * @returns {{id: string, name: string, description: string, plugins: object[]}} preset 定义。
  */

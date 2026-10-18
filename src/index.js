@@ -176,70 +176,15 @@ function noteLegacyWrapper(value, diagnostics) {
   const roles = readVolatileField(value, 'roles');
   if (!Array.isArray(roles) || !roles.some((role) => role &&
     ['agentProvider', 'agentModel'].some((key) => Object.hasOwn(role, key)))) return;
-  const message = '角色 agentProvider / agentModel 已废弃并忽略；请使用插件级 volatile.wrapperProvider / wrapperModel / wrapperEffort';
+  // ⚠️ 这两条旧字段曾经被引导到「插件级 volatile.wrapperProvider / wrapperModel」，但包裹路由
+  //    本身已随中继子代理退役（CLI 角色直接派发后台任务，没有需要选模型的转交代理）。
+  const message = '角色 agentProvider / agentModel 已废弃并忽略；角色的 provider 与 model 直接写在角色定义里';
   if (!diagnostics.deprecatedConfig.includes(message)) {
     diagnostics.deprecatedConfig = [diagnostics.deprecatedConfig, message].filter(Boolean).join('；');
   }
   if (!warnedLegacyWrapper) {
     warnedLegacyWrapper = true;
     console.error(`[${name}] ${message}`);
-  }
-}
-
-/** 空白等同未设置；离线文件与直接 apply 路径也必须校验强度。 */
-function wrapperRouteFrom(value) {
-  const volatile = readVolatile(value);
-  const route = {};
-  const errors = [];
-  for (const key of ['provider', 'model', 'effort']) {
-    const field = `wrapper${key[0].toUpperCase()}${key.slice(1)}`;
-    const raw = volatile[field];
-    if (raw !== undefined && raw !== null && typeof raw !== 'string') {
-      errors.push(`volatile.${field} 必须是字符串`);
-    }
-    if (typeof raw === 'string' && raw.trim()) route[key] = raw.trim();
-  }
-  if (route.effort && !EFFORT_VALUES.includes(route.effort)) {
-    errors.push(`volatile.wrapperEffort "${route.effort}" 非法：只能是 ${EFFORT_VALUES.join(' / ')}`);
-  }
-  return { route, errors };
-}
-
-/** 用既有文件桥接根配置与 preset；显式空值确保清除后不回落 preset 的旧值。 */
-function syncWrapperRouteToFile(resolved, roleConfigPath, diagnostics) {
-  // 独立维护当前同步失败；恢复后不锁存旧错误。
-  const previous = diagnostics.wrapperSyncError;
-  diagnostics.configErrors = diagnostics.configErrors.filter((error) => error !== previous);
-  diagnostics.wrapperSyncError = undefined;
-  diagnostics.wrapperSyncPending = false;
-  const fail = (detail) => {
-    const message = `包裹路由同步失败：${detail}`;
-    diagnostics.wrapperSyncError = message;
-    if (!diagnostics.configErrors.includes(message)) diagnostics.configErrors.push(message);
-    if (message !== previous) console.error(`[${name}] ${message}`);
-  };
-  const current = readRoleConfigFile(roleConfigPath);
-  const fields = ['wrapperProvider', 'wrapperModel', 'wrapperEffort'];
-  const root = readVolatile(resolved);
-  const existing = current.ok ? current.value : {};
-  if (!fields.some((key) => Object.hasOwn(root, key) || Object.hasOwn(existing.volatile ?? {}, key))) return;
-  if (!current.ok) {
-    fail(`拒绝写入包裹路由配置；${current.detail}`);
-    return;
-  }
-  // 仅包裹设置也必须建立桥接文件；空 roles 仍可由迁移脚本后续播种。
-  // 创建失败时 preset 无法得知根设置，可能回落自身路由；pending 必须判为不健康。
-  diagnostics.wrapperSyncPending = current.missing === true;
-  const volatile = { ...existing.volatile };
-  for (const key of fields) volatile[key] = typeof root[key] === 'string' ? root[key].trim() : '';
-  if (JSON.stringify(volatile) === JSON.stringify(existing.volatile)) return;
-  const written = writeConfigFile(roleConfigPath, current.missing
-    ? initialConfig([], { volatile })
-    : { ...existing, volatile });
-  if (!written.ok) fail(written.error);
-  else {
-    diagnostics.wrapperSyncPending = false;
-    if (current.missing) diagnostics.roleConfigSync = '已创建空角色文件以桥接根包裹路由（角色待播种）';
   }
 }
 
@@ -400,9 +345,11 @@ export const Config = z.object({
       //    取舍说明：「会执行本机命令」这件事的可控性现在依赖两点 —— 角色的 `backend`
       //    必须被显式设为 `cli`，且该角色只在 Switchboard preset 会话里存在。这比一个
       //    看不见的全局开关更容易理解和审计。
-      wrapperProvider: z.string().description('统一包裹外部 CLI 角色的 LLM route；留空继承父代理路由，仅对 CLI 角色生效'),
-      wrapperModel: z.string().description('统一包裹外部 CLI 角色的模型（非外部 CLI 模型）；留空继承父代理模型，仅对 CLI 角色生效'),
-      wrapperEffort: z.string().description(`统一包裹外部 CLI 角色的思考强度；留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。可选 ${EFFORT_VALUES.join(' / ')}，仅对 CLI 角色生效`),
+      //
+      // ⚠️ 这里**曾经**有 `wrapperProvider` / `wrapperModel` / `wrapperEffort`（统一包裹路由）。
+      //    它们唯一的消费者是**中继子代理** —— 旧路径要 spawn 一个 LLM 转交代理去调 CLI 工具，
+      //    才需要回答「它用哪个模型」。CLI 角色改为**直派后台任务**后没有转交代理，
+      //    这三个字段失去全部语义，已随中继一起删除。
     })
     .default({})
     .volatile(),
@@ -767,7 +714,7 @@ export function selftestTool(ctx, diagnostics) {
           : ''].filter(Boolean).join('；');
       const ok = diagnostics.fatal === undefined && diagnostics.configErrors.length === 0
         && format?.status !== 'future' && format?.status !== 'unsupported'
-        && !diagnostics.wrapperSyncPending && !mounted.some(m => m.ok === false);
+        && !mounted.some(m => m.ok === false);
       return {
         pluginVersion,
         manifestVersion,
@@ -842,7 +789,6 @@ export function selftestTool(ctx, diagnostics) {
           ...(format?.reason ? [`格式=${format.reason}`] : []),
           `读取=${diagnostics.roleConfigRead ?? '（本作用域未读取）'}`,
           `同步=${diagnostics.roleConfigSync ?? '（本作用域未同步）'}`,
-          ...(diagnostics.wrapperSyncPending ? ['包裹路由=根设置尚未桥接（文件创建未成功，不能宣称已生效）'] : []),
           ...(diagnostics.deprecatedConfig ? [`弃用=${diagnostics.deprecatedConfig}`] : []),
         ].join(' | '),
         configErrors: diagnostics.configErrors.join('\n'),
@@ -887,7 +833,7 @@ export function selftestTool(ctx, diagnostics) {
  * @param {number} maxDepth - 允许嵌套时的额外层数。
  * @returns {Promise<{ok: boolean, detail: string}>} 挂载结果。
  */
-async function mountRoleTool(ctx, role, toolModule, resolver, roles, maxDepth, wrapperRoute, dispatch) {
+async function mountRoleTool(ctx, role, toolModule, resolver, roles, maxDepth, dispatch) {
   if (typeof ctx.plugin !== 'function') return { ok: false, detail: 'ctx.plugin 不可用' };
   try {
     const liveRole = () => {
@@ -898,8 +844,7 @@ async function mountRoleTool(ctx, role, toolModule, resolver, roles, maxDepth, w
     const liveConfig = toolConfigFor(role, {
       getRole: liveRole,
       getMaxDepth: () => (dispatch.storage.getStore() ?? resolver()).maxDepth,
-      getWrapperRoute: () => (dispatch.storage.getStore() ?? resolver()).wrapperRoute,
-      maxDepth, wrapperRoute,
+      maxDepth,
     });
     const fiber = ctx.plugin({ ...toolModule, apply: (toolCtx) => {
       // Cordis Config 校验产物会物化 getter；官方 apply 必须持有原 liveConfig 才能延迟解析。
@@ -1066,22 +1011,14 @@ function applyInner(ctx, config) {
   //    调不到；留着它只会平添「注册失败拖垮启动」的风险。现在客户端走 `settings`。
   if (!mountHere) {
     const sync = (updated, syncDepth = false) => {
-      const wrapper = wrapperRouteFrom(updated);
-      diagnostics.configErrors = diagnostics.configErrors.filter((error) => !error.startsWith('volatile.wrapper'));
-      if (wrapper.errors.length > 0) {
-        diagnostics.configErrors.push(...wrapper.errors);
-        for (const error of wrapper.errors) console.error(`[${name}] ${error}`);
-        return;
-      }
       if (syncRolesToFile({ resolved: updated, roleConfigPath, diagnostics, syncDepth }) !== false) {
-        syncWrapperRouteToFile(updated, roleConfigPath, diagnostics);
+        // 角色已同步。
       }
     };
     if (ctx.on) ctx.on('loader/volatile-update', paths => {
       if (!Array.isArray(paths)) return;
       const relevant = paths.some(path => Array.isArray(path) && (
-        path.length === 1 && ['roles', 'maxDepth'].includes(path[0]) ||
-        path.length === 2 && path[0] === 'volatile' && ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].includes(path[1])
+        path.length === 1 && ['roles', 'maxDepth'].includes(path[0])
       ));
       if (!relevant) return;
       try { sync(resolved, true); }
@@ -1505,7 +1442,6 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
       const current = resolver();
       const definitions = buildRolePresets(current.roles, {
         maxDepth: current.maxDepth ?? initial.maxDepth,
-        wrapperRoute: current.wrapperRoute ?? initial.wrapperRoute,
       });
       const wanted = new Map(definitions.map((definition) => [definition.id, definition]));
 
@@ -1575,7 +1511,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
         diagnostics.mounts.push({ id: role.id, ok: cliDispatch.ok, detail: cliDispatch.detail });
         continue;
       }
-      const outcome = await mountRoleTool(ctx, role, toolModule, resolver, roles, initial.maxDepth, initial.wrapperRoute, dispatch);
+      const outcome = await mountRoleTool(ctx, role, toolModule, resolver, roles, initial.maxDepth, dispatch);
       diagnostics.mounts.push({ id: role.id, ok: outcome.ok, detail: outcome.detail });
     }
   }).catch(error => { diagnostics.fatal = `无法 import @deepseek-ai/dsh-tool-subagent：${error.message ?? error}`; });
@@ -1641,11 +1577,10 @@ function createRoleResolver(roleConfigPath, resolved) {
     }
     const maxDepth = Number.isInteger(value.maxDepth) && value.maxDepth >= 0 ? value.maxDepth
       : typeof resolved.maxDepth === 'number' ? resolved.maxDepth : 3;
-    const wrapperRoute = wrapperRouteFrom(fromFile.ok && value.volatile ? value : resolved);
     const routes = normalized.roles.map(role => ({ id: role.id,
       summary: `${routeSummaryFor(role)} source=${configuredRoles !== undefined ? 'preset' : 'file'} stale=${fromFile.stale === true}` }));
-    return { ok: fromFile.ok && wrapperRoute.errors.length === 0, roles: normalized.roles,
-      errors: [...normalized.errors, ...wrapperRoute.errors], error: fromFile.error,
-      maxDepth, wrapperRoute: wrapperRoute.route, routes, source: fromFile.source ?? 'preset', stale: fromFile.stale === true };
+    return { ok: fromFile.ok, roles: normalized.roles,
+      errors: normalized.errors, error: fromFile.error,
+      maxDepth, routes, source: fromFile.source ?? 'preset', stale: fromFile.stale === true };
   };
 }

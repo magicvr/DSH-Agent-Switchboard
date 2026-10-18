@@ -247,16 +247,11 @@ function check(label, condition) {
   console[condition ? 'log' : 'error'](`${condition ? 'PASS' : 'FAIL'}  ${label}`);
   if (!condition) process.exitCode = 1;
 }
+// ⚠️ 这里**曾经**逐字段断言 `volatile.wrapperProvider/Model/Effort` 的存在与空值语义。
+// 那三个字段是**中继子代理**的 LLM 路由；CLI 角色改为直派后台任务后没有转交代理，
+// 它们已从 Config 删除。此处的正向断言改为「**不再存在**」——防止它们悄悄回流。
 for (const key of ['wrapperProvider', 'wrapperModel', 'wrapperEffort']) {
-  const node = deref(volDict[key]);
-  check(`volatile.${key} 为可选字符串并说明空值语义`,
-    node?.type === 'string' && !node.meta?.required && (key === 'wrapperEffort'
-      ? node.meta?.description.includes('留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。') &&
-        node.meta.description.includes('仅对 CLI 角色生效') && !node.meta.description.includes('留空继承父代理强度')
-      : /留空继承父代理/.test(node.meta?.description ?? '')));
-  const resolved = mod.Config({ volatile: { [key]: '' } });
-  check(`${key} 接受空字符串且不生成路由默认值`, mod.readVolatile(resolved)[key] === '' &&
-    mod.readVolatile(mod.Config({}))[key] === undefined);
+  check(`volatile.${key} 已删除（包裹路由随中继子代理退役）`, deref(volDict[key]) === undefined);
 }
 
 // effort / backend 必须带取值约束，否则用户能配出运行时才失败的值

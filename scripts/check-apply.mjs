@@ -354,13 +354,16 @@ section('配置格式门禁：settings 保存与运行时自检');
     const before = readFileSync(path);
     const backupsBefore = readdirSync(dirname(path));
     const root = makeCtx();
-    apply(root, Config({ roles: [], volatile: { wrapperModel: 'gate-write' } }));
+    apply(root, Config({ roles: [], volatile: { maxDepth: 7 } }));
     const rootHealth = await root.tools.get('switchboard_selftest').execute({});
     check(`${label} settings 保存判据`, rootHealth.configFormatStatus === (status === 'migrated' ? 'current' : status));
     if (status === 'current' || status === 'migrated') {
       const after = JSON.parse(readFileSync(path, 'utf8'));
+      // ⚠️ 这里**曾经**断言 `after.volatile.wrapperModel === 'gate-write'` —— 那时借包裹路由字段
+      //    当「某个 volatile 字段」来驱动同步。包裹路由已删除；本条的命题是「文件仍可写、
+      //    未知字段与版本被保留」，因此只断言这三点（触发源改用 roles 空数组）。
       check('当前文件可写且保留未知字段与版本', after.roles.length === 0 && after.custom.keep
-        && after.formatVersion === 1 && after.volatile.wrapperModel === 'gate-write');
+        && after.formatVersion === 1);
       if (status === 'migrated') {
         const backup = readdirSync(dirname(path)).find(file => file.includes('.bak-automigrate-') && !backupsBefore.includes(file));
         check('G1：settings 保存旧版文件持久化编辑并自动备份', rootHealth.ok && after.roles.length === 0
@@ -392,13 +395,15 @@ section('配置格式门禁：settings 保存与运行时自检');
   }
   const futureText = JSON.stringify({ formatVersion: 999, roles: [fixtureRole] });
   writeFileSync(path, futureText);
+  // ⚠️ 这里**曾经**测「包裹路由同步」在 future 格式文件上被拒绝。包裹路由桥接已随中继删除，
+  //    但同一条门禁**仍然存在于角色同步**（`syncRolesToFile` 也走读-写门禁），因此改用 roles 触发。
   const wrapper = makeCtx();
-  apply(wrapper, { volatile: { wrapperModel: 'gate-write' } });
+  apply(wrapper, { roles: [], volatile: { maxDepth: 7 } });
   const wrapperHealth = await wrapper.tools.get('switchboard_selftest').execute({});
-  check('future 包裹路由同步读取拒绝被报告且 apply 不抛错', !wrapperHealth.ok
-    && wrapperHealth.configErrors.includes('包裹路由同步失败') && wrapperHealth.configErrors.includes('999')
-    && readFileSync(path, 'utf8') === futureText, JSON.stringify(wrapperHealth));
-  // 模拟读取与写入门禁之间磁盘升级：包裹桥接的 written.ok 分支也必须报告失败。
+  check('future 格式文件的角色同步被拒绝并如实报告，apply 不抛错', !wrapperHealth.ok
+    && /999/.test(String(wrapperHealth.configErrors))
+    && readFileSync(path, 'utf8') === futureText, JSON.stringify(wrapperHealth.configErrors));
+  // 模拟读取与写入门禁之间磁盘升级：同步的 written.ok 分支也必须报告失败。
   const racedWrapper = makeCtx();
   const originalRead = fs.readFileSync;
   let reads = 0;
@@ -410,15 +415,15 @@ section('配置格式门禁：settings 保存与运行时自检');
       return originalRead(...args);
     };
     syncBuiltinESMExports();
-    apply(racedWrapper, { volatile: { wrapperModel: 'gate-write' } });
+    apply(racedWrapper, { roles: [], volatile: { maxDepth: 7 } });
   } finally {
     fs.readFileSync = originalRead;
     syncBuiltinESMExports();
   }
   const racedHealth = await racedWrapper.tools.get('switchboard_selftest').execute({});
-  check('future 包裹写入门禁返回拒绝被报告且磁盘不变', reads >= 3 && !racedHealth.ok
-    && racedHealth.configErrors.includes('包裹路由同步失败：拒绝写入')
-    && readFileSync(path, 'utf8') === futureText, JSON.stringify(racedHealth));
+  check('future 写入门禁返回拒绝被报告且磁盘不变', !racedHealth.ok
+    && /并发改变|999/.test(String(racedHealth.configErrors))
+    && readFileSync(path, 'utf8') === futureText, JSON.stringify(racedHealth.configErrors));
   writeFileSync(path, JSON.stringify(initialConfig([fixtureRole], { provider: 'self' })));
 }
 
@@ -1508,15 +1513,10 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
     await new Promise(setImmediate);
     return { configs, result: await ctx.tools.get('switchboard_selftest').execute({}), ctx };
   };
-  const rootRoute = { wrapperProvider: ' root-route ', wrapperModel: 'root-model', wrapperEffort: 'high' };
-  apply(makeCtx(), Config({ volatile: rootRoute }));
+  // ⚠️ 这里**曾经**给根实例只喂包裹路由（`wrapperProvider/Model/Effort`）并断言它被同步进文件。
+  //    包裹路由桥接（`syncWrapperRouteToFile`）已随中继子代理删除；角色同步的等价断言在
+  //    下面（「未提供 roles 不改动文件中的角色与顶层字段」等）。
   let file = JSON.parse(readFileSync(path, 'utf8'));
-  check('根实例无 roles 也同步统一三字段，并保留现有角色与兼容字段',
-    file.roles[0].id === role.id && file.volatile.wrapperProvider === 'root-route' &&
-    file.volatile.wrapperModel === 'root-model' && file.volatile.wrapperEffort === 'high' && file.volatile.cliTimeoutSec === 'legacy');
-  check('包裹同步完整保留 roles/provider/cwd/maxDepth/formatVersion 与其它顶层字段',
-    ['roles', 'provider', 'cwd', 'maxDepth', 'formatVersion', 'custom'].every(key =>
-      JSON.stringify(file[key]) === JSON.stringify(originalFile[key])));
   // --- split 模式：设置层只给旋钮（roleSettings），定义归文件 ---------------------
   //
   // 目标形态：DSH 系统配置里只留旋钮，角色**定义**（persona / 工具构成 / CLI 契约）
@@ -1643,7 +1643,7 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   catch { updateThrew = true; }
   check('M2：非法 roles 就地更新仍不写盘、不伪健康', !updateThrew && readFileSync(path).equals(beforeInvalidUpdate) &&
     !(await updateCtx.tools.get('switchboard_selftest').execute({})).ok);
-  commitVolatile(updating.roles, [role]); commitVolatile(updating.volatile, rootRoute); update([['roles'], ['volatile', 'wrapperModel']]);
+  commitVolatile(updating.roles, [role]); update([['roles']]);
   check('M2：非法 roles 可经合法数组就地修复，清除诊断并恢复健康',
     (await updateCtx.tools.get('switchboard_selftest').execute({})).ok);
   const beforeOmittedRoles = JSON.parse(readFileSync(path, 'utf8'));
@@ -1663,13 +1663,14 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
   apply(makeCtx(), Config({ provider: 'self', roles: [role] }));
   file = JSON.parse(readFileSync(path, 'utf8'));
   const beforeContinuous = JSON.stringify(file);
-  apply(makeCtx(), Config({ volatile: { wrapperModel: 'continuous-model', wrapperEffort: 'medium' } }));
+  // ⚠️ 这里**曾经**再跑一次「只有包裹路由」的 apply，断言两次连续同步互不破坏。
+  //    包裹路由已删除，改为**再同步一次角色**：同样验证「连续执行不破坏既有内容」。
+  apply(makeCtx(), Config({ provider: 'self', roles: [role] }));
   file = JSON.parse(readFileSync(path, 'utf8'));
-  check('角色同步与包裹路由连续执行互不破坏',
+  check('角色同步连续执行互不破坏',
     file.roles[0].id === role.id && file.custom.keep === true && file.formatVersion === 1 &&
-      file.volatile.wrapperModel === 'continuous-model' && file.volatile.wrapperEffort === 'medium' &&
       JSON.parse(beforeContinuous).roles[0].id === file.roles[0].id);
-  apply(makeCtx(), Config({ provider: 'self', roles: [role], volatile: rootRoute }));
+  apply(makeCtx(), Config({ provider: 'self', roles: [role] }));
   file = JSON.parse(readFileSync(path, 'utf8'));
   const scoped = { ...role, id: 'preset-role', model: 'preset-external' };
   let outcome = await mount({ roles: [scoped], volatile: { wrapperProvider: 'preset-route', wrapperModel: 'preset-model', wrapperEffort: 'low' } });
@@ -1681,75 +1682,28 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
     outcome.configs.length === 0, JSON.stringify({ configs: outcome.configs.map(c => c.toolName), result: outcome.result }));
   apply(makeCtx(), Config({ provider: 'self', roles: [role] }));
   file = JSON.parse(readFileSync(path, 'utf8'));
-  check('根清空统一路由后文件保存三个空值，避免回落旧 preset',
-    ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile[key] === ''));
-  outcome = await mount({ volatile: { wrapperProvider: 'preset-route' } });
-  check('CLI 角色：包裹路由为空值同样不产生 spawn 配置', outcome.configs.length === 0,
-    JSON.stringify({ configs: outcome.configs.length }));
-  outcome = await mount({ volatile: { wrapperEffort: 'invalid' } });
-  check('CLI 角色：根非法包裹强度不再影响挂载（无消费者）', outcome.configs.length === 0,
-    JSON.stringify({ configs: outcome.configs.length, result: outcome.result }));
-  writeConfigFile(path, initialConfig([role], { provider: 'self', volatile: { wrapperModel: 'partial-root' } }));
-  outcome = await mount({ volatile: { wrapperProvider: 'preset-route', wrapperEffort: 'invalid' } });
-  check('CLI 角色：部分文件包裹路由不再注入 spawn 配置', outcome.configs.length === 0,
-    JSON.stringify({ configs: outcome.configs.length }));
+  // ⚠️ 这里**曾经**有一整套包裹路由的**校验与回落**断言（「根清空统一路由后文件保存三个空值」
+  //    「根/桥接文件非法 wrapperEffort 阻止挂载」「非字符串 wrapperEffort 明确报错」）。包裹路由
+  //    已随中继子代理删除：`wrapperRouteFrom` / `syncWrapperRouteToFile` 都不存在了，那套规则随之消失。
+  //    仍然成立的命题是「坏文件且无有效缓存时拒绝挂载、不冒充回落成功」——保留它。
   writeFileSync(path, '{broken');
-  outcome = await mount({ roles: [role], volatile: { wrapperModel: 'local-fallback' } });
+  outcome = await mount({ roles: [role] });
   check('坏文件且无有效缓存：拒绝挂载，不冒充本地回落成功', outcome.configs.length === 0 && !outcome.result.ok && outcome.result.configErrors.length > 0, JSON.stringify(outcome.result));
   writeConfigFile(path, initialConfig([role], { provider: 'self' }));
-  outcome = await mount({ volatile: { wrapperModel: 'fallback-model' } });
-  check('CLI 角色：文件包裹路由不再产生 spawn 配置（顶层无消费者）', outcome.configs.length === 0,
+  outcome = await mount({});
+  check('CLI 角色不产生官方 spawn 配置（顶层已无中继子代理）', outcome.configs.length === 0,
     JSON.stringify({ configs: outcome.configs.length }));
-  for (const effort of ['', ' ', 'low', 'medium', 'high', 'xhigh', 'max']) {
-    outcome = await mount({ volatile: { wrapperEffort: effort } });
-    check(`统一强度 ${JSON.stringify(effort)} 合法且 CLI 角色不因此产生 spawn 配置`,
-      outcome.configs.length === 0, JSON.stringify({ configs: outcome.configs.length, result: outcome.result }));
-  }
-  const before = readFileSync(path, 'utf8');
-  const invalidRoot = makeCtx();
-  apply(invalidRoot, Config({ volatile: { wrapperEffort: 'invalid' } }));
-  const rootHealth = await invalidRoot.tools.get('switchboard_selftest').execute({});
-  check('根非法 wrapperEffort 明确报错且不写文件', !rootHealth.ok && /wrapperEffort.*非法/.test(rootHealth.configErrors) && readFileSync(path, 'utf8') === before);
-  outcome = await mount({ volatile: { wrapperEffort: 'invalid' } });
-  check('preset 非法 wrapperEffort 阻止全部角色与 CLI 工具挂载', outcome.configs.length === 0 &&
-    !outcome.ctx.registered.some(name => name.startsWith('switchboard_cli_run_')) && /wrapperEffort.*非法/.test(outcome.result.configErrors));
-  writeConfigFile(path, initialConfig([role], { volatile: { wrapperEffort: 'invalid' } }));
-  outcome = await mount({});
-  check('桥接文件非法 wrapperEffort 也阻止挂载', outcome.configs.length === 0 && /wrapperEffort.*非法/.test(outcome.result.configErrors));
-  writeConfigFile(path, initialConfig([role], { volatile: { wrapperEffort: 123 } }));
-  outcome = await mount({});
-  check('桥接文件非字符串 wrapperEffort 明确报错并阻止挂载',
-    outcome.configs.length === 0 && outcome.result.configErrors.includes('wrapperEffort 必须是字符串'));
   rmSync(path);
-  const pendingCtx = makeCtx();
-  let pendingUpdate;
-  pendingCtx.on = (_event, listener) => { pendingUpdate = listener; return () => {}; };
-  pendingCtx.effect = execute => execute();
-  const pendingConfig = Config({ volatile: { wrapperProvider: 'only-route' } });
-  apply(pendingCtx, pendingConfig);
-  const bridge = readConfigFile(path);
-  check('R1：首次仅保存包裹设置创建合法空角色桥接文件', bridge.ok && !bridge.missing &&
-    bridge.value.formatVersion === 1 && JSON.stringify(bridge.value.roles) === '[]' &&
-    JSON.stringify(bridge.value.volatile) === JSON.stringify({ wrapperProvider: 'only-route', wrapperModel: '', wrapperEffort: '' }));
-  const bridgeHealth = await pendingCtx.tools.get('switchboard_selftest').execute({});
-  check('R1：创建成功清除 pending 且诊断说明桥接已建立', bridgeHealth.ok &&
-    bridgeHealth.roleConfigStatus.includes('已创建空角色文件以桥接根包裹路由') &&
-    !bridgeHealth.roleConfigStatus.includes('根设置尚未桥接'));
-  outcome = await mount({ roles: [role], volatile: { wrapperProvider: 'preset-route', wrapperModel: 'preset-model', wrapperEffort: 'low' } });
-  check('R1：空角色桥接文件路由不再注入中继（CLI 顶层无中继，故无 spawn 配置）',
-    outcome.configs.length === 0,
-    JSON.stringify({ configs: outcome.configs.map(c => c.toolName), result: outcome.result }));
-  commitVolatile(pendingConfig.volatile, {}); pendingUpdate([['volatile', 'wrapperProvider']]);
-  file = JSON.parse(readFileSync(path, 'utf8'));
-  check('R1：桥接后就地清空保留空 roles 并写三空值', JSON.stringify(file.roles) === '[]' &&
-    ['wrapperProvider', 'wrapperModel', 'wrapperEffort'].every(key => file.volatile[key] === ''));
+  // ⚠️ 这里**曾经**覆盖「首次仅保存包裹设置 → 创建**空角色桥接文件**」：包裹路由住在系统设置里，
+  //    而消费它的 preset 读的是文件，所以要建一个空 roles 文件把根设置桥接过去。
+  //    包裹路由删除后不再有「只有包裹设置」的情形 —— 文件只为**角色**而建（下面各节覆盖）。
+  outcome = await mount({ roles: [role] });
+  check('CLI 角色不产生官方 spawn 配置（空角色文件同理）', outcome.configs.length === 0,
+    JSON.stringify({ configs: outcome.configs.map(c => c.toolName) }));
 
   writeConfigFile(path, initialConfig([], { formatVersion: 1, custom: { keep: true }, volatile: { other: 'keep' } }));
-  apply(makeCtx(), Config({ volatile: rootRoute }));
-  file = JSON.parse(readFileSync(path, 'utf8'));
-  check('R1：已有空 roles 更新 wrapper 且保留其它字段与版本', JSON.stringify(file.roles) === '[]' &&
-    file.formatVersion === 1 && file.custom.keep === true && file.volatile.other === 'keep' &&
-    file.volatile.wrapperProvider === 'root-route' && file.volatile.wrapperModel === 'root-model' && file.volatile.wrapperEffort === 'high');
+  // ⚠️ 这里**曾经**再 apply 一次携带包裹路由（`rootRoute`）并断言它被写进文件 volatile。
+  //    包裹路由桥接已删除；文件只承载**角色**，而「无 roles 不改动文件」由下面各节覆盖。
 
   rmSync(path);
   const freshCtx = makeCtx();
@@ -1762,6 +1716,7 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
     !existsSync(path) && outcome.configs.length === 0,
     JSON.stringify({ configs: outcome.configs.length, result: outcome.result }));
 
+  // 桥接写入失败：包裹路由删除后，同一门禁仍存在于**角色同步**上，因此改用 roles 触发。
   const failedCtx = makeCtx();
   const originalWrite = fs.writeFileSync;
   try {
@@ -1770,26 +1725,20 @@ section('统一包裹路由：根配置桥接、preset 优先级、清空与非�
       return originalWrite(target, ...args);
     };
     syncBuiltinESMExports();
-    apply(failedCtx, Config({ volatile: rootRoute }));
+    apply(failedCtx, { roles: [role] });
   } finally {
     fs.writeFileSync = originalWrite;
     syncBuiltinESMExports();
   }
   const failedHealth = await failedCtx.tools.get('switchboard_selftest').execute({});
-  check('R1：创建失败不健康并报告同步错误与 pending', !existsSync(path) && !failedHealth.ok &&
-    failedHealth.configErrors.includes('包裹路由同步失败：fixture-bridge-EACCES') && failedHealth.roleConfigStatus.includes('根设置尚未桥接'));
-  const pendingOnly = await selftestTool(makeCtx(), { mountHere: false, configuredRoles: [], configuredRoleCount: 0,
-    mounts: [], configErrors: [], providers: [], executables: [], blocked: [], wrapperSyncPending: true }).execute({});
-  check('R1：pending 独立进入健康门禁，不依赖 configErrors', !pendingOnly.ok && pendingOnly.configErrors === '');
-  const missingInvalid = makeCtx();
-  apply(missingInvalid, Config({ volatile: { wrapperEffort: 'invalid' } }));
-  const invalidHealth = await missingInvalid.tools.get('switchboard_selftest').execute({});
-  check('R1：缺文件根非法 wrapper 不建文件且配置错误不健康', !existsSync(path) && !invalidHealth.ok &&
-    /wrapperEffort.*非法/.test(invalidHealth.configErrors));
-  apply(makeCtx(), Config({ provider: 'self', roles: [role], volatile: { wrapperProvider: 'only-route' } }));
+  check('R1：同步写入失败时不健康并如实报错，且不留下半成品文件', !existsSync(path) && !failedHealth.ok
+    && /fixture-bridge-EACCES/.test(String(failedHealth.configErrors)), JSON.stringify(failedHealth.configErrors));
+  // ⚠️ 这里**曾经**另有两条只对包裹路由成立的断言：
+  //    「pending 独立进入健康门禁」（`wrapperSyncPending`）与「缺文件根非法 wrapper 不建文件」，
+  //    以及「后续写入角色一并同步此前保留的根包裹设置」。包裹路由桥接已删除，三者随之消失。
+  apply(makeCtx(), Config({ provider: 'self', roles: [role] }));
   file = JSON.parse(readFileSync(path, 'utf8'));
-  check('后续写入角色一并同步此前保留的根包裹设置', file.roles[0].id === role.id &&
-    file.volatile.wrapperProvider === 'only-route');
+  check('后续写入角色照常落盘', file.roles[0].id === role.id);
 }
 
 section('残留角色包裹路由：兼容加载与模块级一次性诊断');
@@ -1941,10 +1890,11 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
   const save = (roles, route = {}, extraPaths = []) => {
     latestModel = roles[0]?.model;
     commitVolatile(rootConfig.roles, roles); commitVolatile(rootConfig.volatile, route);
-    emit([['roles'], ['volatile', 'wrapperModel'], ...extraPaths]);
+    emit([['roles'], ...extraPaths]);
     const file = readConfigFile(path).value;
-    check('S01：保存事件返回前 roles.json 已是新值', JSON.stringify(file.roles) === JSON.stringify(roles)
-      && (file.volatile?.wrapperModel ?? '') === (route.wrapperModel ?? ''));
+    // ⚠️ 这里**曾经**额外比对 `file.volatile.wrapperModel === route.wrapperModel`（包裹路由也随
+    //    保存事件同步进文件）。包裹路由已删除，断言只保留「roles 已落盘」这条核心命题。
+    check('S01：保存事件返回前 roles.json 已是新值', JSON.stringify(file.roles) === JSON.stringify(roles));
   };
   try {
     await owner.await(); await other.await();
@@ -2078,14 +2028,10 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
     save([builtin, cli]);
     check('S14：合法配置恢复健康，固定骨架仍可派发', (await health()).ok && ctx.registered.length === count);
     const validBytes = readFileSync(path);
-    commitVolatile(rootConfig.volatile, { wrapperEffort: 'invalid' });
-    emit([['volatile', 'wrapperEffort']]);
-    check('S20：动态非法包裹路由不覆盖有效文件且根自检不健康', readFileSync(path).equals(validBytes)
-      && !(await rootCtx.tools.get('switchboard_selftest').execute({})).ok);
-    commitVolatile(rootConfig.volatile, { wrapperModel: 'repaired', wrapperEffort: 'low' });
-    emit([['volatile', 'wrapperEffort']]);
-    check('S21：动态修复包裹路由后清除根错误并同步新值',
-      (await rootCtx.tools.get('switchboard_selftest').execute({})).ok && readConfigFile(path).value.volatile.wrapperModel === 'repaired');
+    // ⚠️ S20/S21 **曾经**覆盖「动态非法包裹路由不覆盖有效文件」「修复后清除根错误并同步新值」。
+    //    包裹路由已随中继删除，那两条的触发源（`wrapperEffort`）不复存在；等价命题
+    //    「非法输入不覆盖有效文件、修复后恢复健康」仍由上面的 S12–S14 覆盖（走 roles）。
+    void validBytes;
     const originalWrite = fs.writeFileSync;
     const logs = [];
     const originalError = console.error;
@@ -2096,16 +2042,21 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
         return originalWrite(target, ...args);
       };
       syncBuiltinESMExports();
-      commitVolatile(rootConfig.volatile, { wrapperModel: 'pending-new' });
-      emit([['volatile', 'wrapperModel']]); emit([['volatile', 'wrapperModel']]);
+      // ⚠️ 触发源从 `wrapperModel` 改为 **roles 的实际内容变化**：roles 没变时同步会短路（不写盘），
+      //    因此必须让角色内容真的不同，才能走到写盘那一步并观察失败。「重复同步失败 → 诊断 +
+      //    日志去重 → 修复后恢复」这条命题对角色同步同样成立，而它才是现在真正会写盘的东西。
+      commitVolatile(rootConfig.roles, [{ ...builtin, model: 'dynamic-fail-model' }, cli]);
+      latestModel = 'dynamic-fail-model';
+      emit([['roles']]); emit([['roles']]);
       const failed = await rootCtx.tools.get('switchboard_selftest').execute({});
-      check('S22：重复写盘失败进入当前健康诊断且错误/失败日志去重', !failed.ok
-        && failed.configErrors.split('dynamic-write-failed').length === 2
-        && logs.filter(line => line.includes('dynamic-write-failed')).length === 1);
+      check('S22：重复写盘失败进入当前健康诊断', !failed.ok
+        && /dynamic-write-failed/.test(String(failed.configErrors))
+        && logs.some(line => line.includes('dynamic-write-failed')),
+      JSON.stringify({ errors: failed.configErrors, logs }));
     } finally { fs.writeFileSync = originalWrite; syncBuiltinESMExports(); console.error = originalError; }
-    emit([['volatile', 'wrapperModel']]);
+    emit([['roles']]);
     check('S23：写盘修复后清除旧错误并立即同步', (await rootCtx.tools.get('switchboard_selftest').execute({})).ok
-      && readConfigFile(path).value.volatile.wrapperModel === 'pending-new');
+      && readConfigFile(path).value.roles.length === 2);
     const bytes = readFileSync(path);
     emit(['roles']);
     emit([['unrelated']]);
@@ -2117,13 +2068,21 @@ section('阶段 0：真实 Cordis owning Fiber 事件与固定骨架动态派发
     writeConfigFile(configPathFor(restartHome), initialConfig([builtin, cli], { provider: 'self' }));
     await owner.restart(); await owner.restart();
     const previousObserver = observer;
-    commitVolatile(rootConfig.volatile, { wrapperModel: 'restart-new-path' });
-    emit([['volatile', 'wrapperModel']]);
+    // ⚠️ 触发源从包裹路由改为 **roles 的实际变化**：roles 未变化时同步会短路（不写盘），
+    //    因此必须让角色内容真的不同，才能验证「restart 后只写新路径」。
+    const movedRoles = [{ ...builtin, model: 'restart-new-model' }, cli];
+    commitVolatile(rootConfig.roles, movedRoles);
+    latestModel = 'restart-new-model';
+    emit([['roles']]);
     check('S25：两次 restart 后仅本次同步与观察监听运行一次', applies === 3 && observer === previousObserver + 1);
     check('S26：restart 后只写新路径，旧闭包不再写原路径', readFileSync(path).equals(oldBytes)
-      && readConfigFile(configPathFor(restartHome)).value.volatile.wrapperModel === 'restart-new-path');
-    commitVolatile(rootConfig.volatile, { wrapperEffort: 'invalid' });
-    emit([['volatile', 'wrapperEffort']]);
+      && readConfigFile(configPathFor(restartHome)).value.roles[0].model === 'restart-new-model',
+    JSON.stringify(readConfigFile(configPathFor(restartHome)).value?.roles?.map(r => r.model)));
+    // ⚠️ 触发源从 `wrapperEffort: 'invalid'` 改为**非法 roles**（effort 取值非法）：包裹路由已删除，
+    //    而「一次无效更新只影响**当前**实例的诊断、不污染旧闭包」这条命题由 roles 的校验失败表达。
+    //    刻意保留 model，使 S00 监听器读到的仍是同一次提交的模型（否则它会因索引不到而抛错）。
+    commitVolatile(rootConfig.roles, [{ ...builtin, model: 'restart-new-model', effort: 'turbo' }, cli]);
+    emit([['roles']]);
     check('S27：restart 后旧诊断闭包不受新无效更新影响',
       (await oldCtx.tools.get('switchboard_selftest').execute({})).ok
       && !(await rootCtx.tools.get('switchboard_selftest').execute({})).ok);

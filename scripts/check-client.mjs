@@ -56,10 +56,10 @@ function section(title) {
 const CLIENT_SRC = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
 // 执行真实客户端源码，仅在测试副本中暴露内部函数；生产模块不增加测试导出。
 const clientWindow = { __ModuleLoader__: { load: (spec) => { clientWindow.spec = spec; } } };
-new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleCard, RoleRow, WrapperSettings, makeRoleStore, SwitchboardSettings, selectCliComposer, makeCliStore, CliReadOnlyComposer, CliOutputPanel, CliJobOutput, isAtScrollBottom, // **读**走'))(clientWindow);
+new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleCard, RoleRow, makeRoleStore, SwitchboardSettings, selectCliComposer, makeCliStore, CliReadOnlyComposer, CliOutputPanel, CliJobOutput, isAtScrollBottom, // **读**走'))(clientWindow);
 const clientData = new Function(`${CLIENT_SRC.slice(0, CLIENT_SRC.indexOf('\nwindow.__ModuleLoader__.load'))}\nreturn { CLI_DRIVER_OPTIONS, DEFAULT_CLI_DRIVER, cliFieldsFor, inferCliDriver };`)();
 const rowReact = { createElement: (type, props, ...children) => ({ type, props, children }) };
-const { RoleRow, WrapperSettings, makeRoleStore } = clientWindow.spec.factory(() => rowReact);
+const { RoleRow, makeRoleStore } = clientWindow.spec.factory(() => rowReact);
 function rowElements(role, writes) {
   const tree = RoleRow({ role, index: 3, onChange: (index, value) => writes.push({ index, value }), onRemove: () => {}, disabled: false });
   const all = [];
@@ -646,7 +646,7 @@ section('预设反推：客户端镜像与 Host 必须对同一批配置给出�
 
 section('面板字段：源码结构与桩化 RoleRow（不替代真机验收）');
 {
-  const rowSource = CLIENT_SRC.slice(CLIENT_SRC.indexOf('    function RoleRow('), CLIENT_SRC.indexOf('    function WrapperSettings('));
+  const rowSource = CLIENT_SRC.slice(CLIENT_SRC.indexOf('    function RoleRow('), CLIENT_SRC.indexOf('    /**\n     * 设置页主组件。'));
   const renderSource = rowSource.slice(rowSource.indexOf('      return h('));
   // 用条件分支锚点约束控件位置；再对 spawn / cli 的元素树验证显示条件。
   check('Provider 输入位于 builtin 条件分支',
@@ -666,8 +666,9 @@ section('面板字段：源码结构与桩化 RoleRow（不替代真机验收）
   check('参数占位符提示已移除', !renderSource.includes('参数（占位符：'));
   check('预设说明不再显示命令参数细节',
     !rowSource.includes('driverDef.description') && !renderSource.includes('-s read-only'));
-  check('外部模型与包裹模型标签明确区分',
-    renderSource.includes("isCli ? '外部 CLI 模型' : '模型'") && CLIENT_SRC.includes('模型（非外部 CLI 模型）'));
+  // ⚠️ 这里**曾经**同时断言「包裹模型」标签（`模型（非外部 CLI 模型）`）以区分两种模型。
+  //    包裹路由已随中继子代理删除，只剩角色自己的模型标签。
+  check('外部 CLI 模型标签明确区分', renderSource.includes("isCli ? '外部 CLI 模型' : '模型'"));
   for (const backend of ['spawn', 'cli']) {
     const role = {
       id: 'r', backend, description: '描述', instructions: '原始指令\n第二行',
@@ -721,26 +722,11 @@ section('统一包裹小节：真实控件、读取与原子写入');
     if (!node || typeof node !== 'object') return;
     all.push(node); node.children?.forEach(walk);
   };
-  const wrapper = { wrapperProvider: 'route', wrapperModel: 'model', wrapperEffort: 'high' };
-  const writes = [];
-  walk(WrapperSettings({ wrapper, onChange: (next) => writes.push(next), disabled: false }));
-  check('小节标题及仅 CLI 生效说明存在', all.some(n => n.children.includes('包裹子代理（外部 CLI 角色的转交代理）')) &&
-    all.some(n => n.children.includes('仅对 CLI 角色生效；内置角色仍使用各自的 Provider、模型和思考强度。')));
-  for (const [key, placeholder] of [['wrapperProvider', '留空继承父代理路由'], ['wrapperModel', '留空继承父代理模型']]) {
-    const control = all.find(n => n.type === 'input' && n.props.placeholder === placeholder);
-    check(`${key} 统一文本控件读取已保存值`, control?.props.value === wrapper[key]);
-    control?.props.onChange({ target: { value: '  ' } });
-    check(`${key} 空白草稿保留其他统一字段`, JSON.stringify(writes.at(-1)) === JSON.stringify({ ...wrapper, [key]: '  ' }));
-  }
-  const select = all.find(n => n.type === 'select');
-  const { EFFORT_VALUES } = await import('../src/roles.js');
-  check('统一思考强度下拉含空不指定项与全部 EFFORT_VALUES', select?.props.value === 'high' &&
-    JSON.stringify(select.children.flat().map(n => n.props.value)) === JSON.stringify(['', ...EFFORT_VALUES]) &&
-    select.children.flat()[0]?.children.includes('留空：不指定强度'));
-  check('强度帮助说明限定最终同路由与父未指定时的默认处理',
-    all.some(n => n.type === 'span' && n.children.includes('留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。')));
-  select?.props.onChange({ target: { value: '' } });
-  check('强度可清空且不修改其他字段', JSON.stringify(writes.at(-1)) === JSON.stringify({ ...wrapper, wrapperEffort: '' }));
+  // ⚠️ 这里**曾经**逐控件断言 `WrapperSettings`（包裹子代理的 Provider / 模型 / 思考强度）：
+  //    小节标题、两个文本框的已保存值/空白草稿、强度下拉含空项与全部 EFFORT_VALUES、帮助文案、
+  //    清空强度不连带改其它字段。那三个字段是**中继子代理**的 LLM 路由，已随中继子代理退役 ——
+  //    整节 UI 从面板删除，check-config-schema 里有「不再存在」的正向守卫。
+  const wrapper = { wrapperProvider: '', wrapperModel: '', wrapperEffort: '' };
   const calls = [];
   const store = makeRoleStore({
     configForms: { describe: () => ({ ensure: async () => {}, getSnapshot: () => ({ view: { namespaces: [
@@ -749,7 +735,10 @@ section('统一包裹小节：真实控件、读取与原子写入');
     remote: { settings: { mutate: async (...args) => { calls.push(args); return { ok: true }; } } },
   });
   const read = await store.read();
-  check('镜像读取统一三字段并保留同一 revision', JSON.stringify(read.wrapper) === JSON.stringify(wrapper) && read.revision === 23);
+  // ⚠️ 这里**曾经**断言「镜像读取统一三字段（包裹路由）」并比对其值。包裹路由已删除，
+  //    读取只剩 roles + revision。
+  check('镜像读取保留同一 revision', read.ok === true && read.revision === 23
+    && Array.isArray(read.roles), JSON.stringify(read));
   // ⚠️ split 模式：设置里只有旋钮层 `roleSettings`（角色定义住在 roles.json）。此时**不得**
   //    渲染可编辑的空角色列表 —— 那既让人以为角色丢了，一次保存又会写回 `roles: []`，
   //    把刚迁移好的设置退回「roles 与 roleSettings 并存」的回退陷阱。
@@ -773,120 +762,22 @@ section('统一包裹小节：真实控件、读取与原子写入');
     splitSaved.ok && JSON.stringify(splitCalls.at(-1)) === JSON.stringify(['agent-switchboard',
       [{ op: 'set', path: ['roleSettings'], value: [{ id: 'scout', backend: 'cli' }] }], 24]),
     JSON.stringify(splitCalls.at(-1)));
-  const saved = await store.write([], read.revision, { wrapperProvider: ' route ', wrapperModel: ' ', wrapperEffort: '' });
-  check('角色与 volatile 三路径在同一次 mutate 提交，使用读取 revision', saved.ok && calls.length === 1 &&
+  const saved = await store.write([], read.revision);
+  check('角色写入只提交 roles 一条路径，并使用读取 revision', saved.ok && calls.length === 1 &&
     JSON.stringify(calls[0]) === JSON.stringify(['agent-switchboard', [
       { op: 'set', path: ['roles'], value: [] },
-      { op: 'set', path: ['volatile', 'wrapperProvider'], value: 'route' },
-      { op: 'set', path: ['volatile', 'wrapperModel'], value: '' },
-      { op: 'set', path: ['volatile', 'wrapperEffort'], value: '' },
     ], 23]));
-  check('小节位于角色列表之前且不以 CLI 角色数量为显示条件',
-    /h\(WrapperSettings, \{ wrapper, onChange: setWrapper, disabled: busy \}\) : null,\s*children,/.test(CLIENT_SRC));
-  check('保存按角色及各包裹字段 dirty 提交，未改 roles 传 undefined',
+  // ⚠️ 这里**曾经**断言「小节位于角色列表之前」「保存按角色及各包裹字段 dirty 提交」。包裹路由
+  //    （`wrapperProvider/Model/Effort`）已随中继子代理删除，dirty 判据只剩角色一项。
+  check('保存按角色 dirty 提交，未改 roles 传 undefined',
     CLIENT_SRC.includes('JSON.stringify(roles) !== JSON.stringify(saved.roles)') &&
-    CLIENT_SRC.includes(".filter((key) => (wrapper[key] ?? '') !== (saved.wrapper?.[key] ?? ''))") &&
-    CLIENT_SRC.includes('store.write(forceRoles || rolesDirty ? nextRoles : undefined, revision, wrapperChanges)'));
+    CLIENT_SRC.includes('store.write(forceRoles || rolesDirty ? nextRoles : undefined, revision)'));
 }
 
-section('统一包裹草稿：组件编辑、保存、清空与非法值的真实回调');
-{
-  const states = [], refs = [], effects = [];
-  let stateIndex = 0, refIndex = 0;
-  const react = {
-    ...rowReact,
-    useState: (initial) => {
-      const index = stateIndex++;
-      if (!(index in states)) states[index] = initial;
-      return [states[index], value => { states[index] = typeof value === 'function' ? value(states[index]) : value; }];
-    },
-    useRef: (initial) => refs[refIndex++] ?? (refs[refIndex - 1] = { current: initial }),
-    useEffect: (effect) => effects.push(effect),
-    useCallback: (fn) => fn,
-  };
-  const { SwitchboardSettings } = clientWindow.spec.factory(() => react);
-  const calls = [];
-  const home = mkdtempSync(join(tmpdir(), 'switchboard-client-save-'));
-  const path = configPathFor(home);
-  const role = { id: 'preserved', description: '保留角色', instructions: '保留指令', model: 'test-model' };
-  writeConfigFile(path, initialConfig([role], { provider: 'self', volatile: { other: 'keep' } }));
-  let wrapper = { wrapperProvider: '', wrapperModel: '', wrapperEffort: '' };
-  let revision = 31;
-  const mirror = { volatile: wrapper }; // 根未提供 roles，但有效角色存在于文件。
-  const store = makeRoleStore({
-    configForms: { describe: () => ({ ensure: async () => {}, getSnapshot: () => ({ view: { namespaces: [
-      // 行形态与 Host 的 `namespaceView()` 一致：无 per-namespace `writable`。
-      { ns: 'agent-switchboard', value: mirror, revision },
-    ] } }) }) },
-    remote: { settings: { mutate: async (ns, ops, rev) => {
-      calls.push({ ns, ops, rev });
-      for (const op of ops) {
-        if (op.path[0] === 'roles') mirror.roles = op.value;
-        else mirror.volatile[op.path[1]] = op.value;
-      }
-      wrapper = mirror.volatile;
-      revision++;
-      // 真正调用根同步和原子文件写入；仅 settings 传输与 ctx 服务被桩化。
-      apply({ tools: { register() {} }, get: key => key === 'profileContext' ? { home } : undefined }, Config(mirror));
-      return { ok: true };
-    } } },
-  });
-  try {
-  const render = () => {
-    stateIndex = 0; refIndex = 0;
-    const all = [];
-    const walk = (node) => {
-      if (Array.isArray(node)) return node.forEach(walk);
-      if (!node || typeof node !== 'object') return;
-      all.push(node); node.children?.forEach(walk);
-    };
-    walk(SwitchboardSettings({ store }));
-    return all;
-  };
-  const saveButton = all => all.find(n => n.type === 'button' && n.children.some(c => typeof c === 'string' && c.startsWith('保存')));
-  render(); effects[0](); await new Promise(setImmediate);
-  let nodes = render();
-  let sectionNode = nodes.find(n => n.type?.name === 'WrapperSettings');
-  check('没有任何 CLI 或角色时仍显示统一小节，初始保存禁用', sectionNode !== undefined && saveButton(nodes)?.props.disabled === true);
-  sectionNode.props.onChange({ ...wrapper, wrapperModel: 'new-model', wrapperEffort: 'high' });
-  nodes = render();
-  check('仅编辑包裹字段就标记 dirty 并允许保存', saveButton(nodes)?.children.includes('保存 *') && !saveButton(nodes)?.props.disabled);
-  await saveButton(nodes).props.onClick(); await new Promise(setImmediate);
-  check('保存真实回调只提交已改包裹字段及原读取 revision', calls.length === 1 && calls[0].rev === 31 &&
-    JSON.stringify(calls[0].ops) === JSON.stringify([
-      { op: 'set', path: ['volatile', 'wrapperModel'], value: 'new-model' },
-      { op: 'set', path: ['volatile', 'wrapperEffort'], value: 'high' },
-    ]));
-  check('M1：非空文件 + 根未提供 roles，客户端仅改 wrapper 保存仍保留文件角色',
-    JSON.stringify(readConfigFile(path).value?.roles) === JSON.stringify([role]) && mirror.roles === undefined);
-  check('M1：wrapper-only 保存不提交 roles，不把未提供折叠为显式清空',
-    calls[0].ops.every(op => op.path[0] !== 'roles'));
-  nodes = render();
-  check('保存后刷新统一字段与 revision，dirty 清除', saveButton(nodes)?.props.disabled &&
-    nodes.find(n => n.type?.name === 'WrapperSettings')?.props.wrapper.wrapperModel === 'new-model');
-  nodes.find(n => n.type?.name === 'WrapperSettings').props.onChange({ wrapperProvider: '', wrapperModel: '', wrapperEffort: '' });
-  nodes = render(); await saveButton(nodes).props.onClick(); await new Promise(setImmediate);
-  check('清空后仍能保存，使用刷新后的 revision', calls.length === 2 && calls[1].rev === 32 &&
-    calls[1].ops.length === 2 && calls[1].ops.every(op => op.value === '' && op.path[0] === 'volatile'));
-  nodes = render();
-  nodes.find(n => n.type?.name === 'WrapperSettings').props.onChange({ ...wrapper, wrapperEffort: 'invalid' });
-  nodes = render(); await saveButton(nodes).props.onClick();
-  check('非法包裹强度不调用写通道并给错误提示', calls.length === 2 &&
-    render().some(n => n.children.includes('包裹子代理思考强度非法')));
-  mirror.roles = [role];
-  render().find(n => n.type === 'button' && n.children.includes('放弃改动')).props.onClick();
-  await new Promise(setImmediate);
-  nodes = render();
-  await nodes.find(n => n.type?.name === 'RoleCard').props.onRemove();
-  await new Promise(setImmediate);
-  check('确认删除全部角色直接提交而非等待全局保存', calls.length === 3);
-  check('删除全部角色明确提交 []，不提交未改包裹字段，并真正清空文件',
-    JSON.stringify(calls[2]?.ops) === JSON.stringify([{ op: 'set', path: ['roles'], value: [] }]) &&
-    readConfigFile(path).value?.roles.length === 0);
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-  }
-}
+// ⚠️ 这里**曾经**有整节「统一包裹草稿：组件编辑、保存、清空与非法值的真实回调」——
+//    覆盖包裹小节在真实组件里的编辑/保存/清空/非法值回调，以及「仅改包裹字段也能保存」。
+//    包裹路由（中继子代理的 LLM 路由）已随中继一起删除，那节 UI 与判据都不复存在。
+//    等价的「dirty → 只提交改动」覆盖仍在：见上面 store.write 的 roles 断言与角色卡片小节。
 
 section('角色卡片：真实编辑、草稿、校验、并发与增删回调');
 {
@@ -957,7 +848,8 @@ section('角色卡片：真实编辑、草稿、校验、并发与增删回调')
   buttonOf(inCard(nodes, 'scout'), '编辑').props.onClick(); nodes = render();
   fieldOf(nodes, '角色标题').props.onChange({ target: { value: '切换焦点丢弃' } }); nodes = render();
   buttonOf(inCard(nodes, 'worker'), '编辑').props.onClick(); nodes = render();
-  check('卡片聚焦：切换第二卡只展开一张，CLI 隐藏 Provider，包裹小节仍显示', nodes.filter(n => n.props?.className === 'rowEditor').length === 1 && !fieldOf(nodes, 'Provider') && Boolean(fieldOf(nodes, 'Provider（LLM route）')) && Boolean(fieldOf(nodes, '模型（非外部 CLI 模型）')));
+  check('卡片聚焦：切换第二卡只展开一张，CLI 隐藏 Provider', nodes.filter(n => n.props?.className === 'rowEditor').length === 1
+    && Boolean(fieldOf(nodes, '角色标题')) && !fieldOf(nodes, 'Provider'));
   buttonOf(inCard(nodes, 'scout'), '编辑').props.onClick(); nodes = render();
   check('卡片聚焦：回到内置显示 Provider，切换时丢弃旧草稿', Boolean(fieldOf(nodes, 'Provider')) && fieldOf(nodes, '角色标题').props.value === '侦察员');
   reject = true;

@@ -430,8 +430,6 @@ window.__ModuleLoader__.load({
             mode: 'split',
             roles: [],
             settings: row.value.roleSettings,
-            wrapper: Object.fromEntries(['wrapperProvider', 'wrapperModel', 'wrapperEffort']
-              .map((key) => [key, row.value?.volatile?.[key] ?? ''])),
             revision: row.revision,
             writable: view.writable ?? row.writable,
             missing: false,
@@ -440,8 +438,6 @@ window.__ModuleLoader__.load({
         return {
           ok: true,
           roles,
-          wrapper: Object.fromEntries(['wrapperProvider', 'wrapperModel', 'wrapperEffort']
-            .map((key) => [key, row.value?.volatile?.[key] ?? ''])),
           revision: row.revision,
           // ⚠️ `writable` 在 0.2.1-rc.1 里属于**视图根**而不是每个 namespace 行：
           // `describe()` 返回 `{writable, hasDocument, namespaces:[...]}`，而
@@ -553,7 +549,7 @@ window.__ModuleLoader__.load({
      * @param {number|undefined} revision - 读取时拿到的 revision，用于并发保护。
      * @returns {Promise<{ok: boolean, message: string}>} 结果。
      */
-    async function saveRoles(ctx, roles, revision, wrapper, path = ['roles']) {
+    async function saveRoles(ctx, roles, revision, path = ['roles']) {
       const { channel, tried, form } = writeChannel(ctx, CONFIG_NS);
       if (channel === undefined) {
         return {
@@ -563,10 +559,7 @@ window.__ModuleLoader__.load({
             `诊断：${tried.join(' | ')}。`,
         };
       }
-      const ops = [...(roles === undefined ? [] : [{ op: 'set', path, value: roles }]),
-        ...(wrapper === undefined ? [] : ['wrapperProvider', 'wrapperModel', 'wrapperEffort']
-          .filter((key) => Object.hasOwn(wrapper, key))
-          .map((key) => ({ op: 'set', path: ['volatile', key], value: (wrapper[key] ?? '').trim() })))];
+      const ops = roles === undefined ? [] : [{ op: 'set', path, value: roles }];
       try {
         // 两个通道的调用形态不同（见 writeChannel 的说明），必须分开调用。
         if (form === 'form') {
@@ -621,16 +614,16 @@ window.__ModuleLoader__.load({
         /** 读角色。 */
         read: async () => { const result = await fetchRoles(ctx); mode = result.mode ?? 'legacy'; return result; },
         /** 写角色；`revision` 来自上一次读。 */
-        write: (roles, revision, wrapper) => (mode === 'split'
+        write: (roles, revision) => (mode === 'split'
           ? Promise.resolve({ ok: false, message: '角色设置处于「定义 + 旋钮」形态；本页面不写 roles（会退回半迁移状态）' })
-          : saveRoles(ctx, roles, revision, wrapper)),
+          : saveRoles(ctx, roles, revision)),
         /**
          * 写**旋钮层**（split 模式专用）：只 `set(['roleSettings'])`，绝不碰 `roles`。
          *
          * 与 `write` 分开而不是重载，是为了让「split 下不写 roles」这条自保保持简单可验证。
          */
         writeSettings: (settings, revision) => (mode === 'split'
-          ? saveRoles(ctx, settings, revision, undefined, ['roleSettings'])
+          ? saveRoles(ctx, settings, revision, ['roleSettings'])
           : Promise.resolve({ ok: false, message: '当前不是「定义 + 旋钮」形态，无需写 roleSettings' })),
       };
     }
@@ -1003,26 +996,10 @@ window.__ModuleLoader__.load({
           button('保存', () => onSave(draftRole), { disabled, primary: true }), button('取消', onCancel, { disabled })) : null);
     }
 
-    /** 插件级统一路由始终可见，仅影响外部 CLI 的转交代理。 */
-    function WrapperSettings({ wrapper, onChange, disabled }) {
-      const control = (key, placeholder) => h('input', {
-        type: 'text', value: wrapper[key] ?? '', placeholder, disabled,
-        onChange: (e) => onChange({ ...wrapper, [key]: e.target.value }),
-        style: inputStyle(),
-      });
-      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
-        h('h4', { style: { margin: 0 } }, '包裹子代理（外部 CLI 角色的转交代理）'),
-        h('span', null, '仅对 CLI 角色生效；内置角色仍使用各自的 Provider、模型和思考强度。'),
-        field('Provider（LLM route）', control('wrapperProvider', '留空继承父代理路由')),
-        field('模型（非外部 CLI 模型）', control('wrapperModel', '留空继承父代理模型')),
-        field('思考强度', h('select', {
-          value: wrapper.wrapperEffort ?? '', disabled, style: selectStyle(),
-          onChange: (e) => onChange({ ...wrapper, wrapperEffort: e.target.value }),
-        }, h('option', { value: '' }, '留空：不指定强度'),
-        EFFORTS.map((effort) => h('option', { key: effort, value: effort }, effort)))),
-        h('span', null, '留空时不指定思考强度：包裹子代理最终使用的 Provider 和模型均与父代理一致时，沿用父代理当前强度；否则按目标模型的默认设置处理。父代理未指定强度时，也按模型默认设置处理。'),
-      );
-    }
+    // ⚠️ 这里**曾经**有 `WrapperSettings`（包裹子代理的 Provider / 模型 / 思考强度）。
+    // 那三个字段是**中继子代理**的 LLM 路由：旧路径要先 spawn 一个 LLM 转交代理去调 CLI 工具，
+    // 才需要回答「它用哪个模型」。CLI 角色改为**直派后台任务**后没有转交代理，
+    // 字段与整个小节一并从 Host schema 和本面板删除。
 
     /**
      * 设置页主组件。
@@ -1048,7 +1025,6 @@ window.__ModuleLoader__.load({
       const [confirmingIndex, setConfirmingIndex] = useState(null);
       const [readSucceeded, setReadSucceeded] = useState(false);
       const [cardProblem, setCardProblem] = useState(null);
-      const [wrapper, setWrapper] = useState({});
       const [status, setStatus] = useState('loading');
       // split 模式（设置里只有旋钮层 `roleSettings`，角色定义住在 roles.json）的旋钮草稿。
       const [splitSettings, setSplitSettings] = useState(null);
@@ -1078,15 +1054,13 @@ window.__ModuleLoader__.load({
             setReadSucceeded(false);
             // 读取失败必须如实显示：静默当作空会把用户配置「藏起来」。
             setDraft([]);
-            setWrapper({});
-            savedRef.current = JSON.stringify({ roles: [], wrapper: {} });
+            savedRef.current = JSON.stringify({ roles: [] });
             setRevision(undefined);
             setStatus(`error:${result.error}`);
             return;
           }
           setDraft(cloneRoles(result.roles));
-          setWrapper(result.wrapper ?? {});
-          savedRef.current = JSON.stringify({ roles: result.roles, wrapper: result.wrapper ?? {} });
+          savedRef.current = JSON.stringify({ roles: result.roles });
           // revision 用于并发保护：写回时必须带上读取时的那一个。
           setRevision(result.revision);
           setReadSucceeded(true);
@@ -1113,10 +1087,7 @@ window.__ModuleLoader__.load({
       const roles = draft ?? [];
       const saved = savedRef.current === null ? {} : JSON.parse(savedRef.current);
       const rolesDirty = draft !== null && JSON.stringify(roles) !== JSON.stringify(saved.roles);
-      const wrapperChanges = Object.fromEntries(['wrapperProvider', 'wrapperModel', 'wrapperEffort']
-        .filter((key) => (wrapper[key] ?? '') !== (saved.wrapper?.[key] ?? ''))
-        .map((key) => [key, wrapper[key] ?? '']));
-      const dirty = rolesDirty || Object.keys(wrapperChanges).length > 0;
+      const dirty = rolesDirty;
 
       const beginEdit = id => { setConfirmingIndex(null); setEditingId(id); setCardProblem(null); };
       const cancelEdit = () => { setConfirmingIndex(null); setEditingId(null); setCardProblem(null); };
@@ -1133,9 +1104,7 @@ window.__ModuleLoader__.load({
        * @returns {string|null} 错误信息，或 null 表示通过。
        */
       const validate = (nextRoles) => validateRoles(nextRoles) ||
-        (nextRoles.some(r => r.backend === 'cli' && !inferCliDriver(r)) ? '需重选预设：当前配置无法识别为 codex / grok' : null) ||
-        (wrapper.wrapperEffort?.trim() && !EFFORTS.includes(wrapper.wrapperEffort.trim())
-          ? '包裹子代理思考强度非法' : null);
+        (nextRoles.some(r => r.backend === 'cli' && !inferCliDriver(r)) ? '需重选预设：当前配置无法识别为 codex / grok' : null);
 
       /** 保存角色列表。 */
       const save = async (nextRoles = roles, forceRoles = false) => {
@@ -1151,12 +1120,12 @@ window.__ModuleLoader__.load({
           return;
         }
         setBusy(true);
-        // 只提交已改草稿，避免包裹编辑把根未提供的 roles 误写成 []；删空仍为 dirty。
-        const result = await store.write(forceRoles || rolesDirty ? nextRoles : undefined, revision, wrapperChanges);
+        // 只提交已改草稿，避免把根未提供的 roles 误写成 []；删空仍为 dirty。
+        const result = await store.write(forceRoles || rolesDirty ? nextRoles : undefined, revision);
         setBusy(false);
         if (result.ok) {
           setDraft(cloneRoles(nextRoles));
-          savedRef.current = JSON.stringify({ roles: nextRoles, wrapper });
+          savedRef.current = JSON.stringify({ roles: nextRoles });
           setNotice({
             kind: 'ok',
             text: `已保存 ${nextRoles.length} 个角色。Switchboard 正在应用配置，无需重启；后续派发使用新配置，应用失败请查看自检。`,
@@ -1234,8 +1203,6 @@ window.__ModuleLoader__.load({
                 notice.text,
               )
             : null,
-          draft !== null && !status.startsWith('error:')
-            ? h(WrapperSettings, { wrapper, onChange: setWrapper, disabled: busy }) : null,
           children,
           footer,
         );

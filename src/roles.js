@@ -449,23 +449,15 @@ export function normalizeRoles(rawRoles, defaultProvider, defaultCwd) {
 /**
  * 角色的子代理 LLM 路由（provider / model / reasoningEffort）。
  *
- * CLI 角色用的是**包裹子代理**的路由：先在 DSH 内置 spawn 子代理里跑一个转交代理，
- * 再由它调用专属 CLI 工具。内置角色用自己的 provider / model / effort。
+ * ⚠️ 这里**曾经**有第二个分支：CLI 角色用「包裹子代理」的路由（插件级 wrapperRoute）。
+ *    中继子代理退役后（CLI 角色直接派发后台任务，不再 spawn 转交代理），那个分支与
+ *    `wrapperProvider` / `wrapperModel` / `wrapperEffort` 三个字段一并删除 —— 只有 spawn
+ *    角色还会用这份配置，而它们一律用自己的 provider / model / effort。
  *
  * @param {Role} role - 规范化后的角色。
- * @param {object} [wrapperRoute] - 插件级包裹路由（provider / model / effort）。
- * @returns {object|undefined} `agentOptions`；没有任何取值时返回 undefined。
+ * @returns {object} `agentOptions`。
  */
-export function agentOptionsFor(role, wrapperRoute) {
-  if (role.backend === CLI_BACKEND) {
-    const route = wrapperRoute ?? {};
-    const agentOptions = {};
-    for (const [key, target] of [['provider', 'provider'], ['model', 'model'], ['effort', 'reasoningEffort']]) {
-      const value = typeof route[key] === 'string' ? route[key].trim() : '';
-      if (value) agentOptions[target] = value;
-    }
-    return Object.keys(agentOptions).length > 0 ? agentOptions : undefined;
-  }
+export function agentOptionsFor(role) {
   const agentOptions = { provider: role.provider, model: role.model };
   if (role.effort !== undefined) agentOptions.reasoningEffort = role.effort;
   return agentOptions;
@@ -485,10 +477,8 @@ export function agentOptionsFor(role, wrapperRoute) {
  * @param {Role} role - 规范化后的角色。
  * @param {object} options - 全局选项。
  * @param {number} options.maxDepth - 第一层之外，**额外**可用的层数。
- * @param {object} [options.wrapperRoute] - 插件级包裹路由（provider / model / effort）。
  * @param {Function} [options.getRole] - 执行期现读角色（配置可热更新）。
  * @param {Function} [options.getMaxDepth] - 执行期现读深度预算。
- * @param {Function} [options.getWrapperRoute] - 执行期现读包裹路由。
  * @returns {object} `dsh-tool-subagent` 的 Config。
  */
 export function toolConfigFor(role, options = {}) {
@@ -496,13 +486,10 @@ export function toolConfigFor(role, options = {}) {
   const getMaxDepth = typeof options.getMaxDepth === 'function'
     ? options.getMaxDepth
     : () => options.maxDepth;
-  const getWrapperRoute = typeof options.getWrapperRoute === 'function'
-    ? options.getWrapperRoute
-    : () => options.wrapperRoute;
   return {
     get provider() { return DELEGATION_PROVIDER; },
     get toolName() { return (getRole() ?? role).toolName; },
-    get agentOptions() { return agentOptionsFor(getRole() ?? role, getWrapperRoute()); },
+    get agentOptions() { return agentOptionsFor(getRole() ?? role); },
     // preset id 由角色 id 派生，不随 instructions/readOnly 变化；因此改这些字段
     // 只需重注册 preset 的新 revision，不必重挂工具。
     get agentPreset() { return rolePresetId((getRole() ?? role).id); },
