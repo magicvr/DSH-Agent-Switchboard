@@ -801,6 +801,72 @@ section('统一包裹小节：真实控件、读取与原子写入');
 //    包裹路由（中继子代理的 LLM 路由）已随中继一起删除，那节 UI 与判据都不复存在。
 //    等价的「dirty → 只提交改动」覆盖仍在：见上面 store.write 的 roles 断言与角色卡片小节。
 
+section('split 旋钮表单：操作区的启用/取消是真实行为');
+{
+  // ⚠️ 这一节的存在本身就是教训：split 分支原先**没有自己的 dirty 判据**，我给它接上了
+  //    roles 列表的 `dirty`（split 下恒为 false），于是「取消 / 保存」**永久禁用** ——
+  //    真机上表现为「点取消毫无反应」。只断言源码形状挡不住这类 bug，所以这里**渲染真组件**：
+  //    改一个旋钮 → 两个按钮必须变可用 → 点取消 → 值回到快照且**没有**写盘。
+  const contexts = new Map(); let active, used;
+  const react = { ...rowReact,
+    useState(initial) { const at = active.index++; if (!(at in active.states)) active.states[at] = typeof initial === 'function' ? initial() : initial;
+      const current = active; return [current.states[at], value => { current.states[at] = typeof value === 'function' ? value(current.states[at]) : value; }]; },
+    useRef(initial) { const at = active.refIndex++; return active.refs[at] ?? (active.refs[at] = { current: initial }); },
+    useCallback: fn => fn, useEffect: effect => { active.effects.push(effect); },
+  };
+  const api = clientWindow.spec.factory(() => react);
+  const settings = [{ id: 'worker', backend: 'cli', cliDriver: 'codex', model: 'gpt-6-luna', effort: 'high' }];
+  const writes = [];
+  const store = makeRoleStore({ configForms: { describe: () => ({ ensure: async () => {}, getSnapshot: () => ({ view: { namespaces: [
+    { ns: 'agent-switchboard', value: { roleSettings: structuredClone(settings) }, revision: 91 },
+  ] } }) }) }, remote: { settings: { mutate: async (ns, ops, rev) => { writes.push({ ns, ops: structuredClone(ops), rev }); return { ok: true }; } } } });
+  function component(fn, props, key) {
+    used.add(key); const prior = active;
+    active = contexts.get(key) ?? { states: [], refs: [], effects: [] }; contexts.set(key, active);
+    active.index = 0; active.refIndex = 0; active.effects = [];
+    const tree = fn(props); active = prior; return tree;
+  }
+  function render() {
+    used = new Set(); const nodes = [];
+    const walk = node => {
+      if (Array.isArray(node)) return node.forEach(walk);
+      if (!node || typeof node !== 'object') return;
+      if (typeof node.type === 'function') return walk(component(node.type, node.props, node.type.name + ':' + (node.props.key ?? 'singleton')));
+      nodes.push(node); node.children?.forEach(walk);
+    };
+    walk(component(api.SwitchboardSettings, { store }, 'root'));
+    for (const key of contexts.keys()) if (!used.has(key)) contexts.delete(key);
+    return nodes;
+  }
+  const pageButton = (nodes, which) => nodes.find(n => n.type === 'button'
+    && n.props?.className === ['pageAction', which].join(''));
+  const settle = () => new Promise(setImmediate);
+  render();
+  // 组件用 useEffect 触发首次读取；桩不会自动跑，必须显式执行一次（与角色卡片那节同法）。
+  contexts.get('root').effects[0]();
+  await settle();
+  let nodes = render();
+  check('split：未改动时操作区两个按钮都禁用（没有可保存/可取消的东西）',
+    pageButton(nodes, 'Save')?.props.disabled === true && pageButton(nodes, 'Cancel')?.props.disabled === true,
+    JSON.stringify({ save: pageButton(nodes, 'Save')?.props.disabled, cancel: pageButton(nodes, 'Cancel')?.props.disabled }));
+  // 改一个旋钮：模型输入框
+  const model = nodes.find(n => n.type === 'input' && n.props.value === 'gpt-6-luna');
+  check('split：旋钮表单渲染出模型输入框（用来改一个值）', model !== undefined);
+  model?.props.onChange({ target: { value: 'changed-model' } });
+  nodes = render();
+  check('split：改动后两个按钮都可用，且保存键显示星号',
+    pageButton(nodes, 'Save')?.props.disabled === false && pageButton(nodes, 'Cancel')?.props.disabled === false
+      && pageButton(nodes, 'Save')?.children.includes('保存 *'),
+    JSON.stringify({ save: pageButton(nodes, 'Save')?.children, cancelDisabled: pageButton(nodes, 'Cancel')?.props.disabled }));
+  pageButton(nodes, 'Cancel')?.props.onClick();
+  nodes = render();
+  check('split：取消把值还原到读取时的快照，且**没有**写盘',
+    nodes.some(n => n.type === 'input' && n.props.value === 'gpt-6-luna')
+      && !nodes.some(n => n.type === 'input' && n.props.value === 'changed-model')
+      && writes.length === 0,
+    JSON.stringify({ writes: writes.length }));
+}
+
 section('角色卡片：真实编辑、草稿、校验、并发与增删回调');
 {
   const contexts = new Map(); let active, used;

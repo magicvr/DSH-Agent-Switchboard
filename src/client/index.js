@@ -1040,6 +1040,9 @@ window.__ModuleLoader__.load({
       const [revision, setRevision] = useState(undefined);
       const savedRef = useRef(null);
       const readSequenceRef = useRef(0);
+      // 旋钮层（split 模式）的已保存快照：与 `savedRef`（roles 列表）分开，因为两者是**不同**
+      // 的编辑对象 —— 混用会让 split 下的 dirty 恒为 false，操作区按钮永久禁用。
+      const settingsRef = useRef(null);
 
       /** 重新读取本插件的配置。 */
       const refresh = useCallback(() => {
@@ -1073,11 +1076,17 @@ window.__ModuleLoader__.load({
           // split 模式：设置里只有旋钮层，角色**定义**住在 roles.json。
           // 这里渲染旋钮小表单，保存只写 `roleSettings`。
           if (result.mode === 'split') {
-            setSplitSettings((result.settings ?? []).map((entry) => ({ ...entry })));
+            // ⚠️ 旋钮表单需要**自己的**快照与 dirty 判据：`savedRef` 记的是 roles 列表，
+            //    而 split 模式下那份列表根本不参与编辑（恒等于已保存值），拿它当判据会让
+            //    「取消 / 保存」**永久禁用**（实测：用户点了没反应）。
+            const snapshot = (result.settings ?? []).map((entry) => ({ ...entry }));
+            settingsRef.current = snapshot;
+            setSplitSettings(snapshot.map((entry) => ({ ...entry })));
             setStatus('split');
             return;
           }
           setSplitSettings(null);
+          settingsRef.current = null;
           setStatus(result.roles.length > 0 ? 'ready' : result.missing === true ? 'missing' : 'empty');
         });
       }, [store]);
@@ -1225,11 +1234,21 @@ window.__ModuleLoader__.load({
         const entries = splitSettings ?? [];
         const patch = (index, field, value) => setSplitSettings((current) =>
           (current ?? []).map((entry, i) => (i === index ? { ...entry, [field]: value } : entry)));
+        // 旋钮是否被改过：与**读取时**（或上次保存成功时）的快照逐字比较。
+        const settingsDirty = settingsRef.current !== null
+          && JSON.stringify(entries) !== JSON.stringify(settingsRef.current);
+        // 「取消」= 丢弃本地编辑、回到上次读取/保存的状态。刻意**不**重新读配置：
+        // 那会多发一次远程读（可能失败），而用户要的只是「撤销我刚才改的」。
+        const cancelSettings = () => {
+          setSplitSettings((settingsRef.current ?? []).map((entry) => ({ ...entry })));
+          setNotice(null);
+        };
         const saveSettings = async () => {
           if (store === undefined || typeof store.writeSettings !== 'function') return;
           setBusy(true);
           try {
             const result = await store.writeSettings(entries, revision);
+            if (result.ok) settingsRef.current = entries.map((entry) => ({ ...entry }));
             setNotice({ kind: result.ok ? 'info' : 'error',
               text: result.ok ? '已保存旋钮设置。模型、强度与外部 CLI 选择下次派发即生效；只读与能否嵌套派发属角色定义（roles.json），本页不改。' : result.message });
           } finally { setBusy(false); }
@@ -1296,9 +1315,12 @@ window.__ModuleLoader__.load({
             + `${entry.allowNestedDispatch === true ? '可继续派发' : '不再派发'}`
             + '（属角色定义，改动请编辑 roles.json）')))),
           // 底部操作区：靠右，取消在左、保存在最右。
+          // ⚠️ 禁用判据必须用**旋钮层自己的** `settingsDirty`（不是 roles 列表的 dirty）——
+          //    用错了会让两个按钮在 split 模式下永久禁用（实测踩到：点「取消」毫无反应）。
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '10px' } },
-            button('取消', refresh, { disabled: busy || !dirty, className: 'pageActionCancel' }),
-            button(dirty ? '保存 *' : '保存', saveSettings, { disabled: busy, primary: dirty, className: 'pageActionSave' }))));
+            button('取消', cancelSettings, { disabled: busy || !settingsDirty, className: 'pageActionCancel' }),
+            button(settingsDirty ? '保存 *' : '保存', saveSettings,
+              { disabled: busy || !settingsDirty, primary: settingsDirty, className: 'pageActionSave' }))));
       }
       if (status.startsWith('error:')) {
         // 读取失败必须显式呈现原因，而不是显示成「尚未配置」——后者会让用户以为配置丢了。
