@@ -595,12 +595,7 @@ background job cli-dedf627a1c664b6f (cli: 审查员) finished [status: killed, e
   17.5 秒。判断「谁在何时做了什么」应查**会话日志**（`scripts/probes/session-log.mjs`；
   多帧 zstd 的 JSONL，权威时间源，界面记时可能挂在别的对象上）。
 
-仍未验收：客户端任务面板的**视觉**（stdout 正文 / stderr 默认折叠 / 失败自动展开）。
-⚠️ 「面板出现在哪种会话」**已不是未验收项，而是一个已修的真 bug**：面板原先只在
-「一次性子代理会话」渲染（`selectCliComposer` 判 `mode === 'one-shot'`），而 D33 改直派后
-owner 是**主代理**、D34 又让 CLI 角色成为叶子 ⇒ 它**永远不渲染**（真机确认：CLI 输出只在官方
-任务列表里看得到）。已放宽为「**主会话** 或 一次性子代理会话」（`16b5131`），
-并同步改掉那条把 bug 写成预期的断言（原断言是「主会话不接管」）。
+**CLI 输出面板：已删除（D36）。** 它原先只在「一次性子代理会话」渲染，而 D33 把 CLI 改成**直派**（owner 变成发起派发的 agent，顶层就是主代理）、D34 又让 CLI 角色成为叶子 ⇒ 它**永远不渲染**。中途按「主会话 / 一次性子会话」放宽过判定（16b5131），真机复验仍不出现 —— 说明主会话根本不请求那个 composer 槽位，问题不在判定条件。用户裁决：**官方后台任务区已经够用**，于是整块删除（面板 + 只服务它的 makeCliStore + 对应断言），不再保留永远不跑的界面代码。CLI 的输出、通道（stdout/stderr）与终态仍由 job.append / jobs.start 交给官方 Jobs，在任务区可见。
 
 **真机取证（2026-10-03，`worker=cli(codex)` 实测）：** 一次 `node -v` 任务中，当时的阻塞式工具 `switchboard_cli_run_worker`（**该工具已随 D33 删除**）返回的 `stdout` 只有 172 字符（最终答案），`stderr` 有 5723 字符 —— 含 codex banner 与路由事实、**角色指令回显**、`exec "<powershell>" -Command 'node -v; Get-Location' … succeeded in 132ms` 的**工具轨迹**、`tokens used` 计数与重连告警。这正是用户报告「工具调用等消息被当成文本显示」的内容来源，也证明通道分区的前提成立。同一份结果的 `routeSummary` 自报 `model=gpt-6.1-sol`、`effort=medium`、`sandbox=workspace-write`，与角色配置一致 —— 把 stderr 折起来并没有丢掉「配置真的生效」的证据。**折叠交互与失败自动展开仍待人工查看（GUI 视觉），不能以离线断言代替。** ⚠️ 直派后同样的分区原则不变，只是数据源从「工具返回值」变成「job 的输出环」（`job.append(text, { channel })`）。
 
