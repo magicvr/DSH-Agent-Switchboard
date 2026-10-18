@@ -1282,8 +1282,15 @@ window.__ModuleLoader__.load({
         return wrap(h('div', null,
           h('div', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '8px' } },
             '角色定义（persona、工具构成、CLI 参数）住在 $DSH_HOME/agent-switchboard/roles.json，'
-            + '本页只调每个角色的旋钮（派发方式 / 模型 / 强度 / 外部 CLI）。'
+            + '本页只调每个角色的旋钮（派发方式 / 供应商 / 模型 / 强度 / 外部 CLI）。'
             + '只读与能否嵌套派发属**角色定义**，不在本页编辑 —— 它们决定角色 preset 的构成，改了要重建组合。'),
+          // 拿不到供应商目录时把**原因**摆出来（只报形状与错误消息，不回显值）：
+          // 这个下拉连错两轮都是"猜 API 形状"导致的，界面上直接说清比再猜一次便宜得多。
+          providers.length === 0 && (catalog?.getDiagnostic?.() ?? '') !== ''
+            ? h('div', { style: { fontSize: '11px', marginBottom: '8px',
+              color: 'var(--dsw-alias-state-error-primary, var(--dsw-alias-label-secondary))' } },
+            `供应商目录不可用：${catalog.getDiagnostic()}`)
+            : null,
           h('ul', { style: { margin: 0, padding: 0, listStyle: 'none', display: 'flex',
             flexDirection: 'column', gap: '10px' } },
           entries.map((entry, index) => h('li', { key: String(entry.id ?? index),
@@ -1441,9 +1448,15 @@ window.__ModuleLoader__.load({
     function makeModelCatalog() {
       let llm = null;
       let providers = [];
+      // 拿不到目录时把**原因**摆到界面上：前两次我靠猜 API 形状，连错两轮。
+      // ⚠️ 只描述形状、不回显内容 —— 供应商条目里可能带凭据线索，界面上不该出现值。
+      let diagnostic = '尚未绑定 remote.llm（注入未生效或 ctx.remote 为空）';
       const listeners = new Set();
       const models = new Map();
       const emit = () => { for (const fn of [...listeners]) { try { fn(); } catch { /* 单个订阅者出错不影响其它 */ } } };
+      const shapeOf = (value) => (Array.isArray(value) ? `数组(${value.length})`
+        : value === null ? 'null'
+          : typeof value === 'object' ? `对象{${Object.keys(value).slice(0, 6).join(',')}}` : typeof value);
       // 目录形态按「信封 / 裸数组、字符串或对象」都收 —— 真机核对结果（2026-10-19）：
       //   · `listProviders()` 返回**信封** `{ok:true, value} | {ok:false, error:{message}}`；
       //     官方模型页的写法就是 `if (!registered.ok) failLoad(registered.error.message)`。
@@ -1479,7 +1492,13 @@ window.__ModuleLoader__.load({
         bind(next) {
           llm = next === undefined || next === null || typeof next.listProviders !== 'function' ? null : next;
           models.clear();
-          if (llm === null) { providers = []; emit(); return Promise.resolve([]); }
+          if (llm === null) {
+            providers = [];
+            diagnostic = 'remote.llm 不可用（注入未生效，或 ctx.remote 为空）';
+            emit();
+            return Promise.resolve([]);
+          }
+          diagnostic = '正在读取供应商目录…';
           return Promise.resolve()
             .then(() => llm.listProviders())
             .then((answer) => {
@@ -1487,16 +1506,26 @@ window.__ModuleLoader__.load({
               //    裸数组也容忍，但绝不把信封本身当成列表（那会让目录永远为空）。
               providers = answer?.ok === true ? toList(answer.value)
                 : Array.isArray(answer) ? toList(answer) : [];
+              diagnostic = providers.length > 0 ? ''
+                : answer?.ok === false ? `listProviders 被拒绝：${String(answer?.error?.message ?? '（无消息）')}`
+                  : `listProviders 返回了无法识别的形状：${shapeOf(answer)}`
+                    + (answer?.ok === true ? `（value 是 ${shapeOf(answer.value)}）` : '') + diagnostic;
               emit();
               // 预取：设置页总在 `apply` 之后才打开，预取完成后面板就能**同步**读到模型清单
               // —— 不必为一个下拉再加 effect 与订阅（那会打乱钩子顺序、牵连既有断言）。
               for (const provider of providers) void loadModels(provider);
               return providers;
             })
-            .catch(() => { providers = []; emit(); return providers; });
+            .catch((error) => {
+              providers = [];
+              diagnostic = `listProviders 调用抛错：${String(error?.message ?? error)}`;
+              emit();
+              return providers;
+            });
         },
         getProviders: () => providers,
         getModels: (providerId) => models.get(providerId) ?? [],
+        getDiagnostic: () => diagnostic,
         subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
       };
     }
