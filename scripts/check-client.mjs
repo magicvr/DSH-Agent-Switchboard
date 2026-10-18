@@ -803,22 +803,27 @@ section('模型供应商目录：remote.llm 的信封、失败降级与同步读
   const calls = [];
   const catalog = makeModelCatalog();
   await catalog.bind({
-    listProviders: () => [{ id: 'llm-deepseek', name: 'DeepSeek', settingsNs: 'llm-deepseek' }],
+    // ⚠️ 用**真机形状**：`listProviders()` 返回信封，且条目里 id 叫 `provider`、`name` 是显示名。
+    //    第一版按「裸数组 + id」写，真机目录永远是空的（面板一直退回文本框 ✗）。
+    //    这条断言就是防复发：不拆信封 ⇒ providers 为空 ⇒ 下面第一条立刻红。
+    listProviders: () => ({ ok: true, value: [
+      { provider: 'deepseek-official', name: 'DeepSeek', settingsNs: 'llm-deepseek' },
+    ] }),
     discoverModels: (ns, request) => {
       calls.push({ ns, request });
       return Promise.resolve({ ok: true, value: ['gpt-6.1-sol', { id: 'grok-4.7', label: 'Grok 4.7' }] });
     },
   });
   await new Promise(setImmediate);
-  check('供应商目录：对象形态读取 id/label，且**保留 settingsNs**（模型发现的钥匙）',
-    catalog.getProviders().length === 1 && catalog.getProviders()[0].id === 'llm-deepseek'
+  check('供应商目录：信封 ok=true 才取 value；条目 id 取 `provider`（不是显示名 name）',
+    catalog.getProviders().length === 1 && catalog.getProviders()[0].id === 'deepseek-official'
       && catalog.getProviders()[0].settingsNs === 'llm-deepseek',
     JSON.stringify(catalog.getProviders()));
   check('模型目录：按该供应商自己的 settingsNs 发现，请求是 `{provider}`（与官方模型页一致）',
-    calls.length === 1 && calls[0].ns === 'llm-deepseek' && calls[0].request.provider === 'llm-deepseek',
+    calls.length === 1 && calls[0].ns === 'llm-deepseek' && calls[0].request.provider === 'deepseek-official',
     JSON.stringify(calls));
   check('模型目录：信封 ok=true 才取 value，字符串与对象两种形态都收',
-    JSON.stringify(catalog.getModels('llm-deepseek').map(model => model.id))
+    JSON.stringify(catalog.getModels('deepseek-official').map(model => model.id))
       === JSON.stringify(['gpt-6.1-sol', 'grok-4.7']));
   // 失败/缺失一律记空数组 —— 面板据此退回文本框，而不是抛错或往下拉框里塞空值。
   const failing = makeModelCatalog();

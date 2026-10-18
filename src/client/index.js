@@ -1434,17 +1434,19 @@ window.__ModuleLoader__.load({
       const listeners = new Set();
       const models = new Map();
       const emit = () => { for (const fn of [...listeners]) { try { fn(); } catch { /* 单个订阅者出错不影响其它 */ } } };
-      // 目录形态按「字符串或对象」两种都收（`listProviders()` 的确切形状未在真机逐字段核对过），
-      // 认不出 id 的条目直接丢弃 —— 宁可少列，也不往下拉框里塞空值。
-      //
-      // ⚠️ 必须**保留 `settingsNs`**：模型发现是按各供应商自己的配置命名空间做的
-      //    （官方模型页：`discoverModels(probe.settingsNs, { provider: catalogProvider })`），
-      //    丢掉它就等于丢掉「这家供应商有哪些模型」的钥匙。
+      // 目录形态按「信封 / 裸数组、字符串或对象」都收 —— 真机核对结果（2026-10-19）：
+      //   · `listProviders()` 返回**信封** `{ok:true, value} | {ok:false, error:{message}}`；
+      //     官方模型页的写法就是 `if (!registered.ok) failLoad(registered.error.message)`。
+      //     ⚠️ 第一版把整个信封当数组 ⇒ 永远得到空目录 ⇒ 面板一直退回文本框（真机踩到）。
+      //   · 条目里的 **id 叫 `provider`**（如 `deepseek-official`），`name` 是显示名
+      //     —— id 必须优先取 `provider`，否则会拿到「DeepSeek」这种显示名当 id。
+      //   · 必须**保留 `settingsNs`**：模型发现按各供应商自己的命名空间做
+      //     （`discoverModels(probe.settingsNs, { provider })`），丢了它就没有模型清单的钥匙。
       const toList = (value) => (Array.isArray(value) ? value : [])
         .map((item) => (typeof item === 'string'
           ? { id: item, label: item }
-          : { id: String(item?.id ?? item?.name ?? item?.provider ?? ''),
-            label: String(item?.label ?? item?.name ?? item?.id ?? item?.provider ?? ''),
+          : { id: String(item?.provider ?? item?.id ?? item?.name ?? ''),
+            label: String(item?.label ?? item?.name ?? item?.provider ?? item?.id ?? ''),
             settingsNs: typeof item?.settingsNs === 'string' ? item.settingsNs : undefined }))
         .filter((item) => item.id !== '');
       // 模型可能是字符串数组、也可能是对象数组 —— 同样两种都收。
@@ -1470,8 +1472,11 @@ window.__ModuleLoader__.load({
           if (llm === null) { providers = []; emit(); return Promise.resolve([]); }
           return Promise.resolve()
             .then(() => llm.listProviders())
-            .then((value) => {
-              providers = toList(value);
+            .then((answer) => {
+              // ⚠️ 先拆**信封**再取目录（`{ok:true, value}` / `{ok:false, error}`）；
+              //    裸数组也容忍，但绝不把信封本身当成列表（那会让目录永远为空）。
+              providers = answer?.ok === true ? toList(answer.value)
+                : Array.isArray(answer) ? toList(answer) : [];
               emit();
               // 预取：设置页总在 `apply` 之后才打开，预取完成后面板就能**同步**读到模型清单
               // —— 不必为一个下拉再加 effect 与订阅（那会打乱钩子顺序、牵连既有断言）。
