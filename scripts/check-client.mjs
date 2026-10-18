@@ -56,7 +56,7 @@ function section(title) {
 const CLIENT_SRC = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
 // 执行真实客户端源码，仅在测试副本中暴露内部函数；生产模块不增加测试导出。
 const clientWindow = { __ModuleLoader__: { load: (spec) => { clientWindow.spec = spec; } } };
-new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleCard, RoleRow, makeRoleStore, SwitchboardSettings, // **读**走'))(clientWindow);
+new Function('window', CLIENT_SRC.replace(/    return \{\s*\/\/ \*\*读\*\*走/, '    return { RoleCard, RoleRow, makeRoleStore, SwitchboardSettings, makeModelCatalog, // **读**走'))(clientWindow);
 const clientData = new Function(`${CLIENT_SRC.slice(0, CLIENT_SRC.indexOf('\nwindow.__ModuleLoader__.load'))}\nreturn { CLI_DRIVER_OPTIONS, DEFAULT_CLI_DRIVER, cliFieldsFor, inferCliDriver };`)();
 const rowReact = { createElement: (type, props, ...children) => ({ type, props, children }) };
 const { RoleRow, makeRoleStore } = clientWindow.spec.factory(() => rowReact);
@@ -797,8 +797,53 @@ section('统一包裹小节：真实控件、读取与原子写入');
 //    包裹路由（中继子代理的 LLM 路由）已随中继一起删除，那节 UI 与判据都不复存在。
 //    等价的「dirty → 只提交改动」覆盖仍在：见上面 store.write 的 roles 断言与角色卡片小节。
 
-section('split 旋钮表单：操作区的启用/取消是真实行为');
+section('模型供应商目录：remote.llm 的信封、失败降级与同步读取');
 {
+  const { makeModelCatalog } = clientWindow.spec.factory(() => rowReact);
+  const calls = [];
+  const catalog = makeModelCatalog();
+  await catalog.bind({
+    listProviders: () => [{ id: 'llm-deepseek', name: 'DeepSeek', settingsNs: 'llm-deepseek' }],
+    discoverModels: (ns, request) => {
+      calls.push({ ns, request });
+      return Promise.resolve({ ok: true, value: ['gpt-6.1-sol', { id: 'grok-4.7', label: 'Grok 4.7' }] });
+    },
+  });
+  await new Promise(setImmediate);
+  check('供应商目录：对象形态读取 id/label，且**保留 settingsNs**（模型发现的钥匙）',
+    catalog.getProviders().length === 1 && catalog.getProviders()[0].id === 'llm-deepseek'
+      && catalog.getProviders()[0].settingsNs === 'llm-deepseek',
+    JSON.stringify(catalog.getProviders()));
+  check('模型目录：按该供应商自己的 settingsNs 发现，请求是 `{provider}`（与官方模型页一致）',
+    calls.length === 1 && calls[0].ns === 'llm-deepseek' && calls[0].request.provider === 'llm-deepseek',
+    JSON.stringify(calls));
+  check('模型目录：信封 ok=true 才取 value，字符串与对象两种形态都收',
+    JSON.stringify(catalog.getModels('llm-deepseek').map(model => model.id))
+      === JSON.stringify(['gpt-6.1-sol', 'grok-4.7']));
+  // 失败/缺失一律记空数组 —— 面板据此退回文本框，而不是抛错或往下拉框里塞空值。
+  const failing = makeModelCatalog();
+  await failing.bind({ listProviders: () => [{ id: 'p1', settingsNs: 'ns1' }, { id: 'p2' }],
+    discoverModels: () => Promise.reject(new Error('boom')) });
+  await new Promise(setImmediate);
+  check('模型目录：发现失败记空数组、缺 settingsNs 不发请求',
+    failing.getModels('p1').length === 0 && failing.getModels('p2').length === 0);
+  const refused = makeModelCatalog();
+  await refused.bind({ listProviders: () => ['p1'],
+    discoverModels: () => Promise.resolve({ ok: false, error: { message: 'refused' } }) });
+  await new Promise(setImmediate);
+  check('模型目录：信封 ok=false 不取 value（拒绝时也退回文本框）', refused.getModels('p1').length === 0);
+  // 拿不到 `remote.llm`、或 `listProviders` 直接抛错 ⇒ 空目录，绝不把设置页拖垮。
+  const none = makeModelCatalog();
+  await none.bind(null);
+  await none.bind({ listProviders: () => { throw new Error('unavailable'); } });
+  check('供应商目录：没有 remote.llm / 调用抛错时为空且不抛错', none.getProviders().length === 0);
+  const strings = makeModelCatalog();
+  await strings.bind({ listProviders: () => ['self', 'llm-pi-ai'] });
+  check('供应商目录：字符串数组形态也收', JSON.stringify(strings.getProviders().map(item => item.id))
+    === JSON.stringify(['self', 'llm-pi-ai']));
+}
+
+section('split 旋钮表单：操作区的启用/取消是真实行为');{
   // ⚠️ 这一节的存在本身就是教训：split 分支原先**没有自己的 dirty 判据**，我给它接上了
   //    roles 列表的 `dirty`（split 下恒为 false），于是「取消 / 保存」**永久禁用** ——
   //    真机上表现为「点取消毫无反应」。只断言源码形状挡不住这类 bug，所以这里**渲染真组件**：
@@ -861,6 +906,17 @@ section('split 旋钮表单：操作区的启用/取消是真实行为');
       && !nodes.some(n => n.type === 'input' && n.props.value === 'changed-model')
       && writes.length === 0,
     JSON.stringify({ writes: writes.length }));
+  // 夹具里那条是 **cli** 角色：按用户明确要求，外部 CLI **不指定供应商** ——
+  // 既没有「供应商」这一行，模型也保持自由文本（CLI 的模型 id 不在 DSH 目录里）。
+  const cliEntrySpans = nodes.filter(n => n.type === 'span'
+    && n.children.some(t => typeof t === 'string' && (t === '供应商' || t === '外部 CLI')));
+  check('split：cli 角色不显示「供应商」（只显示「外部 CLI」）',
+    !cliEntrySpans.some(span => span.children.includes('供应商'))
+      && cliEntrySpans.some(span => span.children.includes('外部 CLI')),
+    JSON.stringify(cliEntrySpans.map(span => span.children)));
+  check('split：cli 角色的模型仍是自由文本（不是下拉）',
+    nodes.some(n => n.type === 'input' && n.props.value === 'gpt-6-luna')
+      && !nodes.some(n => n.type === 'select' && n.props.value === 'gpt-6-luna'));
 }
 
 section('角色卡片：真实编辑、草稿、校验、并发与增删回调');

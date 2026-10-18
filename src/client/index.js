@@ -1326,10 +1326,28 @@ window.__ModuleLoader__.load({
                   placeholder: '留空则跟随默认 provider（未读到供应商目录，可手填）',
                   // 空串写 `undefined`：让这个键**消失**，而不是在配置里留一个空字符串。
                   onChange: (event) => patch(index, 'provider', event?.target?.value || undefined) })),
-          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
-            h('span', { style: { fontSize: '11px', width: '56px' } }, '模型'),
-            h('input', { type: 'text', value: entry.model ?? '', disabled: busy, style: inputStyle(),
-              placeholder: '留空则跟随默认', onChange: (event) => patch(index, 'model', event?.target?.value ?? '') })),
+          // 「模型」：**只有**在「本地派发 + 已选供应商 + 已读到该供应商的模型」时才是下拉。
+          // 其余情况（外部 CLI、未选供应商、目录读不到）一律退回自由文本 ——
+          // 外部 CLI 的模型 id 来自驱动自己的世界（如 `gpt-6.1-sol`），DSH 目录里根本没有。
+          (() => {
+            const models = entry.backend !== 'cli' && entry.provider !== undefined && entry.provider !== ''
+              ? (catalog?.getModels?.(entry.provider) ?? []) : [];
+            return h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
+              h('span', { style: { fontSize: '11px', width: '56px' } }, '模型'),
+              models.length > 0
+                ? h('select', { value: entry.model ?? '', disabled: busy, style: selectStyle(),
+                  onChange: (event) => patch(index, 'model', event?.target?.value || undefined) },
+                  h('option', { value: '' }, '（跟随默认模型）'),
+                  models.map((model) => h('option', { key: model.id, value: model.id }, model.label)),
+                  // 现值不在目录里（手写过、或驱动侧特有）时原样保留 —— 不锁死、不静默改值。
+                  entry.model !== undefined && entry.model !== ''
+                    && !models.some((model) => model.id === entry.model)
+                    ? h('option', { value: entry.model }, entry.model) : null)
+                : h('input', { type: 'text', value: entry.model ?? '', disabled: busy, style: inputStyle(),
+                  placeholder: entry.backend === 'cli' ? '外部 CLI 自己的模型 id（如 gpt-6.1-sol）'
+                    : '留空则跟随默认（未读到模型目录时会话可手填）',
+                  onChange: (event) => patch(index, 'model', event?.target?.value ?? '') }));
+          })(),
           h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
             h('span', { style: { fontSize: '11px', width: '56px' } }, '思考强度'),
             h('select', { value: entry.effort ?? '', disabled: busy, style: selectStyle(),
@@ -1414,24 +1432,56 @@ window.__ModuleLoader__.load({
       let llm = null;
       let providers = [];
       const listeners = new Set();
+      const models = new Map();
       const emit = () => { for (const fn of [...listeners]) { try { fn(); } catch { /* 单个订阅者出错不影响其它 */ } } };
-      // 目录形态按「字符串或对象」两种都收（`listProviders()` 的确切形状未在真机核对过），
+      // 目录形态按「字符串或对象」两种都收（`listProviders()` 的确切形状未在真机逐字段核对过），
       // 认不出 id 的条目直接丢弃 —— 宁可少列，也不往下拉框里塞空值。
+      //
+      // ⚠️ 必须**保留 `settingsNs`**：模型发现是按各供应商自己的配置命名空间做的
+      //    （官方模型页：`discoverModels(probe.settingsNs, { provider: catalogProvider })`），
+      //    丢掉它就等于丢掉「这家供应商有哪些模型」的钥匙。
       const toList = (value) => (Array.isArray(value) ? value : [])
+        .map((item) => (typeof item === 'string'
+          ? { id: item, label: item }
+          : { id: String(item?.id ?? item?.name ?? item?.provider ?? ''),
+            label: String(item?.label ?? item?.name ?? item?.id ?? item?.provider ?? ''),
+            settingsNs: typeof item?.settingsNs === 'string' ? item.settingsNs : undefined }))
+        .filter((item) => item.id !== '');
+      // 模型可能是字符串数组、也可能是对象数组 —— 同样两种都收。
+      const toModels = (value) => (Array.isArray(value) ? value : [])
         .map((item) => (typeof item === 'string'
           ? { id: item, label: item }
           : { id: String(item?.id ?? item?.name ?? ''), label: String(item?.label ?? item?.name ?? item?.id ?? '') }))
         .filter((item) => item.id !== '');
+      // 某供应商的模型：没有 ns / 调用失败 / 信封 ok=false 一律记空数组（面板据此退回文本框）。
+      const loadModels = (provider) => {
+        if (llm === null || typeof llm.discoverModels !== 'function') return Promise.resolve([]);
+        if (provider.settingsNs === undefined) return Promise.resolve([]);
+        return Promise.resolve()
+          .then(() => llm.discoverModels(provider.settingsNs, { provider: provider.id }))
+          .then((answer) => (answer?.ok === true ? toModels(answer.value) : []))
+          .catch(() => [])
+          .then((list) => { models.set(provider.id, list); emit(); return list; });
+      };
       return {
         bind(next) {
           llm = next === undefined || next === null || typeof next.listProviders !== 'function' ? null : next;
+          models.clear();
           if (llm === null) { providers = []; emit(); return Promise.resolve([]); }
           return Promise.resolve()
             .then(() => llm.listProviders())
-            .then((value) => { providers = toList(value); emit(); return providers; })
+            .then((value) => {
+              providers = toList(value);
+              emit();
+              // 预取：设置页总在 `apply` 之后才打开，预取完成后面板就能**同步**读到模型清单
+              // —— 不必为一个下拉再加 effect 与订阅（那会打乱钩子顺序、牵连既有断言）。
+              for (const provider of providers) void loadModels(provider);
+              return providers;
+            })
             .catch(() => { providers = []; emit(); return providers; });
         },
         getProviders: () => providers,
+        getModels: (providerId) => models.get(providerId) ?? [],
         subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
       };
     }
