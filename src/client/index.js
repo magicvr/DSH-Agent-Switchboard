@@ -1033,6 +1033,12 @@ window.__ModuleLoader__.load({
       //    原因：slot 的组件侧上下文与插件上下文不是同一个，直接读 `props.ctx.remote`
       //    会拿不到远程命名空间（实测：读得到 configForms、写不到 remote.settings）。
       const store = props.store;
+      // 供应商目录（可能为 undefined：拿不到 `remote.llm` —— 那时供应商退回文本框）。
+      // ⚠️ 同步读一次快照、不订阅：目录在 `apply` 阶段就已开始加载，设置页总在这之后打开，
+      //    到渲染时通常已就绪；真为空也只是退化成文本框（功能不丢），不值得再加一个 effect
+      //    与一轮订阅（那会打乱钩子顺序、牵连既有断言）。
+      const catalog = props.catalog;
+      const providers = catalog?.getProviders?.() ?? [];
       const [draft, setDraft] = useState(null);
       const [editingId, setEditingId] = useState(null);
       const [confirmingIndex, setConfirmingIndex] = useState(null);
@@ -1306,10 +1312,20 @@ window.__ModuleLoader__.load({
             ? null
             : h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
               h('span', { style: { fontSize: '11px', width: '56px' } }, '供应商'),
-              h('input', { type: 'text', value: entry.provider ?? '', disabled: busy, style: inputStyle(),
-                placeholder: '留空则跟随默认 provider',
-                // 空串写 `undefined`：让这个键**消失**，而不是在配置里留一个空字符串。
-                onChange: (event) => patch(index, 'provider', event?.target?.value || undefined) })),
+              // 目录可用 → 下拉；不可用 → 文本框（**绝不**因为读不到目录就让人没法填）。
+              providers.length > 0
+                ? h('select', { value: entry.provider ?? '', disabled: busy, style: selectStyle(),
+                  onChange: (event) => patch(index, 'provider', event?.target?.value || undefined) },
+                  h('option', { value: '' }, '（跟随默认 provider）'),
+                  providers.map((item) => h('option', { key: item.id, value: item.id }, item.label)),
+                  // 现值不在目录里（手写过、或在别处配的）时原样保留 —— 不锁死、不静默改值。
+                  entry.provider !== undefined && entry.provider !== ''
+                    && !providers.some((item) => item.id === entry.provider)
+                    ? h('option', { value: entry.provider }, entry.provider) : null)
+                : h('input', { type: 'text', value: entry.provider ?? '', disabled: busy, style: inputStyle(),
+                  placeholder: '留空则跟随默认 provider（未读到供应商目录，可手填）',
+                  // 空串写 `undefined`：让这个键**消失**，而不是在配置里留一个空字符串。
+                  onChange: (event) => patch(index, 'provider', event?.target?.value || undefined) })),
           h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
             h('span', { style: { fontSize: '11px', width: '56px' } }, '模型'),
             h('input', { type: 'text', value: entry.model ?? '', disabled: busy, style: inputStyle(),
@@ -1388,6 +1404,38 @@ window.__ModuleLoader__.load({
           button(dirty ? '保存 *' : '保存', () => save(), { disabled: busy || !readSucceeded || !dirty, primary: dirty, className: 'pageActionSave' }))));
     }
 
+    // 「模型供应商」目录：尽力而为地绑定 `remote.llm`（内核提供；官方「模型」设置页也用它）。
+    //
+    // ⚠️ 刻意**不**写进插件的 `inject`：那里是**必需**依赖，缺一个整页起不来（历史事故：
+    //    注入过我们自己延迟注册的 `remote.roleConfig`，页面直接不激活）。这里在 `apply` 里用
+    //    `ctx.inject(['remote'], …)` 拿到网关后再取 `.llm`，拿不到或调用失败就退化成文本框 ——
+    //    供应商下拉是**增强**，不该有能力把设置页拖垮。
+    function makeModelCatalog() {
+      let llm = null;
+      let providers = [];
+      const listeners = new Set();
+      const emit = () => { for (const fn of [...listeners]) { try { fn(); } catch { /* 单个订阅者出错不影响其它 */ } } };
+      // 目录形态按「字符串或对象」两种都收（`listProviders()` 的确切形状未在真机核对过），
+      // 认不出 id 的条目直接丢弃 —— 宁可少列，也不往下拉框里塞空值。
+      const toList = (value) => (Array.isArray(value) ? value : [])
+        .map((item) => (typeof item === 'string'
+          ? { id: item, label: item }
+          : { id: String(item?.id ?? item?.name ?? ''), label: String(item?.label ?? item?.name ?? item?.id ?? '') }))
+        .filter((item) => item.id !== '');
+      return {
+        bind(next) {
+          llm = next === undefined || next === null || typeof next.listProviders !== 'function' ? null : next;
+          if (llm === null) { providers = []; emit(); return Promise.resolve([]); }
+          return Promise.resolve()
+            .then(() => llm.listProviders())
+            .then((value) => { providers = toList(value); emit(); return providers; })
+            .catch(() => { providers = []; emit(); return providers; });
+        },
+        getProviders: () => providers,
+        subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+      };
+    }
+
     return {
       // **读**走 `configForms` 镜像，**写**走 `remote.settings` —— 这是官方「模型」设置页
       // （`dsh-client-ui-settings-models`）的分工，其 inject 里两者都在：
@@ -1408,6 +1456,13 @@ window.__ModuleLoader__.load({
         //    （`createModelsOperations(ctx)`）一致。不要把 `ctx` 本身注入给组件：
         //    slot 的组件侧上下文与插件上下文不是同一个，实测表现为「读得到、写不到」。
         const store = makeRoleStore(ctx);
+        // 供应商目录（可能一直为空：拿不到 `remote.llm`、或调用失败 —— 面板会退回文本框）。
+        const catalog = makeModelCatalog();
+        if (typeof ctx.inject === 'function') {
+          ctx.inject(['remote'], (scope) => {
+            try { return catalog.bind(scope?.remote?.llm); } catch { return catalog.bind(null); }
+          });
+        }
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(
             {
@@ -1416,7 +1471,7 @@ window.__ModuleLoader__.load({
               id: 'agent-switchboard',
               order: 25,
               label: '角色与派发',
-              inject: () => ({ store }),
+              inject: () => ({ store, catalog }),
             },
             SwitchboardSettings,
           ),
