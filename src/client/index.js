@@ -1296,6 +1296,20 @@ window.__ModuleLoader__.load({
               entry.cliDriver !== undefined && !CLI_DRIVER_OPTIONS.some(d => d.id === entry.cliDriver)
                 ? h('option', { value: entry.cliDriver }, entry.cliDriver) : null))
             : null,
+          // 「用哪个**供应商**」——只在**本地（spawn）**派发时出现。
+          //
+          // ⚠️ 这条原先在 split 表单里**漏了**（`provider` 一直是旋钮字段集的一员，legacy 卡片也
+          //    一直在渲染它，只有 split 表单没有入口）⇒ 拆分配置的用户**无法**指定子代理的
+          //    provider，只能吃默认值。CLI 角色则没有意义：它的 provider 由驱动（codex / grok）
+          //    自己的登录态决定，所以这一行沿用 legacy 卡片的做法——cli 时隐藏。
+          entry.backend === 'cli'
+            ? null
+            : h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
+              h('span', { style: { fontSize: '11px', width: '56px' } }, '供应商'),
+              h('input', { type: 'text', value: entry.provider ?? '', disabled: busy, style: inputStyle(),
+                placeholder: '留空则跟随默认 provider',
+                // 空串写 `undefined`：让这个键**消失**，而不是在配置里留一个空字符串。
+                onChange: (event) => patch(index, 'provider', event?.target?.value || undefined) })),
           h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
             h('span', { style: { fontSize: '11px', width: '56px' } }, '模型'),
             h('input', { type: 'text', value: entry.model ?? '', disabled: busy, style: inputStyle(),
