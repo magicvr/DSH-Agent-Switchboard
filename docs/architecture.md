@@ -595,6 +595,30 @@ background job cli-dedf627a1c664b6f (cli: 审查员) finished [status: killed, e
   17.5 秒。判断「谁在何时做了什么」应查**会话日志**（`scripts/probes/session-log.mjs`；
   多帧 zstd 的 JSONL，权威时间源，界面记时可能挂在别的对象上）。
 
+**真机端到端验收（2026-10-19，会话 `session-ccbe7846-ca99-407d-b5d4-9220bce7b4eb`）：全部通过。**
+一次派发覆盖 CLI 直派、spawn 直派、嵌套派发、工具边界与只读边界；判据全部由**会话日志 +
+文件系统**作证（不依赖自述）：
+
+| 判据 | 证据 |
+| --- | --- |
+| CLI 直派受理 | `delegate_to_reviewer`（00:07:33）→ `{"status":"accepted","jobId":"cli-e455b3fdbb704e6f"}` |
+| CLI 任务终态 | `job/settled status=completed cause=producer ran=14.5s`；通知 `[status: completed, exit code: 0]` |
+| spawn 直派受理 | `delegate_to_worker` → `started subagent 73fe8009-…`（官方形状） |
+| **worker 的工具边界** | worker 自报 31 个工具，`delegate_to_` 仅 `delegate_to_scout`（无 architect / reviewer） |
+| worker 可写 | `raw/acceptance-worker-ok.txt` 存在（文件系统为证） |
+| scout 只读 | `raw/acceptance-scout-ok.txt` 不存在；scout 自报「未提供任何文件创建/写入工具」 |
+| 嵌套派发 | worker 调 `delegate_to_scout` → `started subagent 3fdb5a70-…` |
+| nonce 链式冒泡 | scout 写出 `ACCEPTANCE-NONCE-9f2b` → 送达 worker → worker `send_message` 转报主代理 |
+| 孙代通知不外溢 | 主会话中与 `3fdb5a70` 相关的记录只有 worker 的转报，无 `Background subagent 3fdb5a70… finished` |
+
+⇒ D34（CLI 角色是叶子）、D35（`canDispatch` 显式清单）与**作用域隔离**三条同时成立：
+scout 与 worker **都没有** CLI 角色的直派工具（scout 一个委派工具都没有）。
+
+⚠️ **一处外部怪现象（`dsh-tool-subagent` 侧，非本插件）**：scout 收到的运行时提示写的是
+`Your parent agent id is "session-ccbe7846-…"`（**根会话**），而它的直接父级是 worker
+（`73fe8009-…`）。scout 据此发了**两次** `send_message`（一次给 worker ✓、一次给主会话 ✗）；
+主会话里没有落地那次错误投递，正确的那条送达 worker 并由其转报 ⇒ **链路最终正确**。
+该提示会诱导子代理朝「父级的父级」投递，值得上游修。
 **CLI 输出面板：已删除（D36）。** 它原先只在「一次性子代理会话」渲染，而 D33 把 CLI 改成**直派**（owner 变成发起派发的 agent，顶层就是主代理）、D34 又让 CLI 角色成为叶子 ⇒ 它**永远不渲染**。中途按「主会话 / 一次性子会话」放宽过判定（16b5131），真机复验仍不出现 —— 说明主会话根本不请求那个 composer 槽位，问题不在判定条件。用户裁决：**官方后台任务区已经够用**，于是整块删除（面板 + 只服务它的 makeCliStore + 对应断言），不再保留永远不跑的界面代码。CLI 的输出、通道（stdout/stderr）与终态仍由 job.append / jobs.start 交给官方 Jobs，在任务区可见。
 
 **真机取证（2026-10-03，`worker=cli(codex)` 实测）：** 一次 `node -v` 任务中，当时的阻塞式工具 `switchboard_cli_run_worker`（**该工具已随 D33 删除**）返回的 `stdout` 只有 172 字符（最终答案），`stderr` 有 5723 字符 —— 含 codex banner 与路由事实、**角色指令回显**、`exec "<powershell>" -Command 'node -v; Get-Location' … succeeded in 132ms` 的**工具轨迹**、`tokens used` 计数与重连告警。这正是用户报告「工具调用等消息被当成文本显示」的内容来源，也证明通道分区的前提成立。同一份结果的 `routeSummary` 自报 `model=gpt-6.1-sol`、`effort=medium`、`sandbox=workspace-write`，与角色配置一致 —— 把 stderr 折起来并没有丢掉「配置真的生效」的证据。**折叠交互与失败自动展开仍待人工查看（GUI 视觉），不能以离线断言代替。** ⚠️ 直派后同样的分区原则不变，只是数据源从「工具返回值」变成「job 的输出环」（`job.append(text, { channel })`）。
