@@ -1193,9 +1193,14 @@ section('CLI composer：one-shot 选择、官方只读占位与无 turn 输出')
   const scrollNodes = cliNodes(scrollPropsTree);
   check('滚动容器携带 ref 与滚动状态回调', scrollNodes.some(node => node.type === 'pre' && node.props.ref && typeof node.props.onScroll === 'function'));
   check('回底按钮中文标签清晰', CLIENT_SRC.includes("'aria-label': '滚动到最下'"));
-  check('CLI select：仅 session.subagent.address.mode one-shot 被选中',
+  // ⚠️ 这条断言**改过判据**：原先是「仅一次性子代理会话被选中，主会话不接管」。D33 改直派后
+  //    CLI 任务的 owner 变成**发起派发的 agent**（顶层就是主代理），D34 又让 CLI 角色成为叶子
+  //    ⇒ 按原条件面板**永远不渲染**（真机确认：CLI 输出只在官方任务列表里）。现在主会话也要接管。
+  check('CLI select：一次性子代理会话被选中',
     selectCliComposer({ session: { subagent: { address: { mode: 'one-shot' } } } })?.reason === 'one-shot');
-  for (const [name, owner] of Object.entries({ main: { session: {} }, continuable: { session: { subagent: { address: { mode: 'continuable' } } } },
+  check('CLI select：**主会话**也被选中（直派之后 owner 是主代理）',
+    selectCliComposer({ session: {} })?.reason === 'main');
+  for (const [name, owner] of Object.entries({ continuable: { session: { subagent: { address: { mode: 'continuable' } } } },
     unknown: { session: { subagent: { address: { mode: 'unknown' } } } }, missing: {}, decoy: { session: { mode: 'one-shot', subagent: { mode: 'one-shot' } } } })) {
     check(`CLI select：${name} 不接管`, selectCliComposer(owner) === null);
   }

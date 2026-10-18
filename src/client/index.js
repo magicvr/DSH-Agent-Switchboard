@@ -1376,7 +1376,16 @@ window.__ModuleLoader__.load({
 
     // 与官方选择器一致，仅明确的一次性子会话；未知/continuable 不接管。
     function selectCliComposer(owner) {
-      return owner.session?.subagent?.address?.mode === 'one-shot' ? { reason: 'one-shot' } : null;
+      // ⚠️ 这里**曾经**只认「一次性子代理会话」（`mode === 'one-shot'`）—— 那时 CLI 任务由
+      //    中继子代理派发，owner 正是那个子代理。D33 改成**直派**之后，owner 变成**发起派发的
+      //    agent**（顶层就是主代理）；D34 又让 CLI 角色成为叶子（嵌套也到不了它）⇒
+      //    按原条件这个面板**永远不渲染**（真机确认：CLI 输出只在官方任务列表里看得到）。
+      //    现在放宽为「**主会话** 或 一次性子代理会话」；面板自身在没有 CLI 任务时返回 null，
+      //    因此不会在无关会话里占位。
+      const mode = owner.session?.subagent?.address?.mode;
+      if (owner.session === undefined || owner.session === null) return null;
+      if (owner.session.subagent === undefined) return { reason: 'main' };
+      return mode === 'one-shot' ? { reason: 'one-shot' } : null;
     }
 
     const CLI_JOB_LIMIT = 8;
