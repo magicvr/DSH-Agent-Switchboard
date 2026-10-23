@@ -907,11 +907,11 @@ CLI 自身工具与受控委派白名单、只读 deny、`allow: []` 拒绝继�
 
 **2026-10-03 修订：由硬编码改为 preset 承载。** 用户要求规则归属 Switchboard preset，继续禁止 UI 编辑。唯一运行时载体为内部条目 `switchboard-roles.config.supervisorRules` 多行字符串，由 `scripts/gen-preset.mjs` 的 `selfEntry` 生成；从 `src/roles.js` 移除完整常量，Config 声明字符串、无默认值、非 volatile，根条目不带此字段。动态小节读取本实例配置，仍只进主代理，不改官方插件或派发机制。
 
-**修订代价与兜底：** 不能手改生成 YAML，否则下一次生成会洗掉；profile 内联展开导致多 profile 漂移，必须各自执行 `npm run gen:preset` → `npm run inject:preset` → 重启。未同步时会失去调度规则；缺失/空白不注入、不猜测、不回退代码副本，已用自检明确告警兜住（“调度规则：未配置（profile 可能未同步 preset：需 gen:preset → inject:preset → 重启）”），健康等级为“可用但告警”，不判为不健康或阻断派发。R06 修订为 preset 载体与不可编辑契约，新增缺省行为、诊断及生成幂等断言；历史硬编码验证保留为历史记录。
+**修订代价与兜底：** 不能手改生成 YAML，否则下一次生成会洗掉。**后续修订：** preset 现由 bundle 投递，profile 不再内联展开；`inject:preset` 已退役（注入副本会造成重复声明），各 profile 只需执行 `npm run gen:preset` → 确认 bundle 登记 → 完全重启。未同步时会失去调度规则；缺失/空白不注入、不猜测、不回退代码副本，已用自检明确告警兜住（“调度规则：未配置（本 preset 未加载或 supervisorRules 为空：确认 dsh.profile.bundles 含本包并运行 plugin:verify，然后完全重启 DSH）”），健康等级为“可用但告警”，不判为不健康或阻断派发。R06 修订为 preset 载体与不可编辑契约，新增缺省行为、诊断及生成幂等断言；历史硬编码验证保留为历史记录。
 
 **2026-10-03 修订：新增提交纪律。** 载体不变：规则仍由生成器 `selfEntry` 生成到 preset 的 `supervisorRules`，位于结果与失败路由之后、成本纪律之前，沿用 D28 的主代理身份判据。主代理将提交作为状态维护统一执行，worker 任务包明确要求不要自行提交并返回改动范围与验证证据；在可独立验收的增量或批次收口后及时保存可追溯结果。提交前核对仓库、分支、已有改动与暂存范围，归属不清或混有他人改动时暂缓；通过目标仓库检查与测试后只提交本次范围。失败或取消先核查副作用，仅提交独立验收通过的部分；无法验证时仅按用户明确要求留检查点并说明未验证与未完成项。禁止提交临时区、忽略目录、密钥令牌、本机绝对路径或构建产物，禁止强制添加忽略文件；尊重用户禁令、只读任务及仓库范围，遵守提交规范，记录提交标识与验证结果，不擅自推送或改写历史。
 
-**提交纪律的代价与生效链路：** 增加主代理核对暂存归属、验证及记录的成本，及时提交仍可能污染用户仓库历史，因此受上述范围与用户意图护栏约束；这是模型行为规则，不新增自动提交机制或工具权限保证。R01 检查主代理实际组装中的关键护栏，R02–R04 排除子代理及未知上下文泄漏。仍需各 profile 执行 `npm run gen:preset` → `npm run inject:preset` → 重启 DSH；规则改动的生成一致性、离线断言及真机生效须分别验证，不将源码更新视为 profile 已同步。
+**提交纪律的代价与生效链路：** 增加主代理核对暂存归属、验证及记录的成本，及时提交仍可能污染用户仓库历史，因此受上述范围与用户意图护栏约束；这是模型行为规则，不新增自动提交机制或工具权限保证。R01 检查主代理实际组装中的关键护栏，R02–R04 排除子代理及未知上下文泄漏。**后续修订：** 各 profile 只需 `npm run gen:preset` → 确认 bundle 登记 → 完全重启 DSH；`inject:preset` 已退役，不再需要向 profile 注入。规则改动的生成一致性、离线断言及真机生效须分别验证，不将源码更新视为 profile 已同步。
 
 **素材适配：** `raw/AGENTS.md` 原样不可用，仅是用户指定的历史素材，不是正式项目决策或运行时来源。第 22、32–41、76、337–340 行的本机角色文件路径、TOML 和手工传模型/强度方案删除，改为插件配置解析角色、`delegate_to_*` 派发、适配层决定模型/强度，主代理不得覆盖；第 22 行的 sandbox_mode 改为 readOnly 工具层权限过滤并保留 CLI 权限边界。第 322–325 行的 spawn_agent/wait_agent/send_input/close_agent 生命周期改为**异步受理**（`delegate_to_*` 只返回受理确认，结果以完成通知送达，不阻塞等待）、不重复派发、不为催进度打断，取消后检查部分副作用并按失败性质路由。第 354–371 行的临时提高 reasoning effort 删除，改为先检查角色是否选错、再考虑更高角色。四问路由、任务包、一次性专业单元、核心文档理解、按支持能力并行、上下文卫生、结果验证、reviewer 独立性、失败路由与成本纪律保留并合并重复叙述。
 
@@ -994,14 +994,14 @@ for (const field of ["persona", "toolFilter"])
 
 **后续实测：`0.2.1-rc.1 → rc.2` 是一次纯版本坐标变更。** 升级落地后 DSH 又从 rc.1 升到 rc.2，四个 dsh peers 再次不匹配、插件再次被门禁拒载。逐包核对后确认：**所有相关包的代码树逐字节相同**（对每个包的 `lib/` 等非 `package.json` 文件做 SHA-256 聚合对比，`dsh-tool-subagent` / `dsh-subagent` / `dsh-tools` / `dsh-agent-preset-registry` / `dsh-app-boot` / `dsh-scope` / `dsh-system-prompt` / `dsh-agent` / `dsh-typert-protocol` 全部一致），唯一差异是 `package.json` 里的版本号与依赖 pin；上游 `standard.patch.yml` 也逐字节相同，因此生成物与行模板无需重新生成。**结论：这次只需重 pin，零代码改动**——`npm run check` 与 `plugin:verify` 随即全绿。
 
-这条实测同时说明**精确 pin 的代价是真的**：一个完全兼容的版本照样会被拒载。之所以仍然保留精确 pin：拒载是**响亮且安全**的（插件不加载、设置页消失、stderr 有明确原因），而不是静默地按错误接口运行；代价是一次重 pin 加一次差异核对。**不放宽成 `~0.2.1-rc.1`**：范围会顺带接受与运行时不同的构建，与本仓库「离线检查必须与运行时同版本」的前提冲突。**也不提供「按运行时版本自动改写 pin」的辅助命令**：那种命令会在没有核对接口差异的情况下让插件加载到一个可能已破坏 API 的运行时上，正是本项目一直在防的静默失效。**把判定自动化、把关留在人手上：`npm run dsh:delta`**（`scripts/ops/dsh-delta.mjs`）。它**只读**、不改任何仓库文件：从 registry 取下 pin 的版本与本机运行时版本，对契约面 12 个包逐文件做 sha256 比对，**代码与资产/配置分开判定**，并单独报告上游 `presets/standard.patch.yml` 是否变化（决定生成物要不要重新生成、profile 要不要重新注入）。退出码 `0` = 只改版本坐标、可放心重 pin；`1` = 有接口/实现变化、必须先核对；`2` = **无法判定**——只要有一个包没比对上就不给「可以放心」的结论，因为把「没看到差异」当成「没有差异」正是一直在防的失效。已实测：`0.2.1-rc.1 → rc.2` 报 `0`，`0.2.0-rc.2 → rc.2` 报 `1` 并列出真实变化的代码文件。每次 DSH 升级的固定仪式见 [`lifecycle.md`](./lifecycle.md) §4。
+这条实测同时说明**精确 pin 的代价是真的**：一个完全兼容的版本照样会被拒载。之所以仍然保留精确 pin：拒载是**响亮且安全**的（插件不加载、设置页消失、stderr 有明确原因），而不是静默地按错误接口运行；代价是一次重 pin 加一次差异核对。**不放宽成 `~0.2.1-rc.1`**：范围会顺带接受与运行时不同的构建，与本仓库「离线检查必须与运行时同版本」的前提冲突。**也不提供「按运行时版本自动改写 pin」的辅助命令**：那种命令会在没有核对接口差异的情况下让插件加载到一个可能已破坏 API 的运行时上，正是本项目一直在防的静默失效。**把判定自动化、把关留在人手上：`npm run dsh:delta`**（`scripts/ops/dsh-delta.mjs`）。它**只读**、不改任何仓库文件：从 registry 取下 pin 的版本与本机运行时版本，对契约面 12 个包逐文件做 sha256 比对，**代码与资产/配置分开判定**，并单独报告上游 `presets/standard.patch.yml` 是否变化（决定生成物要不要重新生成、profile 要不要收敛（剥离内联副本））。退出码 `0` = 只改版本坐标、可放心重 pin；`1` = 有接口/实现变化、必须先核对；`2` = **无法判定**——只要有一个包没比对上就不给「可以放心」的结论，因为把「没看到差异」当成「没有差异」正是一直在防的失效。已实测：`0.2.1-rc.1 → rc.2` 报 `0`，`0.2.0-rc.2 → rc.2` 报 `1` 并列出真实变化的代码文件。每次 DSH 升级的固定仪式见 [`lifecycle.md`](./lifecycle.md) §4。
 
 **防复发（结构修复）：**
 - `scripts/check-profile-wiring.mjs` 新增两条依赖环境的断言：仓库声明的 DSH 要求必须满足**安装归档里的运行时**；仓库 `node_modules` 中每个 `@deepseek-ai/dsh*` 必须与运行时**完全同版本**。归档不可用时显式 SKIP 并打「未验证」告警，**不计入通过**。
 - `scripts/check-lifecycle.mjs` 的 fixture 运行时版本不再硬编码，改为取仓库唯一精确的 dsh peer pin，并有断言要求 pins 是**同一个精确版本**（不一致即失败，`:29–32`、`:214–215`）：manifest 升级 peers 后 stub 必须一起走，否则检查会继续在陈旧 stub 上绿。
 - `package.json` 的 `check` 链现以 `node scripts/gen-preset.mjs --check` 收尾，同时比对 `presets/switchboard.patch.yml` 与 `presets/standard-plugins.json`。升级落地时该检查还不在主链内，这是 standard 漂移（含三个被移除的行）长期未被发现的原因。
 
-**验证边界（2026-10-17 真机重启后更新）：** profile 已重新注入（`upgrade --apply`，写后复读验证通过），并已完成一次**完全重启**的真机验收：插件正常装载（`switchboard_selftest` 健康：健康、无 fatal）、`plugin:verify` 报 `consistent / 已就绪`、运行时 `0.2.1-rc.2` 且 `DSH peers：compatible`（无需豁免）；**四个角色 preset 在 preset roster 中全部出现且「无异常行」**，即 `agentPresets.register()` 接受本插件组装的角色 preset。**仍未验收的只剩一项**：`delegate_to_*` 在**选中 Switchboard preset 的会话**里的实际挂载与一次真实派发（根实例只注册自检、不挂载角色工具，所以本轮自检如实报告「本作用域不挂载角色工具」）；`agentPreset` 装载期校验通过后子代理实际拿到的工具构成与只读裁剪，以及客户端半边，仍只有静态 / 离线证据。详见 [`lifecycle.md`](./lifecycle.md) §6.3 / §6.4。
+**验证边界（2026-10-17 真机重启后更新）：** profile 已收敛（当时的 `upgrade --apply` 执行的是重新注入；现机制为剥离内联副本，preset 由 bundle 投递；写后复读验证通过），并已完成一次**完全重启**的真机验收：插件正常装载（`switchboard_selftest` 健康：健康、无 fatal）、`plugin:verify` 报 `consistent / 已就绪`、运行时 `0.2.1-rc.2` 且 `DSH peers：compatible`（无需豁免）；**四个角色 preset 在 preset roster 中全部出现且「无异常行」**，即 `agentPresets.register()` 接受本插件组装的角色 preset。**仍未验收的只剩一项**：`delegate_to_*` 在**选中 Switchboard preset 的会话**里的实际挂载与一次真实派发（根实例只注册自检、不挂载角色工具，所以本轮自检如实报告「本作用域不挂载角色工具」）；`agentPreset` 装载期校验通过后子代理实际拿到的工具构成与只读裁剪，以及客户端半边，仍只有静态 / 离线证据。详见 [`lifecycle.md`](./lifecycle.md) §6.3 / §6.4。
 
 #### D32 补记一：角色组合改为**派发前热同步**
 
@@ -1089,7 +1089,9 @@ for (const field of ["persona", "toolFilter"])
 bundle（`presets/switchboard.patch.yml`，`package.json` 的 `dsh.bundle.patch` 声明）贡献。
 补记二设想的改动（「让 `--inject` 不再往 profile 写 preset 声明，`plugin:verify` 的
 `preset.rules` 改为校验仓库 preset 与 bundle 装配」）因此**已无对象**：现状即是目标状态，
-不需要再动 tooling，也不需要改用户的 profile。
+不需要改用户的 profile。**但 tooling 仍需收口：** `inject:preset` 能重新制造这个重复声明，
+后续已将其从 `package.json` 移除、让 `probe-preset.mjs --inject` 硬拒绝，并把自检提示改为
+「确认 bundle 登记 + `plugin:verify` + 重启」；这属于消除复发入口，不是重复实现修复。
 
 **保留的排查线索：** 若将来又看到重复声明，按补记二的结论查 —— `applyEntryPatches` 的顶层
 `insert`（无 `id`）是 `data.push(...insert)`，**纯追加、不按 id 去重**。
@@ -1207,5 +1209,24 @@ bundle（`presets/switchboard.patch.yml`，`package.json` 的 `dsh.bundle.patch`
 2. **在自办 preset 里保留 `delegate_to_worker` 但用提示词禁止调用** —— 否决。工具在清单里就等于可用，提示词禁令不是边界；而且 worker 的角色 preset 仍会被注册，白白多一套组合。
 3. **让两个 preset 共用同一批角色 preset id，靠先注册者复用** —— 否决。注册表对所有声明 eager 装载，先后顺序不是契约；先卸载一个 preset 还会让另一个失去角色组合。命名空间是确定性的。
 4. **只改 `name` / `description`，不真正排除 worker** —— 否决。那只是把「不使用 worker」写成文案，模型仍能看到并调用 worker，违背用户要求。
+
+---
+
+## D38 · 生命周期验收语义与边界修复
+
+**决策：** 保留「DSH 管包、工具管派生制品」的 D31 分工，但修掉会让工具把未知状态或跨边界状态误判为成功的路径：
+
+1. **未知不等于通过。** `verify` 只在 issues 与 unverified 都为空时返回 `consistent`；runtime / peers / 生成物判据未知时为 `unverified` 并以退出码 `1` 失败，确认接受未知时显式加 `--allow-unknown`。
+2. **运行时按 profile 类型取值。** desktop 继续读 Electron 归档；CLI-managed profile 必须用 `--runtime-version <精确版本>`，不再拿 Electron 归档冒充，也不让生成物漂移判据建立在错误的 standard 上。
+3. **roles 播种按设置形态分流。** 文件缺失且根条目有 legacy 完整 `roles` 时，用设置播种并在同一次 install 内裁成 `roleSettings`；设置层已是 split（`roleSettings`）时拒绝写空文件并退出 `3`，`verify` 增加 `roles.definitions`。
+4. **purge 的共享数据边界。** `roles.json` 是 home 级文件；只要同一 home 下还有 profile 声明或启用本包，`--purge-roles` 就在任何写入前拒绝。
+5. **卸载扫描覆盖 home patch。** `$DSH_HOME/cordis.patch.yml` 与 profile patch、profile `cordis.yml` 一起扫描；home 层的内联 preset 只报告，不自动改写。未登记但残留 profile preset 不再 `skipped`。
+6. **豁免键按已安装版本。** 兼容性判定优先用已安装 manifest，豁免键用 `resolvedVersion`，仓库目标版本另列 `targetKey`；卸载提示残留授权，不自动删除。
+7. **缺失 profile patch 按空用户层。** 不再因 ENOENT 失败（DSH 的 initProfile 会创建，fatal recovery 会改名）。
+8. **退役 `inject:preset`。** 从 package.json 移除，`probe-preset.mjs --inject` 硬拒绝；自检提示改为确认 bundle 登记 + `plugin:verify` + 重启。
+
+**依据：** 本机合成 profile 实测：无归档时 `verify` 原为 `consistent/0`；split 模式缺 roles 时 install 原为 `exit 0` 且写入空文件；其它 profile 仍登记时 purge 原会删除共享 roles；home patch 引用原不被扫描；先移包后 verify 原为 `skipped`；已安装 0.0.0 / 仓库 0.0.1 时豁免键原用 0.0.1；缺 patch 原报 ENOENT；自检与文档仍教 `inject:preset`，而仓库自己的 `check-profile-wiring` 注释已指出这会把重复声明装回去。
+
+**验证边界：** `node scripts/check-lifecycle.mjs` 扩到 **250 通过 / 0 失败**，新增覆盖见 `docs/lifecycle.md` §6.1；真实 desktop profile 的 `plugin:status` / `plugin:verify` 仍为 `consistent`。这些是离线夹具与只读真机状态，不等于真实 `--apply` 写入、CLI 包安装 / 移除或重启后的运行时验收。
 
 ---

@@ -16,7 +16,7 @@
 
 ### Changed
 
-- 按 D31 将包安装与 bundle 登记留给 DSH 官方通道；仓库工具不改 `dependencies`、不执行 pnpm、不自动创建兼容豁免，仅维护本插件派生制品并报告人工步骤。当前格式的用户角色文件保持原始字节，缺失时播种空列表。
+- 按 D31 将包安装与 bundle 登记留给 DSH 官方通道；仓库工具不改 `dependencies`、不执行 pnpm、不自动创建兼容豁免，仅维护本插件派生制品并报告人工步骤。当前格式的用户角色文件保持原始字节；缺失时优先用根条目 legacy `roles` 播种，纯 split（`roleSettings`）模式拒绝播种空文件并退出 `3`。
 - 安全卸载先剥离并复读验证内联 preset，再提示移除包，避免悬空引用破坏 profile 启动；默认保留 `roles.json`，包仍登记时拒绝 `--purge-roles`。
 - 以 `package.json.version` 为插件版本唯一事实来源，按 SemVer 2.0.0 管理正式版与预发布版；manifest 与配置格式各自独立演进。
 - 版本 bump 永不自动 commit 或 tag；显式 `--apply` 才写入，使用原子替换与写后复读校验。
@@ -24,6 +24,13 @@
 
 ### Fixed
 
+- 修复 `plugin:verify` 把“没验证”当成通过的问题：runtime / peers / 生成物判据未知时状态改为 `unverified` 并退出 `1`，显式 `--allow-unknown` 才接受；CLI-managed profile 不再拿 Electron 归档版本冒充运行时，新增 `--runtime-version`。
+- 修复 split 模式（设置层只有 `roleSettings`）缺 `roles.json` 时播种空文件并返回 `0`、运行期角色全部失效的问题：拒绝空播种，`verify` 增加 `roles.definitions`；legacy 完整 `roles` 可直接播种并在同一次 install 内裁成 `roleSettings`。
+- 修复 `--purge-roles` 删除 home 级共享 `roles.json` 时只看当前 profile、会破坏其它仍登记本包 profile 的问题；现在拒绝发生在任何写入之前。
+- 修复卸载扫描漏掉 home 级 `$DSH_HOME/cordis.patch.yml` 的问题，并把未登记但残留 profile preset 的情况从 `skipped` 改为 `inconsistent`。
+- 修复兼容豁免键使用仓库版本而不是已安装版本的问题；卸载时提示 `compatibility.json` 中的残留授权，不自动删除。
+- 修复缺失 `cordis.patch.yml` 时 install/upgrade/uninstall 以 ENOENT 失败的问题：缺失按空用户层处理。
+- 退役 `inject:preset`：`probe-preset.mjs --inject` 现在硬拒绝，自检提示改为“确认 bundle 登记 + plugin:verify + 重启”，避免重新制造重复 preset 声明。
 - 修复外部 CLI 角色的回流区把**过程与工具轨迹当成正文**平铺的问题：一次性子会话的 CLI 观察席改为
   **按通道分区** —— 正文区只显示 stdout（CLI 的最终消息，流式贴底），stderr 归入默认折叠的
   「过程与诊断」（失败且用户未手动干预时自动展开并改用错误色），并把它自己上报的路由事实

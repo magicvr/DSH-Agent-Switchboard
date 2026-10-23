@@ -19,12 +19,20 @@
 // `dsh-web-app/presets/standard.patch.yml` 顶层直接就是 `- insert:`，可对照。
 //
 // 用法：
-//   node scripts/ops/probe-preset.mjs --check   只校验将要注入的内容（不写盘）
-//   node scripts/ops/probe-preset.mjs --inject  写盘（自动备份）
-import { readFileSync, writeFileSync } from 'node:fs';
+//   node scripts/ops/probe-preset.mjs --check   只校验（不写盘）
+//
+// ⚠️ `--inject` 已退役：preset 现在由 bundle（`dsh.bundle.patch`）投递，往 profile
+//    再写一份会被顶层 insert 纯追加，触发 `Duplicate agent preset` 硬抛。清理残留请用
+//    `node scripts/ops/plugin-lifecycle.mjs install --apply` / `uninstall --apply`。
+import { readFileSync } from 'node:fs';
 import { stripInjectedPreset, assertNoStrayOperations, findPresetDeclaration, pluginsWithoutName } from '../lib/preset-patch.mjs';
 import { resolvePaths, printPaths } from '../lib/paths.mjs';
 
+if (process.argv.includes('--inject')) {
+  console.error('FAIL  --inject 已退役：preset 由 bundle 投递，注入 profile 副本会造成重复声明。');
+  console.error('      请运行 node scripts/ops/plugin-lifecycle.mjs install --apply 剥离残留，然后完全重启 DSH。');
+  process.exit(1);
+}
 const paths = resolvePaths({ argv: process.argv.slice(2).filter(a => !['--check', '--inject'].includes(a)) });
 printPaths(paths);
 const PATCH = paths.patch;
@@ -93,15 +101,4 @@ if (noName.length > 0) {
 }
 console.log('PASS  每个插件行都有 name');
 
-if (process.argv.includes('--inject')) {
-  if (already) {
-    console.log('\n已存在，未重复写入。');
-  } else {
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    writeFileSync(`${PATCH}.bak-${stamp}`, readFileSync(PATCH), 'utf8');
-    writeFileSync(PATCH, next, 'utf8');
-    console.log(`\n已备份并写入 ${PATCH}`);
-  }
-} else {
-  console.log('\n未写盘（加 --inject 才写入）。');
-}
+console.log('\n未写盘：preset 由 bundle 投递，--inject 已退役；清理 profile 残留请用 plugin-lifecycle install --apply。');

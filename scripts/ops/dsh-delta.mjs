@@ -296,9 +296,9 @@ if (asJson) {
       console.log(`  另：${assetChanged.length} 个包有资产/配置变化（上方 WARN），不影响本插件加载。`);
     }
     if (standardPresetChanged) {
-      console.log('\n⚠️ 上游 `presets/standard.patch.yml` 变了 → 生成物需要重新生成：跑 `npm run check:preset`，漂移则 `npm run gen:preset`，再用 `plugin-lifecycle upgrade --apply` 重新注入并完全重启。');
+      console.log('\n⚠️ 上游 `presets/standard.patch.yml` 变了 → 生成物需要重新生成：跑 `npm run check:preset`，漂移则 `npm run gen:preset`，再用 `plugin-lifecycle upgrade --apply` 收敛（preset 由 bundle 投递，工具只剥离 profile 残留副本）并完全重启。');
     } else {
-      console.log('上游 `presets/standard.patch.yml` 未变 → 生成物无需重新生成，profile 也无需重新注入。');
+      console.log('上游 `presets/standard.patch.yml` 未变 → 生成物无需重新生成，profile 也无需改动。');
     }
   }
 }

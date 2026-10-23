@@ -1,6 +1,6 @@
 # 实施方案
 
-> **记录性质与 D29 当前实现补记：** 本文保留各阶段的历史方案、实测与待验收状态，不把历史记录视为当前验收结论。当前 preset 中本插件条目带 `mount: true` 与 `supervisorRules`，不带 `roles`；角色仍在 `$DSH_HOME/agent-switchboard/roles.json`。DSH 基线为 `0.2.1-rc.2`：preset 整体复制该版 standard，`instructions` / `readOnly` / `allowNestedDispatch` 由**每角色独立 Agent Preset** 承载（D32），`fork` 后端已移除，派发一律异步受理。调度规则文本由 `scripts/gen-preset.mjs` 生成，字段非 volatile、无默认值、UI 不可编辑；改动后须执行 `npm run gen:preset` → `npm run inject:preset` → 重启 DSH 才生效。规则注入已实现并有离线验证；生成器新增提交纪律，提交由主代理统一执行，worker 不自行提交。新增规则的生成与检查、profile 同步及真机提示词验收须分别确认，不将源码更新视为生效（见 D29）。
+> **记录性质与 D29 当前实现补记：** 本文保留各阶段的历史方案、实测与待验收状态，不把历史记录视为当前验收结论。当前 preset 中本插件条目带 `mount: true` 与 `supervisorRules`，不带 `roles`；角色仍在 `$DSH_HOME/agent-switchboard/roles.json`。DSH 基线为 `0.2.1-rc.2`：preset 整体复制该版 standard，`instructions` / `readOnly` / `allowNestedDispatch` 由**每角色独立 Agent Preset** 承载（D32），`fork` 后端已移除，派发一律异步受理。调度规则文本由 `scripts/gen-preset.mjs` 生成，字段非 volatile、无默认值、UI 不可编辑；改动后须执行 `npm run gen:preset` → 确认 bundle 登记 → 重启 DSH 才生效（preset 由 bundle 投递，`inject:preset` 已退役）。规则注入已实现并有离线验证；生成器新增提交纪律，提交由主代理统一执行，worker 不自行提交。新增规则的生成与检查、profile 同步及真机提示词验收须分别确认，不将源码更新视为生效（见 D29）。
 
 > 配套阅读：[`decisions.md`](./decisions.md)（为什么这么选）、[`architecture.md`](./architecture.md)（契约与取证）。生命周期当前支持路径与验证边界见 [`lifecycle.md`](./lifecycle.md) 及本文末尾 D31 补记；上面的底层生成 / 注入步骤保留为历史记录。
 
@@ -67,7 +67,7 @@
 │   │   ├── collapse-role-fork.mjs     实验角色分支收敛
 │   │   ├── experiment-dormant.mjs     preset 挂载实验与还原
 │   │   ├── seed-root-roles.mjs        根条目角色播种
-│   │   ├── probe-preset.mjs           preset 校验与注入
+│   │   ├── probe-preset.mjs           preset 校验（注入已退役）
 │   │   └── gen-role-config.mjs        角色配置块生成
 │   ├── probes/                  环境相关取证与实机实验（批次 2d-1 已归类）
 │   │   ├── probe-claude-isolate.mjs  Claude 隔离调用探针
@@ -271,7 +271,7 @@
 | R9 | **`failed to import` 会掩盖真实错误** | 排查方向被误导，可能浪费大量时间（Phase 1 已实际发生） | 已记录取证手法（`architecture.md` 第 3.2 节）：先用落地文件探针判定「模块是否已加载」，再查 `apply` 内部 |
 | R10 | **插件自身缺陷可能让应用起不来** | 用户进不去，只能禁用插件；而**禁用操作会重写 profile 并丢弃条目**（实测发生两次） | `apply` 整体包一层兜底 try/catch；**不注册任何 Cordis 服务**（有测试锁死）；客户端不用自建远程命名空间；`decisions.md` D14 第 5、6 条 |
 | R11 | **平台能力被「自己发明」而非「照官方实现」** | 连续三次失败、多次重启（实测发生） | 先读同构先例再动手（D14 第 8 条）；`scripts/check-profile-wiring.mjs` 之类的**显式断言**挡住「静默不存在」 |
-| R12 | 规则要求自动提交可能污染用户仓库历史 / profile 未重新 inject 导致规则漂移 | 误提交他人改动、未验证内容或会话继续使用旧规则 | 主代理统一提交，worker 不提交；核对仓库、分支与暂存归属，仅提交本次独立验收通过的范围，尊重用户禁令及只读任务；禁止敏感与临时产物，不擅自推送或改写历史。各 profile 按 gen:preset → inject:preset → 重启同步，核验主代理含新规则、子代理与未知上下文不含 |
+| R12 | 规则要求自动提交可能污染用户仓库历史 / profile 未重新 inject 导致规则漂移 | 误提交他人改动、未验证内容或会话继续使用旧规则 | 主代理统一提交，worker 不提交；核对仓库、分支与暂存归属，仅提交本次独立验收通过的范围，尊重用户禁令及只读任务；禁止敏感与临时产物，不擅自推送或改写历史。各 profile 按 gen:preset → 确认 bundle 登记 → 重启同步（不再 inject），核验主代理含新规则、子代理与未知上下文不含 |
 
 ## 与项目硬规则的对应
 
@@ -440,7 +440,7 @@
 - `node scripts/gen-preset.mjs --check`：`standard 插件数: 22`、`合计 23`、`!!js 表达式 2 → 2`、YAML 与行模板均无漂移，退出 `0`。
   > 2026-10-23 加入「自办调度台」后，同一命令输出改为 `preset 数: 2，每个 23 行` / `!!js 表达式 2 → 4`，并对 YAML 做**逐字节**比对。上面的 `合计 23` 是单 preset 时代的历史证据。
 - `npm run check`：全链退出 `0`（`check-roles` 309、`check-drivers` 130、`check-cli` 71、`check-cli-provider` 292、`check-config-*` 全部通过 / 33 / 67、`check-apply` 383、`check-validation-parity` 56、`check-client` 328、`check-profile-wiring` 13、`check-version` 107、`check-lifecycle` 213、`check-script-portability` 146，均 `0 失败`）。
-- `node scripts/check-profile-wiring.mjs`：**13 通过 / 0 失败**。运行时 `0.2.1-rc.2`；仓库 DSH 要求满足运行时；仓库 `node_modules` 23 个 `@deepseek-ai/dsh*` 全部等于运行时。（重新注入 preset 之前该项曾报 `12 通过 / 1 失败`，失败项即 profile 仍内联 `0.2.0-rc.2` 时代的旧 preset 正文。）
+- `node scripts/check-profile-wiring.mjs`：**13 通过 / 0 失败**。运行时 `0.2.1-rc.2`；仓库 DSH 要求满足运行时；仓库 `node_modules` 23 个 `@deepseek-ai/dsh*` 全部等于运行时。（历史阶段重新注入 preset 之前该项曾报 `12 通过 / 1 失败`，失败项即 profile 仍内联 `0.2.0-rc.2` 时代的旧 preset 正文。）
 
 ### 验收证据（真机，2026-10-17 完全重启后）
 

@@ -733,7 +733,7 @@ export function selftestTool(ctx, diagnostics) {
 
       const scheduling = !diagnostics.mountHere ? '（根实例不注入；请在 Switchboard preset 中自检）'
         : diagnostics.readSupervisorRules?.() ? '已配置（仅注入主代理）'
-          : '未配置（profile 可能未同步 preset：需 gen:preset → inject:preset → 重启）';
+          : '未配置（本 preset 未加载或 supervisorRules 为空：确认 dsh.profile.bundles 含本包并运行 plugin:verify，然后完全重启 DSH）';
       const format = diagnostics.roleConfigPath ? readConfigFileDetailed(diagnostics.roleConfigPath).format : null;
       // ⚠️ 嵌套派发的配置体检（D35）。四条都**必须让用户看见**：
       //    ① 仍靠旧布尔 `allowNestedDispatch: true` 生效 —— 它的语义是「除自己以外**全部**」，

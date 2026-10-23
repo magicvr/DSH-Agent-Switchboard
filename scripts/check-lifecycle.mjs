@@ -1,5 +1,5 @@
 // 离线检查：只修改 tmpdir fixture，不接触真实 DSH profile 或归档。
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync, cpSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync, cpSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -261,6 +261,8 @@ try {
   check('当前运行时不在豁免数组明确失败', collect().compatibility.runtimeExempt === false && invoke('verify').exitCode === 1);
   put(compatibilityFile, { [key]: [stubRuntime] });
   check('desktop basename 分类', collect().profile.kind === 'desktop');
+  check('Desktop 大小写不改变 desktop 分类', collectLifecycle({ ...options,
+    paths: { ...paths, profile: join(temp, 'Desktop') } }).profile.kind === 'desktop');
   check('其他 basename 分类 cli-managed', collectLifecycle({ ...options, paths: { ...paths, profile: join(temp, 'server') } }).profile.kind === 'cli-managed');
   check('模块变化完整重启是固定事实', collect().restart.requiredForModuleChange === true);
   check('完全一致 fixture verify 退出 0', invoke('verify').exitCode === 0 && collect().verification.status === 'consistent');
@@ -322,8 +324,14 @@ try {
   const before = fingerprint(temp);
   invoke('status'); invoke('verify');
   const status = cli('status'), verify = cli('verify');
-  check('status / verify CLI 退出 0 且 JSON 是单份快照', status.status === 0 && verify.status === 0
-    && JSON.parse(status.stdout).paths.sources.home === '--home' && JSON.parse(verify.stdout).verification.status === 'consistent', status.stderr + verify.stderr);
+  // CLI fixture 故意让归档不可读：status 仍应 0，但 verify 必须把 unknown 判为 unverified 而非假绿。
+  check('status / verify CLI 单份 JSON；无归档时 verify 为 unverified 且退出 1', status.status === 0 && verify.status === 1
+    && JSON.parse(status.stdout).paths.sources.home === '--home'
+    && JSON.parse(verify.stdout).verification.status === 'unverified'
+    && JSON.parse(verify.stdout).verification.unverified.length === 3, status.stderr + verify.stderr);
+  const allowedUnknown = captureSync(process.execPath, [script, 'verify', '--home', home, '--json', '--allow-unknown'], { env, cwd: REPO_ROOT });
+  check('verify --allow-unknown 显式接受未知判据并退出 0', allowedUnknown.status === 0
+    && JSON.parse(allowedUnknown.stdout).verification.status === 'unverified', allowedUnknown.stderr);
   check('零写入：所有 fixture 文件 mtimeMs 与 size 及文件集合不变', fingerprint(temp) === before);
   put(paths.patch, cleanPatch + generated);
   const drift = cli('verify');
@@ -415,7 +423,7 @@ try {
   const danglingResult = dangling.run('uninstall', ['--apply']);
   check('双引用卸载拒绝移包指令且保留用户根条目', danglingResult.exitCode === 1
     && danglingResult.output.includes(`${dangling.p.patch}:3 id=agent-switchboard`)
-    && /profile 配置中仍有包引用/.test(danglingResult.output) && /刻意不删除用户编写的内容/.test(danglingResult.output)
+    && /profile \/ home 配置中仍有包引用/.test(danglingResult.output) && /刻意不删除用户编写的内容/.test(danglingResult.output)
     && /请自行解决或移除下列条目后重新运行/.test(danglingResult.output)
     && /悬空引用/.test(danglingResult.output) && !/人工包移除步骤/.test(danglingResult.output)
     && readFileSync(dangling.p.patch, 'utf8').includes(rootReference) && !readPatch(dangling.p.patch).entries.some(row => row.id === 'preset-switchboard'), danglingResult.output);
@@ -521,7 +529,7 @@ try {
     check(`${command} 真实生成器再生成并复读 current`, applied.exitCode === 0
       && readFileSync(regenerationFile, 'utf8') === generated
       && /已写入/.test(applied.output) && /PASS  preset 再生成后复读验证/.test(applied.output), applied.output);
-    check(`${command} 再生成后重新注入并写后验证`, applied.snapshot.preset.rules.status === 'current'
+    check(`${command} 再生成后重新收敛并写后验证`, applied.snapshot.preset.rules.status === 'current'
       && !readFileSync(f.p.patch, 'utf8').includes('旧主代理调度规则') && /PASS  写后复读验证/.test(applied.output), applied.output);
     const secondBefore = fingerprint(temp), second = f.run(command, ['--apply']);
     check(`${command} 再生成后第二次 no-op`, second.exitCode === 0 && fingerprint(temp) === secondBefore
@@ -595,7 +603,8 @@ fs.writeFileSync = (...args) => {
   const versionHelp = captureSync(process.execPath, [join(REPO_ROOT, 'scripts', 'ops', 'plugin-version.mjs'), '--help'], { env });
   check('lifecycle --help 五个命令、全部参数、dry-run 和完整退出码', lifecycleHelp.status === 0
     && ['status', 'verify', 'install', 'upgrade', 'uninstall', '--apply', '--purge-roles', '--json',
-      '--home', '--profile', '--patch', '--roles-file', '--cwd', '没有 --dry-run', '0 =', '1 =', '3 =']
+      '--runtime-version', '--allow-unknown', '--home', '--profile', '--patch', '--roles-file', '--cwd',
+      '没有 --dry-run', '0 =', '1 =', '3 =']
       .every(token => lifecycleHelp.stdout.includes(token)), lifecycleHelp.stdout + lifecycleHelp.stderr);
   check('version --help 命令、参数、互斥与无备份/commit/tag', versionHelp.status === 0
     && ['show', 'bump', 'major|minor|patch|X.Y.Z', '--pre <tag>', '--finalize', '--apply', '互斥', '显式版本', '.bak', 'commit', 'tag']
@@ -668,6 +677,117 @@ fs.writeFileSync = (...args) => {
   const purged = removed.run('uninstall', ['--apply', '--purge-roles']);
   check('包已移除允许 purge 且备份原数据、验证缺失', purged.exitCode === 0 && !fs.existsSync(removed.p.roles)
     && readdirSync(dirnameFor(removed.p.roles)).some(name => name.includes('.bak-lifecycle-')) && /写后复读验证/.test(purged.output));
+  section('边界修复：split / legacy 播种 / 跨 profile purge / home patch / 缺 patch');
+  {
+    const splitPatch = `- id: agent-switchboard\n  name: ${JSON.stringify(pkg.name)}\n  config:\n    roleSettings:\n      - id: worker\n        backend: spawn\n`;
+    const f = fixture({ patch: splitPatch, roles: null });
+    const r = f.run('install', ['--apply']);
+    check('split 模式缺 roles 时拒绝播种空文件并 exit=3', r.exitCode === 3
+      && !existsSync(f.p.roles) && /人工角色定义步骤/.test(r.output)
+      && !/roles 将播种空角色列表/.test(r.output), r.output);
+    const v = f.run('verify');
+    check('split 模式缺定义时 verify 明确报 roles.definitions', v.exitCode === 1
+      && v.snapshot.verification.issues.some(i => i.code === 'roles.definitions'), v.output);
+    mkdirSync(join(f.p.roles, '..'), { recursive: true });
+    put(f.p.roles, { formatVersion: 1, roles: [{ id: 'worker', backend: 'spawn' }] });
+    const ok = f.run('install', ['--apply']);
+    check('split 模式补齐定义后 install 收敛', ok.exitCode === 0
+      && ok.snapshot.verification.status === 'consistent', ok.output);
+  }
+  {
+    const legacyPatch = `- id: agent-switchboard\n  name: ${JSON.stringify(pkg.name)}\n  config:\n    roles:\n      - id: worker\n        backend: spawn\n        model: m\n`;
+    const f = fixture({ patch: legacyPatch, roles: null });
+    const r = f.run('install', ['--apply']);
+    const rolesBody = existsSync(f.p.roles) ? JSON.parse(readFileSync(f.p.roles, 'utf8')) : null;
+    const patchBody = readFileSync(f.p.patch, 'utf8');
+    check('legacy roles 在缺文件时从设置播种并裁成 roleSettings', r.exitCode === 0
+      && rolesBody?.roles?.length === 1 && rolesBody.roles[0].id === 'worker'
+      && /^    roleSettings:/m.test(patchBody) && !/^    roles:/m.test(patchBody), r.output);
+  }
+  {
+    const f = fixture({ patch: cleanPatch, roles: null });
+    rmSync(f.p.patch);
+    const r = f.run('install', ['--apply']);
+    check('缺 profile patch 时按空用户层收敛', r.exitCode === 0 && !existsSync(f.p.patch)
+      && JSON.parse(readFileSync(f.p.roles, 'utf8')).roles.length === 0, r.output);
+    const u = f.run('uninstall', ['--apply']);
+    check('缺 profile patch 时 uninstall 不因 ENOENT 失败', u.exitCode === 3
+      && /人工包移除步骤/.test(u.output), u.output);
+  }
+  {
+    const orphan = fixture({ registration: 'none', patch: cleanPatch + generated });
+    const v = orphan.run('verify');
+    check('未登记但残留 profile preset 时 verify 不再 skipped', v.exitCode === 1
+      && v.snapshot.verification.status === 'inconsistent'
+      && v.snapshot.verification.issues.some(i => i.code === 'preset.injectedInProfile')
+      && /uninstall --apply/.test(v.snapshot.nextStep), v.output);
+  }
+  {
+    const f = fixture({ patch: cleanPatch });
+    put(join(f.home, 'cordis.patch.yml'), generated);
+    const s = f.run('status');
+    check('home patch 的注入副本被识别', s.exitCode === 0 && s.snapshot.preset.injectedInHome
+      && s.snapshot.verification.issues.some(i => i.code === 'preset.injectedInHome'));
+    const v = f.run('verify');
+    check('home patch 注入副本让 verify 非零', v.exitCode === 1, v.output);
+    const u = f.run('uninstall', ['--apply']);
+    check('home patch 的包引用阻止移包', u.exitCode === 1
+      && u.output.includes(join(f.home, 'cordis.patch.yml'))
+      && /profile \/ home 配置中仍有包引用/.test(u.output), u.output);
+  }
+  {
+    const f = fixture({ registration: 'none', patch: cleanPatch });
+    const other = join(f.home, 'profiles', 'server');
+    mkdirSync(other, { recursive: true });
+    put(join(other, 'package.json'), { dependencies: { [pkg.name]: 'link:fixture' },
+      dsh: { profile: { bundles: [pkg.name] } } });
+    const beforeRoles = readFileSync(f.p.roles);
+    const refused = f.run('uninstall', ['--purge-roles', '--apply']);
+    check('其它 profile 仍登记时 --purge-roles 拒绝且 roles 保留', refused.exitCode === 1
+      && /下列 profile 仍声明或启用本包/.test(refused.output)
+      && beforeRoles.equals(readFileSync(f.p.roles)), refused.output);
+    put(join(other, 'package.json'), {});
+    const allowed = f.run('uninstall', ['--purge-roles', '--apply']);
+    check('其它 profile 移除后 --purge-roles 允许', allowed.exitCode === 0 && !existsSync(f.p.roles), allowed.output);
+  }
+  {
+    const f = fixture({ registration: 'none', patch: cleanPatch + generated });
+    const other = join(f.home, 'profiles', 'other');
+    mkdirSync(other, { recursive: true });
+    put(join(other, 'package.json'), { dependencies: { [pkg.name]: 'link:fixture' } });
+    const beforePatch = readFileSync(f.p.patch);
+    const refused = f.run('uninstall', ['--purge-roles', '--apply']);
+    check('purge 跨 profile 拒绝发生在任何写入之前', refused.exitCode === 1
+      && beforePatch.equals(readFileSync(f.p.patch))
+      && !readdirSync(f.p.profile).some(name => name.includes('.bak-lifecycle-')), refused.output);
+  }
+  {
+    const f = fixture();
+    put(join(f.p.profile, 'node_modules', pkg.name, 'package.json'), { ...pkg, version: '0.0.0' });
+    const s = f.run('status');
+    check('豁免键按已安装版本构造并标注 manifest 来源', s.snapshot.compatibility.key === `${pkg.name}@0.0.0`
+      && s.snapshot.compatibility.targetKey === `${pkg.name}@${pkg.version}`
+      && s.snapshot.compatibility.manifestSource === 'installed', JSON.stringify(s.snapshot.compatibility));
+  }
+  {
+    const f = fixture({ registration: 'none', patch: cleanPatch });
+    put(join(f.p.profile, 'compatibility.json'), { [`${pkg.name}@${pkg.version}`]: [stubRuntime] });
+    const r = f.run('uninstall', ['--apply']);
+    check('卸载后提示 compatibility 豁免残留且不自动删除', r.exitCode === 0
+      && /兼容性豁免残留/.test(r.output) && existsSync(join(f.p.profile, 'compatibility.json')), r.output);
+  }
+  {
+    const f = fixture({ kind: 'server', patch: cleanPatch });
+    const s = f.run('status');
+    check('CLI-managed 默认不拿 Electron 归档当运行时',
+      s.snapshot.compatibility.runtime.status === 'unknown'
+        && /CLI-managed/.test(s.snapshot.compatibility.runtime.reason)
+        && s.snapshot.verification.status === 'unverified');
+    const v = f.run('verify', ['--runtime-version', stubRuntime]);
+    check('CLI-managed 显式 --runtime-version 后恢复验证', v.exitCode === 0
+      && v.snapshot.compatibility.runtime.version === stubRuntime
+      && v.snapshot.verification.status === 'consistent', v.output);
+  }
   for (const kind of ['desktop', 'server']) {
     const f = fixture({ kind });
     const result = f.run('uninstall', ['--apply']);

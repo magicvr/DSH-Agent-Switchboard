@@ -1,9 +1,9 @@
 // 生命周期只读快照；所有路径和归档读取均可注入，缺失制品不抛异常。
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, statSync, existsSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { captureSync } from './capture.mjs';
 import { resolvePaths, resolveAsar, REPO_ROOT } from './paths.mjs';
-import { readPatch, presetConfig } from './preset-patch.mjs';
+import { readPatch, presetConfig, findPatchEntry } from './preset-patch.mjs';
 import { generatePreset } from './preset-generator.mjs';
 import { CONFIG_FORMAT_VERSION, readConfigFileDetailed } from '../../src/config-file.js';
 import { parseVersion, compareVersions, formatVersion } from './version.mjs';
@@ -121,7 +121,7 @@ export function archiveReader({ env = process.env } = {}) {
 
 /** 不写任何文件；readArchive 注入时可完全离线（传 null 表示无归档）。 */
 export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repoRoot ?? REPO_ROOT,
-  env = process.env, readArchive } = {}) {
+  env = process.env, readArchive, runtimeVersion } = {}) {
   const pkg = readJson(join(repoRoot, 'package.json'));
   if (!pkg.value?.name || !pkg.value.version) throw new Error(`仓库 package.json 无效：${pkg.error ?? '缺少 name/version'}`);
   const name = pkg.value.name;
@@ -132,9 +132,9 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
     enginesDsh: engines && Object.hasOwn(engines, 'dsh') ? engines.dsh : null,
     configFormatVersion: CONFIG_FORMAT_VERSION };
   const profilePackage = readJson(join(paths.profile, 'package.json'));
-  // DSH 以 profile 目录 basename desktop 拒绝 CLI 管理；不从路径其他片段猜测。
+  // DSH 以 profile 目录 basename（大小写不敏感）desktop 拒绝 CLI 管理；不从路径其他片段猜测。
   const profile = { exists: directory(paths.profile), packageExists: profilePackage.exists,
-    name: basename(paths.profile), kind: basename(paths.profile) === 'desktop' ? 'desktop' : 'cli-managed',
+    name: basename(paths.profile), kind: basename(paths.profile).toLowerCase() === 'desktop' ? 'desktop' : 'cli-managed',
     error: profilePackage.error ?? null };
   const dependencies = profilePackage.value?.dependencies;
   const dependencyPresent = object(dependencies) && Object.hasOwn(dependencies, name);
@@ -150,16 +150,30 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
   //    app-boot 合成。profile patch 里**不应**再有注入的副本——顶层 `insert` 是纯追加、
   //    不按 id 去重，而 `dsh-agent-preset` 注册重复 id 会**硬抛**，于是那份副本既是多余的
   //    又会装载失败。历史实现把 preset 内联进 profile，这里改为以仓库那份为准，
-  //    并把「profile 里是否还留着多余注入」单列出来。
+  //    并把「profile / home 里是否还留着多余注入」单列出来。
   // 同一个文件声明两个 preset：完整分工版与自办版（不组合 worker）。
   const repoPresetPatch = readPatch(join(repoRoot, 'presets', 'switchboard.patch.yml'));
   const generated = presetConfig(repoPresetPatch, name);
   const generatedSolo = presetConfig(repoPresetPatch, name, 'preset-switchboard-solo');
   // 「profile 里没有这份声明」是**期望状态**，不是解析错误——所以按条目直接判定，
   // 而不是复用 presetConfig 的「缺少声明」错误串（那会把正常状态报成无法解析）。
-  const injectedPatch = readPatch(paths.patch);
-  const injectedPresent = injectedPatch.error === undefined
-    && injectedPatch.entries.some(row => row.id === 'preset-switchboard' || row.id === 'preset-switchboard-solo');
+  const patchPath = paths.patch;
+  const patchExists = existsSync(patchPath);
+  let profilePatchText = '';
+  if (patchExists) {
+    try { profilePatchText = readFileSync(patchPath, 'utf8'); }
+    catch { profilePatchText = ''; /* readPatch 会把不可读原因写进 injectedError */ }
+  }
+  const injectedPatch = patchExists ? readPatch(patchPath) : { entries: [] };
+  const homePatchPath = join(paths.home, 'cordis.patch.yml');
+  const homePatchExists = existsSync(homePatchPath);
+  const homePatch = homePatchExists ? readPatch(homePatchPath) : { entries: [] };
+  const presetRowIds = ['preset-switchboard', 'preset-switchboard-solo'];
+  const entriesOf = patch => Array.isArray(patch.entries) ? patch.entries : [];
+  const hasPresetRow = patch => patch.error === undefined
+    && entriesOf(patch).some(row => presetRowIds.includes(row?.id));
+  const injectedPresent = hasPresetRow(injectedPatch);
+  const homeInjectedPresent = hasPresetRow(homePatch);
   // 声明本身以仓库 preset 为准。
   const bundlePatches = pkg.value?.dsh?.bundle?.patch;
   const preset = {
@@ -175,9 +189,14 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
     bundleDeclaresPreset: Array.isArray(bundlePatches)
       && bundlePatches.some(entry => String(entry).replace(/^\.\//, '') === 'presets/switchboard.patch.yml'),
     bundleDeclaresError: pkg.error ?? null,
-    // 清理前的历史状态：profile 里还留着注入的副本（应当为 false）。
+    // 清理前的历史状态：profile / home 里还留着注入的副本（应当为 false）。
+    patchExists,
     injectedInProfile: injectedPresent,
+    injectedInHome: homeInjectedPresent,
     injectedError: injectedPatch.error ?? null,
+    homePatchPath,
+    homePatchExists,
+    homePatchError: homePatch.error ?? null,
     generatedError: generated.error ?? null, generatedDrift: unknown('尚未读取 DSH standard preset') };
   const presetSolo = {
     present: Boolean(generatedSolo.preset),
@@ -192,23 +211,45 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
     generatedError: generatedSolo.error ?? null };
   let runtime = unknown('尚未读取 Electron 安装归档');
   let archive = null;
+  let archiveError = null;
   try {
     if (readArchive === null) throw new Error('DSH 归档不可用');
     if (readArchive === undefined) { const reader = archiveReader({ env }); readArchive = reader.read; archive = { path: reader.archive, source: reader.source }; }
-  } catch (error) { readArchive = null; runtime = unknown(error.message); preset.generatedDrift = unknown(error.message); }
+  } catch (error) { readArchive = null; archiveError = error.message; preset.generatedDrift = unknown(error.message); }
+  let archiveRuntimeVersion = null;
   if (readArchive) {
     try {
-      const expected = generatePreset(readArchive('dsh/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml'), name).body;
-      const existing = readFileSync(join(repoRoot, 'presets', 'switchboard.patch.yml'));
-      preset.generatedDrift = { status: existing.equals(Buffer.from(expected)) ? 'current' : 'drifted',
-        reason: existing.equals(Buffer.from(expected)) ? null : '仓库 preset 与生成器当前产物字节不一致' };
-    } catch (error) { preset.generatedDrift = unknown(error.message); }
-    try {
-      // Electron 归档中实际启动的 dsh 包版本，不使用机器上另装的 CLI 版本。
       const runtimePackage = JSON.parse(readArchive('dsh/package.json'));
       if (!parseVersion(runtimePackage.version)) throw new Error('dsh/package.json 无有效严格 SemVer 版本');
-      runtime = { status: 'known', version: runtimePackage.version, source: 'Electron app.asar 内 dsh/package.json（安装运行时；未确认当前运行进程）' };
-    } catch (error) { runtime = unknown(error.message); }
+      archiveRuntimeVersion = runtimePackage.version;
+    } catch (error) { archiveError ??= error.message; }
+    // standard preset 只可信于 desktop；CLI-managed 只有显式版本与归档同版本时才可复用。
+    const driftTrusted = profile.kind === 'desktop'
+      || (runtimeVersion !== undefined && archiveRuntimeVersion !== null && runtimeVersion === archiveRuntimeVersion);
+    if (driftTrusted) {
+      try {
+        const expected = generatePreset(readArchive('dsh/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml'), name).body;
+        const existing = readFileSync(join(repoRoot, 'presets', 'switchboard.patch.yml'));
+        preset.generatedDrift = { status: existing.equals(Buffer.from(expected)) ? 'current' : 'drifted',
+          reason: existing.equals(Buffer.from(expected)) ? null : '仓库 preset 与生成器当前产物字节不一致' };
+      } catch (error) { preset.generatedDrift = unknown(error.message); }
+    } else {
+      preset.generatedDrift = unknown('CLI-managed profile：Electron 归档的 standard 不能代表该 CLI 的运行时；'
+        + '请用 --runtime-version 指定同版本，或手工运行 npm run gen:preset');
+    }
+  }
+  if (runtimeVersion !== undefined) {
+    runtime = parseVersion(runtimeVersion)
+      ? { status: 'known', version: runtimeVersion, source: '--runtime-version（显式提供；未确认当前运行进程）' }
+      : unknown(`--runtime-version 不是合法 SemVer：${JSON.stringify(runtimeVersion)}`);
+  } else if (profile.kind === 'cli-managed') {
+    runtime = unknown('CLI-managed profile：Electron 归档版本不是它的运行时；请用 --runtime-version <加载它的 dsh 版本>');
+  } else if (readArchive) {
+    runtime = archiveRuntimeVersion === null
+      ? unknown(archiveError ?? 'dsh/package.json 无有效严格 SemVer 版本')
+      : { status: 'known', version: archiveRuntimeVersion, source: 'Electron app.asar 内 dsh/package.json（安装运行时；未确认当前运行进程）' };
+  } else {
+    runtime = unknown(archiveError ?? 'DSH 归档不可用');
   }
   const rolesRead = readConfigFileDetailed(paths.roles);
   // 即使格式未来/不支持，仍只读报告磁盘上的角色数和 wrapper，不尝试迁移写回。
@@ -217,11 +258,28 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
   for (const [scope, value] of [['', config], ['volatile.', config?.volatile]]) {
     if (object(value)) for (const key of Object.keys(value)) if (/^wrapper/i.test(key)) wrapperKeys.push(scope + key);
   }
+  const rootRow = profilePatchText ? findPatchEntry(profilePatchText, 'agent-switchboard') : undefined;
+  const rootConfig = object(rootRow?.config) ? rootRow.config : null;
+  const settingsRolesPresent = Boolean(rootConfig && Object.hasOwn(rootConfig, 'roles'));
+  const settingsRoleSettingsPresent = Boolean(rootConfig && Object.hasOwn(rootConfig, 'roleSettings'));
+  const definitionIds = Array.isArray(config?.roles)
+    ? config.roles.map(role => role?.id).filter(id => typeof id === 'string') : [];
   const roles = { exists: !rolesRead.missing, verdict: rolesRead.missing ? 'missing' : rolesRead.format?.status ?? 'unreadable',
     format: rolesRead.format, ok: rolesRead.ok, error: rolesRead.error ?? null,
-    count: Array.isArray(config?.roles) ? config.roles.length : null, wrapperPresent: wrapperKeys.length > 0, wrapperKeys };
+    count: Array.isArray(config?.roles) ? config.roles.length : null, wrapperPresent: wrapperKeys.length > 0, wrapperKeys,
+    // 设置层的两种形态：split（roleSettings 旋钮）与 legacy（完整 roles）。
+    settingsRolesPresent,
+    settingsRoles: settingsRolesPresent && Array.isArray(rootConfig.roles) ? rootConfig.roles : null,
+    settingsRoleSettingsPresent,
+    settingsRoleSettings: settingsRoleSettingsPresent ? rootConfig.roleSettings : undefined,
+    definitionIds };
   const compat = readJson(join(paths.profile, 'compatibility.json'));
-  const key = `${name}@${repo.version}`;
+  // DSH 的兼容性门禁读取的是**已安装包**的 manifest；版本不同时不能用仓库 manifest 冒充。
+  const installedManifest = registration.resolved ? resolved.value : null;
+  const usesInstalledManifest = installedManifest !== null && installedManifest.version !== repo.version;
+  const compatibilityManifest = usesInstalledManifest ? installedManifest : pkg.value;
+  const compatibilityVersion = usesInstalledManifest ? installedManifest.version : repo.version;
+  const key = `${name}@${compatibilityVersion}`;
   const keyValid = isExactDshExemptionKey(key);
   const recordPresent = object(compat.value) && Object.hasOwn(compat.value, key);
   const values = recordPresent ? compat.value[key] : null;
@@ -230,9 +288,11 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
   const olderKeys = Object.keys(compat.value ?? {}).filter(entry => entry.startsWith(`${name}@`) && entry !== key);
   // `peers` 保存真实 gate 的最终判定：engines.dsh 存在时 peers 被完全忽略（字段名沿用既有调用方）。
   const requirements = runtime.status === 'known'
-    ? evaluateDshRequirements(runtime.version, pkg.value) : { status: 'unknown', reason: runtime.reason };
+    ? evaluateDshRequirements(runtime.version, compatibilityManifest) : { status: 'unknown', reason: runtime.reason };
   const compatibility = { runtime, fileExists: compat.exists, error: compat.exists ? compat.error ?? null : null,
     key, keyValid, exemptionPresent: recordPresent, values, olderKeys,
+    installedVersion: installedManifest?.version ?? null, targetVersion: repo.version, targetKey: `${name}@${repo.version}`,
+    manifestSource: usesInstalledManifest ? 'installed' : 'repo',
     exemption: recordPresent ? (exemptionAccepted ? 'exempt' : 'invalid') : olderKeys.length ? 'expired' : 'absent',
     runtimeExempt: runtime.status === 'known' ? exemptionAccepted && values.includes(runtime.version) : null,
     enginesDsh: repo.enginesDsh, peers: requirements };
@@ -245,15 +305,23 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
 
 export function verifyLifecycle(s) {
   const issues = [];
+  const unverified = [];
   const add = (code, reason) => issues.push({ code, reason });
+  const addUnverified = (code, reason) => unverified.push({ code, reason });
   if (!s.profile.packageExists) {
     if (s.paths.explicitTarget) add('profile.missing', `显式目标缺少 profile package.json：${s.paths.profile}`);
-    return { status: issues.length ? 'inconsistent' : 'skipped', issues };
+    return { status: issues.length ? 'inconsistent' : 'skipped', issues, unverified: [] };
   }
   if (s.profile.error) add('profile.invalid', s.profile.error);
-  // 完全未注册时无需断言插件派生制品；部分注册不得跳过。
+  // 卸载后的残留制品必须先于「未登记就跳过」检查：否则先移除包再 verify 会把
+  // 残留的 preset 副本报成 skipped，正好漏掉最需要发现的悬空配置。
+  if (s.preset.injectedError) add('preset.injectedInProfile', `profile patch 无法解析：${s.preset.injectedError}`);
+  else if (s.preset.injectedInProfile) add('preset.injectedInProfile', 'profile patch 里还留着注入的 preset 副本（与 bundle 投递的声明重复）；运行同步即可剥离');
+  if (s.preset.homePatchError) add('preset.homePatch', `home patch 无法解析：${s.preset.homePatchError}`);
+  else if (s.preset.injectedInHome) add('preset.injectedInHome', 'home patch（$DSH_HOME/cordis.patch.yml）里还留着注入的 preset 副本；工具不自动修改 home 层，请手动移除该块');
+  // 完全未注册时无需断言插件自身制品；但上面的残留检查已经执行，部分注册不得跳过。
   if (!s.profile.error && !s.registration.dependencyPresent && !s.registration.inBundles && !s.registration.resolved)
-    return { status: 'skipped', issues };
+    return { status: issues.length ? 'inconsistent' : 'skipped', issues, unverified: [] };
   if (!s.registration.dependencyPresent) add('registration.dependencies', 'dependencies 缺少插件包');
   if (!s.registration.inBundles) add('registration.bundles', s.registration.silentFailureTrap ? '静默不加载陷阱：dependencies 有本包，但 dsh.profile.bundles 缺少本包' : 'dsh.profile.bundles 缺少插件包');
   if (!s.registration.resolved) add('registration.resolution', `登记后包体无法解析：node_modules/<包名>/package.json；${s.registration.resolutionError ?? '包名或版本无效'}`);
@@ -279,11 +347,26 @@ export function verifyLifecycle(s) {
   // preset 由 bundle 投递：这两条是「声明真的会被合成」的前提。
   if (s.preset.bundleDeclaresError) add('preset.bundleDeclaration', `无法读取仓库 package.json：${s.preset.bundleDeclaresError}`);
   else if (!s.preset.bundleDeclaresPreset) add('preset.bundleDeclaration', 'package.json 的 dsh.bundle.patch 未声明 presets/switchboard.patch.yml，bundle 不会投递该 preset');
-  // 历史实现把 preset 内联进 profile；顶层 insert 不去重，重复声明会让第二个条目装载失败。
-  if (s.preset.injectedError) add('preset.injectedInProfile', `profile patch 无法解析：${s.preset.injectedError}`);
-  else if (s.preset.injectedInProfile) add('preset.injectedInProfile', 'profile patch 里还留着注入的 preset 副本（与 bundle 投递的声明重复）；运行同步即可剥离');
   if (s.preset.generatedDrift.status === 'drifted') add('preset.generatedDrift', s.preset.generatedDrift.reason);
   if (s.roles.verdict !== 'current' || !s.roles.ok) add('roles.format', `roles.json：${s.roles.verdict}；${s.roles.error ?? s.roles.format?.reason ?? '需要当前格式的角色文件'}`);
+  // split 模式：设置层只保留旋钮，定义必须住在文件里；文件缺失就是运行期错误，
+  // 不能因为「文件格式 future/missing」之外没有别的 issue 就判 consistent。
+  if (s.roles.settingsRoleSettingsPresent) {
+    if (!Array.isArray(s.roles.settingsRoleSettings)) {
+      add('roles.roleSettings', '设置层 roleSettings 必须是数组；运行时会拒绝该配置');
+    } else {
+      const requiredIds = s.roles.settingsRoleSettings.map(role => role?.id).filter(id => typeof id === 'string');
+      const missing = requiredIds.filter(id => !s.roles.definitionIds.includes(id));
+      if (s.roles.definitionIds.length === 0)
+        add('roles.definitions', '设置层已使用 roleSettings，但 roles.json 没有角色定义；preset 会话将没有可派发角色');
+      else if (missing.length > 0)
+        add('roles.definitions', `roleSettings 引用的角色在 roles.json 缺失：${missing.join(', ')}`);
+    }
+  } else if (s.roles.settingsRolesPresent) {
+    if (!Array.isArray(s.roles.settingsRoles)) add('roles.settings', '根条目 roles 必须是数组；运行时会拒绝该配置');
+    else if (s.roles.settingsRoles.length > 0 && s.roles.definitionIds.length === 0)
+      add('roles.legacy', '根条目仍用完整 roles，但 roles.json 没有定义；安装会从设置播种，重启前 preset 会话没有角色');
+  }
   if (s.compatibility.error) add('compatibility.file', s.compatibility.error);
   if (!s.compatibility.keyValid) add('compatibility.key', `当前插件版本不是规范 SemVer，DSH 会忽略该精确豁免键：${s.compatibility.key}`);
   if (s.compatibility.exemption === 'invalid') add('compatibility.exemption', '豁免值必须是精确规范 SemVer 字符串数组（范围、v 前缀、空白与畸形版本都会被 DSH 忽略）');
@@ -291,25 +374,51 @@ export function verifyLifecycle(s) {
   if (s.compatibility.exemptionPresent && s.compatibility.runtimeExempt === false) add('compatibility.runtime', '当前运行时版本不在当前插件版本豁免值中');
   if (s.compatibility.peers.status === 'incompatible' && s.compatibility.runtimeExempt !== true)
     add('compatibility.peers', s.compatibility.peers.reason);
-  return { status: issues.length ? 'inconsistent' : 'consistent', issues };
+  // 未知不是通过：这些判据没做时 status 必须是 unverified，而不是 consistent。
+  if (s.compatibility.runtime.status === 'unknown') addUnverified('compatibility.runtime', s.compatibility.runtime.reason);
+  if (s.compatibility.peers.status === 'unknown') addUnverified('compatibility.peers', s.compatibility.peers.reason);
+  if (s.preset.generatedDrift.status === 'unknown') addUnverified('preset.generatedDrift', s.preset.generatedDrift.reason);
+  const status = issues.length ? 'inconsistent' : unverified.length ? 'unverified' : 'consistent';
+  return { status, issues, unverified };
 }
 
 function nextStep(s) {
   // 供当前平台终端复制；JSON 转义会把 Windows 路径的反斜线加倍，不能用于指令。
   const quote = value => process.platform === 'win32' ? `'${String(value).replaceAll("'", "''")}'`
     : `'${String(value).replaceAll("'", "'\\''")}'`;
-  if (!s.registration.dependencyPresent || !s.registration.inBundles || !s.registration.resolved) {
+  const registered = s.registration.dependencyPresent || s.registration.inBundles || s.registration.resolved;
+  // 残留制品必须先于“未安装 → 去安装”的提示：先移包再 verify 时，安装提示会把用户
+  // 引回重复 preset，而不是清掉残留。
+  if (s.preset.injectedInHome)
+    return `home patch 里仍有 preset 副本：手动移除 ${quote(s.preset.homePatchPath)} 中的 preset-switchboard / preset-switchboard-solo 块（工具不自动修改 home 层），然后重新运行 verify。`;
+  if (s.preset.homePatchError)
+    return `home patch 无法解析：先修复 ${quote(s.preset.homePatchPath)}（或删除该层），再重新运行 verify。`;
+  if (s.preset.injectedError)
+    return `profile patch 无法解析：先修复 ${quote(s.paths.patch)}，再重新运行 verify。`;
+  if (s.preset.injectedInProfile) {
+    return registered
+      ? `profile patch 里仍有注入的 preset 副本：运行 node scripts/ops/plugin-lifecycle.mjs install --apply --home ${quote(s.paths.home)} --profile ${quote(s.paths.profile)} 剥离，然后完全重启 DSH。`
+      : `包已移除但 profile patch 里仍有 preset 副本：运行 node scripts/ops/plugin-lifecycle.mjs uninstall --apply --home ${quote(s.paths.home)} --profile ${quote(s.paths.profile)} 剥离，然后完全重启 DSH。`;
+  }
+  if (!registered) {
     const spec = `link:${s.paths.repoRoot}`;
     return s.profile.kind === 'desktop'
       ? `打开 Electron DSH → 设置 → Plugins → 安装本地目录 ${s.paths.repoRoot}；确认 dependencies 与 dsh.profile.bundles 均登记 ${s.repo.name}，完全退出并重启 DSH。`
       : `dsh plugin --profile ${quote(s.profile.name)} add ${quote(spec)}`;
   }
-  // preset 由 bundle 投递，profile 里只应**剥离**残留的注入副本。
+  // preset 由 bundle 投递，profile 里只应**剥离**残留的注入副本；home 层工具不改，必须人工处理。
   if (s.verification.issues.some(i => i.code.startsWith('preset.')))
     return `node scripts/gen-preset.mjs && node scripts/ops/plugin-lifecycle.mjs install --apply --home ${quote(s.paths.home)} --profile ${quote(s.paths.profile)} --patch ${quote(s.paths.patch)}；然后完全退出并重启 DSH。`;
+  if (s.verification.issues.some(i => i.code === 'roles.definitions' || i.code === 'roles.roleSettings'))
+    return `设置层已使用 roleSettings，但 roles.json 没有可用定义：先在 DSH → 设置 → 角色与派发保存角色定义，或把定义写入 ${quote(s.paths.roles)}；然后重新运行 install/upgrade --apply 与 verify。`;
+  if (s.verification.issues.some(i => i.code === 'roles.legacy'))
+    return `根条目仍带完整 roles：运行 node scripts/ops/plugin-lifecycle.mjs install --apply --home ${quote(s.paths.home)} --profile ${quote(s.paths.profile)} 从设置播种 roles.json，然后 verify。`;
   if (s.verification.issues.some(i => i.code.startsWith('roles.')))
     return '打开 DSH → 设置 → 角色与派发 → 保存角色配置；然后重新运行 verify。';
   if (s.verification.issues.length) return `打开 DSH → 设置 → Plugins → 检查 ${s.repo.name}@${s.repo.version} 的安装版本和兼容性提示；处理后完全退出并重启 DSH，再运行 verify。`;
-  return s.preset.generatedDrift.status === 'unknown' || s.compatibility.runtime.status === 'unknown'
-    ? '已知制品一致；补齐 DSH_ASAR 后运行 node scripts/ops/plugin-lifecycle.mjs verify（生成物/运行时仍未验证）。' : '已就绪';
+  if (s.verification.status === 'unverified') {
+    const codes = (s.verification.unverified ?? []).map(item => item.code).join(', ');
+    return `未验证：${codes}；补齐 DSH_ASAR 或用 --runtime-version 指定运行时后重新运行 verify（确认接受未知时用 --allow-unknown）。`;
+  }
+  return '已就绪';
 }

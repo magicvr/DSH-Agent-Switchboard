@@ -19,9 +19,9 @@
 //   node scripts/ops/migrate-roles-to-file.mjs --apply
 //   node scripts/ops/migrate-roles-to-file.mjs --apply --seed-from <备份文件>
 //
-// ⚠️ `--seed-from` 是必需的救援路径：`node scripts/ops/probe-preset.mjs --inject` 会用生成好的 preset
-//    文件**整块替换** profile 里的声明，因此如果先重新注入、再迁移，profile 里那份
-//    角色就已经被替换掉了。此时只能从备份里取回角色。实测踩到过这一步。
+// ⚠️ `--seed-from` 是必需的救援路径：历史脚本曾用 `probe-preset.mjs --inject` 把生成好的
+//    preset **整块替换**进 profile；如果先重新注入、再迁移，profile 里那份角色就已经被替换掉了。
+//    该注入路径现已退役（preset 由 bundle 投递），但历史备份仍是救援来源。实测踩到过这一步。
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { parse } from 'yaml';
@@ -141,7 +141,7 @@ if (!selfRow) {
 console.log(`preset 里本包 config = ${JSON.stringify(selfRow.config ?? null)}`);
 if (selfRow.config?.mount !== true) {
   console.error('FAIL  preset 里本包条目没有 mount:true —— 若移除 config，角色工具将不再挂载。');
-  console.error('      请先跑 `npm run gen:preset` 与 `npm run inject:preset`，让声明带上 mount。');
+  console.error('      请先跑 `npm run gen:preset`，并确认 package.json 的 dsh.bundle.patch 投递 presets/switchboard.patch.yml；不要再向 profile 注入副本。');
   process.exit(1);
 }
 const hasRolesInProfile = Array.isArray(selfRow.config?.roles) && selfRow.config.roles.length > 0;

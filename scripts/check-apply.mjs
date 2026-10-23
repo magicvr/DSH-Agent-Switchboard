@@ -2305,7 +2305,7 @@ section('preset 调度规则：缺失告警与生成幂等');
       text: section.text({ agent: { session: { header: {} }, options: {} } }) })) };
     check(`R11：规则 ${label} 不注入`, !assembled.sections.some(s => s.name === 'agent-switchboard:scheduling' && s.text));
     const tool = ctx.tools.get('switchboard_selftest'); const result = await tool.execute({});
-    const warning = '调度规则：未配置（profile 可能未同步 preset：需 gen:preset → inject:preset → 重启）';
+    const warning = '调度规则：未配置（本 preset 未加载或 supervisorRules 为空：确认 dsh.profile.bundles 含本包并运行 plugin:verify，然后完全重启 DSH）';
     check(`R12：规则 ${label} 有诊断与可用但告警门禁`, result.ok && result.health === '可用但告警'
       && result.warnings === warning && tool.output.render({}, result).some(b => b.text.includes(warning)));
   }

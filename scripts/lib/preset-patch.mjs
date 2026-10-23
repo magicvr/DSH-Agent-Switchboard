@@ -101,6 +101,31 @@ export function planRolesMigration(text, definitions) {
     text: [...lines.slice(0, rolesAt), ...emitted, ...lines.slice(end)].join('\n') };
 }
 
+/**
+ * 在 profile patch 中按 id 查条目，同时识别两种合法形态：
+ *   1. 顶层覆盖条目 `- id: agent-switchboard`（设置页写入的根条目通常是这种）；
+ *   2. `insert:` 操作里的新条目。
+ *
+ * ⚠️ `readPatch` 只收集 insert 行，不能拿它判断根条目配置——那会把真实 profile 的
+ *    `roleSettings` 误报成“无设置层”。这里按 patch 的应用顺序取最后一个命中。
+ *
+ * @param {string} text - patch 全文。
+ * @param {string} id - 条目 id。
+ * @returns {object|undefined} 命中的条目；无法解析或没有时返回 undefined。
+ */
+export function findPatchEntry(text, id) {
+  let doc;
+  try { doc = parse(text); } catch { return undefined; }
+  if (!Array.isArray(doc)) return undefined;
+  const rows = [];
+  for (const op of doc) {
+    if (!isObject(op)) continue;
+    if (op.id === id) rows.push(op);
+    if (Array.isArray(op.insert)) for (const row of op.insert) if (isObject(row) && row.id === id) rows.push(row);
+  }
+  return rows.at(-1);
+}
+
 // 生命周期只接受独立且带生成器标记的块；剥离仍唯一委托给历史 guard。
 // 同时比较解析后的其它操作，防止剥离误吞相邻用户配置。
 export function planInjectedPreset(original, block, { remove = false } = {}) {
@@ -199,7 +224,7 @@ export function compareRules(profileRules, repoRules) {
   let offset = 0;
   while (offset < Math.min(profileRules.length, repoRules.length) && profileRules[offset] === repoRules[offset]) offset++;
   const snippet = value => JSON.stringify(value.slice(Math.max(0, offset - 12), offset + 20));
-  return { status: 'drifted', offset, reason: `profile 已过期，需重新注入；长度（UTF-16）：profile=${profileRules.length}，生成物=${repoRules.length}；首个不同位置（从 0 起）=${offset}，附近 profile=${snippet(profileRules)}，生成物=${snippet(repoRules)}` };
+  return { status: 'drifted', offset, reason: `profile 已过期，需重新收敛（install/upgrade --apply）；长度（UTF-16）：profile=${profileRules.length}，生成物=${repoRules.length}；首个不同位置（从 0 起）=${offset}，附近 profile=${snippet(profileRules)}，生成物=${snippet(repoRules)}` };
 }
 
 

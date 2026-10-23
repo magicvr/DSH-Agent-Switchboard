@@ -1,20 +1,22 @@
 // 包管理始终由 DSH 完成；这里只收敛插件自己的派生制品。
 import { pathToFileURL } from 'node:url';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync, accessSync, constants } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync, accessSync, constants, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { resolvePaths, printPaths } from '../lib/paths.mjs';
-import { collectLifecycle } from '../lib/lifecycle.mjs';
+import { collectLifecycle, isExactDshVersion } from '../lib/lifecycle.mjs';
 import { captureSync } from '../lib/capture.mjs';
 import { planInjectedPreset, planRolesMigration, readPatch, presetConfig, pluginsWithoutName, scanPackageReferences } from '../lib/preset-patch.mjs';
 import { initialConfig, migrateConfigFileOnDisk, readConfigFileDetailed } from '../../src/config-file.js';
 
-const HELP = `用法：node scripts/ops/plugin-lifecycle.mjs <status|verify|install|upgrade|uninstall> [路径参数] [--json]
+const HELP = `用法：node scripts/ops/plugin-lifecycle.mjs <status|verify|install|upgrade|uninstall> [路径参数] [--json] [--runtime-version <semver>] [--allow-unknown]
 status：只读报告；verify：只读验证；install：安装后收敛；upgrade：升级收敛；uninstall：安全剥离后提示移除包。
 写入操作默认 dry-run（省略 --apply；没有 --dry-run flag）；只有 --apply 才写盘，包括漂移的仓库 preset 再生成。
---purge-roles：uninstall 仅包已移除后删除角色文件。--json：输出单份 JSON 快照及操作事件。
+--purge-roles：uninstall 仅包已移除、且没有其它 profile 仍登记本包时删除角色文件。--json：输出单份 JSON 快照及操作事件。
+--runtime-version：CLI-managed profile 用它指定实际加载 profile 的 dsh 版本；desktop 默认读 Electron 归档。
+--allow-unknown：verify 专用；显式接受 runtime / 生成物判据未知，否则 unknown 判为 unverified 并退出 1。
 本工具不安装依赖、不执行 pnpm、不修改包登记。
-退出码：0 = 收敛目标一致（status 正常采集、verify 跳过未安装插件或默认缺失 profile 也为 0）；1 = 失败或未修复的漂移（含 dry-run 待写入）；3 = 人工包安装/更新/移除或兼容豁免步骤待完成。
+退出码：0 = 收敛目标一致（status 正常采集、verify 跳过未安装插件或默认缺失 profile 也为 0）；1 = 失败、未修复的漂移或 verify 的未验证判据（含 dry-run 待写入）；3 = 人工包安装/更新/移除、角色定义或兼容豁免步骤待完成。
 路径参数：--home <path> / --profile <path> / --patch <path> / --roles-file <path> / --cwd <path>。
 代码升级必须完全退出并重启 DSH；reload 无法生效。`;
 
@@ -27,12 +29,20 @@ export function packageInstruction(s, remove = false) {
   if (s.profile.kind === 'desktop') return remove
     ? `Electron DSH → Plugins 页面 → 找到 ${s.repo.name} → 卸载插件（GUI 按钮名称未验证）；确认 dependencies 与 dsh.profile.bundles 均已移除。`
     : `Electron DSH → Plugins 页面 → 添加插件 → 粘贴 ${spec} → 安装 → 立即启用（GUI 文案未验证；link: 绝对路径见 docs/plan.md 历史实测）。`;
-  return `未验证（本工具未核实本机 dsh CLI/源码）：dsh plugin --profile ${quote(s.profile.name)} ${remove ? `remove ${quote(s.repo.name)}` : `add ${quote(spec)}`}`;
+  return `未实测（本机 dsh CLI 可能是更旧版本；0.2.1-rc.2 归档源码/README 支持该语法）：dsh plugin --profile ${quote(s.profile.name)} ${remove ? `remove ${quote(s.repo.name)}` : `add ${quote(spec)}`}`;
 }
 
 function exemptionInstruction(s) {
-  // 不猜测 CLI flag 或 GUI 精确文案；给出可核对的精确文件键值，但不代写豁免。
-  return `${s.profile.kind === 'desktop' ? 'Electron DSH → Plugins → 本插件 → 允许不兼容版本（按钮/流程未验证）' : 'DSH CLI 豁免子命令未验证'}；人工确认后在 ${join(s.paths.profile, 'compatibility.json')} 设置精确键 ${JSON.stringify(s.compatibility.key)} 的值为 ${JSON.stringify([s.compatibility.runtime.version])}；不自动创建豁免。`;
+  // 不猜测 GUI 精确文案；CLI 语法有 0.2.1-rc.2 归档源码依据，但本机 CLI 可能更旧，仍标未实测。
+  const key = s.compatibility.key;
+  const runtime = s.compatibility.runtime.version ?? '<runtime>';
+  const warning = '允许不兼容版本运行可能导致崩溃或数据损坏；请先判断能否重 pin / 升级插件，豁免只应作为最后手段。';
+  const manual = `人工确认后在 ${join(s.paths.profile, 'compatibility.json')} 设置精确键 ${JSON.stringify(key)} 的值为 ${JSON.stringify([runtime])}；不自动创建豁免。`;
+  if (s.profile.kind === 'desktop') {
+    return `Electron DSH → Plugins → 本插件 → 允许不兼容版本（按钮/流程未验证）；${manual}${warning}`;
+  }
+  return `未实测（本机 dsh CLI 版本可能低于 0.2.1-rc.2，源码语法）：dsh plugin --profile ${quote(s.profile.name)} `
+    + `allow-version ${quote(key)} --dsh-version ${quote(runtime)} --accept-risk；或${manual}${warning}`;
 }
 
 function writableParent(path) {
@@ -40,6 +50,42 @@ function writableParent(path) {
   while (!existsSync(parent)) parent = dirname(parent);
   accessSync(parent, constants.W_OK);
   if (existsSync(path)) accessSync(path, constants.W_OK);
+}
+
+const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+function readJson(path) {
+  try {
+    const value = JSON.parse(readFileSync(path, 'utf8'));
+    return isObject(value) ? { value } : { error: '顶层必须是对象' };
+  } catch (error) {
+    return { error: error.code === 'ENOENT' ? '文件不存在' : error.message };
+  }
+}
+
+/** 同一 home 下仍声明或启用本包的其它 profile；roles.json 是 home 级共享数据。 */
+function otherProfilesUsingPackage(home, packageName, currentProfile) {
+  const profiles = join(home, 'profiles');
+  if (!existsSync(profiles)) return [];
+  const rows = [];
+  for (const entry of readdirSync(profiles, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const dir = join(profiles, entry.name);
+    if (dir === currentProfile) continue;
+    const manifest = readJson(join(dir, 'package.json'));
+    if (!manifest.value) continue;
+    const dependency = ['dependencies', 'devDependencies', 'optionalDependencies']
+      .some(field => isObject(manifest.value[field]) && Object.hasOwn(manifest.value[field], packageName));
+    const bundle = Array.isArray(manifest.value.dsh?.profile?.bundles)
+      && manifest.value.dsh.profile.bundles.includes(packageName);
+    if (dependency || bundle) rows.push({ name: entry.name, dir, dependency, bundle });
+  }
+  return rows;
+}
+
+function purgeRefusal(rows) {
+  return `--purge-roles 被拒绝：roles.json 是 home 级共享数据，下列 profile 仍声明或启用本包：\n`
+    + `${rows.map(row => `${row.name}${row.dependency ? ' dependency' : ''}${row.bundle ? ' bundle' : ''}`).join('\n')}\n`
+    + '请先在那些 profile 中卸载，或自行确认后再删除角色文件。';
 }
 
 const snapshotBytes = path => existsSync(path) ? readFileSync(path) : null;
@@ -84,7 +130,9 @@ function converge(command, s, { apply, purge, collect, env, log }) {
       : `manifestVersion：${s.registration.resolvedManifestVersion} → ${s.repo.manifestVersion}${s.registration.resolvedManifestVersion === s.repo.manifestVersion ? '（未变）' : '（变化）'}`);
     log(`DSH peers：${s.compatibility.peers.status}；${s.compatibility.peers.reason ?? '范围接受当前运行时'}`);
   }
-  const patchOriginal = readFileSync(s.paths.patch);
+  // 缺失的 profile patch 在 DSH 中等价于空用户层（initProfile 会创建；fatal recovery 会改名备份）。
+  const patchBytes = snapshotBytes(s.paths.patch);
+  const patchOriginal = patchBytes ?? Buffer.from('[]\n');
   const original = patchOriginal.toString('utf8');
   const rolesOriginal = snapshotBytes(s.paths.roles);
   const generatedPath = join(s.paths.repoRoot, 'presets', 'switchboard.patch.yml');
@@ -118,9 +166,12 @@ function converge(command, s, { apply, purge, collect, env, log }) {
   if (command === 'uninstall') {
     rolesMigration = { ok: true, changed: false, text: next, reason: '卸载不迁移' };
   } else {
-    // 定义从文件**原文**读，不用快照的汇总字段（快照不含原始 roles）。
+    // 定义从文件**原文**读；文件缺失时允许用根条目里的 legacy roles 作为播种来源，
+    // 这样“先播种文件、再裁设置”可以在同一次 install 内完成，不依赖重启时的根实例同步。
     const rolesRead = readConfigFileDetailed(s.paths.roles);
-    const definitions = rolesRead.ok && Array.isArray(rolesRead.config?.roles) ? rolesRead.config.roles : [];
+    const fileDefinitions = rolesRead.ok && Array.isArray(rolesRead.config?.roles) ? rolesRead.config.roles : [];
+    const definitions = fileDefinitions.length > 0 ? fileDefinitions
+      : (!s.roles.exists && Array.isArray(s.roles.settingsRoles) ? s.roles.settingsRoles : []);
     const planned = planRolesMigration(next, definitions);
     if (!planned.ok) {
       // ⚠️ 拒绝是**跳过**，不是失败：闸门拦住时设置层仍是完整的 `roles`，legacy 路径照常工作。
@@ -143,7 +194,7 @@ function converge(command, s, { apply, purge, collect, env, log }) {
         writableParent(generatedPath);
         writableParent(s.paths.patch);
         if (!s.roles.exists || s.roles.verdict === 'migrated') writableParent(s.paths.roles);
-        assertUnchanged(s.paths.patch, patchOriginal);
+        assertUnchanged(s.paths.patch, patchBytes);
         assertUnchanged(s.paths.roles, rolesOriginal);
         assertUnchanged(generatedPath, generatedOriginal);
         log('再生成：node scripts/gen-preset.mjs（shell: false，文件描述符 captureSync）。');
@@ -153,7 +204,7 @@ function converge(command, s, { apply, purge, collect, env, log }) {
         if (result.error || result.status !== 0)
           throw new Error(`preset 再生成失败：${result.error?.message ?? `退出码 ${result.status}，信号 ${result.signal ?? '-'}；${result.stderr.trim() || result.stdout.trim()}`}`);
         const regenerated = readFileSync(generatedPath, 'utf8');
-        assertUnchanged(s.paths.patch, patchOriginal);
+        assertUnchanged(s.paths.patch, patchBytes);
         assertUnchanged(s.paths.roles, rolesOriginal);
         const afterGeneration = collect();
         if (regenerated === block || afterGeneration.preset.generatedDrift.status !== 'current')
@@ -166,12 +217,24 @@ function converge(command, s, { apply, purge, collect, env, log }) {
     }
   }
   const patchChanged = original !== next;
-  const seed = command !== 'uninstall' && !s.roles.exists;
+  // split 模式的定义必须已经在文件里；缺失时绝不能播种空文件，否则运行期直接报
+  // “有 roleSettings 但没有角色定义”，而工具却会以 0 退出。
+  const splitSettings = s.roles.settingsRoleSettingsPresent === true;
+  const invalidLegacyRoles = s.roles.settingsRolesPresent === true && !Array.isArray(s.roles.settingsRoles);
+  const seedRoles = Array.isArray(s.roles.settingsRoles) ? s.roles.settingsRoles : [];
+  const seed = command !== 'uninstall' && !s.roles.exists && !splitSettings && !invalidLegacyRoles;
+  const manualRoles = command !== 'uninstall' && !s.roles.exists && splitSettings;
   const migrate = command !== 'uninstall' && s.roles.verdict === 'migrated';
   const purgeRoles = command === 'uninstall' && purge && s.roles.exists;
+  // --purge-roles 删除的是 home 级共享文件：写入前先拒绝「其它 profile 仍在用」，避免先改
+  // profile patch 再报错。这样 dry-run 也不会打印“roles 将删除”。
+  if (purgeRoles) {
+    const otherProfiles = otherProfilesUsingPackage(s.paths.home, s.repo.name, s.paths.profile);
+    if (otherProfiles.length > 0) throw new Error(purgeRefusal(otherProfiles));
+  }
   // 所有结构/格式/权限预检先于任何备份、目录创建或写入。
   if (apply) {
-    assertUnchanged(s.paths.patch, patchOriginal);
+    assertUnchanged(s.paths.patch, patchBytes);
     assertUnchanged(s.paths.roles, rolesOriginal);
     if (patchChanged) writableParent(s.paths.patch);
     if (seed || migrate || purgeRoles) writableParent(s.paths.roles);
@@ -181,26 +244,40 @@ function converge(command, s, { apply, purge, collect, env, log }) {
   const parts = [willStrip ? '将剥离残留注入副本' : '', rolesMigration.changed ? '将收尾角色设置迁移' : '']
     .filter(Boolean);
   const presetPlan = parts.length > 0 ? parts.join('并') : '无需改动';
+  const rolesPlan = seed ? (seedRoles.length > 0 ? `将用设置里的 ${seedRoles.length} 个角色播种` : '将播种空角色列表')
+    : manualRoles ? '缺失但设置已是 roleSettings 形态，拒绝播种空文件'
+      : migrate ? '将迁移格式' : purgeRoles ? '将删除' : '保留原始字节';
   log(`${apply ? 'apply' : 'dry-run'}：preset ${presetPlan}`
     + `${rolesMigration.changed ? `（roles → roleSettings：${rolesMigration.knobs.length} 个角色，定义已住在文件里）` : ''}`
-    + `；roles ${seed ? '将播种空角色列表' : migrate ? '将迁移格式' : purgeRoles ? '将删除' : '保留原始字节'}。`);
-  if (patchChanged && apply) backedChange(s.paths.patch, next, log, patchOriginal);
+    + `；roles ${rolesPlan}。`);
+  if (patchChanged && apply) backedChange(s.paths.patch, next, log, patchBytes);
   if (command === 'uninstall') {
     // 强制屏障：复读确认引用已消失，才能输出包移除指令。
     if (apply || !patchChanged) {
-      const patch = readPatch(s.paths.patch);
-      if (patch.error || patch.entries.some(row => row.id === 'preset-switchboard')) throw new Error('卸载剥离后验证失败！不得移除包');
+      const patch = existsSync(s.paths.patch) ? readPatch(s.paths.patch) : { entries: [] };
+      if (patch.error || (Array.isArray(patch.entries) && patch.entries.some(row =>
+        row.id === 'preset-switchboard' || row.id === 'preset-switchboard-solo')))
+        throw new Error('卸载剥离后验证失败！不得移除包');
       const remaining = [];
-      // 只扫描移包后仍保留的 profile 配置；仓库 bundle patch 随包分发、随包移除，不会悬空。
-      const profileConfig = join(s.paths.profile, 'cordis.yml');
-      for (const path of [s.paths.patch, ...(existsSync(profileConfig) ? [profileConfig] : [])]) {
+      // 扫描移包后仍保留的用户层：profile patch、profile cordis.yml、home patch。
+      // home patch 在 profile patch 之后应用，漏掉它会把悬空引用放进更优先的层。
+      const scanned = [s.paths.patch, join(s.paths.profile, 'cordis.yml'), s.preset.homePatchPath]
+        .filter(path => existsSync(path));
+      for (const path of scanned) {
         for (const ref of scanPackageReferences(readFileSync(path, 'utf8'), s.repo.name))
           remaining.push(`${path}:${ref.line} id=${ref.id}`);
       }
-      if (remaining.length) throw new Error(`profile 配置中仍有包引用，移除包将留下悬空引用；拒绝移除指令及 --purge-roles。工具刻意不删除用户编写的内容；请自行解决或移除下列条目后重新运行：\n${remaining.join('\n')}`);
-      log('PASS  preset 剥离后复读验证；profile patch 与 cordis.yml（若存在）均无剩余包引用。');
+      if (remaining.length) throw new Error(`profile / home 配置中仍有包引用，移除包将留下悬空引用；拒绝移除指令及 --purge-roles。工具刻意不删除用户编写的内容；请自行解决或移除下列条目后重新运行：\n${remaining.join('\n')}`);
+      log('PASS  preset 剥离后复读验证；profile patch、cordis.yml 与 home patch（若存在）均无剩余包引用。');
     } else { log('未写盘：必须先 --apply 剥离并验证 preset，之后才可移除包。'); return { snapshot: s, exitCode: 1 }; }
+    // 豁免是精确版本的风险授权，卸载后不会自动失效；至少提示用户撤销。
+    const staleKeys = [s.compatibility.key, ...s.compatibility.olderKeys];
+    if (s.compatibility.exemptionPresent || s.compatibility.olderKeys.length > 0) {
+      log(`兼容性豁免残留：${staleKeys.join(', ')} 仍在 ${join(s.paths.profile, 'compatibility.json')}；`
+        + '移除包后如不再需要，请在 DSH 插件页或 dsh plugin revoke-version（版本支持时）撤销；工具不自动删除授权。');
+    }
     if (registered) { log(`人工包移除步骤：${packageInstruction(s, true)}`); return { snapshot: collect(), exitCode: 3 }; }
+    if (purgeRoles && !apply) log('未写盘：roles 文件未删除；加 --apply 才执行 --purge-roles。');
     if (purgeRoles && apply) backedChange(s.paths.roles, null, log, rolesOriginal, () => {
       const current = JSON.parse(readFileSync(join(s.paths.profile, 'package.json'), 'utf8'));
       if (!current || typeof current !== 'object' || Array.isArray(current)
@@ -210,7 +287,7 @@ function converge(command, s, { apply, purge, collect, env, log }) {
     log(s.restart.reason);
     return { snapshot: collect(), exitCode: !apply && purgeRoles ? 1 : 0 };
   }
-  if (seed && apply) backedChange(s.paths.roles, `${JSON.stringify(initialConfig(), null, 2)}\n`, log, rolesOriginal);
+  if (seed && apply) backedChange(s.paths.roles, `${JSON.stringify(initialConfig(seedRoles), null, 2)}\n`, log, rolesOriginal);
   if (migrate) {
     const result = migrateConfigFileOnDisk(s.paths.roles, { apply, expected: rolesOriginal });
     if (!result.ok) throw new Error(result.error);
@@ -220,13 +297,22 @@ function converge(command, s, { apply, purge, collect, env, log }) {
   const after = collect();
   if (apply && (seed || migrate) && (!readConfigFileDetailed(s.paths.roles).ok || after.roles.verdict !== 'current'))
     throw new Error('roles 写后格式验证失败！请从备份恢复');
+  if (manualRoles) {
+    log(`人工角色定义步骤：设置层已使用 roleSettings，但 roles.json 不存在；拒绝写入空角色列表。`
+      + `请先在 DSH → 设置 → 角色与派发保存角色定义，或把定义写入 ${s.paths.roles}，然后重新运行 install/upgrade。`);
+    log(after.restart.reason);
+    const otherIssues = after.verification.issues.filter(issue =>
+      issue.code !== 'roles.definitions' && issue.code !== 'roles.format');
+    for (const issue of otherIssues) log(`FAIL  ${issue.code}：${issue.reason}`);
+    return { snapshot: after, exitCode: otherIssues.length ? 1 : 3 };
+  }
   const needsPackageUpdate = command === 'upgrade' && after.registration.resolvedVersion !== after.repo.version;
   const needsExemption = after.compatibility.peers.status === 'incompatible' && after.compatibility.runtimeExempt !== true;
   if (needsPackageUpdate) {
     log(`安装版本 ${after.registration.resolvedVersion} 与仓库版本 ${after.repo.version} 不同；人工包更新步骤：${packageInstruction(after)}`);
   }
   if (needsExemption) {
-    log(`兼容性人工豁免步骤：${exemptionInstruction(after)}`);
+    log(`兼容性人工豁免步骤（优先重 pin / 升级插件，豁免有风险）：${exemptionInstruction(after)}`);
   }
   if (needsPackageUpdate || needsExemption) {
     log(after.restart.reason);
@@ -238,6 +324,7 @@ function converge(command, s, { apply, purge, collect, env, log }) {
   log(`${after.verification.issues.length ? '制品尚未完全同步' : '制品已同步'}；生效必须重启。`);
   log(after.restart.reason);
   for (const issue of after.verification.issues) log(`FAIL  ${issue.code}：${issue.reason}`);
+  for (const item of after.verification.unverified ?? []) log(`UNVERIFIED  ${item.code}：${item.reason}`);
   return { snapshot: after, exitCode: after.verification.issues.length ? 1 : 0 };
 }
 
@@ -246,19 +333,39 @@ export function runLifecycle({ argv = process.argv.slice(2), env = process.env, 
   const command = argv[0] ?? 'status';
   if (argv.includes('--help') || command === 'help') { log(HELP); return { exitCode: 0 }; }
   if (!['status', 'verify', 'install', 'upgrade', 'uninstall'].includes(command)) throw new Error(`未知子命令：${command}`);
-  const json = argv.slice(1).includes('--json');
-  const apply = argv.slice(1).includes('--apply'), purge = argv.slice(1).includes('--purge-roles');
+  const rest = argv.slice(1);
+  let runtimeVersion;
+  const runtimeAt = rest.indexOf('--runtime-version');
+  if (runtimeAt >= 0) {
+    const value = rest[runtimeAt + 1];
+    if (!value || value.startsWith('--')) throw new Error('--runtime-version 缺少精确 SemVer');
+    if (rest.indexOf('--runtime-version', runtimeAt + 1) >= 0) throw new Error('--runtime-version 重复');
+    if (!isExactDshVersion(value)) throw new Error(`--runtime-version 必须是精确 SemVer：${value}`);
+    runtimeVersion = value;
+    rest.splice(runtimeAt, 2);
+  }
+  const allowUnknown = rest.includes('--allow-unknown');
+  if (allowUnknown) {
+    if (command !== 'verify') throw new Error('--allow-unknown 仅适用于 verify');
+    rest.splice(rest.indexOf('--allow-unknown'), 1);
+  }
+  const json = rest.includes('--json');
+  const apply = rest.includes('--apply'), purge = rest.includes('--purge-roles');
   if ((apply && ['status', 'verify'].includes(command)) || (purge && command !== 'uninstall')) throw new Error('写入参数不适用于此命令');
-  paths ??= resolvePaths({ argv: argv.slice(1).filter(arg => !['--json', '--apply', '--purge-roles'].includes(arg)), env });
-  const snapshot = collectLifecycle({ ...collectOptions, paths, env });
+  paths ??= resolvePaths({ argv: rest.filter(arg => !['--json', '--apply', '--purge-roles'].includes(arg)), env });
+  const effectiveRuntime = runtimeVersion ?? collectOptions.runtimeVersion;
+  const options = { ...collectOptions, paths, env,
+    ...(effectiveRuntime !== undefined ? { runtimeVersion: effectiveRuntime } : {}) };
+  const snapshot = collectLifecycle(options);
   if (['install', 'upgrade', 'uninstall'].includes(command)) {
     const events = [];
     if (!json) printPaths(paths, log);
     let result;
     try { result = converge(command, snapshot, { apply, purge, env,
-      collect: () => collectLifecycle({ ...collectOptions, paths, env }), log: line => { events.push(line); if (!json) log(line); } }); }
+      collect: () => collectLifecycle(options), log: line => { events.push(line); if (!json) log(line); } }); }
     catch (error) { events.push(`FAIL  ${error.message}`); if (!json) log(events.at(-1)); result = { snapshot, exitCode: 1 }; }
-    if (json) log(JSON.stringify({ ...result.snapshot, operation: { command, apply, events, exitCode: result.exitCode } }, null, 2));
+    if (json) log(JSON.stringify({ ...result.snapshot, operation: { command, apply,
+      runtimeVersion: effectiveRuntime ?? null, allowUnknown, events, exitCode: result.exitCode } }, null, 2));
     return { ...result, events };
   }
   if (json) log(JSON.stringify(snapshot, null, 2));
@@ -270,6 +377,7 @@ export function runLifecycle({ argv = process.argv.slice(2), env = process.env, 
     section('repo', [`${s.repo.name}@${s.repo.version}；manifestVersion=${s.repo.manifestVersion}；CONFIG_FORMAT_VERSION=${s.repo.configFormatVersion}`,
       `DSH peers：${JSON.stringify(s.repo.peerDependencies)}`]);
     section('profile', [`目录存在=${s.profile.exists}；package.json 存在=${s.profile.packageExists}；kind=${s.profile.kind}`,
+      `profile patch 存在=${s.preset.patchExists}；home patch（$DSH_HOME/cordis.patch.yml）存在=${s.preset.homePatchExists}`,
       ...(s.profile.error ? [s.profile.error] : [])]);
     section('registration', [`dependencies：${s.registration.dependencySpec ?? '缺失'}`,
       `dsh.profile.bundles：${s.registration.inBundles ? '已登记' : '未登记'}`,
@@ -278,22 +386,29 @@ export function runLifecycle({ argv = process.argv.slice(2), env = process.env, 
     section('preset', [`仓库 preset 的 preset-switchboard 存在=${s.preset.present}；mount:true=${s.preset.mount}；禁止的 roles 字段=${s.preset.hasRoles}`,
       `supervisorRules：${verdict(s.preset.rules)}`, `仓库生成物：${verdict(s.preset.generatedDrift)}`,
       `bundle 投递（dsh.bundle.patch 声明 presets/switchboard.patch.yml）：${s.preset.bundleDeclaresPreset ? '已声明' : '未声明'}`,
-      `profile 里的残留注入副本：${s.preset.injectedInProfile ? '仍有（需剥离）' : '无'}`,
+      `profile 里的残留注入副本：${s.preset.injectedInProfile ? '仍有（需剥离）' : '无'}；`
+        + `home patch 里的残留注入副本：${s.preset.injectedInHome ? '仍有（需手动移除）' : '无'}`,
       `自办 preset（preset-switchboard-solo）：存在=${s.presetSolo?.present}；mount:true=${s.presetSolo?.mount}；`
         + `compositionKey=${JSON.stringify(s.presetSolo?.compositionKey)}；excludedRoles=${JSON.stringify(s.presetSolo?.excludedRoles)}；`
         + `supervisorRules=${verdict(s.presetSolo?.rules ?? { status: 'unknown' })}`]);
     section('roles', [`roles.json：${s.roles.verdict}；角色数=${s.roles.count ?? '未知'}；wrapper=${s.roles.wrapperPresent}`,
+      `设置层：roleSettings=${s.roles.settingsRoleSettingsPresent ? '有' : '无'}；完整 roles=${s.roles.settingsRolesPresent ? '有' : '无'}；`
+        + `文件定义 id=${JSON.stringify(s.roles.definitionIds)}`,
       ...(s.roles.error ? [s.roles.error] : []), ...(s.roles.wrapperKeys.length ? [`wrapper 字段：${s.roles.wrapperKeys.join(', ')}`] : [])]);
-    section('compatibility', [`Electron DSH runtime：${s.compatibility.runtime.version ?? verdict(s.compatibility.runtime)}`,
+    section('compatibility', [`运行时：${s.compatibility.runtime.version ?? verdict(s.compatibility.runtime)}`
+      + `（${s.compatibility.runtime.source ?? '来源未知'}）`,
+      `已安装版本=${s.compatibility.installedVersion ?? '不可解析'}；仓库目标版本=${s.compatibility.targetVersion}`,
       `精确豁免 ${s.compatibility.key}：${s.compatibility.exemption}；值=${JSON.stringify(s.compatibility.values)}`,
       `当前运行时在豁免值中：${s.compatibility.runtimeExempt ?? '未验证'}`,
-      `DSH peers：${verdict(s.compatibility.peers)}`]);
+      `DSH peers（${s.compatibility.manifestSource} manifest）：${verdict(s.compatibility.peers)}`]);
     section('restart', [s.restart.reason]);
     for (const issue of snapshot.verification.issues) log(`  FAIL  ${issue.code}：${issue.reason}`);
+    for (const item of snapshot.verification.unverified ?? []) log(`  UNVERIFIED  ${item.code}：${item.reason}`);
     log(`\n${snapshot.verification.status === 'skipped' ? '跳过：未安装插件或默认 profile 不存在。' : `验证：${snapshot.verification.status}`}`);
     log(`下一步：${snapshot.nextStep}`);
   }
-  return { snapshot, exitCode: command === 'verify' && snapshot.verification.issues.length ? 1 : 0 };
+  return { snapshot, exitCode: command === 'verify' && (snapshot.verification.issues.length > 0
+    || (snapshot.verification.status === 'unverified' && !allowUnknown)) ? 1 : 0 };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
