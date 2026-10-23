@@ -798,6 +798,16 @@ fs.writeFileSync = (...args) => {
       && !readdirSync(f.p.profile).some(name => name.includes('.bak-lifecycle-')), refused.output);
   }
   {
+    const f = fixture({ registration: 'none', patch: cleanPatch });
+    const other = join(f.home, 'profiles', 'broken');
+    mkdirSync(other, { recursive: true });
+    put(join(other, 'package.json'), '{bad');
+    const beforeRoles = readFileSync(f.p.roles);
+    const refused = f.run('uninstall', ['--purge-roles', '--apply']);
+    check('其它 profile 清单不可读时 purge 拒绝且 roles 保留', refused.exitCode === 1
+      && /manifest-unreadable/.test(refused.output) && beforeRoles.equals(readFileSync(f.p.roles)), refused.output);
+  }
+  {
     const f = fixture();
     put(join(f.p.profile, 'node_modules', pkg.name, 'package.json'), { ...pkg, version: '0.0.0' });
     const s = f.run('status');

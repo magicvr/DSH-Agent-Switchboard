@@ -72,7 +72,12 @@ function otherProfilesUsingPackage(home, packageName, currentProfile) {
     const dir = join(profiles, entry.name);
     if (dir === currentProfile) continue;
     const manifest = readJson(join(dir, 'package.json'));
-    if (!manifest.value) continue;
+    if (!manifest.value) {
+      // 读不懂的其它 profile 也可能仍在使用共享 roles；不能当成“没登记”而放行 purge。
+      if (manifest.error && manifest.error !== '文件不存在')
+        rows.push({ name: entry.name, dir, dependency: false, bundle: false, manifestError: true });
+      continue;
+    }
     const dependency = ['dependencies', 'devDependencies', 'optionalDependencies']
       .some(field => isObject(manifest.value[field]) && Object.hasOwn(manifest.value[field], packageName));
     const bundle = Array.isArray(manifest.value.dsh?.profile?.bundles)
@@ -84,7 +89,8 @@ function otherProfilesUsingPackage(home, packageName, currentProfile) {
 
 function purgeRefusal(rows) {
   return `--purge-roles 被拒绝：roles.json 是 home 级共享数据，下列 profile 仍声明或启用本包：\n`
-    + `${rows.map(row => `${row.name}${row.dependency ? ' dependency' : ''}${row.bundle ? ' bundle' : ''}`).join('\n')}\n`
+    + `${rows.map(row => `${row.name}${row.manifestError ? ' manifest-unreadable'
+      : `${row.dependency ? ' dependency' : ''}${row.bundle ? ' bundle' : ''}`}`).join('\n')}\n`
     + '请先在那些 profile 中卸载，或自行确认后再删除角色文件。';
 }
 
