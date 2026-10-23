@@ -563,6 +563,21 @@ try {
     const r = f.run('restore', ['--from', outside, '--apply']);
     check('restore 拒绝允许列表之外的路径', r.exitCode === 1 && /不在允许列表/.test(r.output), r.output);
   }
+  {
+    const f = fixture({ patch: cleanPatch });
+    for (let i = 0; i < 3; i++) {
+      put(f.p.patch, cleanPatch + generated + `\n# rotate ${i}\n`);
+      f.run('install', ['--apply']);
+    }
+    const countBackups = () => readdirSync(f.p.profile).filter(name => name.includes('.bak-lifecycle-')).length;
+    const before = countBackups();
+    const dry = f.run('restore', ['--prune', '--keep', '1']);
+    check('restore --prune dry-run 只报告不删除', dry.exitCode === 0 && before === countBackups()
+      && /将删除/.test(dry.output), dry.output);
+    const applied = f.run('restore', ['--prune', '--keep', '1', '--apply']);
+    check('restore --prune --apply 每个目标只保留最近 N 份', applied.exitCode === 0
+      && countBackups() === 1 && /共删除/.test(applied.output), applied.output);
+  }
   for (const command of ['install', 'upgrade', 'uninstall']) {
     const f = fixture({ patch: cleanPatch + generated });
     const changed = readFileSync(f.p.patch, 'utf8') + '# 并发编辑\n';
@@ -706,7 +721,7 @@ fs.writeFileSync = (...args) => {
   const versionHelp = captureSync(process.execPath, [join(REPO_ROOT, 'scripts', 'ops', 'plugin-version.mjs'), '--help'], { env });
   check('lifecycle --help 六个命令、全部参数、dry-run 和完整退出码', lifecycleHelp.status === 0
     && ['status', 'verify', 'install', 'upgrade', 'uninstall', 'restore', '--apply', '--purge-roles',
-      '--drop-root-entry', '--list', '--from', '--json',
+      '--drop-root-entry', '--list', '--from', '--prune', '--keep', '--json',
       '--runtime-version', '--allow-unknown', '--home', '--profile', '--patch', '--roles-file', '--cwd',
       '没有 --dry-run', '0 =', '1 =', '3 =']
       .every(token => lifecycleHelp.stdout.includes(token)), lifecycleHelp.stdout + lifecycleHelp.stderr);

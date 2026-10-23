@@ -26,6 +26,7 @@
 | `npm run plugin:upgrade -- [路径参数] [--json] [--apply]` | 同步 preset 和可迁移格式，报告 manifest 变化、DSH peers 与版本差异；保留当前格式用户文件的原始字节 |
 | `npm run plugin:uninstall -- [路径参数] [--json] [--apply] [--purge-roles] [--drop-root-entry]` | 先剥离并验证 preset，再提示移除包；默认保留角色文件；`--purge-roles` 只在没有其它 profile 仍登记本包时删除 home 级共享文件；`--drop-root-entry` 按精确 id/name 删除 profile patch 里的插件根条目 |
 | `npm run plugin:restore -- [路径参数] [--list] [--from <备份>] [--apply] [--json]` | 列出或恢复本工具生成的 `.bak-lifecycle-*` / `.bak-migrate-format-*`；只允许 profile patch、home patch、roles 文件三类目标；默认只列，`--apply` 才写，恢复前当前内容另存备份；“原文件不存在”占位备份拒绝恢复 |
+| `npm run plugin:restore -- --prune [--keep N] [--apply]` | 每个目标只保留最近 N 份（默认 5）；默认只报告待删除项，`--apply` 才删除；与 `--from` / `--list` 互斥 |
 | `npm run version:show` | 只读列出插件、manifest、配置格式、lock、CHANGELOG 与 DSH peers；检查插件版本一致性 |
 | `npm run version:bump -- <major\|minor\|patch\|X.Y.Z> [--pre <tag>\|--finalize] [--apply]` | 默认只展示计划；显式版本必须是合法 SemVer 且严格高于当前版本 |
 
@@ -47,7 +48,7 @@
 
 共享路径解析器还接受 `--cli-config <path>`，但生命周期不读取该配置，帮助文本也未列出；不要依赖它改变生命周期行为。路径参数已对照代码，合成 profile 用例验证了路径隔离，未在本轮针对真实目标逐个运行。
 
-`--json` 输出单份 JSON 快照；收敛命令附带 `operation.command`、`apply`、`dropRoot`、`runtimeVersion`、`allowUnknown`、`events` 和 `exitCode`。`status` / `verify` 不接受 `--apply`；`--purge-roles` 与 `--drop-root-entry` 仅适用于 `uninstall`；`--allow-unknown` 仅适用于 `verify`。`restore` 的 `--list` 与 `--from` 互斥，`--apply` 必须与 `--from` 同用；只接受本工具在 profile patch / home patch / roles 文件旁生成的备份，其它路径一律拒绝。
+`--json` 输出单份 JSON 快照；收敛命令附带 `operation.command`、`apply`、`dropRoot`、`runtimeVersion`、`allowUnknown`、`events` 和 `exitCode`。`status` / `verify` 不接受 `--apply`；`--purge-roles` 与 `--drop-root-entry` 仅适用于 `uninstall`；`--allow-unknown` 仅适用于 `verify`。`restore` 的 `--list` / `--from` / `--prune` 三者互斥；`--apply` 必须与 `--from` 或 `--prune` 同用；只接受本工具在 profile patch / home patch / roles 文件旁生成的备份，其它路径一律拒绝。
 
 ### 2.2 预演、写入与退出码
 
@@ -136,19 +137,19 @@
 - **有依赖却不加载：** 查看 `registration` 三项，尤其 `dsh.profile.bundles`；通过 DSH 官方通道补齐登记，不手写 package.json。
 - **归档不可用：** 设置指向可读取归档的 `DSH_ASAR` 后重跑 verify。Windows 默认安装位置由 `LOCALAPPDATA` 或用户 home 推导，非 Windows 必须显式设置。归档缺失或解析失败时生成物 / 运行时判据降级为 `unverified`，`verify` 退出 `1`；确认接受未知时显式加 `--allow-unknown`。CLI-managed profile 用 `--runtime-version` 指定实际运行时，不能用 Electron 归档冒充。
 - **改动未生效：** 完全退出并重启 DSH；preset 已同步、verify 成功或 reload 都不能证明新 JavaScript 已加载。
-- **写坏了要回退：** `npm run plugin:restore -- --list` 查看本工具生成的时间戳备份，再 `npm run plugin:restore -- --from <备份> --apply` 恢复。工具只允许恢复 profile patch、home patch、roles 文件三类目标；恢复前会把当前内容另存一份备份；“原文件不存在”占位记录不能当内容恢复。
+- **写坏了要回退：** `npm run plugin:restore -- --list` 查看本工具生成的时间戳备份，再 `npm run plugin:restore -- --from <备份> --apply` 恢复。工具只允许恢复 profile patch、home patch、roles 文件三类目标；恢复前会把当前内容另存一份备份；“原文件不存在”占位记录不能当内容恢复。备份积累后可用 `npm run plugin:restore -- --prune --keep 5 --apply` 每个目标只保留最近 5 份（默认只报告，不删除）。
 
 ## 6. 验证状态（2026-10-24）
 
 ### 6.1 离线已验证
 
-本轮边界修复后，实际运行 `node scripts/check-lifecycle.mjs`：**270 通过 / 0 失败**，`npm run check` 全链退出 `0`。新增夹具覆盖：verify 的 `unverified` / `--allow-unknown`、split 模式拒绝空播种、legacy roles 播种并裁成 `roleSettings`、缺 profile patch 的收敛、未登记但残留 preset 的 verify、home patch 注入与引用扫描、跨 profile 的 `--purge-roles` 拒绝与放行、按已安装版本构造豁免键、卸载残留豁免提示、CLI-managed 的 `--runtime-version`、`standard-plugins.json` 行模板漂移、link 安装源不指向本仓库、registry 安装源的 unverified、仓库 `node_modules` 的 dsh* 版本对齐。所有写入都在 `node:os` 的 `tmpdir()` 夹具内，不等于真实 profile 写入验收。
+本轮边界修复后，实际运行 `node scripts/check-lifecycle.mjs`：**272 通过 / 0 失败**，`npm run check` 全链退出 `0`。新增夹具覆盖：verify 的 `unverified` / `--allow-unknown`、split 模式拒绝空播种、legacy roles 播种并裁成 `roleSettings`、缺 profile patch 的收敛、未登记但残留 preset 的 verify、home patch 注入与引用扫描、跨 profile 的 `--purge-roles` 拒绝与放行、按已安装版本构造豁免键、卸载残留豁免提示、CLI-managed 的 `--runtime-version`、`standard-plugins.json` 行模板漂移、link 安装源不指向本仓库、registry 安装源的 unverified、仓库 `node_modules` 的 dsh* 版本对齐。所有写入都在 `node:os` 的 `tmpdir()` 夹具内，不等于真实 profile 写入验收。
 
 此前实施阶段记录的 `node scripts/check-lifecycle.mjs`：**144 通过 / 0 失败**；`node scripts/check-version.mjs`：**107 通过 / 0 失败**。`npm run check` 全链退出 `0`，包含 `check:lifecycle` / `check:version` 对应检查。合成 profile 验证路径隔离、零写入预演、幂等收敛、备份和写后复验、卸载顺序屏障、格式拒绝和有界兼容性范围；新增 tmpdir 仓库、ASAR 与真实生成器夹具验证再生成后重新收敛、第二次零写入、生成器失败及假成功的拒绝屏障、归档不可用降级与两个帮助入口。手工将再生成调用替换为不写文件的假成功，检查为 **137 通过 / 7 失败**；手工恢复后回到 **144 通过 / 0 失败**。这些不等于真实 profile 写入验收。
 
 `plugin:verify` 现在也检查 `presets/standard-plugins.json` 的漂移（行模板是运行期按角色裁剪工具清单的输入），并检查仓库 `node_modules/@deepseek-ai/dsh*` 的版本是否等于运行时（运行时未知时用唯一精确 pin）。`link:` 安装源不指向本仓库时直接失败；registry / 非 link 安装源判 `unverified`，不再用仓库制品冒充已安装包。YAML 解析对 `!!js` 使用只读 identity tag，不再刷 `TAG_RESOLVE_FAILED` 警告。
 
-独立 `npm run check:preset`（即 `node scripts/gen-preset.mjs --check`）比对**两个**生成物：`presets/switchboard.patch.yml` 的**逐字节**内容（含两个 preset 的名称、说明、`supervisorRules`、`compositionKey` 与 `excludedRoles`）与 `presets/standard-plugins.json` 的逐字节内容（后者是角色 preset 的行模板，供 Host 在运行期按角色裁剪）。本机实测（2026-10-23 加入自办调度台后，默认归档路径）：归档可读，输出 `standard 插件数: 22` / `preset 数: 2，每个 23 行` / `!!js 表达式 2 → 4`，两个产物均报无漂移，`--check：一致。`（退出 `0`）。同一批运行中 `node scripts/check-lifecycle.mjs` 为 **270 通过 / 0 失败**，`npm run check` 全链退出 `0`。**该检查在 `0.2.1-rc.1` 升级落地时还不在 `npm run check` 主链内**，这是上游 standard 漂移（新增 `dsh-time-context` / `dsh-tool-schedule` / `dsh-plugin-market/tools`，移除 `tool-subagent-codex` / `tool-subagent-claude-code` / `tool-ralph`）长期未被发现的原因；现已作为 `check` 链的最后一步。归档不可用时生成器失败并退出 `1`，属于「未验证」，不能读成一致。
+独立 `npm run check:preset`（即 `node scripts/gen-preset.mjs --check`）比对**两个**生成物：`presets/switchboard.patch.yml` 的**逐字节**内容（含两个 preset 的名称、说明、`supervisorRules`、`compositionKey` 与 `excludedRoles`）与 `presets/standard-plugins.json` 的逐字节内容（后者是角色 preset 的行模板，供 Host 在运行期按角色裁剪）。本机实测（2026-10-23 加入自办调度台后，默认归档路径）：归档可读，输出 `standard 插件数: 22` / `preset 数: 2，每个 23 行` / `!!js 表达式 2 → 4`，两个产物均报无漂移，`--check：一致。`（退出 `0`）。同一批运行中 `node scripts/check-lifecycle.mjs` 为 **272 通过 / 0 失败**，`npm run check` 全链退出 `0`。**该检查在 `0.2.1-rc.1` 升级落地时还不在 `npm run check` 主链内**，这是上游 standard 漂移（新增 `dsh-time-context` / `dsh-tool-schedule` / `dsh-plugin-market/tools`，移除 `tool-subagent-codex` / `tool-subagent-claude-code` / `tool-ralph`）长期未被发现的原因；现已作为 `check` 链的最后一步。归档不可用时生成器失败并退出 `1`，属于「未验证」，不能读成一致。
 
 ### 6.2 真机已验证
 

@@ -12,7 +12,7 @@ import { initialConfig, migrateConfigFileOnDisk, readConfigFileDetailed } from '
 
 const HELP = `用法：node scripts/ops/plugin-lifecycle.mjs <status|verify|install|upgrade|uninstall|restore> [路径参数] [--json] [--runtime-version <semver>] [--allow-unknown] [--drop-root-entry]
 status：只读报告；verify：只读验证；install：安装后收敛；upgrade：升级收敛；uninstall：安全剥离后提示移除包；
-restore：--list 列出/--from <备份> 恢复本工具生成的时间戳备份；默认只列，--apply 才写盘。
+restore：--list 列出/--from <备份> 恢复本工具生成的时间戳备份；--prune --keep <N> 只保留每个目标最近 N 份；默认只列，--apply 才写盘/删除。
 写入操作默认 dry-run（省略 --apply；没有 --dry-run flag）；只有 --apply 才写盘，包括漂移的仓库 preset 再生成。
 --purge-roles：uninstall 仅包已移除、且没有其它 profile 仍登记本包时删除角色文件。--json：输出单份 JSON 快照及操作事件。
 --drop-root-entry：uninstall 专用；按精确 id/name 删除 profile patch 里的插件根条目（含备份/写后复读），用于清掉移包后的悬空引用。
@@ -126,13 +126,45 @@ function listBackups(paths) {
 
 function restoreBackup({ argv, paths, apply, log }) {
   const listOnly = argv.includes('--list');
+  const prune = argv.includes('--prune');
   const fromAt = argv.indexOf('--from');
+  const keepAt = argv.indexOf('--keep');
+  let keep = 5;
+  if (keepAt >= 0) {
+    const raw = argv[keepAt + 1];
+    if (!raw || !/^[1-9][0-9]*$/.test(raw)) throw new Error('--keep 需要正整数');
+    keep = Number(raw);
+  }
+  if (!prune && keepAt >= 0) throw new Error('--keep 只能与 --prune 同用');
+  if (prune && fromAt >= 0) throw new Error('--prune 与 --from 不能同时使用');
+  if (prune && listOnly) throw new Error('--prune 与 --list 不能同时使用');
   if (listOnly && fromAt >= 0) throw new Error('--list 与 --from 不能同时使用');
-  if (apply && fromAt < 0) throw new Error('--apply 需要配合 --from <备份>');
+  if (apply && fromAt < 0 && !prune) throw new Error('--apply 需要配合 --from <备份> 或 --prune');
   if (listOnly && apply) throw new Error('--list 是只读操作，不接受 --apply');
   const rows = listBackups(paths);
   for (const row of rows)
     log(`${row.mtime}  ${String(row.size).padStart(7)}  ${row.backup} -> ${row.target}`);
+  if (prune) {
+    const groups = new Map();
+    for (const row of rows) {
+      if (!groups.has(row.target)) groups.set(row.target, []);
+      groups.get(row.target).push(row);
+    }
+    const remove = [];
+    for (const group of groups.values()) if (group.length > keep) remove.push(...group.slice(keep));
+    if (remove.length === 0) {
+      log(`没有超过保留数 ${keep} 的备份。`);
+      return { exitCode: 0, restore: { list: rows, pruned: false, keep, removed: [] } };
+    }
+    if (!apply) {
+      for (const row of remove) log(`将删除：${row.backup}`);
+      log(`未写盘：--prune 待 --apply；每个目标保留最近 ${keep} 份。`);
+      return { exitCode: 0, restore: { list: rows, pruned: false, keep, removed: remove.map(row => row.backup) } };
+    }
+    for (const row of remove) { unlinkSync(row.backup); log(`已删除：${row.backup}`); }
+    log(`PASS  prune 完成：每个目标保留最近 ${keep} 份，共删除 ${remove.length} 份。`);
+    return { exitCode: 0, restore: { list: rows, pruned: true, keep, removed: remove.map(row => row.backup) } };
+  }
   if (listOnly || fromAt < 0) {
     log(rows.length > 0 ? `共 ${rows.length} 个可恢复备份；用 --from <路径> --apply 恢复。` : '没有可恢复的备份。');
     return { exitCode: 0, restore: { list: rows, applied: false } };
@@ -458,16 +490,16 @@ export function runLifecycle({ argv = process.argv.slice(2), env = process.env, 
     rest.splice(rest.indexOf('--drop-root-entry'), 1);
   }
   if (command === 'restore' && runtimeVersion !== undefined) throw new Error('restore 不接受 --runtime-version');
-  if (command !== 'restore' && (rest.includes('--from') || rest.includes('--list')))
-    throw new Error('--from / --list 仅适用于 restore');
+  if (command !== 'restore' && ['--from', '--list', '--prune', '--keep'].some(flag => rest.includes(flag)))
+    throw new Error('--from / --list / --prune / --keep 仅适用于 restore');
   const json = rest.includes('--json');
   const apply = rest.includes('--apply'), purge = rest.includes('--purge-roles');
   if ((apply && ['status', 'verify'].includes(command)) || (purge && command !== 'uninstall')) throw new Error('写入参数不适用于此命令');
   const pathArgs = [];
   for (let index = 0; index < rest.length; index++) {
     const arg = rest[index];
-    if (['--json', '--apply', '--purge-roles', '--list'].includes(arg)) continue;
-    if (arg === '--from') { index++; continue; }
+    if (['--json', '--apply', '--purge-roles', '--list', '--prune'].includes(arg)) continue;
+    if (arg === '--from' || arg === '--keep') { index++; continue; }
     pathArgs.push(arg);
   }
   paths ??= resolvePaths({ argv: pathArgs, env });
