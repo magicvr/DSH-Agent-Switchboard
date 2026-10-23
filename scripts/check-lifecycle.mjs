@@ -8,7 +8,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { parse, stringify } from 'yaml';
 import { captureSync } from './lib/capture.mjs';
 import { REPO_ROOT, resolvePaths } from './lib/paths.mjs';
-import { collectLifecycle, satisfiesDshRange, evaluateDshPeers, evaluateDshRequirements, isExactDshVersion, isExactDshVersionList, isExactDshExemptionKey } from './lib/lifecycle.mjs';
+import { collectLifecycle, detectDshRuntime, satisfiesDshRange, evaluateDshPeers, evaluateDshRequirements, isExactDshVersion, isExactDshVersionList, isExactDshExemptionKey } from './lib/lifecycle.mjs';
 import { generatePreset, roleRowsTemplate } from './lib/preset-generator.mjs';
 import { readPatch, presetConfig, stripInjectedPreset, isOurBlockLine, assertNoStrayOperations, planInjectedPreset, planRolesMigration, scanPackageReferences } from './lib/preset-patch.mjs';
 import { runLifecycle } from './ops/plugin-lifecycle.mjs';
@@ -73,7 +73,7 @@ try {
     if (entry === 'dsh/package.json') return JSON.stringify({ version: stubRuntime });
     throw new Error(`fixture 无归档条目 ${entry}`);
   };
-  const options = { paths, repoRoot, readArchive: archive };
+  const options = { paths, repoRoot, readArchive: archive, detectCliVersion: null };
   const collect = () => collectLifecycle(options);
   const invoke = (command, extra = {}) => runLifecycle({ argv: [command], paths, collectOptions: options, log: () => {}, ...extra });
   const registered = () => put(profilePackage, { dependencies: { [pkg.name]: `link:${repoRoot}` }, dsh: { profile: { bundles: [pkg.name] } } });
@@ -438,7 +438,8 @@ try {
     const run = (command, args = [], extra = {}) => {
       const logs = [];
       const result = runLifecycle({ argv: [command, ...args], paths: p,
-        collectOptions: { repoRoot, readArchive: archive }, log: line => logs.push(line), ...extra });
+        collectOptions: { repoRoot, readArchive: archive, detectCliVersion: null },
+        log: line => logs.push(line), ...extra });
       return { ...result, output: logs.join('\n') };
     };
     return { p, home: fixtureHome, run };
@@ -624,7 +625,7 @@ try {
   cpSync(join(REPO_ROOT, 'node_modules', 'yaml'), join(regenerationRepo, 'node_modules', 'yaml'), { recursive: true });
   const regenerationFile = join(regenerationRepo, 'presets', 'switchboard.patch.yml');
   const staleGenerated = generated.replace('主代理调度规则', '旧主代理调度规则');
-  const regenerationOptions = { repoRoot: regenerationRepo, readArchive: archive };
+  const regenerationOptions = { repoRoot: regenerationRepo, readArchive: archive, detectCliVersion: null };
   const regenerationFixture = () => {
     const f = fixture({ patch: cleanPatch + staleGenerated });
     f.p.repoRoot = regenerationRepo;
@@ -936,6 +937,34 @@ fs.writeFileSync = (...args) => {
     check('CLI-managed 显式 --runtime-version 后恢复验证', v.exitCode === 0
       && v.snapshot.compatibility.runtime.version === stubRuntime
       && v.snapshot.verification.status === 'consistent', v.output);
+  }
+  {
+    const f = fixture({ kind: 'server', patch: cleanPatch });
+    const stubOptions = { repoRoot, readArchive: archive,
+      detectCliVersion: () => ({ status: 'known', version: stubRuntime, source: 'stub detector' }) };
+    const auto = f.run('status', [], { collectOptions: stubOptions });
+    check('CLI-managed 缺省 --runtime-version 时自动探测', auto.snapshot.compatibility.runtime.status === 'known'
+      && auto.snapshot.compatibility.runtime.version === stubRuntime
+      && auto.snapshot.verification.status === 'consistent', auto.output);
+    const explicit = f.run('verify', ['--runtime-version', stubRuntime], { collectOptions: {
+      ...stubOptions, detectCliVersion: () => ({ status: 'known', version: '9.9.9', source: 'wrong' }) } });
+    check('显式 --runtime-version 覆盖自动探测', explicit.exitCode === 0
+      && explicit.snapshot.compatibility.runtime.version === stubRuntime, explicit.output);
+    const missing = f.run('status', [], { collectOptions: { repoRoot, readArchive: archive,
+      detectCliVersion: () => ({ status: 'unknown', reason: 'stub no dsh' }) } });
+    check('自动探测缺失时保持 unverified 并给出原因', missing.snapshot.compatibility.runtime.status === 'unknown'
+      && /stub no dsh/.test(missing.snapshot.compatibility.runtime.reason)
+      && missing.snapshot.verification.status === 'unverified', missing.output);
+  }
+  {
+    const fakeBin = join(temp, 'fake-bin');
+    const fakePackage = join(fakeBin, 'node_modules', '@deepseek-ai', 'dsh');
+    mkdirSync(fakePackage, { recursive: true });
+    put(join(fakeBin, 'dsh.cmd'), '');
+    put(join(fakePackage, 'package.json'), { name: '@deepseek-ai/dsh', version: stubRuntime });
+    const detected = detectDshRuntime({ env: { PATH: fakeBin }, platform: 'win32' });
+    check('detectDshRuntime 只读 package.json 探测且不执行 CLI', detected.status === 'known'
+      && detected.version === stubRuntime && /未执行 CLI/.test(detected.source), JSON.stringify(detected));
   }
   for (const kind of ['desktop', 'server']) {
     const f = fixture({ kind });

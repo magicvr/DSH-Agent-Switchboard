@@ -34,6 +34,7 @@
 - `plugin:verify` 增加 `presets/standard-plugins.json` 行模板漂移、安装源（`link:` 是否指向本仓库 / registry 的 unverified）与仓库 `node_modules/@deepseek-ai/dsh*` 版本三项判据；再生成时同时复读 YAML 与行模板。
 - `!!js` 的只读 YAML 结构检查改用 identity tag，不再每次 status/verify 输出 `TAG_RESOLVE_FAILED` 警告。
 - `upgrade` 只向前：已安装版本高于仓库版本时拒绝输出包替换指令并退出 `3`，避免用旧 checkout 静默降级。
+- CLI-managed profile 的 `--runtime-version` 可缺省：工具只读探测 PATH 上 dsh 旁的 `@deepseek-ai/dsh/package.json`，不执行 CLI；显式参数优先，探测失败仍判 `unverified`。
 - `uninstall --drop-root-entry`：按精确 id/name 删除本插件顶层根条目，保留其它用户配置与 `!!js`，带备份和写后复读；默认仍不自动删除用户条目。
 - `roles → roleSettings` 收尾迁移增加字段级闸门：设置层非旋钮字段必须与文件定义一致，否则跳过迁移，避免 id 相同但 persona / CLI 契约丢失。
 - 新增 `plugin:restore` / `plugin-lifecycle restore`：列出或恢复 profile patch / home patch / roles 文件旁的备份；`--prune --keep N --apply` 每个目标只保留最近 N 份；只接受允许列表中的目标，恢复前另存当前内容，占位备份拒绝。

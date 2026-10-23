@@ -16,7 +16,7 @@ restore：--list 列出/--from <备份> 恢复本工具生成的时间戳备份�
 写入操作默认 dry-run（省略 --apply；没有 --dry-run flag）；只有 --apply 才写盘，包括漂移的仓库 preset 再生成。
 --purge-roles：uninstall 仅包已移除、且没有其它 profile 仍登记本包时删除角色文件。--json：输出单份 JSON 快照及操作事件。
 --drop-root-entry：uninstall 专用；按精确 id/name 删除 profile patch 里的插件根条目（含备份/写后复读），用于清掉移包后的悬空引用。
---runtime-version：CLI-managed profile 用它指定实际加载 profile 的 dsh 版本；desktop 默认读 Electron 归档。
+--runtime-version：CLI-managed profile 显式指定实际加载它的 dsh 版本；缺省从 PATH 上 dsh 旁的 @deepseek-ai/dsh/package.json 只读探测，显式优先。desktop 默认读 Electron 归档。
 --allow-unknown：verify 专用；显式接受 runtime / 生成物判据未知，否则 unknown 判为 unverified 并退出 1。
 本工具不安装依赖、不执行 pnpm、不修改包登记。
 退出码：0 = 收敛目标一致（status 正常采集、verify 跳过未安装插件或默认缺失 profile 也为 0）；1 = 失败、未修复的漂移或 verify 的未验证判据（含 dry-run 待写入）；3 = 人工包安装/更新/移除、角色定义或兼容豁免步骤待完成。

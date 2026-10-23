@@ -1,6 +1,6 @@
 // 生命周期只读快照；所有路径和归档读取均可注入，缺失制品不抛异常。
 import { readFileSync, statSync, existsSync, realpathSync, readdirSync } from 'node:fs';
-import { join, basename, resolve } from 'node:path';
+import { join, basename, resolve, delimiter, dirname } from 'node:path';
 import { captureSync } from './capture.mjs';
 import { resolvePaths, resolveAsar, REPO_ROOT } from './paths.mjs';
 import { readPatch, presetConfig, findPatchEntry } from './preset-patch.mjs';
@@ -76,6 +76,52 @@ export function evaluateDshPeers(version, peers) {
 }
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/**
+ * 从 PATH 自动探测 CLI-managed profile 实际使用的 dsh 版本。
+ *
+ * ⚠️ **只读文件，不执行 `dsh`**：在 PATH 目录中找到 dsh 启动器后，尝试定位它旁边的
+ * `node_modules/@deepseek-ai/dsh/package.json`（npm 全局布局），读版本号。
+ * 找不到就明确返回 unknown，让调用方提示 `--runtime-version`；绝不猜一个版本。
+ *
+ * @param {object} [options] - env / platform 可注入，便于离线测试。
+ * @returns {{status: 'known', version: string, source: string}|{status: 'unknown', reason: string}} 探测结果。
+ */
+export function detectDshRuntime({ env = process.env, platform = process.platform } = {}) {
+  const pathValue = env.PATH ?? env.Path ?? '';
+  const dirs = String(pathValue).split(delimiter).filter(Boolean);
+  const names = platform === 'win32'
+    ? ['dsh.exe', 'dsh.cmd', 'dsh.bat', 'dsh.ps1', 'dsh']
+    : ['dsh'];
+  let firstLauncher;
+  for (const dir of dirs) {
+    for (const name of names) {
+      const launcher = join(dir, name);
+      try { if (!statSync(launcher).isFile()) continue; } catch { continue; }
+      firstLauncher ??= launcher;
+      const launcherDir = dirname(launcher);
+      // npm 全局布局：<prefix>/dsh.cmd + <prefix>/node_modules/@deepseek-ai/dsh/package.json；
+      // POSIX / nvm：<prefix>/bin/dsh + <prefix>/lib/node_modules/...。
+      const candidates = [
+        join(launcherDir, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'),
+        join(launcherDir, '..', 'node_modules', '@deepseek-ai', 'dsh', 'package.json'),
+        join(launcherDir, '..', 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'package.json'),
+      ];
+      for (const manifestPath of candidates) {
+        try {
+          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+          if (parseVersion(manifest.version)) {
+            return { status: 'known', version: manifest.version,
+              source: `PATH 自动探测：${launcher} 旁的 @deepseek-ai/dsh/package.json（未执行 CLI）` };
+          }
+        } catch { /* 换下一个候选 */ }
+      }
+    }
+  }
+  if (!firstLauncher) return { status: 'unknown', reason: 'PATH 上未找到 dsh；请用 --runtime-version 指定实际加载 profile 的版本' };
+  return { status: 'unknown',
+    reason: `找到 dsh 启动器（${firstLauncher}），但无法定位 @deepseek-ai/dsh/package.json；请用 --runtime-version 指定版本` };
+}
 
 /** 仓库 node_modules 里已安装的 @deepseek-ai/dsh* 版本；离线检查 import 的正是这一份。 */
 function repoDshDependencies(repoRoot) {
@@ -153,7 +199,7 @@ export function archiveReader({ env = process.env } = {}) {
 
 /** 不写任何文件；readArchive 注入时可完全离线（传 null 表示无归档）。 */
 export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repoRoot ?? REPO_ROOT,
-  env = process.env, readArchive, runtimeVersion } = {}) {
+  env = process.env, readArchive, runtimeVersion, detectCliVersion = detectDshRuntime } = {}) {
   const pkg = readJson(join(repoRoot, 'package.json'));
   if (!pkg.value?.name || !pkg.value.version) throw new Error(`仓库 package.json 无效：${pkg.error ?? '缺少 name/version'}`);
   const name = pkg.value.name;
@@ -168,6 +214,13 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
   const profile = { exists: directory(paths.profile), packageExists: profilePackage.exists,
     name: basename(paths.profile), kind: basename(paths.profile).toLowerCase() === 'desktop' ? 'desktop' : 'cli-managed',
     error: profilePackage.error ?? null };
+  let detectedCli = null;
+  if (profile.kind === 'cli-managed' && runtimeVersion === undefined && detectCliVersion) {
+    try { detectedCli = detectCliVersion({ env, profileDir: paths.profile }); }
+    catch (error) { detectedCli = { status: 'unknown', reason: `自动探测 dsh 版本失败：${error.message}` }; }
+  }
+  const cliRuntimeVersion = runtimeVersion
+    ?? (detectedCli?.status === 'known' ? detectedCli.version : undefined);
   const dependencies = profilePackage.value?.dependencies;
   const dependencyPresent = object(dependencies) && Object.hasOwn(dependencies, name);
   const bundles = profilePackage.value?.dsh?.profile?.bundles;
@@ -268,7 +321,7 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
     } catch (error) { archiveError ??= error.message; }
     // standard preset 只可信于 desktop；CLI-managed 只有显式版本与归档同版本时才可复用。
     const driftTrusted = profile.kind === 'desktop'
-      || (runtimeVersion !== undefined && archiveRuntimeVersion !== null && runtimeVersion === archiveRuntimeVersion);
+      || (cliRuntimeVersion !== undefined && archiveRuntimeVersion !== null && cliRuntimeVersion === archiveRuntimeVersion);
     if (driftTrusted) {
       try {
         const generatedPreset = generatePreset(readArchive(STANDARD_ENTRY), name);
@@ -305,7 +358,11 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
       ? { status: 'known', version: runtimeVersion, source: '--runtime-version（显式提供；未确认当前运行进程）' }
       : unknown(`--runtime-version 不是合法 SemVer：${JSON.stringify(runtimeVersion)}`);
   } else if (profile.kind === 'cli-managed') {
-    runtime = unknown('CLI-managed profile：Electron 归档版本不是它的运行时；请用 --runtime-version <加载它的 dsh 版本>');
+    runtime = detectedCli?.status === 'known'
+      ? { status: 'known', version: detectedCli.version,
+        source: detectedCli.source ?? 'PATH 自动探测（未执行 CLI）' }
+      : unknown(detectedCli?.reason
+        ?? 'CLI-managed profile：Electron 归档版本不是它的运行时；请用 --runtime-version <加载它的 dsh 版本>');
   } else if (readArchive) {
     runtime = archiveRuntimeVersion === null
       ? unknown(archiveError ?? 'dsh/package.json 无有效严格 SemVer 版本')

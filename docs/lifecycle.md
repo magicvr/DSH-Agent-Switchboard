@@ -43,7 +43,7 @@
 | `--patch <path>` | 缺省为 profile 下 `cordis.patch.yml` |
 | `--roles-file <path>` | 缺省为 home 下 `agent-switchboard/roles.json` |
 | `--cwd <path>` | 缺省为仓库根；显示工作目录，不改变本工具的仓库根或安装 spec |
-| `--runtime-version <semver>` | CLI-managed profile 用它指定实际加载 profile 的 dsh 版本；只接受精确 SemVer。desktop 默认从 Electron 归档读取 |
+| `--runtime-version <semver>` | CLI-managed profile 显式指定实际加载它的 dsh 版本；只接受精确 SemVer。缺省时只读探测 PATH 上 dsh 旁的 `@deepseek-ai/dsh/package.json`，探测失败才判 unverified；显式值优先。desktop 默认从 Electron 归档读取 |
 | `--allow-unknown` | 仅 `verify`；显式接受 runtime / 生成物判据未知，否则 `unverified` 按失败处理 |
 
 共享路径解析器还接受 `--cli-config <path>`，但生命周期不读取该配置，帮助文本也未列出；不要依赖它改变生命周期行为。路径参数已对照代码，合成 profile 用例验证了路径隔离，未在本轮针对真实目标逐个运行。
@@ -77,7 +77,7 @@
 
 ### 3.2 首次安装：cli-managed
 
-对已存在的非 desktop profile，使用 `--profile <profile目录>` 明确选择目标，重复上述检测、预演、收敛与复验步骤；运行时判据用 `--runtime-version <加载该 profile 的 dsh 精确版本>` 指定，否则保持 `unverified`。人工包步骤候选形式为 `dsh plugin --profile <name> add <spec>`，其中 spec 为 `link:<仓库绝对路径>`：**依据 CLI 自述与 `0.2.1-rc.2` 归档源码，未实测**。`0.2.1-rc.2` 的 `reconcile` 会把**新 add** 的依赖补进 `dsh.profile.bundles`；但已存在、只是缺 bundle 登记的依赖不会被补，所以安装后仍要复核 `dependencies`、`dsh.profile.bundles` 和包体三项。
+对已存在的非 desktop profile，使用 `--profile <profile目录>` 明确选择目标，重复上述检测、预演、收敛与复验步骤。运行时优先用 `--runtime-version <加载该 profile 的 dsh 精确版本>` 显式指定；缺省时工具从 PATH 上的 dsh 启动器旁只读读取 `@deepseek-ai/dsh/package.json`，不执行 CLI。找不到 package.json 时保持 `unverified`，不会猜版本。人工包步骤候选形式为 `dsh plugin --profile <name> add <spec>`，其中 spec 为 `link:<仓库绝对路径>`：**依据 CLI 自述与 `0.2.1-rc.2` 归档源码，未实测**。`0.2.1-rc.2` 的 `reconcile` 会把**新 add** 的依赖补进 `dsh.profile.bundles`；但已存在、只是缺 bundle 登记的依赖不会被补，所以安装后仍要复核 `dependencies`、`dsh.profile.bundles` 和包体三项。
 
 **不要用 `dsh plugin --profile <name> --help` 作只读探针。** 已实测它不会短路，首次使用会初始化 profile，曾尝试写入 profile 的 `package.json.lock`。
 
@@ -85,7 +85,7 @@
 
 1. 用 `npm run version:show` 检查基线，运行 `npm run version:bump -- patch` 或选定类型预演。审阅后才使用 `--apply`（本轮真实写入未验证），再用 `version:show` 复核三个文件。
 2. 运行 `npm run plugin:upgrade`。preset 由 bundle 投递、不依赖 profile 内联副本；profile 里若还留着历史注入的副本，同步会剥离它；预演报告仓库生成物漂移及待再生成步骤，不写盘。DSH 归档可读且生成物判定为 `drifted` 时，`install` / `upgrade --apply` 自动调用既有 `scripts/gen-preset.mjs`，无需先手工生成；不要手改生成 YAML。
-3. 审阅后运行 `npm run plugin:upgrade -- --apply`（本轮真实写入未验证）。版本不匹配时按 DSH 官方通道更新包；若 `link:` 已直接解析到新版本，可能无需重装包。**upgrade 只向前**：已安装版本高于仓库版本时拒绝输出包替换指令并退出 `3`，不会用当前 checkout 静默降级。兼容性不通过时**先判断能否重 pin / 升级插件**（`npm run dsh:delta`），豁免只应作为最后手段；工具不代写，且输出会明确风险。CLI-managed profile 需用 `--runtime-version <实际加载它的 dsh 版本>`，否则运行时判据保持 unverified。反复运行升级直到制品一致，并运行 `plugin:verify`。
+3. 审阅后运行 `npm run plugin:upgrade -- --apply`（本轮真实写入未验证）。版本不匹配时按 DSH 官方通道更新包；若 `link:` 已直接解析到新版本，可能无需重装包。**upgrade 只向前**：已安装版本高于仓库版本时拒绝输出包替换指令并退出 `3`，不会用当前 checkout 静默降级。兼容性不通过时**先判断能否重 pin / 升级插件**（`npm run dsh:delta`），豁免只应作为最后手段；工具不代写，且输出会明确风险。CLI-managed profile 优先用 `--runtime-version <实际加载它的 dsh 版本>`；缺省自动只读探测 PATH 上 dsh 的 package.json，探测失败才保持 unverified。反复运行升级直到制品一致，并运行 `plugin:verify`。
 4. **版本变化或任何插件 JavaScript 变化都要完全退出并重启 DSH。** Node 模块缓存不能驱逐，reload、开关插件或再次安装不能代替进程重启。重启后再核对自检版本与格式门禁。
 
 再生成通过 `captureSync(process.execPath, [<仓库根>/scripts/gen-preset.mjs], { cwd: <仓库根>, env, ... })` 执行，使用 `shell: false` 与临时文件描述符捕获输出，避免受限 Windows 管道派生的 `EPERM`。工具逐步报告生成器输出、再生成后复读验证、剥离残留副本和写后验证。生成器非零退出或产物未改变、未达到预期 `current` 均返回 `1`，不得继续剥离/写入。归档不可用或读取失败时明确报告「未验证」及原因，提示手工回退 `npm run gen:preset`，继续同步已有且有效的制品；不能据此声称生成物已验证。`status` / `verify` 始终只报告，不再生成。
@@ -105,7 +105,7 @@
 
 `status` / `verify` 只报告，不自动迁移磁盘文件。安装和升级遇到不可安全迁移的文件，会在 preset 写入前拒绝。运行时写入门禁也已实现，但重启后的真实行为尚未验收。**已知客户端限制：** `future` / `unsupported` 被硬拒绝时，GUI 设置页可能仍提示保存已接受；文件实际未写入，Host diagnostics 报告错误并把插件标为不健康，客户端尚未接入该错误展示。
 
-兼容性判定只评估 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` peers，镜像 DSH 门禁，不把 `engines.*` 当作已执行约束。范围判断仅支持完整精确版本、`~`、`^`，采用包含预发布版本的边界比较；其它语法给出 `unknown` / `unsupported-range`，不猜测。运行时来源按 profile 类型区分：desktop 读 Electron 安装归档的 `dsh/package.json`；CLI-managed profile 必须用 `--runtime-version <加载它的 dsh 版本>`（否则保持 `unverified`，不拿 Electron 版本冒充）。任何来源都**不证明当前进程已运行该版本**。兼容性判定优先使用**已安装包**的 manifest；只有已安装版本与仓库版本一致时才用仓库 manifest。
+兼容性判定只评估 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` peers，镜像 DSH 门禁，不把 `engines.*` 当作已执行约束。范围判断仅支持完整精确版本、`~`、`^`，采用包含预发布版本的边界比较；其它语法给出 `unknown` / `unsupported-range`，不猜测。运行时来源按 profile 类型区分：desktop 读 Electron 安装归档的 `dsh/package.json`；CLI-managed profile 优先用 `--runtime-version <加载它的 dsh 版本>`，缺省时从 PATH 上的 dsh 启动器旁只读读取 `@deepseek-ai/dsh/package.json`（**不执行 dsh**），两者都没有才保持 `unverified`，不拿 Electron 版本冒充。任何来源都**不证明当前进程已运行该版本**。兼容性判定优先使用**已安装包**的 manifest；只有已安装版本与仓库版本一致时才用仓库 manifest。
 
 > ⚠️ **两侧语义必须分清（`0.2.1-rc.1` 已核实）：** DSH 自己的门禁（`dsh-app-boot.unmetRequirements()`）是「manifest 声明了 `engines.dsh`（字符串）则**它单独决定并忽略全部 peers**，否则逐条校验 DSH peers」。本仓库工具与 `check-profile-wiring.mjs` 复刻的是**后一条分支**，因为本插件的 `package.json` **刻意不写 `engines.dsh`**——peer 精确 pin 是唯一真源，写了会静默覆盖 peers。旧说法「`engines.*` 不被当作已执行约束」只对 `0.2.0-rc.2` 成立（那个版本从不读 `engines`）。**当前本插件四个 dsh peers 精确 pin 到 `0.2.1-rc.2`，每次 DSH 升级都必须手工重 pin**：范围会让仓库 `node_modules` 解析到与运行时不同的构建，离线检查按错误接口版本通过（见 D32）。
 
@@ -143,13 +143,13 @@
 
 ### 6.1 离线已验证
 
-本轮边界修复后，实际运行 `node scripts/check-lifecycle.mjs`：**272 通过 / 0 失败**，`npm run check` 全链退出 `0`。新增夹具覆盖：verify 的 `unverified` / `--allow-unknown`、split 模式拒绝空播种、legacy roles 播种并裁成 `roleSettings`、缺 profile patch 的收敛、未登记但残留 preset 的 verify、home patch 注入与引用扫描、跨 profile 的 `--purge-roles` 拒绝与放行、按已安装版本构造豁免键、卸载残留豁免提示、CLI-managed 的 `--runtime-version`、`standard-plugins.json` 行模板漂移、link 安装源不指向本仓库、registry 安装源的 unverified、仓库 `node_modules` 的 dsh* 版本对齐。所有写入都在 `node:os` 的 `tmpdir()` 夹具内，不等于真实 profile 写入验收。
+本轮边界修复后，实际运行 `node scripts/check-lifecycle.mjs`：**276 通过 / 0 失败**，`npm run check` 全链退出 `0`。新增夹具覆盖：verify 的 `unverified` / `--allow-unknown`、split 模式拒绝空播种、legacy roles 播种并裁成 `roleSettings`、缺 profile patch 的收敛、未登记但残留 preset 的 verify、home patch 注入与引用扫描、跨 profile 的 `--purge-roles` 拒绝与放行、按已安装版本构造豁免键、卸载残留豁免提示、CLI-managed 的 `--runtime-version`、`standard-plugins.json` 行模板漂移、link 安装源不指向本仓库、registry 安装源的 unverified、仓库 `node_modules` 的 dsh* 版本对齐。所有写入都在 `node:os` 的 `tmpdir()` 夹具内，不等于真实 profile 写入验收。
 
 此前实施阶段记录的 `node scripts/check-lifecycle.mjs`：**144 通过 / 0 失败**；`node scripts/check-version.mjs`：**107 通过 / 0 失败**。`npm run check` 全链退出 `0`，包含 `check:lifecycle` / `check:version` 对应检查。合成 profile 验证路径隔离、零写入预演、幂等收敛、备份和写后复验、卸载顺序屏障、格式拒绝和有界兼容性范围；新增 tmpdir 仓库、ASAR 与真实生成器夹具验证再生成后重新收敛、第二次零写入、生成器失败及假成功的拒绝屏障、归档不可用降级与两个帮助入口。手工将再生成调用替换为不写文件的假成功，检查为 **137 通过 / 7 失败**；手工恢复后回到 **144 通过 / 0 失败**。这些不等于真实 profile 写入验收。
 
 `plugin:verify` 现在也检查 `presets/standard-plugins.json` 的漂移（行模板是运行期按角色裁剪工具清单的输入），并检查仓库 `node_modules/@deepseek-ai/dsh*` 的版本是否等于运行时（运行时未知时用唯一精确 pin）。`link:` 安装源不指向本仓库时直接失败；registry / 非 link 安装源判 `unverified`，不再用仓库制品冒充已安装包。YAML 解析对 `!!js` 使用只读 identity tag，不再刷 `TAG_RESOLVE_FAILED` 警告。
 
-独立 `npm run check:preset`（即 `node scripts/gen-preset.mjs --check`）比对**两个**生成物：`presets/switchboard.patch.yml` 的**逐字节**内容（含两个 preset 的名称、说明、`supervisorRules`、`compositionKey` 与 `excludedRoles`）与 `presets/standard-plugins.json` 的逐字节内容（后者是角色 preset 的行模板，供 Host 在运行期按角色裁剪）。本机实测（2026-10-23 加入自办调度台后，默认归档路径）：归档可读，输出 `standard 插件数: 22` / `preset 数: 2，每个 23 行` / `!!js 表达式 2 → 4`，两个产物均报无漂移，`--check：一致。`（退出 `0`）。同一批运行中 `node scripts/check-lifecycle.mjs` 为 **272 通过 / 0 失败**，`npm run check` 全链退出 `0`。**该检查在 `0.2.1-rc.1` 升级落地时还不在 `npm run check` 主链内**，这是上游 standard 漂移（新增 `dsh-time-context` / `dsh-tool-schedule` / `dsh-plugin-market/tools`，移除 `tool-subagent-codex` / `tool-subagent-claude-code` / `tool-ralph`）长期未被发现的原因；现已作为 `check` 链的最后一步。归档不可用时生成器失败并退出 `1`，属于「未验证」，不能读成一致。
+独立 `npm run check:preset`（即 `node scripts/gen-preset.mjs --check`）比对**两个**生成物：`presets/switchboard.patch.yml` 的**逐字节**内容（含两个 preset 的名称、说明、`supervisorRules`、`compositionKey` 与 `excludedRoles`）与 `presets/standard-plugins.json` 的逐字节内容（后者是角色 preset 的行模板，供 Host 在运行期按角色裁剪）。本机实测（2026-10-23 加入自办调度台后，默认归档路径）：归档可读，输出 `standard 插件数: 22` / `preset 数: 2，每个 23 行` / `!!js 表达式 2 → 4`，两个产物均报无漂移，`--check：一致。`（退出 `0`）。同一批运行中 `node scripts/check-lifecycle.mjs` 为 **276 通过 / 0 失败**，`npm run check` 全链退出 `0`。**该检查在 `0.2.1-rc.1` 升级落地时还不在 `npm run check` 主链内**，这是上游 standard 漂移（新增 `dsh-time-context` / `dsh-tool-schedule` / `dsh-plugin-market/tools`，移除 `tool-subagent-codex` / `tool-subagent-claude-code` / `tool-ralph`）长期未被发现的原因；现已作为 `check` 链的最后一步。归档不可用时生成器失败并退出 `1`，属于「未验证」，不能读成一致。
 
 ### 6.2 真机已验证
 
