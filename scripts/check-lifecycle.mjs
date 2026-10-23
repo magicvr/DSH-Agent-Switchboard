@@ -533,6 +533,36 @@ try {
     check('根条目 name 不匹配时拒绝删除', r.exitCode === 1
       && /不等于本包/.test(r.output) && before.equals(readFileSync(f.p.patch)), r.output);
   }
+  section('restore：列出与恢复本工具备份');
+  {
+    const f = fixture({ patch: cleanPatch + generated });
+    f.run('install', ['--apply']);
+    const rows = f.run('restore').restore.list;
+    const patchRow = rows.find(row => row.target === f.p.patch);
+    check('restore 列出 profile patch 备份', Boolean(patchRow));
+    const before = readFileSync(f.p.patch);
+    const dry = f.run('restore', ['--from', patchRow.backup]);
+    check('restore dry-run 零写入', dry.exitCode === 0 && before.equals(readFileSync(f.p.patch)), dry.output);
+    const restored = f.run('restore', ['--from', patchRow.backup, '--apply']);
+    check('restore --apply 恢复备份并保留恢复前备份', restored.exitCode === 0
+      && readFileSync(f.p.patch, 'utf8').includes('id: preset-switchboard')
+      && readdirSync(f.p.profile).filter(name => name.includes('.bak-lifecycle-')).length >= 2, restored.output);
+  }
+  {
+    const f = fixture({ patch: cleanPatch, roles: null });
+    f.run('install', ['--apply']);
+    const roleRow = f.run('restore').restore.list.find(row => row.target === f.p.roles);
+    const r = f.run('restore', ['--from', roleRow.backup, '--apply']);
+    check('restore 拒绝“原文件不存在”占位备份', r.exitCode === 1
+      && /原文件不存在/.test(r.output) && existsSync(f.p.roles), r.output);
+  }
+  {
+    const f = fixture({ patch: cleanPatch });
+    const outside = join(temp, 'outside-backup');
+    put(outside, 'x');
+    const r = f.run('restore', ['--from', outside, '--apply']);
+    check('restore 拒绝允许列表之外的路径', r.exitCode === 1 && /不在允许列表/.test(r.output), r.output);
+  }
   for (const command of ['install', 'upgrade', 'uninstall']) {
     const f = fixture({ patch: cleanPatch + generated });
     const changed = readFileSync(f.p.patch, 'utf8') + '# 并发编辑\n';
@@ -674,8 +704,9 @@ fs.writeFileSync = (...args) => {
   section('帮助入口');
   const lifecycleHelp = captureSync(process.execPath, [script, '--help'], { env });
   const versionHelp = captureSync(process.execPath, [join(REPO_ROOT, 'scripts', 'ops', 'plugin-version.mjs'), '--help'], { env });
-  check('lifecycle --help 五个命令、全部参数、dry-run 和完整退出码', lifecycleHelp.status === 0
-    && ['status', 'verify', 'install', 'upgrade', 'uninstall', '--apply', '--purge-roles', '--drop-root-entry', '--json',
+  check('lifecycle --help 六个命令、全部参数、dry-run 和完整退出码', lifecycleHelp.status === 0
+    && ['status', 'verify', 'install', 'upgrade', 'uninstall', 'restore', '--apply', '--purge-roles',
+      '--drop-root-entry', '--list', '--from', '--json',
       '--runtime-version', '--allow-unknown', '--home', '--profile', '--patch', '--roles-file', '--cwd',
       '没有 --dry-run', '0 =', '1 =', '3 =']
       .every(token => lifecycleHelp.stdout.includes(token)), lifecycleHelp.stdout + lifecycleHelp.stderr);

@@ -1,7 +1,7 @@
 // 包管理始终由 DSH 完成；这里只收敛插件自己的派生制品。
 import { pathToFileURL } from 'node:url';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync, accessSync, constants, readdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync, accessSync, constants, readdirSync, statSync } from 'node:fs';
+import { join, dirname, basename, resolve } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { resolvePaths, printPaths } from '../lib/paths.mjs';
 import { collectLifecycle, isExactDshVersion } from '../lib/lifecycle.mjs';
@@ -10,8 +10,9 @@ import { captureSync } from '../lib/capture.mjs';
 import { planInjectedPreset, planRolesMigration, readPatch, presetConfig, pluginsWithoutName, scanPackageReferences, stripRootEntry } from '../lib/preset-patch.mjs';
 import { initialConfig, migrateConfigFileOnDisk, readConfigFileDetailed } from '../../src/config-file.js';
 
-const HELP = `用法：node scripts/ops/plugin-lifecycle.mjs <status|verify|install|upgrade|uninstall> [路径参数] [--json] [--runtime-version <semver>] [--allow-unknown] [--drop-root-entry]
-status：只读报告；verify：只读验证；install：安装后收敛；upgrade：升级收敛；uninstall：安全剥离后提示移除包。
+const HELP = `用法：node scripts/ops/plugin-lifecycle.mjs <status|verify|install|upgrade|uninstall|restore> [路径参数] [--json] [--runtime-version <semver>] [--allow-unknown] [--drop-root-entry]
+status：只读报告；verify：只读验证；install：安装后收敛；upgrade：升级收敛；uninstall：安全剥离后提示移除包；
+restore：--list 列出/--from <备份> 恢复本工具生成的时间戳备份；默认只列，--apply 才写盘。
 写入操作默认 dry-run（省略 --apply；没有 --dry-run flag）；只有 --apply 才写盘，包括漂移的仓库 preset 再生成。
 --purge-roles：uninstall 仅包已移除、且没有其它 profile 仍登记本包时删除角色文件。--json：输出单份 JSON 快照及操作事件。
 --drop-root-entry：uninstall 专用；按精确 id/name 删除 profile patch 里的插件根条目（含备份/写后复读），用于清掉移包后的悬空引用。
@@ -94,6 +95,64 @@ function purgeRefusal(rows) {
     + `${rows.map(row => `${row.name}${row.manifestError ? ' manifest-unreadable'
       : `${row.dependency ? ' dependency' : ''}${row.bundle ? ' bundle' : ''}`}`).join('\n')}\n`
     + '请先在那些 profile 中卸载，或自行确认后再删除角色文件。';
+}
+
+/** 本工具允许恢复的备份集合：profile patch、home patch、roles 文件。 */
+function backupTargets(paths) {
+  return [
+    { target: paths.patch, prefixes: ['.bak-lifecycle-'] },
+    { target: join(paths.home, 'cordis.patch.yml'), prefixes: ['.bak-lifecycle-'] },
+    { target: paths.roles, prefixes: ['.bak-lifecycle-', '.bak-migrate-format-'] },
+  ];
+}
+
+function listBackups(paths) {
+  const rows = [];
+  for (const { target, prefixes } of backupTargets(paths)) {
+    const dir = dirname(target), base = basename(target);
+    if (!existsSync(dir)) continue;
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith(`${base}.bak-`)) continue;
+      if (!prefixes.some(prefix => name.includes(prefix))) continue;
+      const backup = join(dir, name);
+      try {
+        const stat = statSync(backup);
+        rows.push({ backup, target, size: stat.size, mtime: stat.mtime.toISOString() });
+      } catch { /* 列不出就跳过，不阻断其它备份 */ }
+    }
+  }
+  return rows.sort((left, right) => right.mtime.localeCompare(left.mtime));
+}
+
+function restoreBackup({ argv, paths, apply, log }) {
+  const listOnly = argv.includes('--list');
+  const fromAt = argv.indexOf('--from');
+  if (listOnly && fromAt >= 0) throw new Error('--list 与 --from 不能同时使用');
+  if (apply && fromAt < 0) throw new Error('--apply 需要配合 --from <备份>');
+  if (listOnly && apply) throw new Error('--list 是只读操作，不接受 --apply');
+  const rows = listBackups(paths);
+  for (const row of rows)
+    log(`${row.mtime}  ${String(row.size).padStart(7)}  ${row.backup} -> ${row.target}`);
+  if (listOnly || fromAt < 0) {
+    log(rows.length > 0 ? `共 ${rows.length} 个可恢复备份；用 --from <路径> --apply 恢复。` : '没有可恢复的备份。');
+    return { exitCode: 0, restore: { list: rows, applied: false } };
+  }
+  const value = argv[fromAt + 1];
+  if (!value || value.startsWith('--')) throw new Error('--from 缺少备份路径');
+  if (argv.indexOf('--from', fromAt + 1) >= 0) throw new Error('--from 重复');
+  const backup = resolve(value);
+  const hit = rows.find(row => row.backup === backup);
+  if (!hit) throw new Error(`拒绝恢复不在允许列表中的文件：${backup}`);
+  const bytes = readFileSync(backup);
+  if (bytes.toString('utf8').startsWith('原文件不存在；'))
+    throw new Error('该备份是“原文件不存在”记录，不能当内容恢复；请直接删除目标文件');
+  if (!apply) {
+    log(`未写盘：将恢复 ${hit.target} <- ${hit.backup}；加 --apply 才写入。`);
+    return { exitCode: 0, restore: { list: rows, applied: false, target: hit.target, backup: hit.backup } };
+  }
+  backedChange(hit.target, bytes, log, snapshotBytes(hit.target));
+  log(`PASS  已恢复 ${hit.target}（恢复前当前内容已另存备份）`);
+  return { exitCode: 0, restore: { list: rows, applied: true, target: hit.target, backup: hit.backup } };
 }
 
 const snapshotBytes = path => existsSync(path) ? readFileSync(path) : null;
@@ -376,7 +435,7 @@ export function runLifecycle({ argv = process.argv.slice(2), env = process.env, 
   collectOptions = {}, log = console.log } = {}) {
   const command = argv[0] ?? 'status';
   if (argv.includes('--help') || command === 'help') { log(HELP); return { exitCode: 0 }; }
-  if (!['status', 'verify', 'install', 'upgrade', 'uninstall'].includes(command)) throw new Error(`未知子命令：${command}`);
+  if (!['status', 'verify', 'install', 'upgrade', 'uninstall', 'restore'].includes(command)) throw new Error(`未知子命令：${command}`);
   const rest = argv.slice(1);
   let runtimeVersion;
   const runtimeAt = rest.indexOf('--runtime-version');
@@ -398,10 +457,31 @@ export function runLifecycle({ argv = process.argv.slice(2), env = process.env, 
     if (command !== 'uninstall') throw new Error('--drop-root-entry 仅适用于 uninstall');
     rest.splice(rest.indexOf('--drop-root-entry'), 1);
   }
+  if (command === 'restore' && runtimeVersion !== undefined) throw new Error('restore 不接受 --runtime-version');
+  if (command !== 'restore' && (rest.includes('--from') || rest.includes('--list')))
+    throw new Error('--from / --list 仅适用于 restore');
   const json = rest.includes('--json');
   const apply = rest.includes('--apply'), purge = rest.includes('--purge-roles');
   if ((apply && ['status', 'verify'].includes(command)) || (purge && command !== 'uninstall')) throw new Error('写入参数不适用于此命令');
-  paths ??= resolvePaths({ argv: rest.filter(arg => !['--json', '--apply', '--purge-roles'].includes(arg)), env });
+  const pathArgs = [];
+  for (let index = 0; index < rest.length; index++) {
+    const arg = rest[index];
+    if (['--json', '--apply', '--purge-roles', '--list'].includes(arg)) continue;
+    if (arg === '--from') { index++; continue; }
+    pathArgs.push(arg);
+  }
+  paths ??= resolvePaths({ argv: pathArgs, env });
+  if (command === 'restore') {
+    try {
+      const result = restoreBackup({ argv: rest, paths, apply, log });
+      if (json) log(JSON.stringify({ paths, restore: result.restore }, null, 2));
+      return result;
+    } catch (error) {
+      if (!json) log(`FAIL  ${error.message}`);
+      else log(JSON.stringify({ paths, restore: { error: error.message, applied: false } }, null, 2));
+      return { exitCode: 1, restore: { error: error.message, applied: false } };
+    }
+  }
   const effectiveRuntime = runtimeVersion ?? collectOptions.runtimeVersion;
   const options = { ...collectOptions, paths, env,
     ...(effectiveRuntime !== undefined ? { runtimeVersion: effectiveRuntime } : {}) };
