@@ -91,10 +91,18 @@ function converge(command, s, { apply, purge, collect, env, log }) {
   const generatedOriginal = command === 'uninstall' ? null : readFileSync(generatedPath);
   let block = generatedOriginal?.toString('utf8') ?? '';
   if (command !== 'uninstall') {
-    const generated = presetConfig(readPatch(join(s.paths.repoRoot, 'presets', 'switchboard.patch.yml')), s.repo.name);
-    if (generated.error || generated.config?.mount !== true || Object.hasOwn(generated.config ?? {}, 'roles')
-      || typeof generated.config?.supervisorRules !== 'string' || !generated.config.supervisorRules.trim()
-      || pluginsWithoutName(generated.preset.config.plugins).length) throw new Error('仓库 preset 无效，拒绝同步');
+    const repoPresetPatch = readPatch(join(s.paths.repoRoot, 'presets', 'switchboard.patch.yml'));
+    const generated = presetConfig(repoPresetPatch, s.repo.name);
+    const generatedSolo = presetConfig(repoPresetPatch, s.repo.name, 'preset-switchboard-solo');
+    for (const preset of [generated, generatedSolo]) {
+      if (preset.error || preset.config?.mount !== true || Object.hasOwn(preset.config ?? {}, 'roles')
+        || typeof preset.config?.supervisorRules !== 'string' || !preset.config.supervisorRules.trim()
+        || pluginsWithoutName(preset.preset.config.plugins).length) throw new Error('仓库 preset 无效，拒绝同步');
+    }
+    if (!Array.isArray(generatedSolo.config?.excludedRoles)
+      || !generatedSolo.config.excludedRoles.includes('worker')
+      || generatedSolo.config?.compositionKey === 'switchboard')
+      throw new Error('仓库自办 preset 的组合键/排除角色无效，拒绝同步');
     if (s.roles.exists && !s.roles.ok) throw new Error(`roles.json 不可安全迁移：${s.roles.error}`);
   }
   // ⚠️ preset 由 **bundle**（`dsh.bundle.patch`）投递，profile 里不再内联副本：
@@ -270,7 +278,10 @@ export function runLifecycle({ argv = process.argv.slice(2), env = process.env, 
     section('preset', [`仓库 preset 的 preset-switchboard 存在=${s.preset.present}；mount:true=${s.preset.mount}；禁止的 roles 字段=${s.preset.hasRoles}`,
       `supervisorRules：${verdict(s.preset.rules)}`, `仓库生成物：${verdict(s.preset.generatedDrift)}`,
       `bundle 投递（dsh.bundle.patch 声明 presets/switchboard.patch.yml）：${s.preset.bundleDeclaresPreset ? '已声明' : '未声明'}`,
-      `profile 里的残留注入副本：${s.preset.injectedInProfile ? '仍有（需剥离）' : '无'}`]);
+      `profile 里的残留注入副本：${s.preset.injectedInProfile ? '仍有（需剥离）' : '无'}`,
+      `自办 preset（preset-switchboard-solo）：存在=${s.presetSolo?.present}；mount:true=${s.presetSolo?.mount}；`
+        + `compositionKey=${JSON.stringify(s.presetSolo?.compositionKey)}；excludedRoles=${JSON.stringify(s.presetSolo?.excludedRoles)}；`
+        + `supervisorRules=${verdict(s.presetSolo?.rules ?? { status: 'unknown' })}`]);
     section('roles', [`roles.json：${s.roles.verdict}；角色数=${s.roles.count ?? '未知'}；wrapper=${s.roles.wrapperPresent}`,
       ...(s.roles.error ? [s.roles.error] : []), ...(s.roles.wrapperKeys.length ? [`wrapper 字段：${s.roles.wrapperKeys.join(', ')}`] : [])]);
     section('compatibility', [`Electron DSH runtime：${s.compatibility.runtime.version ?? verdict(s.compatibility.runtime)}`,

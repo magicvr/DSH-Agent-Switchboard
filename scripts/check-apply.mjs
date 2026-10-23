@@ -23,8 +23,14 @@ import { captureSync } from './lib/capture.mjs';
 import { configPathFor, initialConfig, readConfigFile, writeConfigFile } from '../src/config-file.js';
 
 const presetSource = readFileSync(new URL('../presets/switchboard.patch.yml', import.meta.url), 'utf8');
-const presetEntry = parse(presetSource, { customTags: [{ tag: 'tag:yaml.org,2002:js', resolve: value => value }] })[0].insert[0].config.plugins.find(p => p.id === 'switchboard-roles');
+const presetDocument = parse(presetSource, { customTags: [{ tag: 'tag:yaml.org,2002:js', resolve: value => value }] });
+const presetRows = presetDocument[0].insert;
+const selfRowOf = id => presetRows.find(row => row.config?.id === id)?.config.plugins
+  .find(plugin => plugin.id === 'switchboard-roles');
+const presetEntry = selfRowOf('switchboard');
+const soloPresetEntry = selfRowOf('switchboard-solo');
 const supervisorRules = presetEntry?.config?.supervisorRules;
+const soloSupervisorRules = soloPresetEntry?.config?.supervisorRules;
 const fixtureHome = mkdtempSync(join(tmpdir(), 'switchboard-check-apply-'));
 const previousDshHome = process.env.DSH_HOME;
 const fixtureRole = { id: 'fixture', description: '离线测试角色', instructions: '只用于测试', model: 'test-model' };
@@ -80,6 +86,11 @@ function makePresetService() {
   return {
     definitions,
     register(definition) {
+      // 与真实注册表一致：重复 id 硬抛。两个 Switchboard preset 因此必须使用
+      // 不同的角色 preset 命名空间（compositionKey）。
+      if (definitions.some(item => item.id === definition.id)) {
+        return Promise.reject(new Error(`Duplicate agent preset: ${definition.id}`));
+      }
       definitions.push(definition);
       return Promise.resolve(() => {
         const index = definitions.indexOf(definition);
@@ -496,6 +507,33 @@ section('Config：mount 字段与内置 roles 字段是否冲突');
   check('带角色的旧配置可解析', d !== undefined);
 }
 
+section('两个 preset：中文名称/说明与自办版的差异');
+{
+  check('仓库声明恰好两个 preset', presetRows.length === 2
+    && presetRows.some(row => row.id === 'preset-switchboard')
+    && presetRows.some(row => row.id === 'preset-switchboard-solo'),
+  JSON.stringify(presetRows.map(row => row.id)));
+  const full = presetRows.find(row => row.id === 'preset-switchboard')?.config;
+  const solo = presetRows.find(row => row.id === 'preset-switchboard-solo')?.config;
+  check('两个 preset 都有中文名称与说明',
+    full?.name === '分工调度台' && solo?.name === '自办调度台'
+      && /实现者/.test(full?.description ?? '') && /自办|自己承担实现/.test(solo?.description ?? ''),
+    JSON.stringify({ full: full?.name, solo: solo?.name }));
+  check('自办版只排除 worker，且使用独立的角色 preset 命名空间',
+    JSON.stringify(soloPresetEntry?.config?.excludedRoles) === JSON.stringify(['worker'])
+      && soloPresetEntry?.config?.compositionKey === 'switchboard-solo'
+      && presetEntry?.config?.compositionKey === 'switchboard'
+      && soloPresetEntry?.config?.compositionKey !== presetEntry?.config?.compositionKey,
+    JSON.stringify({ full: presetEntry?.config?.compositionKey, solo: soloPresetEntry?.config?.compositionKey,
+      excluded: soloPresetEntry?.config?.excludedRoles }));
+  check('自办版规则不再把执行路由给 worker', typeof soloSupervisorRules === 'string'
+    && !/delegate_to_worker|→ worker/.test(soloSupervisorRules)
+    && /主代理自办执行/.test(soloSupervisorRules), soloSupervisorRules?.slice(0, 40));
+  check('两个 preset 的工具行构成相同（只差本插件条目的配置）',
+    JSON.stringify(presetRows[0].config.plugins.filter(p => p.id !== 'switchboard-roles').map(p => p.id))
+      === JSON.stringify(presetRows[1].config.plugins.filter(p => p.id !== 'switchboard-roles').map(p => p.id)));
+}
+
 section('根条目路径（无 mount）：只注册自检工具，不注册服务');
 {
   const ctx = makeCtx();
@@ -559,6 +597,51 @@ section('preset 路径（mount:true）：读角色文件并挂载工具，不该
     !ctx.registered.includes('roleConfig'),
     ctx.registered.join(','),
   );
+}
+
+section('两个 preset 的角色组合：worker 过滤 + 角色 preset 命名空间不冲突');
+{
+  const home = join(fixtureHome, 'two-presets');
+  mkdirSync(home, { recursive: true });
+  const scout = { id: 'scout', title: '侦察员', description: '只读调研', instructions: 'SCOUT',
+    model: 'test-model', backend: 'spawn' };
+  const worker = { id: 'worker', title: '实现者', description: '实现', instructions: 'WORKER',
+    model: 'test-model', backend: 'spawn' };
+  const written = writeConfigFile(configPathFor(home), initialConfig([scout, worker], { provider: 'self' }));
+  check('两个 preset 的夹具角色文件写入成功', written.ok, written.error);
+  const withHome = (ctx) => {
+    const base = ctx.get.bind(ctx);
+    ctx.get = key => key === 'profileContext' ? { home, dir: join(home, 'profiles', 'desktop') } : base(key);
+    return ctx;
+  };
+
+  const full = withHome(makeCtx());
+  apply(full, Config({ mount: true, provider: 'self', compositionKey: 'switchboard', compositionLabel: '分工调度台' }));
+  const solo = withHome(makeCtx({ presetService: full.presets }));
+  apply(solo, Config({ mount: true, provider: 'self', compositionKey: 'switchboard-solo',
+    compositionLabel: '自办调度台', excludedRoles: ['worker'] }));
+  await import('@deepseek-ai/dsh-tool-subagent');
+  await new Promise(setImmediate); await new Promise(setImmediate);
+
+  const fullHealth = await full.tools.get('switchboard_selftest').execute({});
+  const soloHealth = await solo.tools.get('switchboard_selftest').execute({});
+  check('完整分工版挂载 scout 与 worker 两个角色工具',
+    fullHealth.roleCount === 2 && full.registered.includes('delegate_to_scout')
+      && full.registered.includes('delegate_to_worker'), JSON.stringify(fullHealth));
+  check('自办版只挂载 scout，worker 不进入本 preset',
+    soloHealth.roleCount === 1 && solo.registered.includes('delegate_to_scout')
+      && !solo.registered.includes('delegate_to_worker'),
+    JSON.stringify({ roleCount: soloHealth.roleCount, registered: solo.registered }));
+  check('自办版自检不再把 worker 列进生效角色',
+    !soloHealth.roleRoutes.includes('worker') && !soloHealth.mounted.includes('worker'),
+    JSON.stringify({ routes: soloHealth.roleRoutes, mounted: soloHealth.mounted }));
+  const ids = solo.presets.definitions.map(definition => definition.id);
+  check('自办版注册自己的角色 preset 命名空间，且不为 worker 建 preset',
+    ids.includes('switchboard-solo-role-scout') && !ids.includes('switchboard-solo-role-worker'),
+    JSON.stringify(ids));
+  check('完整分工版仍使用旧命名空间，两套角色 preset 可同时存在',
+    ids.includes('switchboard-role-scout') && ids.includes('switchboard-role-worker')
+      && new Set(ids).size === ids.length, JSON.stringify(ids));
 }
 
 section('同步到文件失败时必须降级而不是抛出');
@@ -1315,7 +1398,7 @@ section('契约模拟（真实 Config / 工具插件，startActivation 为桩）
       && (guidanceText.includes('may delegate further') || guidanceText.includes('cannot delegate further')),
     JSON.stringify(guidanceText.slice(guidanceText.indexOf('Route by'))));
   // ⚠️ 只有 spawn 角色会经官方 Config 校验：CLI 角色已不再挂载 `dsh-tool-subagent`。
-  const expectedPresets = ['builtin-leaf', 'builtin-organizer'].map(rolePresetId).sort();
+  const expectedPresets = ['builtin-leaf', 'builtin-organizer'].map(id => rolePresetId(id)).sort();
   check('真实 Config 只覆盖 spawn 角色，且都使用插件上限 2', validatedConfigs.length === 2
     && validatedConfigs.every(config => config.maxDepth === 2),
     JSON.stringify(validatedConfigs.map(config => config.maxDepth)));
@@ -2228,7 +2311,11 @@ section('preset 调度规则：缺失告警与生成幂等');
   }
   // 只替换官方清单输入与输出路径；实际 selfEntry 和全部生成逻辑执行两次。
   // 夹具不声称已核对本机官方 standard，也不写用户 profile 或仓库产物。
-  const standard = presetSource.replace(/          - id: switchboard-roles[\s\S]*?(?=\n          - )/, '')
+  // 夹具只取**第一个** preset 的插件清单当作 standard 的替身；第二个 preset 是
+  // 同一份清单的副本，留在输入里会让生成器把它当成 standard 行。
+  const soloStart = presetSource.indexOf('\n    - id: preset-switchboard-solo');
+  const firstPresetText = presetSource.slice(0, soloStart) + '\n';
+  const standard = firstPresetText.replace(/          - id: switchboard-roles[\s\S]*?(?=\n          - )/, '')
     .replace(/(\s*- id: tool-subagent(?:-fork)?\n)\s*disabled: true\n/g, '$1');
   const output = join(fixtureHome, 'generated.patch.yml');
   const generator = readFileSync(new URL('./gen-preset.mjs', import.meta.url), 'utf8')
@@ -2242,8 +2329,14 @@ section('preset 调度规则：缺失告警与生成幂等');
   check('R13：真实生成逻辑两次成功且字节幂等', first.status === 0 && second.status === 0
     && bytes.length > 0 && bytes.equals(readFileSync(output)), first.stderr + second.stderr);
   const generated = bytes.length ? parse(bytes.toString(), { customTags: [{ tag: 'tag:yaml.org,2002:js', resolve: value => value }] }) : [];
-  check('R14：selfEntry 生成的 preset 确实包含规则', generated[0]?.insert[0].config.plugins
+  check('R14：selfEntry 生成的完整分工 preset 确实包含规则', generated[0]?.insert[0].config.plugins
     .find(p => p.id === 'switchboard-roles')?.config.supervisorRules === supervisorRules);
+  check('R14b：生成器同时产出带独立命名空间的自办 preset',
+    generated[0]?.insert[1]?.id === 'preset-switchboard-solo'
+      && generated[0].insert[1].config.plugins.find(p => p.id === 'switchboard-roles')?.config.supervisorRules
+        === soloSupervisorRules
+      && JSON.stringify(generated[0].insert[1].config.plugins.find(p => p.id === 'switchboard-roles')
+        ?.config.excludedRoles) === JSON.stringify(['worker']));
 }
 
 section('派发级快照：真实 ToolRuntime + 路由预检挂起');

@@ -136,6 +136,9 @@ section('可写性不变式：roles 必须整体 volatile，且数组下标路�
   // 也交给了设置页，超出 D13 的范围。
   check('provider 不在 volatile 子树下（不应被设置页改写）', !isVolatilePath(schema, ['provider']));
   check('maxDepth 不在 volatile 子树下', !isVolatilePath(schema, ['maxDepth']));
+  // 组合键与排除角色决定角色 preset 的 id 与组合，属组合期事实，不能从设置页改。
+  check('compositionKey 不在 volatile 子树下', !isVolatilePath(schema, ['compositionKey']));
+  check('excludedRoles 不在 volatile 子树下', !isVolatilePath(schema, ['excludedRoles']));
 }
 
 // ---------------------------------------------------------------------------

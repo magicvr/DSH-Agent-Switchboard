@@ -12,6 +12,7 @@
 - 增加插件版本查看、默认 dry-run 的 bump、CHANGELOG 收口及离线一致性检查工具。
 - 增加配置格式版本迁移链与磁盘迁移入口：`inspectConfigFormat` 判定 `current` / `migrated` / `future` / `unsupported`，`migrateConfigFileOnDisk` 默认 dry-run，写入前生成时间戳备份并在写后复读校验。
 - `switchboard_selftest` 上报插件版本、manifest 版本、配置格式版本与格式状态。
+- 新增「自办调度台」Agent preset（`switchboard-solo`）：与「分工调度台」共用 standard 插件清单，但通过 `excludedRoles: [worker]` 不组合 worker，由主代理承担实现；角色 preset id 按 `compositionKey` 分命名空间（`switchboard-role-*` / `switchboard-solo-role-*`），避免两个常驻 preset 撞上 `Duplicate agent preset`。现有预设同步启用中文名称「分工调度台」与中文说明。
 
 ### Changed
 

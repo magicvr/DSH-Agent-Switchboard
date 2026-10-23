@@ -141,11 +141,15 @@ function materializeRow(row, platform, { readOnly }) {
  * @param {number} options.maxDepth - 第一层之外**额外**可用的层数。
  * @param {object[]} [options.roles] - 全部角色，用于生成嵌套派发入口。
  * @param {object[]} [options.rows] - 行模板；默认读取生成物。
+ * @param {string} [options.compositionKey] - 角色 preset id 的命名空间。
+ * @param {string} [options.label] - 显示名前缀，例如「分工调度台」。
  * @returns {{id: string, name: string, description: string, plugins: object[]}} preset 定义。
  */
 export function buildRolePreset(role, options = {}) {
   const platform = options.platform ?? process.platform;
   const rows = options.rows ?? loadRowTemplate().rows;
+  const compositionKey = options.compositionKey ?? 'switchboard';
+  const label = options.label ?? 'Switchboard';
   const isCli = role.backend === CLI_BACKEND;
   // ⚠️ CLI 角色**不再需要 preset**：顶层与嵌套都直接派发后台任务，没有任何东西会 spawn 它。
   //    中继子代理退役后，这份 preset（包裹 persona + 专属 CLI 工具行）整体失去意义。
@@ -204,15 +208,15 @@ export function buildRolePreset(role, options = {}) {
       config: {
         provider: DELEGATION_PROVIDER,
         toolName: target.toolName,
-        agentPreset: rolePresetId(target.id),
+        agentPreset: rolePresetId(target.id, compositionKey),
         maxDepth: absoluteDepthLimit(options.maxDepth ?? 0),
       },
     });
   }
 
   return {
-    id: rolePresetId(role.id),
-    name: `Switchboard · ${role.title ?? role.id}`,
+    id: rolePresetId(role.id, compositionKey),
+    name: `${label} · ${role.title ?? role.id}`,
     description: `角色 ${role.id} 的独立组合：${role.description}`,
     plugins,
   };

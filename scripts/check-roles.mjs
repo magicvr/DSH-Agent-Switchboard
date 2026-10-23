@@ -817,6 +817,28 @@ section('buildRolePreset：角色 persona 与工具构成的唯一承载点');
   }
 }
 
+section('组合命名空间：两个 Switchboard preset 的角色 preset id 不冲突');
+{
+  // 两个 preset 同时常驻装载时，角色 preset 的 id 必须分属不同命名空间；
+  // 否则第二个 preset 会在 agentPresets.register() 撞上 Duplicate agent preset。
+  const role = normalizeRole({ id: 'namespace-probe', title: '命名空间探针', description: 'd',
+    instructions: 'i', model: 'm', backend: 'spawn', canDispatch: [] }, 0, 'p').role;
+  check('rolePresetId 默认保持旧前缀（兼容既有会话与断言）',
+    rolePresetId('scout') === 'switchboard-role-scout');
+  check('rolePresetId 接受独立组合键', rolePresetId('scout', 'switchboard-solo') === 'switchboard-solo-role-scout'
+    && rolePresetId('scout', 'switchboard-solo') !== rolePresetId('scout'));
+  const full = buildRolePreset(role, { platform: 'win32', maxDepth: 3, roles: [role],
+    compositionKey: 'switchboard', label: '分工调度台' });
+  const solo = buildRolePreset(role, { platform: 'win32', maxDepth: 3, roles: [role],
+    compositionKey: 'switchboard-solo', label: '自办调度台' });
+  check('buildRolePreset 使用组合键生成 id、用中文标签生成显示名',
+    full.id === 'switchboard-role-namespace-probe' && full.name === '分工调度台 · 命名空间探针'
+      && solo.id === 'switchboard-solo-role-namespace-probe' && solo.name === '自办调度台 · 命名空间探针');
+  check('toolConfigFor 选中同一命名空间下的角色 preset',
+    toolConfigFor(role, { maxDepth: 3, compositionKey: 'switchboard-solo' }).agentPreset
+      === 'switchboard-solo-role-namespace-probe');
+}
+
 section('回归守卫：已删除的 dsh-tool-subagent Config 字段不得回流');
 {
   // ⚠️ 精确锁死本次升级事故：0.2.1-rc.1 对 `persona` / `toolFilter` 做 `Object.hasOwn`

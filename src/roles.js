@@ -194,10 +194,15 @@ function materializeDriver(entry, definition, upper = {}) {
  * 角色子代理通过它选中「自己的」preset，从而拿到 persona 与工具构成。
  *
  * @param {string} roleId - 角色 id。
+ * @param {string} [compositionKey] - 组合命名空间；默认沿用旧的 `switchboard` 前缀。
+ *   两个 Switchboard preset 同时常驻时，必须用不同的 key，否则会撞上
+ *   `agentPresets.register()` 的 `Duplicate agent preset` 硬报错。
  * @returns {string} preset id。
  */
-export function rolePresetId(roleId) {
-  return `${ROLE_PRESET_PREFIX}${roleId}`;
+export function rolePresetId(roleId, compositionKey = 'switchboard') {
+  return compositionKey === 'switchboard'
+    ? `${ROLE_PRESET_PREFIX}${roleId}`
+    : `${compositionKey}-role-${roleId}`;
 }
 
 /**
@@ -540,6 +545,7 @@ export function agentOptionsFor(role) {
  * @param {number} options.maxDepth - 第一层之外，**额外**可用的层数。
  * @param {Function} [options.getRole] - 执行期现读角色（配置可热更新）。
  * @param {Function} [options.getMaxDepth] - 执行期现读深度预算。
+ * @param {string} [options.compositionKey] - 角色 preset id 的命名空间。
  * @returns {object} `dsh-tool-subagent` 的 Config。
  */
 export function toolConfigFor(role, options = {}) {
@@ -553,7 +559,7 @@ export function toolConfigFor(role, options = {}) {
     get agentOptions() { return agentOptionsFor(getRole() ?? role); },
     // preset id 由角色 id 派生，不随 instructions/readOnly 变化；因此改这些字段
     // 只需重注册 preset 的新 revision，不必重挂工具。
-    get agentPreset() { return rolePresetId((getRole() ?? role).id); },
+    get agentPreset() { return rolePresetId((getRole() ?? role).id, options.compositionKey); },
     get maxDepth() { return absoluteDepthLimit(getMaxDepth() ?? 3); },
   };
 }

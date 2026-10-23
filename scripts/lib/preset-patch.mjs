@@ -110,10 +110,17 @@ export function planInjectedPreset(original, block, { remove = false } = {}) {
     && (!Object.hasOwn(op, 'insert') || (Array.isArray(op.insert) && op.insert.length > 0
       && op.insert.every(row => row && typeof row === 'object' && !Array.isArray(row)))));
   if (!valid(doc)) throw new Error('profile patch 结构无效，拒绝写入');
-  const hits = doc.filter(op => op.id === 'preset-switchboard'
-    || op.insert?.some(row => row.id === 'preset-switchboard'));
+  // ⚠️ 允许**历史单条**注入被剥离（升级路径），但新注入必须恰好包含两个 preset。
+  const PRESET_ROW_IDS = ['preset-switchboard', 'preset-switchboard-solo'];
+  const presetRowIds = (op) => Array.isArray(op?.insert) ? op.insert.map(row => row?.id) : [];
+  const isPresetOperation = (op) => op.id === 'preset-switchboard'
+    || presetRowIds(op).some(id => PRESET_ROW_IDS.includes(id));
+  const hits = doc.filter(isPresetOperation);
+  const hitRows = hits[0] !== undefined ? presetRowIds(hits[0]) : [];
+  const hitRowsClean = hitRows.length > 0 && hitRows.every(id => PRESET_ROW_IDS.includes(id))
+    && new Set(hitRows).size === hitRows.length;
   if (hits.length > 1 || (hits.length && (Object.keys(hits[0]).length !== 1
-    || hits[0].insert?.length !== 1 || !/^# Switchboard/m.test(original))))
+    || !hitRowsClean || !/^# Switchboard/m.test(original))))
     throw new Error('preset 块未标记或有歧义，拒绝写入');
   if (hits.length) {
     const markers = [...original.matchAll(/^# Switchboard.*$/gm)];
@@ -129,8 +136,11 @@ export function planInjectedPreset(original, block, { remove = false } = {}) {
     throw new Error('preset 剥离会改变其它操作或留下残留，拒绝写入');
   if (remove) return hits.length ? (remaining.length ? cleaned : `${cleaned.replace(/\n*$/, '')}\n[]\n`) : original;
   const generated = parse(block);
-  if (!valid(generated) || generated.length !== 1 || generated[0].insert?.length !== 1
-    || generated[0].insert[0].id !== 'preset-switchboard') throw new Error('仓库 preset 结构无效');
+  const generatedRows = generated[0]?.insert;
+  if (!valid(generated) || generated.length !== 1 || !Array.isArray(generatedRows)
+    || generatedRows.length !== PRESET_ROW_IDS.length
+    || !PRESET_ROW_IDS.every(id => generatedRows.some(row => row?.id === id)))
+    throw new Error('仓库 preset 结构无效');
   // 已同步时保留所有原始字节，第二次运行不再改动换行或备份。
   if (hits.length && isDeepStrictEqual(hits[0], generated[0])) return original;
   // 空序列不能和块式序列拼接；只移除 [] 本身，保留用户注释。
@@ -217,11 +227,11 @@ export function readPatch(path) {
   return { entries };
 }
 
-export function presetConfig(patch, packageName) {
+export function presetConfig(patch, packageName, presetId = 'preset-switchboard') {
   if (patch.error) return { error: patch.error };
-  const preset = patch.entries.find(row => row.id === 'preset-switchboard');
-  if (!preset) return { error: '缺少 preset-switchboard 声明' };
-  if (!isObject(preset.config)) return { preset, error: 'preset-switchboard 的 config 必须是对象' };
+  const preset = patch.entries.find(row => row.id === presetId);
+  if (!preset) return { error: `缺少 ${presetId} 声明` };
+  if (!isObject(preset.config)) return { preset, error: `${presetId} 的 config 必须是对象` };
   if (!Array.isArray(preset.config.plugins)) return { preset, error: 'preset 的 plugins 必须是数组' };
   if (!preset.config.plugins.every(isObject)) return { preset, error: 'plugins 数组中的条目必须是对象' };
   const selfRow = preset.config.plugins.find(plugin => plugin.name === packageName);

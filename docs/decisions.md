@@ -1174,5 +1174,38 @@ bundle（`presets/switchboard.patch.yml`，`package.json` 的 `dsh.bundle.patch`
 - 兼容判据有个坑：Config 给 `canDispatch` 设了默认值 `[]`，因此「是否 legacy」必须判
   **清单为空**，不能判「不是数组」—— 第一版就是这么写的，告警永远不触发（断言当场报空）。
 
+---
+
+## D37 · 双 Agent preset：完整分工与主代理自办执行
+
+> 编号说明：D36 已在提交记录中用于「删除 CLI 输出面板」，本文件尚未回填那一条；本决策顺延为 D37。
+
+**决策：** 在同一个 `presets/switchboard.patch.yml` 里声明两个 Agent preset，共用 standard 插件清单：
+
+1. **分工调度台**（`switchboard`，order 50）：保留四角色分工，worker 负责实现。
+2. **自办调度台**（`switchboard-solo`，order 51）：`excludedRoles: [worker]`，主代理自己承担实现、修复、测试与文档；scout / architect / reviewer 仍按角色派发。
+
+两个名称与说明由生成器写入，属于展示层；`config.id` 保持稳定，已有会话继续引用 `switchboard`。
+
+**依据：**
+
+- 用户明确希望「现有预设 + 一个只差 worker 的新预设」，并让主代理合并 worker 的职责。把差异表达在 preset 层的 `excludedRoles`，比复制一份 `roles.json` 或让用户手工删角色更小、更可逆：角色定义仍只有一份，设置页不会出现两套真相。
+- 两个 preset 必须能**同时常驻**：`dsh-agent-preset` 的声明是 eagerly mounted，不是按需加载。Host 的 `agentPresets` 注册表是全局单例，对重复 id **硬抛** `Duplicate agent preset`。因此角色 preset id 不能都叫 `switchboard-role-<id>`；引入 `compositionKey` 命名空间（`switchboard-solo-role-<id>`）是第二个 preset 能装载的前提，不是可选优化。
+- 自办版不能只删工具而保留原调度规则：规则里的「执行→worker」会让主代理找不到可用入口，或诱导它调用不存在的 `delegate_to_worker`。因此同时提供一套不含 worker 路由的 `supervisorRules`；其余段落保持同构，避免两份提示词无意义地漂移。
+
+**代价与边界：**
+
+- 两个 preset 会各挂一份 `switchboard_selftest` 与角色工具集；自办版的自检角色数为 3（不含 worker），完整版仍为 4（按实际后端可能更少）。这是预期差异，不是缺失。
+- 角色 preset 的显示名多了组合前缀（`分工调度台 · 侦察员` / `自办调度台 · 侦察员`）；id 不再是唯一一种 `switchboard-role-*` 形态，检查与文档必须按组合键区分。
+- `excludedRoles` / `compositionKey` 是**组合期**配置：改它们需要重新挂载 / 完整重启 DSH，和 `readOnly` / `instructions` 同类。
+- `canDispatch` 指向被排除角色的条目会被静默裁掉（当前角色定义里没有这种指向；将来若出现，自检应补一条可见告警）。
+- **真机验收进展（2026-10-23 完全重启后）**：根实例自检的 roster 同时出现 `switchboard` / `switchboard-solo` 与 `switchboard-role-scout` / `switchboard-role-worker` / `switchboard-solo-role-scout`，`preset 异常行：（无异常行）`；两套组合的注册与命名空间隔离已确认。**仍缺**：选中自办会话后实际只有 3 个角色工具、无 `delegate_to_worker`，并完成一次真实派发。
+
+**被否决的替代方案：**
+
+1. **复制一份 `roles.json` / 另起一个角色文件** —— 否决。两份角色定义会立刻漂移，设置页与 `overrides` 也不知道该写哪一份。
+2. **在自办 preset 里保留 `delegate_to_worker` 但用提示词禁止调用** —— 否决。工具在清单里就等于可用，提示词禁令不是边界；而且 worker 的角色 preset 仍会被注册，白白多一套组合。
+3. **让两个 preset 共用同一批角色 preset id，靠先注册者复用** —— 否决。注册表对所有声明 eager 装载，先后顺序不是契约；先卸载一个 preset 还会让另一个失去角色组合。命名空间是确定性的。
+4. **只改 `name` / `description`，不真正排除 worker** —— 否决。那只是把「不使用 worker」写成文案，模型仍能看到并调用 worker，违背用户要求。
 
 ---

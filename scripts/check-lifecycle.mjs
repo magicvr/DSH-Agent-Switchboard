@@ -75,7 +75,14 @@ try {
     document[0].insert[0].config.plugins.find(row => row.name === pkg.name).config = config;
     return stringify(document);
   };
-  const config = presetConfig(readPatch(join(repoRoot, 'presets', 'switchboard.patch.yml')), pkg.name).config;
+  const patchSoloWith = config => {
+    const document = parse(generated);
+    document[0].insert[1].config.plugins.find(row => row.name === pkg.name).config = config;
+    return stringify(document);
+  };
+  const repoPresetPatch = readPatch(join(repoRoot, 'presets', 'switchboard.patch.yml'));
+  const config = presetConfig(repoPresetPatch, pkg.name).config;
+  const soloConfig = presetConfig(repoPresetPatch, pkg.name, 'preset-switchboard-solo').config;
   const cleanPatch = '- insert:\n    - id: unrelated\n      name: unrelated\n      config:\n        cwd: DSH-Agent-Switchboard\n';
 
   section('缺失与包登记');
@@ -119,14 +126,29 @@ try {
     try { parsed = parse(planInjectedPreset(original, generated)); } catch (e) { error = e.message; }
     check(`${label} 可解析且 preset 存在`, parsed?.[0]?.insert?.[0]?.id === 'preset-switchboard', error);
   }
+  // 历史 profile 可能只注入过单条 preset；升级必须能剥离旧块并换上双 preset 块。
+  {
+    const soloStartInGenerated = generated.indexOf('\n    - id: preset-switchboard-solo');
+    const oldSingle = generated.slice(0, soloStartInGenerated) + '\n';
+    let upgraded, upgradeError;
+    try { upgraded = parse(planInjectedPreset(oldSingle, generated)); } catch (error) { upgradeError = error.message; }
+    check('历史单 preset 注入可升级为双 preset 且不重复',
+      !upgradeError && Array.isArray(upgraded?.[0]?.insert)
+        && upgraded[0].insert.length === 2
+        && upgraded[0].insert[0].id === 'preset-switchboard'
+        && upgraded[0].insert[1].id === 'preset-switchboard-solo',
+      upgradeError);
+  }
   const userComment = '# 用户注释：必须逐字保留\n';
   check('相邻用户注释剥离后逐字保留', stripInjectedPreset(generated + userComment + cleanPatch).includes(userComment)
     && planInjectedPreset(generated + userComment, '', { remove: true }).includes(userComment));
   check('缩进的尾随用户注释也逐字保留', stripInjectedPreset(generated + '  ' + userComment + cleanPatch).includes('  ' + userComment));
   const rootReference = `- insert:\n    - id: agent-switchboard\n      name: ${JSON.stringify(pkg.name)}\n`;
-  check('全深度引用扫描列出根条目与嵌套 preset', scanPackageReferences(rootReference + generated, pkg.name).length === 2
-    && scanPackageReferences(rootReference + generated, pkg.name)[0].id === 'agent-switchboard'
-    && scanPackageReferences(rootReference + generated, pkg.name)[0].line === 3);
+  const packageRefs = scanPackageReferences(rootReference + generated, pkg.name);
+  check('全深度引用扫描列出根条目与两个 preset 的本包行', packageRefs.length === 3
+    && packageRefs[0].id === 'agent-switchboard'
+    && packageRefs[0].line === 3
+    && packageRefs.filter(ref => ref.id === 'switchboard-roles').length === 2);
   const aliasReferences = scanPackageReferences(`- insert:\n    - id: alias-owner\n      module: &pkg ${JSON.stringify(pkg.name)}\n    - id: alias-user\n      package: *pkg\n`, pkg.name);
   check('等价字段与 alias 引用保留 id 和行', aliasReferences.length === 2 && aliasReferences[1].id === 'alias-user' && aliasReferences[1].line === 5);
   // 仓库 preset（权威副本）自身的结构问题仍必须逐条报告。
@@ -142,6 +164,15 @@ try {
   put(generatedFile, patchWith({ ...config, mount: false }));
   check('仓库 preset 缺少 mount:true 时明确失败',
     collect().verification.issues.some(i => i.code === 'preset.mount'));
+  put(generatedFile, patchSoloWith({ ...soloConfig, supervisorRules: '' })); s = collect();
+  check('自办 preset 的 supervisorRules 为空时明确失败',
+    s.presetSolo.rules.status === 'invalid' && s.verification.issues.some(i => i.code === 'preset.solo.rules'));
+  put(generatedFile, patchSoloWith({ ...soloConfig, excludedRoles: [] })); s = collect();
+  check('自办 preset 未排除 worker 时明确失败',
+    s.verification.issues.some(i => i.code === 'preset.solo.exclusion'));
+  put(generatedFile, patchSoloWith({ ...soloConfig, compositionKey: 'switchboard' })); s = collect();
+  check('自办 preset 与完整分工版共用 compositionKey 时明确失败',
+    s.verification.issues.some(i => i.code === 'preset.solo.compositionKey'));
   put(generatedFile, generated);
   check('规则有效且生成物无漂移', collect().preset.rules.status === 'current' && collect().preset.generatedDrift.status === 'current');
   put(paths.patch, cleanPatch + generated);

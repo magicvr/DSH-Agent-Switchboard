@@ -251,6 +251,11 @@ function newDiagnostics() {
     staleRolesAlongsideSettings: false,
     /** 由挂载作用域注入：当场计算组合是否偏离（自检用它，而不是读快照）。 */
     compositionDrift: undefined,
+    /** 本 preset 的组合命名空间与显示名（根实例为 undefined/默认值）。 */
+    compositionKey: undefined,
+    compositionLabel: undefined,
+    /** 本 preset 明确不组合的角色 id；角色定义仍在 roles.json。 */
+    excludedRoles: [],
     roleConfigPath: undefined,
     roleConfigRead: undefined,
     roleConfigSync: undefined,
@@ -322,6 +327,24 @@ export function liveRoleTools(ctx, roles, viewer) {
 export const Config = z.object({
   // 仅 preset 条目承载，不设默认值、不标 volatile、不开放设置页编辑。
   supervisorRules: z.string().description('主代理调度规则（由 preset 生成）'),
+  /**
+   * 本 preset 的组合命名空间。角色 preset id 以它为前缀，避免同一进程里两个
+   * Switchboard preset 各自注册 `switchboard-role-*` 时撞上注册表的重复 id 硬报错。
+   *
+   * 仅 preset 条目承载；根条目不会挂载，因此用默认值即可。
+   */
+  compositionKey: z.string().default('switchboard')
+    .description('本 preset 的组合命名空间（角色 preset id 前缀；仅 preset 声明使用）'),
+  /** 角色 preset 的显示名前缀，例如「分工调度台 · 侦察员」。仅 preset 条目承载。 */
+  compositionLabel: z.string().default('Switchboard')
+    .description('角色 preset 的显示名前缀（仅 preset 声明使用）'),
+  /**
+   * 本 preset 不组合的角色 id。角色定义仍保留在 `roles.json`，只是**不进入本 preset**：
+   * 不给工具、不建角色 preset、不写进主代理的调度提示。用于「自办调度台」把
+   * `worker` 的职责并回主代理，同时保留角色定义供完整分工 preset 继续使用。
+   */
+  excludedRoles: z.array(z.string()).default([])
+    .description('本 preset 不组合的角色 id（仅 preset 声明使用）'),
   // ⚠️ `.volatile()` 是必须调用的，仅把子对象**命名**为 volatile 没有任何效果。
   // 依据 dsh-settings 的 volatileForm：
   //   if (schema.meta.volatile) return plainSchema(schema)
@@ -871,7 +894,7 @@ export function selftestTool(ctx, diagnostics) {
  * @param {number} maxDepth - 允许嵌套时的额外层数。
  * @returns {Promise<{ok: boolean, detail: string}>} 挂载结果。
  */
-async function mountRoleTool(ctx, role, toolModule, resolver, roles, maxDepth, dispatch) {
+async function mountRoleTool(ctx, role, toolModule, resolver, roles, maxDepth, dispatch, compositionKey) {
   if (typeof ctx.plugin !== 'function') return { ok: false, detail: 'ctx.plugin 不可用' };
   try {
     const liveRole = () => {
@@ -883,6 +906,7 @@ async function mountRoleTool(ctx, role, toolModule, resolver, roles, maxDepth, d
       getRole: liveRole,
       getMaxDepth: () => (dispatch.storage.getStore() ?? resolver()).maxDepth,
       maxDepth,
+      compositionKey,
     });
     const fiber = ctx.plugin({ ...toolModule, apply: (toolCtx) => {
       // Cordis Config 校验产物会物化 getter；官方 apply 必须持有原 liveConfig 才能延迟解析。
@@ -1357,13 +1381,26 @@ function mountCliDispatchTools(ctx, cliRoles, resolver, dispatch, diagnostics) {
  * @param {object} options.diagnostics - 诊断记录。
  */
 function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, disposeSelftest }) {
+  // 组合标识决定「本 preset 排除哪些角色」与角色 preset 的 id 命名空间。
+  // 两个 Switchboard preset 会同时常驻装载，若沿用同一批角色 preset id，
+  // 第二个 preset 会在 `agentPresets.register()` 撞上 `Duplicate agent preset`。
+  const composition = compositionFromConfig(resolved);
+  if (composition.error) {
+    diagnostics.configErrors = [composition.error];
+    diagnostics.fatal = composition.error;
+    return;
+  }
+  diagnostics.compositionKey = composition.key;
+  diagnostics.compositionLabel = composition.label;
+  diagnostics.excludedRoles = composition.excludedRoles;
   const loaded = readRoleConfigFile(roleConfigPath);
   diagnostics.roleConfigRead = loaded.detail;
   if (loaded.ok) { noteLegacyTimeout(loaded.value, diagnostics); noteLegacyWrapper(loaded.value, diagnostics); }
   // 保留 preset 显式 roles（包括 []）及真实 Volatile 引用，文件只补缺省来源。
-  const read = createRoleResolver(roleConfigPath, { ...resolved });
+  const read = createRoleResolver(roleConfigPath, { ...resolved }, composition);
   const initial = read();
   const roles = initial.roles;
+  diagnostics.excludedRoles = initial.excludedRoles ?? composition.excludedRoles;
   const resolver = () => {
     const current = read();
     const changed = JSON.stringify(current.roles.map(item => [item.id, item.toolName, item.backend])) !==
@@ -1503,6 +1540,8 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
       const current = resolver();
       const definitions = buildRolePresets(current.roles, {
         maxDepth: current.maxDepth ?? initial.maxDepth,
+        compositionKey: composition.key,
+        label: composition.label,
       });
       const wanted = new Map(definitions.map((definition) => [definition.id, definition]));
 
@@ -1572,7 +1611,7 @@ function mountRolesInThisScope(ctx, { roleConfigPath, resolved, diagnostics, dis
         diagnostics.mounts.push({ id: role.id, ok: cliDispatch.ok, detail: cliDispatch.detail });
         continue;
       }
-      const outcome = await mountRoleTool(ctx, role, toolModule, resolver, roles, initial.maxDepth, dispatch);
+      const outcome = await mountRoleTool(ctx, role, toolModule, resolver, roles, initial.maxDepth, dispatch, composition.key);
       diagnostics.mounts.push({ id: role.id, ok: outcome.ok, detail: outcome.detail });
     }
   }).catch(error => { diagnostics.fatal = `无法 import @deepseek-ai/dsh-tool-subagent：${error.message ?? error}`; });
@@ -1607,7 +1646,33 @@ function isMainAgentContext(context) {
     (agent.options?.subagentDepth ?? 0) === 0;
 }
 
-function createRoleResolver(roleConfigPath, resolved) {
+/** 组合命名空间只允许小写字母、数字与连字符；它会进入角色 preset id。 */
+const COMPOSITION_KEY_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+
+/**
+ * 读取并校验本 preset 的组合标识。
+ *
+ * 这些字段只由 preset 声明提供；根条目（`mount: false`）不会注册角色 preset，
+ * 因此缺省值必须安全且不影响根路径。
+ *
+ * @param {object} resolved - 已校验的插件配置。
+ * @returns {{key: string, label: string, excludedRoles: string[], error?: undefined}|{error: string}} 组合设置。
+ */
+function compositionFromConfig(resolved) {
+  const key = typeof resolved?.compositionKey === 'string' && resolved.compositionKey.trim()
+    ? resolved.compositionKey.trim() : 'switchboard';
+  const label = typeof resolved?.compositionLabel === 'string' && resolved.compositionLabel.trim()
+    ? resolved.compositionLabel.trim() : 'Switchboard';
+  const excludedRoles = Array.isArray(resolved?.excludedRoles)
+    ? resolved.excludedRoles.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim())
+    : [];
+  if (!COMPOSITION_KEY_PATTERN.test(key)) {
+    return { error: `compositionKey 非法：${JSON.stringify(key)}（只允许小写字母、数字与连字符，且以字母开头）` };
+  }
+  return { key, label, excludedRoles };
+}
+
+function createRoleResolver(roleConfigPath, resolved, composition = {}) {
   const file = createConfigFileResolver(roleConfigPath);
   return () => {
     const fromFile = file.read();
@@ -1644,12 +1709,28 @@ function createRoleResolver(roleConfigPath, resolved) {
       item.toolName !== normalized.roles.find(role => role.id === item.id)?.toolName)) {
       normalized.errors.push('toolName 改动会改变角色工具集；阶段 3 未实现，请使用由 id 派生的工具名');
     }
+    // --- 本 preset 的角色过滤 -------------------------------------------------
+    // 角色定义仍住在共享的 roles.json；`excludedRoles` 只决定本 preset **组合**哪些角色。
+    // 过滤放在 normalize 之后：定义层照常校验，拼错角色 id 不会把整个配置变成非法。
+    // 同时把 canDispatch 里指向被排除角色的条目裁掉，避免子代理 preset 里出现
+    // 「指向一个本组合根本没有的委派目标」的死行。
+    const excluded = new Set(composition.excludedRoles ?? []);
+    if (excluded.size > 0) {
+      const kept = normalized.roles.filter(role => !excluded.has(role.id));
+      const keptIds = new Set(kept.map(role => role.id));
+      normalized.roles = kept.map(role => ({
+        ...role,
+        canDispatch: (Array.isArray(role.canDispatch) ? role.canDispatch : [])
+          .filter(id => keptIds.has(id) && id !== role.id),
+      }));
+    }
     const maxDepth = Number.isInteger(value.maxDepth) && value.maxDepth >= 0 ? value.maxDepth
       : typeof resolved.maxDepth === 'number' ? resolved.maxDepth : 3;
     const routes = normalized.roles.map(role => ({ id: role.id,
       summary: `${routeSummaryFor(role)} source=${configuredRoles !== undefined ? 'preset' : 'file'} stale=${fromFile.stale === true}` }));
     return { ok: fromFile.ok, roles: normalized.roles,
       errors: normalized.errors, error: fromFile.error,
+      excludedRoles: [...excluded],
       maxDepth, routes, source: fromFile.source ?? 'preset', stale: fromFile.stale === true };
   };
 }

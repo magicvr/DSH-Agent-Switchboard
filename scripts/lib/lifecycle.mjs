@@ -151,12 +151,15 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
   //    不按 id 去重，而 `dsh-agent-preset` 注册重复 id 会**硬抛**，于是那份副本既是多余的
   //    又会装载失败。历史实现把 preset 内联进 profile，这里改为以仓库那份为准，
   //    并把「profile 里是否还留着多余注入」单列出来。
-  const generated = presetConfig(readPatch(join(repoRoot, 'presets', 'switchboard.patch.yml')), name);
+  // 同一个文件声明两个 preset：完整分工版与自办版（不组合 worker）。
+  const repoPresetPatch = readPatch(join(repoRoot, 'presets', 'switchboard.patch.yml'));
+  const generated = presetConfig(repoPresetPatch, name);
+  const generatedSolo = presetConfig(repoPresetPatch, name, 'preset-switchboard-solo');
   // 「profile 里没有这份声明」是**期望状态**，不是解析错误——所以按条目直接判定，
   // 而不是复用 presetConfig 的「缺少声明」错误串（那会把正常状态报成无法解析）。
   const injectedPatch = readPatch(paths.patch);
   const injectedPresent = injectedPatch.error === undefined
-    && injectedPatch.entries.some(row => row.id === 'preset-switchboard');
+    && injectedPatch.entries.some(row => row.id === 'preset-switchboard' || row.id === 'preset-switchboard-solo');
   // 声明本身以仓库 preset 为准。
   const bundlePatches = pkg.value?.dsh?.bundle?.patch;
   const preset = {
@@ -176,6 +179,17 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
     injectedInProfile: injectedPresent,
     injectedError: injectedPatch.error ?? null,
     generatedError: generated.error ?? null, generatedDrift: unknown('尚未读取 DSH standard preset') };
+  const presetSolo = {
+    present: Boolean(generatedSolo.preset),
+    mount: generatedSolo.config?.mount === true,
+    hasRoles: generatedSolo.config !== undefined && Object.hasOwn(generatedSolo.config, 'roles'),
+    error: generatedSolo.error ?? null,
+    compositionKey: generatedSolo.config?.compositionKey ?? null,
+    excludedRoles: Array.isArray(generatedSolo.config?.excludedRoles) ? generatedSolo.config.excludedRoles : null,
+    rules: typeof generatedSolo.config?.supervisorRules === 'string' && generatedSolo.config.supervisorRules.trim()
+      ? { status: 'current' }
+      : { status: 'invalid', reason: '自办 preset 的 supervisorRules 缺失、类型错误或仅含空白' },
+    generatedError: generatedSolo.error ?? null };
   let runtime = unknown('尚未读取 Electron 安装归档');
   let archive = null;
   try {
@@ -222,7 +236,7 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
     exemption: recordPresent ? (exemptionAccepted ? 'exempt' : 'invalid') : olderKeys.length ? 'expired' : 'absent',
     runtimeExempt: runtime.status === 'known' ? exemptionAccepted && values.includes(runtime.version) : null,
     enginesDsh: repo.enginesDsh, peers: requirements };
-  const snapshot = { paths, archive, repo, profile, registration, preset, roles, compatibility,
+  const snapshot = { paths, archive, repo, profile, registration, preset, presetSolo, roles, compatibility,
     restart: { requiredForModuleChange: true, reason: '插件模块改动必须完全退出并重启 DSH 进程；Node 模块缓存不能驱逐，reload 不能应用代码升级。' } };
   snapshot.verification = verifyLifecycle(snapshot);
   snapshot.nextStep = nextStep(snapshot);
@@ -249,6 +263,19 @@ export function verifyLifecycle(s) {
   if (s.preset.hasRoles) add('preset.roles', 'preset 携带禁止的 roles 字段；角色只能存放在 roles.json');
   if (s.preset.generatedError) add('preset.generated', s.preset.generatedError);
   if (s.preset.rules.status !== 'current') add('preset.rules', s.preset.rules.reason);
+  // 第二个 preset（自办版）必须与完整分工版一起可用：它不组合 worker，且使用
+  // 独立的角色 preset 命名空间，否则两个常驻声明会撞上重复 id。
+  const solo = s.presetSolo;
+  if (solo !== undefined) {
+    if (solo.error) add('preset.solo.structure', solo.error);
+    if (!solo.mount) add('preset.solo.mount', '自办 preset 的本包 config 缺少 mount: true');
+    if (solo.hasRoles) add('preset.solo.roles', '自办 preset 携带禁止的 roles 字段；角色只能存放在 roles.json');
+    if (solo.rules.status !== 'current') add('preset.solo.rules', solo.rules.reason);
+    if (!solo.error && !(Array.isArray(solo.excludedRoles) && solo.excludedRoles.includes('worker')))
+      add('preset.solo.exclusion', '自办 preset 必须用 excludedRoles 排除 worker');
+    if (!solo.error && (solo.compositionKey === null || solo.compositionKey === 'switchboard'))
+      add('preset.solo.compositionKey', '自办 preset 必须使用独立的 compositionKey（不能与完整分工版都是 switchboard）');
+  }
   // preset 由 bundle 投递：这两条是「声明真的会被合成」的前提。
   if (s.preset.bundleDeclaresError) add('preset.bundleDeclaration', `无法读取仓库 package.json：${s.preset.bundleDeclaresError}`);
   else if (!s.preset.bundleDeclaresPreset) add('preset.bundleDeclaration', 'package.json 的 dsh.bundle.patch 未声明 presets/switchboard.patch.yml，bundle 不会投递该 preset');

@@ -27,11 +27,22 @@
 
 一句话：**主代理是调度台，角色是接线员，CLI 是可选的话务线路。**
 
-选用本插件 preset 时，动态系统提示小节向主代理注入 preset 内部条目 `switchboard-roles.config.supervisorRules` 承载的调度规则：四问路由（事实→scout、执行→worker、方向→architect、正确性→reviewer）、任务包、生命周期、上下文与成本纪律及独立审查；其中派发语义为**异步受理**（`delegate_to_*` 返回子代理 id 后即可继续推进有用的工作，结果以完成通知送达，不轮询、不空转）。只进入可靠识别的主代理；子代理只拿自身 persona，不继承这套主代理规则；身份未知时不输出。字段由 `scripts/gen-preset.mjs` 的 `selfEntry` 生成，Config 仅声明字符串，无默认值、非 volatile，不在根条目，不开放 UI 编辑，模型与强度仍由角色配置和派发适配层决定。
+本插件提供**两个 Agent preset**，展示信息由 `scripts/gen-preset.mjs` 生成并写入 `presets/switchboard.patch.yml`：
 
-支持的更新路径是先运行 `npm run plugin:upgrade` 预演，审阅后运行 `npm run plugin:upgrade -- --apply` 收敛，再完全退出并重启 DSH：preset 由 bundle 投递、profile 里不再内联副本。DSH 归档可读且仓库 preset 判定为漂移时，`install` / `upgrade --apply` 自动调用既有生成器再同步，无需先手工生成；归档不可用时明确报告未验证，并提示 `npm run gen:preset` 手工回退。自动再生成已有离线验证，真实写入仍未验证；预演的真机证据与待验收项见 [`docs/lifecycle.md`](./docs/lifecycle.md)。不要手改生成的 YAML，下次生成会覆盖。字段缺失、空串或仅空白时不注入、不回退代码副本；`switchboard_selftest` 明确告警并标为“可用但告警”，不阻断派发。`npm run check` 现在以 `node scripts/gen-preset.mjs --check` 收尾，同时比对 `presets/switchboard.patch.yml` 与 `presets/standard-plugins.json` 两个生成物：该漂移检查早先存在，但升级落地时**不在** `npm run check` 主链内，这正是漂移未被发现的原因；现已加入主链。**真机已验证（2026-10-17 重启后）：** 插件正常装载（`switchboard_selftest` 健康：健康、无 fatal）；`plugin:verify` 报 `验证：consistent / 下一步：已就绪`，运行时 `0.2.1-rc.2`、`DSH peers：compatible`、无需豁免（`0.2.1-rc.1 → rc.2` 只改版本坐标：全部代码树逐字节相同，无需改任何代码，只需重 pin）；**四个角色 preset 全部注册成功**——preset roster 出现 `switchboard-role-scout|worker|architect|reviewer`，`preset 异常行：（无异常行）`。profile 已用 `node scripts/ops/plugin-lifecycle.mjs upgrade --apply` 重新注入（写后复读验证通过，原文件备份为 `cordis.patch.yml.bak-lifecycle-2026-10-17T09-03-32-369Z-226b6e831bdd`），`check-profile-wiring` 为 `13 通过 / 0 失败`。
+| preset id | 中文名称 | 差异 |
+| --- | --- | --- |
+| `switchboard` | **分工调度台** | 完整四角色分工：scout 查事实、worker 实现、architect 定方向、reviewer 做独立审查。 |
+| `switchboard-solo` | **自办调度台** | 不组合 worker，主代理自己承担实现与修复；scout / architect / reviewer 仍按角色派发。 |
 
-**尚待验收的一项：** 上面的自检来自**根实例**——根条目只注册自检并同步配置，不挂载角色工具。要确认 `delegate_to_*` 的实际挂载与一次真实派发，需要一个**选中 Switchboard preset** 的会话（那里自检会报 `已挂载角色工具：4`）。在默认 `standard` preset 下看不到角色工具是设计使然，不是失败。
+两者共用同一份 standard 插件清单与调度规则骨架；自办版只换一套不含 worker 路由的 `supervisorRules`，并用 `excludedRoles: [worker]` 把 worker 排除出本组合。角色定义仍只有一份（`$DSH_HOME/agent-switchboard/roles.json`）：在设置页里改 worker 只影响分工调度台，自办版不会挂载它，也不会为它注册角色 preset。两个 preset 同时常驻装载，角色 preset 的 id 因此使用独立命名空间（`switchboard-role-*` / `switchboard-solo-role-*`）——沿用同一批 id 会撞上 `agentPresets.register()` 的 `Duplicate agent preset` 硬报错。
+
+选用任一 preset 时，动态系统提示小节向主代理注入 preset 内部条目 `switchboard-roles.config.supervisorRules` 承载的调度规则：四问路由（事实→scout、执行→worker、方向→architect、正确性→reviewer）或自办版的三问路由（事实→scout、方向→architect、正确性→reviewer，实现由主代理承担）、任务包、生命周期、上下文与成本纪律及独立审查；其中派发语义为**异步受理**（`delegate_to_*` 返回子代理 id 后即可继续推进有用的工作，结果以完成通知送达，不轮询、不空转）。只进入可靠识别的主代理；子代理只拿自身 persona，不继承这套主代理规则；身份未知时不输出。字段由 `scripts/gen-preset.mjs` 生成，Config 仅声明字符串，无默认值、非 volatile，不在根条目，不开放 UI 编辑，模型与强度仍由角色配置和派发适配层决定。
+
+支持的更新路径是先运行 `npm run plugin:upgrade` 预演，审阅后运行 `npm run plugin:upgrade -- --apply` 收敛，再完全退出并重启 DSH：preset 由 bundle 投递、profile 里不再内联副本。DSH 归档可读且仓库 preset 判定为漂移时，`install` / `upgrade --apply` 自动调用既有生成器再同步，无需先手工生成；归档不可用时明确报告未验证，并提示 `npm run gen:preset` 手工回退。自动再生成已有离线验证，真实写入仍未验证；预演的真机证据与待验收项见 [`docs/lifecycle.md`](./docs/lifecycle.md)。不要手改生成的 YAML，下次生成会覆盖。字段缺失、空串或仅空白时不注入、不回退代码副本；`switchboard_selftest` 明确告警并标为“可用但告警”，不阻断派发。`npm run check` 现在以 `node scripts/gen-preset.mjs --check` 收尾，同时比对 `presets/switchboard.patch.yml` 与 `presets/standard-plugins.json` 两个生成物：该漂移检查早先存在，但升级落地时**不在** `npm run check` 主链内，这正是漂移未被发现的原因；现已加入主链。**真机已验证（2026-10-17 重启后）：** 插件正常装载（`switchboard_selftest` 健康：健康、无 fatal）；`plugin:verify` 报 `验证：consistent / 下一步：已就绪`，运行时 `0.2.1-rc.2`、`DSH peers：compatible`、无需豁免（`0.2.1-rc.1 → rc.2` 只改版本坐标：全部代码树逐字节相同，无需改任何代码，只需重 pin）；**四个角色 preset 全部注册成功**（当时只有完整分工版）——preset roster 出现 `switchboard-role-scout|worker|architect|reviewer`，`preset 异常行：（无异常行）`。profile 已用 `node scripts/ops/plugin-lifecycle.mjs upgrade --apply` 重新注入（写后复读验证通过，原文件备份为 `cordis.patch.yml.bak-lifecycle-2026-10-17T09-03-32-369Z-226b6e831bdd`），`check-profile-wiring` 为 `13 通过 / 0 失败`（加入自办 preset 后为 `18 通过 / 0 失败`）。
+
+**尚待验收的一项：** 上面的自检来自**根实例**——根条目只注册自检并同步配置，不挂载角色工具。要确认 `delegate_to_*` 的实际挂载与一次真实派发，需要一个**选中 Switchboard preset** 的会话（按当前四角色配置，分工调度台会报 `已挂载角色工具：4`；自办调度台为 3，且不含 worker；具体数量取决于各角色的 spawn / cli 后端）。在默认 `standard` preset 下看不到角色工具是设计使然，不是失败。
+
+**自办调度台的验收进展（2026-10-23 完全重启后）：** 根实例 `switchboard_selftest` 的 roster 已同时出现 `switchboard`、`switchboard-solo`、`switchboard-role-scout`、`switchboard-role-worker`、`switchboard-solo-role-scout`，且 `preset 异常行：（无异常行）`——两套组合的注册与角色 preset 命名空间隔离已真机通过。**仍未验收：** 在选中自办调度台的会话里实际挂载 3 个角色工具（无 worker）并完成一次真实派发；`delegate_to_worker` 的缺席与主代理自办执行也需要该会话实测。改动 preset 文件或 Host 代码后必须**完全退出并重启** DSH，reload 不生效。
 
 这取代了此前依靠 `raw/AGENTS.md` 在触碰临时文件时偶然注入的状态：现在正式来源是受版本控制的适配文本，不读取临时草稿。官方工作区指令插件对子目录文件的动态注入仍可能把 `raw/AGENTS.md` 带入触碰 `raw/*` 的子代理；本插件未改动该机制。实现与离线验证见 [D29](./docs/decisions.md#d29--主代理调度规则硬编码并按-preset-动态注入)，真机提示词待验收。
 

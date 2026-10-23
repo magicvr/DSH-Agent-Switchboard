@@ -438,6 +438,7 @@
 ### 验收证据（离线）
 
 - `node scripts/gen-preset.mjs --check`：`standard 插件数: 22`、`合计 23`、`!!js 表达式 2 → 2`、YAML 与行模板均无漂移，退出 `0`。
+  > 2026-10-23 加入「自办调度台」后，同一命令输出改为 `preset 数: 2，每个 23 行` / `!!js 表达式 2 → 4`，并对 YAML 做**逐字节**比对。上面的 `合计 23` 是单 preset 时代的历史证据。
 - `npm run check`：全链退出 `0`（`check-roles` 309、`check-drivers` 130、`check-cli` 71、`check-cli-provider` 292、`check-config-*` 全部通过 / 33 / 67、`check-apply` 383、`check-validation-parity` 56、`check-client` 328、`check-profile-wiring` 13、`check-version` 107、`check-lifecycle` 213、`check-script-portability` 146，均 `0 失败`）。
 - `node scripts/check-profile-wiring.mjs`：**13 通过 / 0 失败**。运行时 `0.2.1-rc.2`；仓库 DSH 要求满足运行时；仓库 `node_modules` 23 个 `@deepseek-ai/dsh*` 全部等于运行时。（重新注入 preset 之前该项曾报 `12 通过 / 1 失败`，失败项即 profile 仍内联 `0.2.0-rc.2` 时代的旧 preset 正文。）
 

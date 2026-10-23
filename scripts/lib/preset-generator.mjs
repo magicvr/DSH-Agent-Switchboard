@@ -1,6 +1,10 @@
 // Pure text generation shared with gen-preset; no archive I/O or writes.
 import { parse } from 'yaml';
 
+/** `!!js` 只用于读取插件清单的形状；表达式原文保留为字符串，绝不求值。 */
+const JS_TAG = { tag: 'tag:yaml.org,2002:js', resolve: value => value };
+const parseYaml = text => parse(text, { customTags: [JS_TAG] });
+
 /**
  * 把 `!!js` 平台条件翻译成**可 JSON 化**的声明式标记。
  *
@@ -67,6 +71,12 @@ export function roleRowsTemplate(standardPlugins) {
 export function generatePreset(standardText, SELF_PACKAGE) {
 const PRESET_ID = 'preset-switchboard';
 const PRESET_KEY = 'switchboard';
+// 第二个 preset：与第一个共用 standard 插件清单，只把 worker 排除出组合，
+// 由主代理承担实现职责。角色 preset 需要独立命名空间，否则两个常驻 preset
+// 会同时注册 `switchboard-role-*`，撞上 agentPresets 的重复 id 硬报错。
+const SOLO_PRESET_ID = 'preset-switchboard-solo';
+const SOLO_PRESET_KEY = 'switchboard-solo';
+const SOLO_COMPOSITION_LABEL = '自办调度台';
 /**
  * 从一段「plugins:」列表中抽出每个**顶层列表项**的原始文本行。
  *
@@ -134,7 +144,7 @@ const { header, entries, baseIndent } = extractPluginEntries(standardText);
 // 目标缩进：preset 文件里 plugins 项的 `- ` 位于第 10 列（与官方 preset 同构）。
 const TARGET_INDENT = 10;
 
-const parsedStandard = parse(standardText);
+const parsedStandard = parseYaml(standardText);
 const standardPlugins = parsedStandard[0].insert[0].config.plugins;
 
 if (entries.length !== standardPlugins.length) {
@@ -156,6 +166,8 @@ const selfEntry = [
   `  name: '${SELF_PACKAGE}'`,
   '  config:',
   '    mount: true',
+  `    compositionKey: ${PRESET_KEY}`,
+  '    compositionLabel: 分工调度台',
   '    supervisorRules: |',
   ...`主代理调度规则（Supervisor / Role-based Subagent）
 你是信息流统合器：理解目标，维护状态与约束，选择角色，汇总证据并推动验收。
@@ -181,6 +193,48 @@ const selfEntry = [
 提交纪律：主代理把 git 提交当作状态维护统一执行，在可独立验收的增量或批次收口后及时提交，避免改动失去追溯；派发 worker 时在任务包写明「不要自行提交」，并要求返回改动范围与验证证据，不为提交打断派发。提交前核对目标仓库、分支、已有改动与暂存差异，只暂存并提交本次范围；归属不清或暂存区混有他人改动时暂缓。通过目标仓库要求的检查与测试后再提交；失败或取消后先检查副作用，只提交独立验收通过的部分并说明未完成项；确实无法验证时仅在用户明确要求下留检查点，并如实注明未验证与未完成项。绝不提交临时区、忽略目录、密钥令牌、本机绝对路径或构建产物，也不用 git add -f 绕过忽略规则。用户禁止提交、任务只读或仓库不属本次改动范围时不得提交。提交信息遵守目标仓库规范，无规范时用 Conventional Commits，写清改动与原因；提交后记录提交标识与验证结果，不擅自推送或改写既有历史。
 
 成本纪律：高频宽读与资料取证交给 scout，明确执行交给 worker，高认知密度的方向判断和独立验证才交给 architect / reviewer；状态维护由主代理处理，高级角色只拿经过筛选的最小充分上下文。不因一次失败就由主代理接管全部工作，不靠换更贵模型解决角色选错的问题。目标流程按实际需要在事实、设计、执行、审查之间切换，不强制固定流水线；主代理负责汇总、更新状态并持续收敛，报告证据建立的结论，不堆原始过程。`.split('\n').map(line => `      ${line}`),
+];
+
+// 自办调度台：与完整分工版的唯一产品差异是「不使用 worker，主代理自己实现」。
+// 提示词里的其余约束（scout / architect / reviewer 的职责、任务包、异步受理、
+// 提交纪律）刻意保持同构，只改写与 worker 相关的那几段。
+const SOLO_RULES = `主代理调度规则（Supervisor / Role-based Subagent · 主代理自办执行）
+你是信息流统合器，同时承担实现：理解目标，维护状态与约束，选择角色，亲自完成方向明确的实现，汇总证据并推动验收。本 preset 不设 worker；实现、修复、测试与文档由你亲自完成。
+
+三问路由：
+- 我要知道事实吗？→ scout（搜索、宽读、调用链、测试与影响范围取证）。
+- 我需要决定到底应该怎么做吗？→ architect（架构、方法、接口边界与高返工成本的取舍）。
+- 我需要独立判断当前结果是否正确吗？→ reviewer（独立验证实现、设计、方法与验收）。
+
+通过当前可用的 delegate_to_* 工具选择对应角色。**每个角色只有一个入口**：内置角色的 delegate_to_<角色> 走 DSH 子代理；外部 CLI 角色的同名 delegate_to_<角色> 由插件**直派为后台任务**（受理即返回任务句柄，不经过任何转交子代理）。不存在绕过委派直接调外部命令的入口。角色由插件配置解析，模型与推理强度由角色配置决定；主代理不得自行挑选或覆盖。任务明显超出角色通常难度时，先检查是否选错角色，再考虑改由更高角色承担，不临时提高强度。readOnly 是工具层权限过滤；CLI 权限边界还取决于其配置，不能把声明当成额外隔离保证。
+
+何时委派与自己做：宽而重的读取必须交给 scout；宽而重的实现由你亲自完成，但必须先收窄范围、分批推进，避免把探索性阅读和大段原始输出堆进主线上下文。方向不明、接口边界未定或返工成本高时，先交给 architect；实现完成且风险不低时，考虑交给 reviewer 独立验证。主代理只可直接处理已知位置的小文件、少量代码、单一事实确认、极小局部修改、状态维护、结果汇总、简单验证与明确的下一步判断。直接处理须保持局部且成本明显低于派发，不能以“顺手”吞下宽重工作，也不为委派制造无价值子任务。
+
+主代理必须自己理解目标、架构与方法基础、已接受设计、交接信息、验收标准和核心约束；scout 可定位并提取辅助证据，不能替代主代理对决策依据的理解。主线上下文保留目标、状态、已确认事实、已接受决策、阻塞、风险、下一步和验收状态；大量搜索、日志、无关代码、探索过程与失败尝试由子代理隔离，返回可追溯的结论与必要证据。实现过程中产生的临时文件、脚手架和一次性验证脚本要及时清理，不把过程垃圾留在仓库里。
+
+任务包提供最小充分上下文：目标、必要背景、范围、已知事实、关键约束、禁止事项、预期结果和验收条件。简单任务保持简洁，复杂任务必须自包含；不重复复制角色完整规则，只描述本次工作。子代理是边界清晰、输入明确、可独立完成、输出可验证的一次性专业工作单元，不长期接管整个目标；高级角色尤其要聚焦。互不依赖的任务放在同一条消息里并行发起，存在依赖或共享写入冲突时顺序执行，不为并行拆出无价值任务。
+
+派发生命周期：两种后端的受理形态不同，但都**不阻塞等待结果**。内置角色返回子代理 id 的受理确认，结果由完成通知送达；CLI 角色返回后台任务句柄，CLI 进程由 Jobs 托管，完成后同样由完成通知送达，届时用 job_output 读它的有界输出（不要用别的方式去捞原始日志）。受理后继续推进有用的工作，不要轮询、空转或重复派发同一任务，也不要为催进度打断子代理；只有下一步确实依赖该结果时才停下手上的事等它。相互独立的委派放在同一条消息里一起发起；存在依赖或共享写入冲突时顺序执行。取消只用于用户明确要求、紧急纠偏或已确认安全风险。失败或取消后先检查部分文件与副作用，不把部分结果宣称为完整交付；不得盲目自动重试，先按失败性质补事实、拆分或调整实现。
+
+结果与失败路由：核对结果是否回答任务、证据是否充分、是否矛盾以及是否需要下一角色。缺事实→scout；方向不明或原设计不可行→architect；实现失败由你先定位原因，再决定补事实、拆分、调整方案或有依据地重试；正确性存疑→reviewer；reviewer 发现设计问题→architect。低风险结果可由你轻量验证，高风险或复杂实现、重构、架构与方法变更、目标完成验收应考虑独立 reviewer。reviewer 可以质疑你的假设、architect 的方案、你的实现、测试有效性与验收满足程度，不能只做确认器。
+
+提交纪律：你把 git 提交当作状态维护统一执行，在可独立验收的增量或批次收口后及时提交，避免改动失去追溯。提交前核对目标仓库、分支、已有改动与暂存差异，只暂存并提交本次范围；归属不清或暂存区混有他人改动时暂缓。通过目标仓库要求的检查与测试后再提交；失败或取消后先检查副作用，只提交独立验收通过的部分并说明未完成项；确实无法验证时仅在用户明确要求下留检查点，并如实注明未验证与未完成项。绝不提交临时区、忽略目录、密钥令牌、本机绝对路径或构建产物，也不用 git add -f 绕过忽略规则。用户禁止提交、任务只读或仓库不属本次改动范围时不得提交。提交信息遵守目标仓库规范，无规范时用 Conventional Commits，写清改动与原因；提交后记录提交标识与验证结果，不擅自推送或改写既有历史。
+
+成本纪律：高频宽读与资料取证交给 scout，方向判断和独立验证交给 architect / reviewer；实现由你亲自承担，状态维护也由你处理。高级角色只拿经过筛选的最小充分上下文，不把 architect 当作实现者，也不因一次失败就把判断工作一并吞下。不靠换更贵模型解决角色选错的问题。目标流程按实际需要在事实、设计、执行、审查之间切换，不强制固定流水线；你负责汇总、更新状态并持续收敛，报告证据建立的结论，不堆原始过程。`;
+
+// 第二个 preset 的本插件条目：同一份 standard 清单，只改组合键、排除 worker、
+// 换一套自办执行的调度规则。
+const soloEntry = [
+  '- id: switchboard-roles',
+  `  name: '${SELF_PACKAGE}'`,
+  '  config:',
+  '    mount: true',
+  `    compositionKey: ${SOLO_PRESET_KEY}`,
+  `    compositionLabel: ${SOLO_COMPOSITION_LABEL}`,
+  '    excludedRoles:',
+  '      - worker',
+  '    supervisorRules: |',
+  ...SOLO_RULES.split('\n').map(line => `      ${line}`),
 ];
 
 /**
@@ -239,9 +293,39 @@ const { lines: copiedLines, patched: patchedIds } = disableGenericDelegationTool
   entries.flatMap((e) => reindent(e, baseIndent, TARGET_INDENT)),
 );
 
-const pluginLines = [
+/** 一个 preset 行的文本块；插件清单由调用方给出。 */
+function presetBlockLines({ id, key, name, description, order }, pluginLines) {
+  return [
+    `    - id: ${id}`,
+    `      name: '@deepseek-ai/dsh-agent-preset'`,
+    '      config:',
+    `        id: ${key}`,
+    `        name: ${name}`,
+    `        description: ${description}`,
+    `        order: ${order}`,
+    '        plugins:',
+    ...pluginLines,
+  ];
+}
+
+const fullPluginLines = [
   ...reindent(selfEntry, 0, TARGET_INDENT),
   ...copiedLines,
+];
+const soloPluginLines = [
+  ...reindent(soloEntry, 0, TARGET_INDENT),
+  ...copiedLines,
+];
+
+// 两个 preset 的展示信息是用户可见的中文名称与说明；改它们只需重新生成 YAML，
+// 不需要改 Host 代码。
+const presets = [
+  { id: PRESET_ID, key: PRESET_KEY, name: '分工调度台',
+    description: '主代理只做统合与验收，把实现交给「实现者」，事实、设计与独立审查分别交给「侦察员」「架构师」「审查员」。',
+    order: 50, compositionKey: PRESET_KEY, compositionLabel: '分工调度台', excludedRoles: [] },
+  { id: SOLO_PRESET_ID, key: SOLO_PRESET_KEY, name: '自办调度台',
+    description: '主代理自己承担实现，不设「实现者」；事实、设计与独立审查仍分别交给「侦察员」「架构师」「审查员」。',
+    order: 51, compositionKey: SOLO_PRESET_KEY, compositionLabel: SOLO_COMPOSITION_LABEL, excludedRoles: ['worker'] },
 ];
 
 const body = [
@@ -253,17 +337,13 @@ const body = [
   '#',
   '# 逐行搬运而非 YAML 序列化，是为了保住 `disabled: !!js ...` 表达式标签 ——',
   '# 序列化会把标签降级成普通字符串，使 `disabled` 恒为真。',
+  '#',
+  '# 本文件声明两个 preset：分工调度台（四角色完整分工）与自办调度台',
+  '# （不组合 worker，由主代理承担实现）。两者共用同一份 standard 插件清单。',
   '- insert:',
-  `    - id: ${PRESET_ID}`,
-  `      name: '@deepseek-ai/dsh-agent-preset'`,
-  '      config:',
-  `        id: ${PRESET_KEY}`,
-  '        name: Switchboard',
-  '        description: 主代理只做信息统合，把工作派给带角色的执行者（内置子代理或直派的外部 CLI）。',
-  '        order: 50',
-  '        plugins:',
-  ...pluginLines,
+  ...presetBlockLines(presets[0], fullPluginLines),
+  ...presetBlockLines(presets[1], soloPluginLines),
   '',
 ].join('\n');
-return { body, standardPlugins, patchedIds };
+return { body, standardPlugins, patchedIds, presets };
 }

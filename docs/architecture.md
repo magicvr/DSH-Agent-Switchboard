@@ -1,6 +1,6 @@
 # 架构设计
 
-> **状态：核心实现已落地。** Host、Client 角色设置页、CLI 专属工具与按角色委派均已实现。CLI 的 spawn 包裹链路已通过离线假 CLI 验证；`0.2.1-rc.1` 迁移已过一次**真机重启**验收（插件正常装载、`plugin:verify` consistent、四个角色 preset 在运行期注册成功，见 [`lifecycle.md`](./lifecycle.md) §6.4），但**选中 Switchboard preset 的会话里的 `delegate_to_*` 挂载与真实派发仍未验收**。本文同时保留 DSH 契约、历史实测与仍适用的设计约束；历史方案被取代处注明当前行为。主代理写工具限制、统一结构化结果契约、并发与预算上限尚未实现；不要把目标形态当作已具备的能力。带「待定」或「未核实」标记的内容仍需验证。
+> **状态：核心实现已落地。** Host、Client 角色设置页、CLI 专属工具与按角色委派均已实现。CLI 的 spawn 包裹链路已通过离线假 CLI 验证；`0.2.1-rc.1` 迁移已过一次**真机重启**验收（插件正常装载、`plugin:verify` consistent、完整分工版的四个角色 preset 在运行期注册成功，见 [`lifecycle.md`](./lifecycle.md) §6.4；自办版见 3.1h，尚未真机重启验收），但**选中 Switchboard preset 的会话里的 `delegate_to_*` 挂载与真实派发仍未验收**。本文同时保留 DSH 契约、历史实测与仍适用的设计约束；历史方案被取代处注明当前行为。主代理写工具限制、统一结构化结果契约、并发与预算上限尚未实现；不要把目标形态当作已具备的能力。带「待定」或「未核实」标记的内容仍需验证。
 >
 > **DSH 基线：`0.2.1-rc.2`。** 该版本删除了 `dsh-tool-subagent` 的 `persona` / `toolFilter` / `backgroundMode` / `enableRunInBackground`，角色 persona 与工具构成改由**每角色独立 Agent Preset** 承载（见 3.1g 与 [`decisions.md`](./decisions.md) D32），`fork` 后端已移除。真机重启已确认角色 preset 注册成功；子代理**实际拿到的**工具构成与只读裁剪、以及客户端半边，仍只有静态 / 离线验证。
 
@@ -304,6 +304,26 @@
 43. **`fork` 后端已移除。** `dsh-subagent-fork-in-process` 声明 `capabilities.agentPreset: false` 且 `inheritsParentContext: true`；`dsh-subagent` 的 `assertCapabilities` 与 `dsh-tool-subagent` 的 `SubagentPresetSelection.assertProvider`（`tool-subagent: provider "..." does not support independent agent preset selection`）都会对此抛错。也就是说 fork 子代理**无法**拥有自己的角色指令与工具限制，保留它只会留下一个静默失效的选项。`src/roles.js` 的 `BUILTIN_PROVIDERS` 现为 `['spawn']`，`backend: 'fork'` 被角色校验拒绝。
 44. **派发语义：一律异步受理。** 工具的输出 schema 固定为 `{kind: 'activation', subagentId}`（`const: "activation"`），`execute` 在 `subagents.startActivation({..., delivery: 'parent'})` 后立即返回；没有前台 / 后台模式，子代理结果稍后以完成通知送达。旧的「delegate 阻塞并返回子输出」描述已不成立；注入的调度规则与路由指引（`scripts/lib/preset-generator.mjs` 的 `selfEntry`、`src/roles.js` 的 `roleGuidanceText`）已按此改写。
 45. **上游 standard 漂移与被整体移除的行。** `0.2.1-rc.1` 的 standard 新增 `dsh-time-context` / `dsh-tool-schedule` / `dsh-plugin-market/tools`，persona 行去掉 `suffix`，delegation 组的 subagent 行去掉 `backgroundMode`，并**整体移除** `tool-subagent-codex` / `tool-subagent-claude-code` / `tool-ralph` 行。仓库 preset 与行模板已重新生成（`npm run gen:preset`）。`npm run check:preset` 覆盖两个生成物；它在升级落地时**不在** `npm run check` 主链内，这是漂移长期未被发现的原因，现已加入主链末尾。
+
+### 3.1h 双 preset：分工调度台与自办调度台
+
+46. **同一份 `presets/switchboard.patch.yml` 声明两个 Agent preset。** 它们共享同一份 standard 插件清单与角色文件，只在「是否组合 worker」及对应调度规则上不同：
+
+    | preset 行 id | `config.id` | 中文名 | `order` | `compositionKey` | 组合角色 |
+    | --- | --- | --- | --- | --- | --- |
+    | `preset-switchboard` | `switchboard` | 分工调度台 | 50 | `switchboard` | scout / worker / architect / reviewer |
+    | `preset-switchboard-solo` | `switchboard-solo` | 自办调度台 | 51 | `switchboard-solo` | scout / architect / reviewer |
+
+    自办版的插件配置额外声明 `excludedRoles: [worker]`，并用一段独立的 `supervisorRules` 把「方向明确的实现」交给主代理；其余段落（scout / architect / reviewer 的职责、任务包、异步受理、提交纪律）与完整版保持同构。
+
+47. **`excludedRoles` 是组合期过滤器，不是角色定义的删除。** Host 在 `createRoleResolver()` 完成 `normalizeRoles` 之后过滤角色：
+    - 被排除的角色不挂载委派工具、不进入 `switchboard` 角色工具集、不写进自检的生效路由；
+    - `canDispatch` 中指向被排除角色的条目会被裁掉，避免子代理 preset 里出现指向不存在目标的死行；
+    - 角色定义仍住在共享的 `roles.json`，设置页对 worker 的修改只影响完整分工版；两个 preset 读取的是同一份定义与 `overrides`。
+
+48. **两个 preset 同时常驻，角色 preset id 必须分命名空间。** `@deepseek-ai/dsh-agent-preset` 的每个声明都会**eagerly**装载，两个 Switchboard preset 因此会同时向同一个 Host `agentPresets` 注册表注册角色 preset。若都沿用 `switchboard-role-<id>`，第二个声明会撞上注册表的 `Duplicate agent preset` 硬报错，整个自办组合装载失败。现在角色 preset id 为 `<compositionKey>-role-<roleId>`：完整版保持旧 id `switchboard-role-*`（与会话、既有 roster 兼容），自办版为 `switchboard-solo-role-*`。`rolePresetId()` 的默认参数保留旧前缀；嵌套委派行与 `toolConfigFor().agentPreset` 都透传同一个组合键。
+
+49. **验证边界。** `check-apply` 在同一 `agentPresets` 桩上依次装载两个组合，断言：完整版挂载 scout + worker，自办版只挂载 scout；两套角色 preset id 同时存在且无重复；生成器同时产出两个 preset 且完整版规则逐字节不变。`check-lifecycle` / `check-profile-wiring` 覆盖两个声明的结构、`excludedRoles` 与独立 `compositionKey`。**2026-10-23 完全重启后已真机验收 roster**：根实例自检列出 `switchboard`、`switchboard-solo`、`switchboard-role-scout`、`switchboard-role-worker`、`switchboard-solo-role-scout`，`preset 异常行：（无异常行）`，说明两个常驻声明与命名空间隔离都被注册表接受。**仍未验收**：选中自办 preset 的会话里的实际角色工具挂载、`delegate_to_worker` 的缺席与一次真实派发；改动 preset / Host 代码必须完全退出并重启 DSH。
 
 ### 3.2 一条误导性的诊断信息（重要）
 

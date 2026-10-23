@@ -42,11 +42,11 @@ function readPatch(path) {
   return { entries };
 }
 
-function presetConfig(patch) {
+function presetConfig(patch, presetId = 'preset-switchboard') {
   if (patch.error) return { error: patch.error };
-  const preset = patch.entries.find(row => row.id === 'preset-switchboard');
-  if (!preset) return { error: '缺少 preset-switchboard 声明' };
-  if (!isObject(preset.config)) return { preset, error: 'preset-switchboard 的 config 必须是对象' };
+  const preset = patch.entries.find(row => row.id === presetId);
+  if (!preset) return { error: `缺少 ${presetId} 声明` };
+  if (!isObject(preset.config)) return { preset, error: `${presetId} 的 config 必须是对象` };
   if (!Array.isArray(preset.config.plugins)) return { preset, error: 'preset 的 plugins 必须是数组' };
   if (!preset.config.plugins.every(isObject)) return { preset, error: 'plugins 数组中的条目必须是对象' };
   const selfRow = preset.config.plugins.find(plugin => plugin.name === SELF);
@@ -416,6 +416,7 @@ check(
 const repoPresetPath = new URL('../presets/switchboard.patch.yml', import.meta.url);
 console.log('\n=== 仓库 presets/switchboard.patch.yml（preset 声明的权威副本）===');
 const repoPreset = presetConfig(readPatch(repoPresetPath));
+const repoPresetSolo = presetConfig(readPatch(repoPresetPath), 'preset-switchboard-solo');
 const { preset, selfRow, config } = repoPreset;
 const presetDetail = `${repoPreset.error ?? '仓库 preset 配置缺失或漂移'}；${repairRules}`;
 check('仓库 preset 里存在 preset-switchboard 声明', preset !== undefined, presetDetail);
@@ -439,6 +440,31 @@ check(
   `调度规则缺失、类型错误或仅含空白；${presetDetail}`,
 );
 
+const solo = repoPresetSolo;
+const soloConfig = solo.config;
+const soloDetail = `${solo.error ?? '仓库自办 preset 配置缺失或漂移'}；${repairRules}`;
+check('仓库 preset 里存在 preset-switchboard-solo 声明', solo.preset !== undefined, soloDetail);
+check(
+  '自办 preset 声明了 mount:true、不含 roles、且 supervisorRules 非空',
+  soloConfig?.mount === true && !Object.hasOwn(soloConfig ?? {}, 'roles')
+    && typeof soloConfig?.supervisorRules === 'string' && soloConfig.supervisorRules.trim().length > 0,
+  soloDetail,
+);
+check(
+  '自办 preset 不组合 worker，并使用独立的 compositionKey',
+  Array.isArray(soloConfig?.excludedRoles) && soloConfig.excludedRoles.includes('worker')
+    && typeof soloConfig?.compositionKey === 'string' && soloConfig.compositionKey !== 'switchboard'
+    && soloConfig.compositionKey !== config?.compositionKey,
+  `${soloDetail} 当前 compositionKey=${JSON.stringify(soloConfig?.compositionKey)}，`
+    + `excludedRoles=${JSON.stringify(soloConfig?.excludedRoles)}`,
+);
+check(
+  '自办 preset 的调度规则不再把执行路由给 worker',
+  typeof soloConfig?.supervisorRules === 'string'
+    && !/delegate_to_worker|→ worker/.test(soloConfig.supervisorRules),
+  `${soloDetail} 规则里仍出现 worker 的派发路由。`,
+);
+
 console.log('\n=== bundle 投递装配 ===');
 const repoPackage = readDocument(new URL('../package.json', import.meta.url), JSON.parse);
 const bundlePatches = repoPackage.data?.dsh?.bundle?.patch;
@@ -458,11 +484,14 @@ if (!existsSync(profilePatch)) {
 }
 const profileDoc = readPatch(profilePatch);
 const profilePreset = presetConfig(profileDoc);
+const profilePresetSolo = presetConfig(profileDoc, 'preset-switchboard-solo');
 const cleanDetail = `${profilePreset.error ?? '仍存在内联的 preset-switchboard 声明'}；`
+  + `${profilePresetSolo.error ?? '仍存在内联的 preset-switchboard-solo 声明'}；`
   + `运行 node scripts/ops/plugin-lifecycle.mjs install --apply 剥离；${repairRules}`;
 check(
   'profile patch 里没有内联的 preset-switchboard 副本',
-  profilePreset.error !== undefined && /缺少 preset-switchboard/.test(profilePreset.error),
+  profilePreset.error !== undefined && /缺少 preset-switchboard/.test(profilePreset.error)
+    && profilePresetSolo.error !== undefined && /缺少 preset-switchboard-solo/.test(profilePresetSolo.error),
   cleanDetail,
 );
 

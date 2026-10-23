@@ -21,10 +21,10 @@ import { captureSync } from './lib/capture.mjs';
 const ROOT = process.cwd();
 // 用裸说明符由 Node 自行解析入口（`yaml` 的入口不是 index.js）。
 const { parse } = await import('yaml');
+/** `!!js` 表达式在生成物里必须原样保留；解析只用于结构校验，绝不求值。 */
+const parseYaml = text => parse(text, { customTags: [{ tag: 'tag:yaml.org,2002:js', resolve: value => value }] });
 
 const STANDARD_ENTRY = 'dsh/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml';
-const PRESET_ID = 'preset-switchboard';
-const PRESET_KEY = 'switchboard';
 const SELF_PACKAGE = '@magicvr/dsh-agent-switchboard';
 const OUT_FILE = join(ROOT, 'presets', 'switchboard.patch.yml');
 // 角色 preset 的**行模板**：同一份标准清单的数据形态，供 Host 在运行期按角色裁剪。
@@ -56,7 +56,7 @@ function cat(asarPath) {
 /** standard preset 的原始文本。 */
 const standardText = cat(STANDARD_ENTRY);
 
-const { body, standardPlugins, patchedIds } = generatePreset(standardText, SELF_PACKAGE);
+const { body, standardPlugins, patchedIds, presets } = generatePreset(standardText, SELF_PACKAGE);
 
 
 // 断言：原文里的 !!js 表达式必须一字不少地带过来。
@@ -72,35 +72,58 @@ const countJsTags = (text) =>
 const jsTagsIn = countJsTags(standardText);
 const jsTagsOut = countJsTags(body);
 console.log(`standard 插件数: ${standardPlugins.length}`);
-console.log(`本插件条目: 1，合计 ${standardPlugins.length + 1}`);
-console.log(`!!js 表达式（非注释行）: 原文 ${jsTagsIn} 个 → 产物 ${jsTagsOut} 个`);
-if (jsTagsIn !== jsTagsOut) {
+console.log(`preset 数: ${presets.length}，每个 ${standardPlugins.length + 1} 行（含本插件条目）`);
+console.log(`!!js 表达式（非注释行）: 原文 ${jsTagsIn} 个 → 产物 ${jsTagsOut} 个（期望 ${jsTagsIn * presets.length}）`);
+if (jsTagsOut !== jsTagsIn * presets.length) {
   console.error('FAIL  !!js 表达式数量不一致 —— 标签可能被破坏');
   process.exit(1);
 }
 console.log('PASS  !!js 表达式全部保留');
 
-// 产物必须仍能被解析，且插件数与预期一致。
+// 产物必须仍能被解析，且每个 preset 的插件数与展示信息一致。
 let produced;
 try {
-  produced = parse(body);
+  produced = parseYaml(body);
 } catch (error) {
   console.error(`FAIL  产物无法解析：${error.message}`);
   process.exit(1);
 }
-const producedPlugins = produced[0].insert[0].config.plugins;
-if (producedPlugins.length !== standardPlugins.length + 1) {
-  console.error(`FAIL  产物插件数 ${producedPlugins.length} 不符（期望 ${standardPlugins.length + 1}）`);
+const inserted = produced[0]?.insert;
+if (!Array.isArray(inserted) || inserted.length !== presets.length) {
+  console.error(`FAIL  产物 insert 条目数 ${Array.isArray(inserted) ? inserted.length : '非数组'} 不符（期望 ${presets.length}）`);
   process.exit(1);
 }
-if (!producedPlugins.some((p) => p.name === SELF_PACKAGE)) {
-  console.error('FAIL  产物未引用本包');
-  process.exit(1);
+for (const expected of presets) {
+  const row = inserted.find((item) => item.id === expected.id);
+  if (!row) {
+    console.error(`FAIL  产物缺少 ${expected.id}`);
+    process.exit(1);
+  }
+  const config = row.config;
+  const self = config?.plugins?.find((plugin) => plugin.name === SELF_PACKAGE);
+  if (!self) {
+    console.error(`FAIL  ${expected.id} 未引用本包`);
+    process.exit(1);
+  }
+  if (config.id !== expected.key || config.name !== expected.name
+    || config.description !== expected.description || config.order !== expected.order) {
+    console.error(`FAIL  ${expected.id} 的展示信息与生成器预期不一致`);
+    process.exit(1);
+  }
+  if (self.config?.compositionKey !== expected.compositionKey
+    || JSON.stringify(self.config?.excludedRoles ?? []) !== JSON.stringify(expected.excludedRoles)) {
+    console.error(`FAIL  ${expected.id} 的组合键或排除角色与生成器预期不一致`);
+    process.exit(1);
+  }
+  if (config.plugins.length !== standardPlugins.length + 1) {
+    console.error(`FAIL  ${expected.id} 插件数 ${config.plugins.length} 不符（期望 ${standardPlugins.length + 1}）`);
+    process.exit(1);
+  }
 }
-console.log('PASS  产物可解析、插件数正确、含本包');
+console.log('PASS  产物可解析、两个 preset 的展示信息/组合键/插件数正确、均含本包');
 console.log(
   patchedIds.length > 0
-    ? `改动：禁用 standard 的通用委派工具 ${patchedIds.join(', ')}（避免架空角色分工）`
+    ? `改动：两个 preset 都禁用 standard 的通用委派工具 ${patchedIds.join(', ')}（避免架空角色分工）`
     : '改动：（无）',
 );
 
@@ -112,22 +135,38 @@ const rowsBody = JSON.stringify({
   rows: roleRows,
 }, null, 2) + '\n';
 
-// 漂移检测：与已落盘的产物比对插件名序列。
+// 漂移检测：逐字节比对已落盘产物。只比插件名会漏掉 preset 名称、说明与
+// supervisorRules 的改动（历史教训：规则漂移不在 check 主链内，很久没被发现）。
+// 字节不一致时再按 preset 给出可读差异，便于定位。
 let drift = false;
 if (existsSync(OUT_FILE)) {
-  const existing = parse(readFileSync(OUT_FILE, 'utf8'));
-  const existingNames = existing[0].insert[0].config.plugins.map((p) => p.name);
-  const producedNames = producedPlugins.map((p) => p.name);
-  if (JSON.stringify(existingNames) !== JSON.stringify(producedNames)) {
-    drift = true;
-    console.warn('\n⚠️  已落盘的 presets/switchboard.patch.yml 与当前 standard 清单**不一致**：');
-    console.warn(`    落盘 ${existingNames.length} 项，当前 standard ${producedNames.length} 项`);
-    const missing = producedNames.filter((n) => !existingNames.includes(n));
-    const extra = existingNames.filter((n) => !producedNames.includes(n));
-    if (missing.length) console.warn(`    应新增：${missing.join(', ')}`);
-    if (extra.length) console.warn(`    已移除：${extra.join(', ')}`);
+  const existingBytes = readFileSync(OUT_FILE);
+  if (existingBytes.equals(Buffer.from(body))) {
+    console.log('\nPASS  无漂移（落盘产物与生成器逐字节一致）');
   } else {
-    console.log('\nPASS  无漂移（与当前 standard 清单一致）');
+    drift = true;
+    console.warn('\n⚠️  已落盘的 presets/switchboard.patch.yml 与生成器产物**不一致**。');
+    let existing;
+    try { existing = parseYaml(existingBytes.toString('utf8')); } catch { existing = null; }
+    const existingInsert = existing?.[0]?.insert;
+    if (!Array.isArray(existingInsert) || existingInsert.length !== presets.length) {
+      console.warn(`    落盘 preset 数 ${Array.isArray(existingInsert) ? existingInsert.length : '无法解析'}，产物 ${presets.length} 个`);
+    }
+    for (const expected of presets) {
+      const row = Array.isArray(existingInsert) ? existingInsert.find((item) => item.id === expected.id) : undefined;
+      if (!row) { console.warn(`    缺少 preset：${expected.id}`); continue; }
+      const existingNames = (row.config?.plugins ?? []).map((p) => p.name);
+      const producedNames = inserted.find((item) => item.id === expected.id).config.plugins.map((p) => p.name);
+      if (JSON.stringify(existingNames) !== JSON.stringify(producedNames)) {
+        console.warn(`    ${expected.id} 的插件清单与 standard 不一致（落盘 ${existingNames.length} 项，产物 ${producedNames.length} 项）`);
+        const missing = producedNames.filter((n) => !existingNames.includes(n));
+        const extra = existingNames.filter((n) => !producedNames.includes(n));
+        if (missing.length) console.warn(`      应新增：${missing.join(', ')}`);
+        if (extra.length) console.warn(`      已移除：${extra.join(', ')}`);
+      } else {
+        console.warn(`    ${expected.id} 的插件名一致，差异在名称/说明/规则或其它字节。`);
+      }
+    }
   }
 } else {
   console.log('\n（尚无落盘文件）');
