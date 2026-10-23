@@ -1,10 +1,10 @@
 // 生命周期只读快照；所有路径和归档读取均可注入，缺失制品不抛异常。
-import { readFileSync, statSync, existsSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { readFileSync, statSync, existsSync, realpathSync, readdirSync } from 'node:fs';
+import { join, basename, resolve } from 'node:path';
 import { captureSync } from './capture.mjs';
 import { resolvePaths, resolveAsar, REPO_ROOT } from './paths.mjs';
 import { readPatch, presetConfig, findPatchEntry } from './preset-patch.mjs';
-import { generatePreset } from './preset-generator.mjs';
+import { generatePreset, roleRowsTemplate } from './preset-generator.mjs';
 import { CONFIG_FORMAT_VERSION, readConfigFileDetailed } from '../../src/config-file.js';
 import { parseVersion, compareVersions, formatVersion } from './version.mjs';
 
@@ -30,6 +30,7 @@ export function satisfiesDshRange(version, range) {
   return { status: accepts ? 'compatible' : 'incompatible', accepts };
 }
 
+const STANDARD_ENTRY = 'dsh/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml';
 const isDshPeerName = name => name === '@deepseek-ai/dsh' || name.startsWith('@deepseek-ai/dsh-');
 // 真实 gate 只对 peerDependencies 把这三个协议值解释为「当前运行时」。
 const WORKSPACE_PEER_RANGES = new Set(['workspace:^', 'workspace:~', 'workspace:*']);
@@ -75,6 +76,37 @@ export function evaluateDshPeers(version, peers) {
 }
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/** 仓库 node_modules 里已安装的 @deepseek-ai/dsh* 版本；离线检查 import 的正是这一份。 */
+function repoDshDependencies(repoRoot) {
+  const scope = join(repoRoot, 'node_modules', '@deepseek-ai');
+  if (!existsSync(scope)) return { status: 'skipped', reason: '仓库 node_modules 缺少 @deepseek-ai', rows: [] };
+  const rows = [];
+  for (const entry of readdirSync(scope, { withFileTypes: true })) {
+    if ((!entry.isDirectory() && !entry.isSymbolicLink()) || !/^dsh(?:-|$)/.test(entry.name)) continue;
+    const manifest = readJson(join(scope, entry.name, 'package.json'));
+    if (typeof manifest.value?.version === 'string')
+      rows.push({ name: `@deepseek-ai/${entry.name}`, version: manifest.value.version });
+  }
+  return rows.length > 0 ? { status: 'collected', rows } : { status: 'skipped', reason: '未找到 dsh 包', rows: [] };
+}
+
+/** 把 link:/file: 依赖解析成绝对路径；其它 spec 返回 null。 */
+function linkTarget(spec, profileDir) {
+  const match = typeof spec === 'string' ? /^(?:link|file):(.+)$/i.exec(spec) : null;
+  if (!match) return null;
+  const raw = match[1];
+  return resolve(/^(?:[A-Za-z]:[\\/]|[\\/])/.test(raw) ? raw : join(profileDir, raw));
+}
+
+/** 比较两个路径；存在时用 realpath，Windows 下忽略大小写。 */
+function samePath(left, right) {
+  const canonical = path => {
+    try { return realpathSync(path); } catch { return resolve(path); }
+  };
+  const normalize = path => process.platform === 'win32' ? path.toLowerCase() : path;
+  return normalize(canonical(left)) === normalize(canonical(right));
+}
 
 // 镜像真实 gate 的豁免记录校验：键必须是精确 package@version，值必须是精确规范 SemVer 列表；
 // 其余记录被 DSH 静默忽略，绝不改变判定。
@@ -141,9 +173,14 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
   const bundles = profilePackage.value?.dsh?.profile?.bundles;
   const inBundles = Array.isArray(bundles) && bundles.includes(name);
   const resolved = readJson(join(paths.profile, 'node_modules', name, 'package.json'));
-  const registration = { dependencyPresent, dependencySpec: dependencyPresent ? dependencies[name] : null, inBundles,
+  const dependencySpec = dependencyPresent ? dependencies[name] : null;
+  const sourceTarget = linkTarget(dependencySpec, paths.profile);
+  const registration = { dependencyPresent, dependencySpec, inBundles,
     resolved: Boolean(resolved.value?.name === name && typeof resolved.value.version === 'string'),
     resolvedVersion: resolved.value?.version ?? null, resolvedManifestVersion: resolved.value?.dsh?.manifestVersion ?? null, resolutionError: resolved.error ?? null,
+    sourceKind: sourceTarget !== null ? 'link' : dependencyPresent ? 'registry' : null,
+    sourceTarget,
+    sourceMatchesRepo: sourceTarget === null ? null : samePath(sourceTarget, repoRoot),
     silentFailureTrap: dependencyPresent && !inBundles };
   // ⚠️ preset 声明的**权威副本在仓库** `presets/switchboard.patch.yml`：它由本包
   //    `package.json` 的 `dsh.bundle.patch` 投递，bundle 层与 profile 的覆盖层一起被
@@ -197,7 +234,9 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
     homePatchPath,
     homePatchExists,
     homePatchError: homePatch.error ?? null,
-    generatedError: generated.error ?? null, generatedDrift: unknown('尚未读取 DSH standard preset') };
+    generatedError: generated.error ?? null,
+    generatedDrift: unknown('尚未读取 DSH standard preset'),
+    rowsDrift: unknown('尚未读取 DSH standard preset') };
   const presetSolo = {
     present: Boolean(generatedSolo.preset),
     mount: generatedSolo.config?.mount === true,
@@ -215,7 +254,11 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
   try {
     if (readArchive === null) throw new Error('DSH 归档不可用');
     if (readArchive === undefined) { const reader = archiveReader({ env }); readArchive = reader.read; archive = { path: reader.archive, source: reader.source }; }
-  } catch (error) { readArchive = null; archiveError = error.message; preset.generatedDrift = unknown(error.message); }
+  } catch (error) {
+    readArchive = null; archiveError = error.message;
+    preset.generatedDrift = unknown(error.message);
+    preset.rowsDrift = unknown(error.message);
+  }
   let archiveRuntimeVersion = null;
   if (readArchive) {
     try {
@@ -228,14 +271,33 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
       || (runtimeVersion !== undefined && archiveRuntimeVersion !== null && runtimeVersion === archiveRuntimeVersion);
     if (driftTrusted) {
       try {
-        const expected = generatePreset(readArchive('dsh/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml'), name).body;
+        const generatedPreset = generatePreset(readArchive(STANDARD_ENTRY), name);
         const existing = readFileSync(join(repoRoot, 'presets', 'switchboard.patch.yml'));
-        preset.generatedDrift = { status: existing.equals(Buffer.from(expected)) ? 'current' : 'drifted',
-          reason: existing.equals(Buffer.from(expected)) ? null : '仓库 preset 与生成器当前产物字节不一致' };
-      } catch (error) { preset.generatedDrift = unknown(error.message); }
+        preset.generatedDrift = { status: existing.equals(Buffer.from(generatedPreset.body)) ? 'current' : 'drifted',
+          reason: existing.equals(Buffer.from(generatedPreset.body)) ? null : '仓库 preset 与生成器当前产物字节不一致' };
+        // 行模板是运行期按角色裁剪工具清单的输入；只比 YAML 会漏掉它的漂移。
+        const rowsPath = join(repoRoot, 'presets', 'standard-plugins.json');
+        const expectedRows = JSON.stringify({
+          generatedFrom: STANDARD_ENTRY,
+          note: '由 scripts/gen-preset.mjs 生成，请勿手改：Host 在运行期据此按角色裁剪出独立 preset。',
+          rows: roleRowsTemplate(generatedPreset.standardPlugins),
+        }, null, 2) + '\n';
+        if (!existsSync(rowsPath)) {
+          preset.rowsDrift = { status: 'drifted', reason: '缺少 presets/standard-plugins.json' };
+        } else {
+          const rowsBytes = readFileSync(rowsPath);
+          preset.rowsDrift = { status: rowsBytes.equals(Buffer.from(expectedRows)) ? 'current' : 'drifted',
+            reason: rowsBytes.equals(Buffer.from(expectedRows)) ? null : '仓库行模板与生成器当前产物字节不一致' };
+        }
+      } catch (error) {
+        preset.generatedDrift = unknown(error.message);
+        preset.rowsDrift = unknown(error.message);
+      }
     } else {
-      preset.generatedDrift = unknown('CLI-managed profile：Electron 归档的 standard 不能代表该 CLI 的运行时；'
-        + '请用 --runtime-version 指定同版本，或手工运行 npm run gen:preset');
+      const reason = 'CLI-managed profile：Electron 归档的 standard 不能代表该 CLI 的运行时；'
+        + '请用 --runtime-version 指定同版本，或手工运行 npm run gen:preset';
+      preset.generatedDrift = unknown(reason);
+      preset.rowsDrift = unknown(reason);
     }
   }
   if (runtimeVersion !== undefined) {
@@ -296,7 +358,28 @@ export function collectLifecycle({ paths = resolvePaths(), repoRoot = paths.repo
     exemption: recordPresent ? (exemptionAccepted ? 'exempt' : 'invalid') : olderKeys.length ? 'expired' : 'absent',
     runtimeExempt: runtime.status === 'known' ? exemptionAccepted && values.includes(runtime.version) : null,
     enginesDsh: repo.enginesDsh, peers: requirements };
-  const snapshot = { paths, archive, repo, profile, registration, preset, presetSolo, roles, compatibility,
+  // 离线检查 import 的是仓库 node_modules 里那份 dsh*；它和运行时/精确 pin 不一致时，
+  // manifest 判据会通过、实际接口却可能是旧的。
+  const repoDeps = repoDshDependencies(repoRoot);
+  const exactPins = [...new Set(Object.values(repo.peerDependencies).filter(isExactDshVersion))];
+  const dependencyTarget = runtime.status === 'known' ? runtime.version
+    : exactPins.length === 1 ? exactPins[0] : null;
+  let repoDependencies = repoDeps;
+  if (repoDeps.status === 'collected') {
+    if (dependencyTarget === null) {
+      repoDependencies = { ...repoDeps, status: 'unknown',
+        reason: '无法从运行时或唯一精确 pin 确定仓库 dsh 包的目标版本' };
+    } else {
+      const mismatched = repoDeps.rows.filter(row => row.version !== dependencyTarget);
+      repoDependencies = { ...repoDeps, status: mismatched.length > 0 ? 'drifted' : 'current',
+        target: dependencyTarget,
+        reason: mismatched.length > 0
+          ? `${mismatched.length} 个 dsh 包版本不等于 ${dependencyTarget}：${mismatched.slice(0, 4)
+            .map(row => `${row.name}@${row.version}`).join(', ')}${mismatched.length > 4 ? ' …' : ''}`
+          : null };
+    }
+  }
+  const snapshot = { paths, archive, repo, profile, registration, preset, presetSolo, roles, compatibility, repoDependencies,
     restart: { requiredForModuleChange: true, reason: '插件模块改动必须完全退出并重启 DSH 进程；Node 模块缓存不能驱逐，reload 不能应用代码升级。' } };
   snapshot.verification = verifyLifecycle(snapshot);
   snapshot.nextStep = nextStep(snapshot);
@@ -326,6 +409,13 @@ export function verifyLifecycle(s) {
   if (!s.registration.inBundles) add('registration.bundles', s.registration.silentFailureTrap ? '静默不加载陷阱：dependencies 有本包，但 dsh.profile.bundles 缺少本包' : 'dsh.profile.bundles 缺少插件包');
   if (!s.registration.resolved) add('registration.resolution', `登记后包体无法解析：node_modules/<包名>/package.json；${s.registration.resolutionError ?? '包名或版本无效'}`);
   else if (s.registration.resolvedVersion !== s.repo.version) add('registration.version', `磁盘包版本 ${s.registration.resolvedVersion} 与仓库 ${s.repo.version} 不一致`);
+  // 本工具的 preset/roles/兼容性检查读的是**本仓库**制品；安装源不是它时，检查对象就错了。
+  if (s.registration.resolved && s.registration.sourceKind === 'link' && s.registration.sourceMatchesRepo === false)
+    add('registration.source', `安装源 ${s.registration.dependencySpec} 不指向本仓库 ${s.paths.repoRoot}；工具检查的 preset/roles 不是已安装包内容`);
+  else if (s.registration.resolved && s.registration.sourceKind === 'registry')
+    addUnverified('registration.source', '安装源不是本仓库 link:/file:；无法确认已安装包与仓库制品一致');
+  if (s.repoDependencies.status === 'drifted') add('dependencies.runtime', s.repoDependencies.reason);
+  else if (s.repoDependencies.status === 'unknown') addUnverified('dependencies.runtime', s.repoDependencies.reason);
   if (s.preset.error) add('preset.structure', s.preset.error);
   if (!s.preset.mount) add('preset.mount', 'preset 本包 config 缺少 mount: true');
   if (s.preset.hasRoles) add('preset.roles', 'preset 携带禁止的 roles 字段；角色只能存放在 roles.json');
@@ -348,6 +438,7 @@ export function verifyLifecycle(s) {
   if (s.preset.bundleDeclaresError) add('preset.bundleDeclaration', `无法读取仓库 package.json：${s.preset.bundleDeclaresError}`);
   else if (!s.preset.bundleDeclaresPreset) add('preset.bundleDeclaration', 'package.json 的 dsh.bundle.patch 未声明 presets/switchboard.patch.yml，bundle 不会投递该 preset');
   if (s.preset.generatedDrift.status === 'drifted') add('preset.generatedDrift', s.preset.generatedDrift.reason);
+  if (s.preset.rowsDrift?.status === 'drifted') add('preset.rowsDrift', s.preset.rowsDrift.reason);
   if (s.roles.verdict !== 'current' || !s.roles.ok) add('roles.format', `roles.json：${s.roles.verdict}；${s.roles.error ?? s.roles.format?.reason ?? '需要当前格式的角色文件'}`);
   // split 模式：设置层只保留旋钮，定义必须住在文件里；文件缺失就是运行期错误，
   // 不能因为「文件格式 future/missing」之外没有别的 issue 就判 consistent。
@@ -378,6 +469,7 @@ export function verifyLifecycle(s) {
   if (s.compatibility.runtime.status === 'unknown') addUnverified('compatibility.runtime', s.compatibility.runtime.reason);
   if (s.compatibility.peers.status === 'unknown') addUnverified('compatibility.peers', s.compatibility.peers.reason);
   if (s.preset.generatedDrift.status === 'unknown') addUnverified('preset.generatedDrift', s.preset.generatedDrift.reason);
+  if (s.preset.rowsDrift?.status === 'unknown') addUnverified('preset.rowsDrift', s.preset.rowsDrift.reason);
   const status = issues.length ? 'inconsistent' : unverified.length ? 'unverified' : 'consistent';
   return { status, issues, unverified };
 }
@@ -415,6 +507,10 @@ function nextStep(s) {
     return `根条目仍带完整 roles：运行 node scripts/ops/plugin-lifecycle.mjs install --apply --home ${quote(s.paths.home)} --profile ${quote(s.paths.profile)} 从设置播种 roles.json，然后 verify。`;
   if (s.verification.issues.some(i => i.code.startsWith('roles.')))
     return '打开 DSH → 设置 → 角色与派发 → 保存角色配置；然后重新运行 verify。';
+  if (s.verification.issues.some(i => i.code === 'registration.source'))
+    return `安装源不是本仓库：用 link:${s.paths.repoRoot} 重新安装本包，或改用本仓库运行生命周期工具；不要用另一个 checkout 的制品做验收。`;
+  if (s.verification.issues.some(i => i.code === 'dependencies.runtime'))
+    return '仓库 node_modules 里的 dsh* 与运行时/精确 pin 不一致：先 npm install，再运行 npm run check:wiring 与 plugin:verify。';
   if (s.verification.issues.length) return `打开 DSH → 设置 → Plugins → 检查 ${s.repo.name}@${s.repo.version} 的安装版本和兼容性提示；处理后完全退出并重启 DSH，再运行 verify。`;
   if (s.verification.status === 'unverified') {
     const codes = (s.verification.unverified ?? []).map(item => item.code).join(', ');

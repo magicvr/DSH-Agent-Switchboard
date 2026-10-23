@@ -136,7 +136,9 @@ function converge(command, s, { apply, purge, collect, env, log }) {
   const original = patchOriginal.toString('utf8');
   const rolesOriginal = snapshotBytes(s.paths.roles);
   const generatedPath = join(s.paths.repoRoot, 'presets', 'switchboard.patch.yml');
+  const rowsPath = join(s.paths.repoRoot, 'presets', 'standard-plugins.json');
   const generatedOriginal = command === 'uninstall' ? null : readFileSync(generatedPath);
+  const rowsOriginal = command === 'uninstall' ? null : snapshotBytes(rowsPath);
   let block = generatedOriginal?.toString('utf8') ?? '';
   if (command !== 'uninstall') {
     const repoPresetPatch = readPatch(join(s.paths.repoRoot, 'presets', 'switchboard.patch.yml'));
@@ -184,14 +186,18 @@ function converge(command, s, { apply, purge, collect, env, log }) {
     }
   }
   if (command !== 'uninstall') {
-    if (s.preset.generatedDrift.status === 'unknown')
-      log(`仓库生成物漂移未验证；无法自动再生成：${s.preset.generatedDrift.reason}；手工回退：npm run gen:preset；继续收敛可验证制品。`);
-    if (s.preset.generatedDrift.status === 'drifted') {
-      log('仓库生成物漂移：待再生成 presets/switchboard.patch.yml（git 跟踪文件）。');
+    const rowsDrift = s.preset.rowsDrift ?? { status: 'unknown', reason: '行模板漂移判据缺失' };
+    if (s.preset.generatedDrift.status === 'unknown' || rowsDrift.status === 'unknown')
+      log(`仓库生成物漂移未验证；无法自动再生成：${s.preset.generatedDrift.reason ?? rowsDrift.reason}；手工回退：npm run gen:preset；继续收敛可验证制品。`);
+    if (s.preset.generatedDrift.status === 'drifted' || rowsDrift.status === 'drifted') {
+      const targets = [s.preset.generatedDrift.status === 'drifted' ? 'presets/switchboard.patch.yml' : '',
+        rowsDrift.status === 'drifted' ? 'presets/standard-plugins.json' : ''].filter(Boolean).join('、');
+      log(`仓库生成物漂移：待再生成 ${targets}（git 跟踪文件）。`);
       if (!apply) log('未写盘：preset 再生成待 --apply；随后剥离残留注入并验证。');
       else {
         // 在生成器写入前完成现有目标的结构、格式和权限预检。
         writableParent(generatedPath);
+        writableParent(rowsPath);
         writableParent(s.paths.patch);
         if (!s.roles.exists || s.roles.verdict === 'migrated') writableParent(s.paths.roles);
         assertUnchanged(s.paths.patch, patchBytes);
@@ -204,12 +210,19 @@ function converge(command, s, { apply, purge, collect, env, log }) {
         if (result.error || result.status !== 0)
           throw new Error(`preset 再生成失败：${result.error?.message ?? `退出码 ${result.status}，信号 ${result.signal ?? '-'}；${result.stderr.trim() || result.stdout.trim()}`}`);
         const regenerated = readFileSync(generatedPath, 'utf8');
+        const rowsRegenerated = snapshotBytes(rowsPath);
         assertUnchanged(s.paths.patch, patchBytes);
         assertUnchanged(s.paths.roles, rolesOriginal);
         const afterGeneration = collect();
-        if (regenerated === block || afterGeneration.preset.generatedDrift.status !== 'current')
-          throw new Error(`preset 再生成后复读验证失败：${regenerated === block ? '文件字节未改变' : afterGeneration.preset.generatedDrift.reason ?? '产物未达到 current'}`);
-        log('PASS  preset 再生成后复读验证：字节已改变，生成物 current。');
+        const yamlChanged = regenerated !== block;
+        const rowsChanged = rowsRegenerated !== null
+          && (rowsOriginal === null || !rowsRegenerated.equals(rowsOriginal));
+        if (!yamlChanged && !rowsChanged)
+          throw new Error('preset 再生成后复读验证失败：文件字节未改变');
+        if (afterGeneration.preset.generatedDrift.status !== 'current' || afterGeneration.preset.rowsDrift?.status !== 'current')
+          throw new Error(`preset 再生成后复读验证失败：${afterGeneration.preset.generatedDrift.reason
+            ?? afterGeneration.preset.rowsDrift?.reason ?? '产物未达到 current'}`);
+        log('PASS  preset 再生成后复读验证：字节已改变，YAML 与行模板均为 current。');
         s = afterGeneration;
         block = regenerated;
         next = planInjectedPreset(original, block, { remove: true });
@@ -380,11 +393,15 @@ export function runLifecycle({ argv = process.argv.slice(2), env = process.env, 
       `profile patch 存在=${s.preset.patchExists}；home patch（$DSH_HOME/cordis.patch.yml）存在=${s.preset.homePatchExists}`,
       ...(s.profile.error ? [s.profile.error] : [])]);
     section('registration', [`dependencies：${s.registration.dependencySpec ?? '缺失'}`,
+      `安装源：${s.registration.sourceKind ?? '无'}${s.registration.sourceKind === 'link'
+        ? `（${s.registration.sourceMatchesRepo ? '指向本仓库' : `不指向本仓库：${s.registration.sourceTarget}`}）`
+        : s.registration.sourceKind === 'registry' ? '（无法确认与仓库制品一致）' : ''}`,
       `dsh.profile.bundles：${s.registration.inBundles ? '已登记' : '未登记'}`,
       `磁盘包体：${s.registration.resolved ? `可解析（${s.registration.resolvedVersion}）` : '不可解析'}`,
+      `仓库 node_modules dsh*：${s.repoDependencies.status}${s.repoDependencies.reason ? ` — ${s.repoDependencies.reason}` : ''}`,
       ...(s.registration.silentFailureTrap ? ['静默不加载陷阱：dependencies 有本包，但 bundles 缺少本包。'] : [])]);
     section('preset', [`仓库 preset 的 preset-switchboard 存在=${s.preset.present}；mount:true=${s.preset.mount}；禁止的 roles 字段=${s.preset.hasRoles}`,
-      `supervisorRules：${verdict(s.preset.rules)}`, `仓库生成物：${verdict(s.preset.generatedDrift)}`,
+      `supervisorRules：${verdict(s.preset.rules)}`, `仓库生成物：${verdict(s.preset.generatedDrift)}；行模板：${verdict(s.preset.rowsDrift ?? { status: 'unknown' })}`,
       `bundle 投递（dsh.bundle.patch 声明 presets/switchboard.patch.yml）：${s.preset.bundleDeclaresPreset ? '已声明' : '未声明'}`,
       `profile 里的残留注入副本：${s.preset.injectedInProfile ? '仍有（需剥离）' : '无'}；`
         + `home patch 里的残留注入副本：${s.preset.injectedInHome ? '仍有（需手动移除）' : '无'}`,

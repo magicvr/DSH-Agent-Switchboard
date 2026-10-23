@@ -9,7 +9,7 @@ import { parse, stringify } from 'yaml';
 import { captureSync } from './lib/capture.mjs';
 import { REPO_ROOT, resolvePaths } from './lib/paths.mjs';
 import { collectLifecycle, satisfiesDshRange, evaluateDshPeers, evaluateDshRequirements, isExactDshVersion, isExactDshVersionList, isExactDshExemptionKey } from './lib/lifecycle.mjs';
-import { generatePreset } from './lib/preset-generator.mjs';
+import { generatePreset, roleRowsTemplate } from './lib/preset-generator.mjs';
 import { readPatch, presetConfig, stripInjectedPreset, isOurBlockLine, assertNoStrayOperations, planInjectedPreset, planRolesMigration, scanPackageReferences } from './lib/preset-patch.mjs';
 import { runLifecycle } from './ops/plugin-lifecycle.mjs';
 import { CONFIG_FORMAT_VERSION } from '../src/config-file.js';
@@ -55,8 +55,15 @@ try {
   mkdirSync(join(repoRoot, 'presets'), { recursive: true });
   put(join(repoRoot, 'package.json'), pkg);
   put(join(repoRoot, 'cordis.patch.yml'), '[]\n');
-  const generated = generatePreset(standard, pkg.name).body;
+  const generatedPreset = generatePreset(standard, pkg.name);
+  const generated = generatedPreset.body;
+  const rowsBody = JSON.stringify({
+    generatedFrom: 'dsh/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml',
+    note: '由 scripts/gen-preset.mjs 生成，请勿手改：Host 在运行期据此按角色裁剪出独立 preset。',
+    rows: roleRowsTemplate(generatedPreset.standardPlugins),
+  }, null, 2) + '\n';
   put(join(repoRoot, 'presets', 'switchboard.patch.yml'), generated);
+  put(join(repoRoot, 'presets', 'standard-plugins.json'), rowsBody);
   const paths = { ...resolvePaths({ argv: ['--home', home], env: {} }), repoRoot, explicitTarget: false };
   const profilePackage = join(paths.profile, 'package.json');
   const packageBody = join(paths.profile, 'node_modules', pkg.name, 'package.json');
@@ -69,7 +76,7 @@ try {
   const options = { paths, repoRoot, readArchive: archive };
   const collect = () => collectLifecycle(options);
   const invoke = (command, extra = {}) => runLifecycle({ argv: [command], paths, collectOptions: options, log: () => {}, ...extra });
-  const registered = () => put(profilePackage, { dependencies: { [pkg.name]: 'link:fixture' }, dsh: { profile: { bundles: [pkg.name] } } });
+  const registered = () => put(profilePackage, { dependencies: { [pkg.name]: `link:${repoRoot}` }, dsh: { profile: { bundles: [pkg.name] } } });
   const patchWith = config => {
     const document = parse(generated);
     document[0].insert[0].config.plugins.find(row => row.name === pkg.name).config = config;
@@ -98,6 +105,19 @@ try {
   check('登记正确但磁盘包体不存在单独报告', s.registration.inBundles && s.registration.dependencyPresent
     && !s.registration.resolved && s.verification.issues.some(i => i.code === 'registration.resolution'));
   mkdirSync(join(packageBody, '..'), { recursive: true }); put(packageBody, pkg);
+  {
+    const depScope = join(repoRoot, 'node_modules', '@deepseek-ai', 'dsh-tools');
+    mkdirSync(depScope, { recursive: true });
+    put(join(depScope, 'package.json'), { name: '@deepseek-ai/dsh-tools', version: '0.0.0' });
+    s = collect();
+    check('仓库 node_modules dsh* 版本不一致时明确失败', s.repoDependencies.status === 'drifted'
+      && s.verification.issues.some(i => i.code === 'dependencies.runtime'));
+    put(join(depScope, 'package.json'), { name: '@deepseek-ai/dsh-tools', version: stubRuntime });
+    s = collect();
+    check('仓库 node_modules dsh* 对齐后清除判据', s.repoDependencies.status === 'current'
+      && !s.verification.issues.some(i => i.code === 'dependencies.runtime'));
+    rmSync(join(repoRoot, 'node_modules', '@deepseek-ai'), { recursive: true, force: true });
+  }
 
   section('preset：权威副本在仓库，profile 只应保持干净');
   put(paths.patch, cleanPatch); s = collect();
@@ -187,6 +207,13 @@ try {
   put(join(repoRoot, 'presets', 'switchboard.patch.yml'), generated);
   check('恢复生成物后清除漂移判据', collect().preset.generatedDrift.status === 'current'
     && !collect().verification.issues.some(i => i.code === 'preset.generatedDrift'));
+  put(join(repoRoot, 'presets', 'standard-plugins.json'), rowsBody + '\n');
+  s = collect();
+  check('行模板单个换行漂移也被检测并进入 verify', s.preset.rowsDrift.status === 'drifted'
+    && s.verification.issues.some(i => i.code === 'preset.rowsDrift') && invoke('verify').exitCode === 1);
+  put(join(repoRoot, 'presets', 'standard-plugins.json'), rowsBody);
+  check('恢复行模板后清除漂移判据', collect().preset.rowsDrift.status === 'current'
+    && !collect().verification.issues.some(i => i.code === 'preset.rowsDrift'));
   check('无归档是 unknown 而不是伪验证或崩溃', collectLifecycle({ ...options, readArchive: null }).preset.generatedDrift.status === 'unknown');
   s = collectLifecycle({ ...options, readArchive: () => { throw new Error('missing entry'); } });
   check('归档读取失败保留生成物与运行时的真实原因', s.preset.generatedDrift.status === 'unknown'
@@ -321,14 +348,19 @@ try {
 
   section('命令行、零写入及实际输出');
   const cli = command => captureSync(process.execPath, [script, command, '--home', home, '--json'], { env, cwd: REPO_ROOT });
-  const before = fingerprint(temp);
   invoke('status'); invoke('verify');
+  // 真实 CLI 的仓库根是 REPO_ROOT，而上面 collect() 的 repoRoot 是 temp fixture；
+  // 安装源检查要求 link: 指向运行工具的那个仓库，所以 CLI 段临时改指向 REPO_ROOT。
+  const setProfileSpec = spec => put(profilePackage, { dependencies: { [pkg.name]: spec },
+    dsh: { profile: { bundles: [pkg.name] } } });
+  setProfileSpec(`link:${REPO_ROOT}`);
+  const before = fingerprint(temp);
   const status = cli('status'), verify = cli('verify');
   // CLI fixture 故意让归档不可读：status 仍应 0，但 verify 必须把 unknown 判为 unverified 而非假绿。
   check('status / verify CLI 单份 JSON；无归档时 verify 为 unverified 且退出 1', status.status === 0 && verify.status === 1
     && JSON.parse(status.stdout).paths.sources.home === '--home'
     && JSON.parse(verify.stdout).verification.status === 'unverified'
-    && JSON.parse(verify.stdout).verification.unverified.length === 3, status.stderr + verify.stderr);
+    && JSON.parse(verify.stdout).verification.unverified.length === 4, status.stderr + verify.stderr);
   const allowedUnknown = captureSync(process.execPath, [script, 'verify', '--home', home, '--json', '--allow-unknown'], { env, cwd: REPO_ROOT });
   check('verify --allow-unknown 显式接受未知判据并退出 0', allowedUnknown.status === 0
     && JSON.parse(allowedUnknown.stdout).verification.status === 'unverified', allowedUnknown.stderr);
@@ -349,6 +381,7 @@ try {
   check('默认缺 profile CLI 退出 0 干净跳过', skipped.status === 0 && /跳过/.test(skipped.stdout));
   const environmental = captureSync(process.execPath, [script, 'verify'], { env: { ...env, DSH_HOME: join(temp, 'absent-home') } });
   check('DSH_HOME 显式缺 profile CLI 退出 1', environmental.status === 1 && /显式目标缺少/.test(environmental.stdout));
+  setProfileSpec(`link:${repoRoot}`);
   section('有界 DSH peer 范围');
   for (const [version, range, expected] of [
     ['0.2.0-rc.2', '0.2.0-rc.2', 'compatible'], ['0.2.0-rc.3', '0.2.0-rc.2', 'incompatible'],
@@ -395,7 +428,7 @@ try {
     const p = { ...resolvePaths({ argv: ['--home', fixtureHome, '--profile', join(fixtureHome, 'profiles', kind)], env: {} }), repoRoot };
     mkdirSync(p.profile, { recursive: true });
     put(join(p.profile, 'package.json'), registration === 'none' ? {} : {
-      dependencies: { [pkg.name]: 'link:fixture' }, dsh: { profile: { bundles: registration === 'complete' ? [pkg.name] : [] } } });
+      dependencies: { [pkg.name]: `link:${repoRoot}` }, dsh: { profile: { bundles: registration === 'complete' ? [pkg.name] : [] } } });
     if (registration !== 'none') {
       mkdirSync(join(p.profile, 'node_modules', pkg.name), { recursive: true });
       put(join(p.profile, 'node_modules', pkg.name, 'package.json'), pkg);
@@ -502,6 +535,7 @@ try {
   mkdirSync(join(regenerationRepo, 'presets'), { recursive: true });
   put(join(regenerationRepo, 'package.json'), pkg);
   put(join(regenerationRepo, 'cordis.patch.yml'), '[]\n');
+  put(join(regenerationRepo, 'presets', 'standard-plugins.json'), rowsBody);
   for (const name of ['gen-preset.mjs', 'dsh-cat.mjs', 'lib/paths.mjs', 'lib/capture.mjs', 'lib/preset-generator.mjs'])
     cpSync(join(REPO_ROOT, 'scripts', name), join(regenerationRepo, 'scripts', name));
   cpSync(join(REPO_ROOT, 'src'), join(regenerationRepo, 'src'), { recursive: true });
@@ -512,6 +546,8 @@ try {
   const regenerationFixture = () => {
     const f = fixture({ patch: cleanPatch + staleGenerated });
     f.p.repoRoot = regenerationRepo;
+    put(join(f.p.profile, 'package.json'), { dependencies: { [pkg.name]: `link:${regenerationRepo}` },
+      dsh: { profile: { bundles: [pkg.name] } } });
     put(regenerationFile, staleGenerated);
     const run = (command, args = [], extra = {}) => f.run(command, args,
       { env: archiveEnv, collectOptions: regenerationOptions, ...extra });
@@ -739,7 +775,7 @@ fs.writeFileSync = (...args) => {
     const f = fixture({ registration: 'none', patch: cleanPatch });
     const other = join(f.home, 'profiles', 'server');
     mkdirSync(other, { recursive: true });
-    put(join(other, 'package.json'), { dependencies: { [pkg.name]: 'link:fixture' },
+    put(join(other, 'package.json'), { dependencies: { [pkg.name]: `link:${repoRoot}` },
       dsh: { profile: { bundles: [pkg.name] } } });
     const beforeRoles = readFileSync(f.p.roles);
     const refused = f.run('uninstall', ['--purge-roles', '--apply']);
@@ -754,7 +790,7 @@ fs.writeFileSync = (...args) => {
     const f = fixture({ registration: 'none', patch: cleanPatch + generated });
     const other = join(f.home, 'profiles', 'other');
     mkdirSync(other, { recursive: true });
-    put(join(other, 'package.json'), { dependencies: { [pkg.name]: 'link:fixture' } });
+    put(join(other, 'package.json'), { dependencies: { [pkg.name]: `link:${repoRoot}` } });
     const beforePatch = readFileSync(f.p.patch);
     const refused = f.run('uninstall', ['--purge-roles', '--apply']);
     check('purge 跨 profile 拒绝发生在任何写入之前', refused.exitCode === 1
@@ -768,6 +804,26 @@ fs.writeFileSync = (...args) => {
     check('豁免键按已安装版本构造并标注 manifest 来源', s.snapshot.compatibility.key === `${pkg.name}@0.0.0`
       && s.snapshot.compatibility.targetKey === `${pkg.name}@${pkg.version}`
       && s.snapshot.compatibility.manifestSource === 'installed', JSON.stringify(s.snapshot.compatibility));
+  }
+  {
+    const f = fixture({ patch: cleanPatch });
+    put(join(f.p.profile, 'package.json'), { dependencies: { [pkg.name]: `link:${join(temp, 'other-repo')}` },
+      dsh: { profile: { bundles: [pkg.name] } } });
+    const s = f.run('status');
+    check('link 安装源不指向本仓库时 verify 失败', s.snapshot.registration.sourceKind === 'link'
+      && s.snapshot.registration.sourceMatchesRepo === false
+      && s.snapshot.verification.issues.some(i => i.code === 'registration.source')
+      && f.run('verify').exitCode === 1, JSON.stringify(s.snapshot.registration));
+  }
+  {
+    const f = fixture({ patch: cleanPatch });
+    put(join(f.p.profile, 'package.json'), { dependencies: { [pkg.name]: pkg.version },
+      dsh: { profile: { bundles: [pkg.name] } } });
+    const s = f.run('status');
+    check('registry 安装源无法用仓库制品证明，判 unverified', s.snapshot.registration.sourceKind === 'registry'
+      && s.snapshot.verification.status === 'unverified'
+      && s.snapshot.verification.unverified.some(i => i.code === 'registration.source')
+      && f.run('verify').exitCode === 1, JSON.stringify(s.snapshot.registration));
   }
   {
     const f = fixture({ registration: 'none', patch: cleanPatch });
@@ -873,6 +929,8 @@ fs.writeFileSync = (...args) => {
   console.log(`  双引用 CLI exit=${cliDanglingResult.status}；${cliDanglingResult.stdout.split('\n').filter(line => /悬空引用|id=/.test(line)).join('；')}`);
   for (const command of ['install', 'upgrade', 'uninstall']) {
     const f = fixture({ patch: cleanPatch + generated });
+    put(join(f.p.profile, 'package.json'), { dependencies: { [pkg.name]: `link:${regenerationRepo}` },
+      dsh: { profile: { bundles: [pkg.name] } } });
     const before = fingerprint(f.home), patchBefore = readFileSync(f.p.patch);
     const args = [isolatedScript, command, '--home', f.home, '--profile', f.p.profile];
     const dry = captureSync(process.execPath, args, { env, cwd: temp });

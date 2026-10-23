@@ -3,6 +3,12 @@ import { parse, parseDocument, LineCounter, isMap, isSeq, isScalar, isAlias } fr
 import { readFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 
+// `!!js` 是 Cordis Loader 的表达式标签；这些解析只读结构，不求值。
+// 用 identity resolver 把它当普通字符串，避免每次 status 都刷 TAG_RESOLVE_FAILED 警告。
+const JS_TAG = { tag: 'tag:yaml.org,2002:js', resolve: value => value };
+const parsePatch = text => parse(text, { customTags: [JS_TAG] });
+const parsePatchDocument = (text, options = {}) => parseDocument(text, { customTags: [JS_TAG], ...options });
+
 /**
  * 旋钮字段：收尾迁移后住进设置的那一组（与 `src/roles.js` 的 ROLE_SETTING_FIELDS 一致）。
  *
@@ -62,7 +68,7 @@ export function planRolesMigration(text, definitions) {
   let roles;
   try {
     // 片段化解析：去掉统一的一级缩进后交给真实解析器，仍只读这一块。
-    roles = parse(lines.slice(rolesAt, end).map(line => line.replace(/^ {4}/, '')).join('\n'))?.roles;
+    roles = parsePatch(lines.slice(rolesAt, end).map(line => line.replace(/^ {4}/, '')).join('\n'))?.roles;
   } catch (error) {
     return { ok: false, changed: false, text, error: `角色块无法解析，拒绝迁移：${error.message}` };
   }
@@ -115,7 +121,7 @@ export function planRolesMigration(text, definitions) {
  */
 export function findPatchEntry(text, id) {
   let doc;
-  try { doc = parse(text); } catch { return undefined; }
+  try { doc = parsePatch(text); } catch { return undefined; }
   if (!Array.isArray(doc)) return undefined;
   const rows = [];
   for (const op of doc) {
@@ -129,7 +135,7 @@ export function findPatchEntry(text, id) {
 // 生命周期只接受独立且带生成器标记的块；剥离仍唯一委托给历史 guard。
 // 同时比较解析后的其它操作，防止剥离误吞相邻用户配置。
 export function planInjectedPreset(original, block, { remove = false } = {}) {
-  const doc = parse(original);
+  const doc = parsePatch(original);
   const valid = operations => Array.isArray(operations) && operations.every(op => op && typeof op === 'object'
     && !Array.isArray(op) && Object.keys(op).length > 0
     && (!Object.hasOwn(op, 'insert') || (Array.isArray(op.insert) && op.insert.length > 0
@@ -151,16 +157,16 @@ export function planInjectedPreset(original, block, { remove = false } = {}) {
     const markers = [...original.matchAll(/^# Switchboard.*$/gm)];
     const tail = original.slice(markers[0].index);
     const boundaries = [...tail.matchAll(/^- /gm)];
-    const marked = parse(tail.slice(0, boundaries[1]?.index ?? tail.length));
+    const marked = parsePatch(tail.slice(0, boundaries[1]?.index ?? tail.length));
     if (markers.length !== 1 || !isDeepStrictEqual(marked, hits))
       throw new Error('preset 标记未对应唯一独立操作，拒绝写入');
   }
   const cleaned = stripInjectedPreset(original);
-  const remaining = cleaned.trim() ? parse(cleaned) ?? [] : [];
+  const remaining = cleaned.trim() ? parsePatch(cleaned) ?? [] : [];
   if (!valid(remaining) || !isDeepStrictEqual(remaining, doc.filter(op => !hits.includes(op))))
     throw new Error('preset 剥离会改变其它操作或留下残留，拒绝写入');
   if (remove) return hits.length ? (remaining.length ? cleaned : `${cleaned.replace(/\n*$/, '')}\n[]\n`) : original;
-  const generated = parse(block);
+  const generated = parsePatch(block);
   const generatedRows = generated[0]?.insert;
   if (!valid(generated) || generated.length !== 1 || !Array.isArray(generatedRows)
     || generatedRows.length !== PRESET_ROW_IDS.length
@@ -171,7 +177,7 @@ export function planInjectedPreset(original, block, { remove = false } = {}) {
   // 空序列不能和块式序列拼接；只移除 [] 本身，保留用户注释。
   const base = remaining.length === 0 ? cleaned.replace(/^\s*\[\]\s*(?=#|$)/m, '') : cleaned;
   const next = `${base.replace(/\n*$/, '\n')}\n${block.replace(/\r\n/g, '\n').replace(/\n*$/, '\n')}`;
-  if (!valid(parse(next))) throw new Error('注入产物结构无效');
+  if (!valid(parsePatch(next))) throw new Error('注入产物结构无效');
   return next;
 }
 
@@ -193,7 +199,7 @@ export function pluginsWithoutName(plugins) {
 /** 扫描所有深度的包名值（含等价字段和 YAML alias），返回条目 id 与来源行。 */
 export function scanPackageReferences(text, packageName) {
   const lineCounter = new LineCounter();
-  const doc = parseDocument(text, { lineCounter });
+  const doc = parsePatchDocument(text, { lineCounter });
   if (doc.errors.length) throw new Error(`patch 引用扫描无法解析：${doc.errors[0].message}`);
   const references = [];
   function walk(node, id = '(无 id)', aliasLine, ancestors = new Set()) {
@@ -238,7 +244,7 @@ function readDocument(path, parser) {
 
 // 结构错误保留为失败原因，不能靠空数组回退掩盖或接受单个 insert 对象。
 export function readPatch(path) {
-  const result = readDocument(path, parse);
+  const result = readDocument(path, parsePatch);
   if (result.error) return result;
   if (!Array.isArray(result.data)) return { error: 'patch 顶层必须是操作列表数组' };
   const entries = [];
@@ -318,7 +324,7 @@ export function stripInjectedPreset(text) {
     if (!isOurBlockLine(lines[start])) continue;
     while (start > 0 && lines[start - 1].trimStart().startsWith('# Switchboard')) start--;
     const offset = lines.slice(0, start).reduce((size, line) => size + line.length + 1, 0);
-    const document = parseDocument(text);
+    const document = parsePatchDocument(text);
     if (!document.errors.length && isSeq(document.contents)) {
       const operation = document.contents.items.find(node => {
         const value = node?.toJSON();
@@ -376,7 +382,7 @@ export function stripInjectedPreset(text) {
 export function assertNoStrayOperations(text, label) {
   let doc;
   try {
-    doc = parse(text);
+    doc = parsePatch(text);
   } catch (error) {
     console.error(`FAIL  ${label} 无法解析：${error.message}`);
     return false;

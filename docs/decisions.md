@@ -1224,9 +1224,13 @@ bundle（`presets/switchboard.patch.yml`，`package.json` 的 `dsh.bundle.patch`
 6. **豁免键按已安装版本。** 兼容性判定优先用已安装 manifest，豁免键用 `resolvedVersion`，仓库目标版本另列 `targetKey`；卸载提示残留授权，不自动删除。
 7. **缺失 profile patch 按空用户层。** 不再因 ENOENT 失败（DSH 的 initProfile 会创建，fatal recovery 会改名）。
 8. **退役 `inject:preset`。** 从 package.json 移除，`probe-preset.mjs --inject` 硬拒绝；自检提示改为确认 bundle 登记 + `plugin:verify` + 重启。
+9. **行模板也纳入 verify。** `presets/standard-plugins.json` 与 YAML 同源同批生成，运行期决定角色工具清单；只比 YAML 会漏掉它，现检测其字节漂移并在再生成时同时复读两个产物。
+10. **安装源必须可解释。** `link:` 指向本仓库才算同一套制品；指向另一个 checkout 直接失败，registry / 非 link 判 `unverified`，避免用仓库文件证明已安装包。
+11. **仓库 node_modules 的 dsh* 版本。** 运行时已知时要求全部等于运行时，否则用唯一精确 pin；不一致时 `plugin:verify` 失败，补上“改了 pin 但忘了 npm install”的缺口。
+12. **`!!js` 解析去噪。** 只读结构检查使用 identity tag，不再每次 status/verify 刷 `TAG_RESOLVE_FAILED` 警告；不求值表达式。
 
 **依据：** 本机合成 profile 实测：无归档时 `verify` 原为 `consistent/0`；split 模式缺 roles 时 install 原为 `exit 0` 且写入空文件；其它 profile 仍登记时 purge 原会删除共享 roles；home patch 引用原不被扫描；先移包后 verify 原为 `skipped`；已安装 0.0.0 / 仓库 0.0.1 时豁免键原用 0.0.1；缺 patch 原报 ENOENT；自检与文档仍教 `inject:preset`，而仓库自己的 `check-profile-wiring` 注释已指出这会把重复声明装回去。
 
-**验证边界：** `node scripts/check-lifecycle.mjs` 扩到 **250 通过 / 0 失败**，新增覆盖见 `docs/lifecycle.md` §6.1；真实 desktop profile 的 `plugin:status` / `plugin:verify` 仍为 `consistent`。这些是离线夹具与只读真机状态，不等于真实 `--apply` 写入、CLI 包安装 / 移除或重启后的运行时验收。
+**验证边界：** `node scripts/check-lifecycle.mjs` 扩到 **256 通过 / 0 失败**，新增覆盖见 `docs/lifecycle.md` §6.1；真实 desktop profile 的 `plugin:status` / `plugin:verify` 仍为 `consistent`。这些是离线夹具与只读真机状态，不等于真实 `--apply` 写入、CLI 包安装 / 移除或重启后的运行时验收。
 
 ---
