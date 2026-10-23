@@ -35,6 +35,7 @@
 - `!!js` 的只读 YAML 结构检查改用 identity tag，不再每次 status/verify 输出 `TAG_RESOLVE_FAILED` 警告。
 - `upgrade` 只向前：已安装版本高于仓库版本时拒绝输出包替换指令并退出 `3`，避免用旧 checkout 静默降级。
 - `uninstall --drop-root-entry`：按精确 id/name 删除本插件顶层根条目，保留其它用户配置与 `!!js`，带备份和写后复读；默认仍不自动删除用户条目。
+- `roles → roleSettings` 收尾迁移增加字段级闸门：设置层非旋钮字段必须与文件定义一致，否则跳过迁移，避免 id 相同但 persona / CLI 契约丢失。
 - 修复外部 CLI 角色的回流区把**过程与工具轨迹当成正文**平铺的问题：一次性子会话的 CLI 观察席改为
   **按通道分区** —— 正文区只显示 stdout（CLI 的最终消息，流式贴底），stderr 归入默认折叠的
   「过程与诊断」（失败且用户未手动干预时自动展开并改用错误色），并把它自己上报的路由事实

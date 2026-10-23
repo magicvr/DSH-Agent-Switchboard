@@ -91,6 +91,20 @@ export function planRolesMigration(text, definitions) {
       error: `设置里的角色与文件不一致（设置=[${movedIds.join(', ')}]，文件=[${fileIds.join(', ')}]）；`
         + '拒绝迁移以免丢角色' };
   }
+  // id 集合一致还不够：设置里的 persona / CLI 契约等字段若在文件里缺失，裁掉设置就会丢数据。
+  const fileById = new Map((Array.isArray(definitions) ? definitions : []).map(role => [role?.id, role]));
+  for (const role of roles) {
+    if (!isObject(role)) return { ok: false, changed: false, text, error: '角色项必须是对象，拒绝迁移' };
+    const definition = fileById.get(role.id);
+    if (!isObject(definition)) return { ok: false, changed: false, text, error: `角色 ${role.id} 在文件里不是对象，拒绝迁移` };
+    for (const [field, value] of Object.entries(role)) {
+      if (field === 'id' || MIGRATION_KNOB_FIELDS.includes(field)) continue;
+      if (!Object.hasOwn(definition, field) || !isDeepStrictEqual(definition[field], value)) {
+        return { ok: false, changed: false, text,
+          error: `角色 ${role.id} 的字段 ${field} 在文件里缺失或不同；先把完整定义同步到文件，再裁剪设置` };
+      }
+    }
+  }
   const knobs = roles.map(role => {
     const out = { id: role?.id };
     for (const field of MIGRATION_KNOB_FIELDS) if (role?.[field] !== undefined) out[field] = role[field];

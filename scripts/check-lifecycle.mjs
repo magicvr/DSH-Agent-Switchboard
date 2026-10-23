@@ -1057,8 +1057,9 @@ fs.writeFileSync = (...args) => {
       '',
     ].join('\n');
     const definitions = [
-      { id: 'scout', description: 'd', instructions: '多行 persona 原文', backend: 'spawn', model: 'm-scout' },
-      { id: 'worker', description: 'd', instructions: 'i', backend: 'cli', model: 'm-worker' },
+      { id: 'scout', title: '侦察', description: 'd', instructions: '多行 persona 原文\n', backend: 'spawn', model: 'm-scout' },
+      { id: 'worker', description: 'd', instructions: 'i', backend: 'cli', model: 'm-worker',
+        cliArgs: ['exec', '{prompt}'] },
     ];
     const plan = planRolesMigration(migrationPatch, definitions);
     check('迁移计划成立且报告被裁剪的角色数',
@@ -1095,6 +1096,16 @@ fs.writeFileSync = (...args) => {
     check('设置与文件的角色 id 集合不一致时拒绝迁移',
       planRolesMigration(migrationPatch, [...definitions, { id: 'extra' }]).ok === false
         && /不一致/.test(planRolesMigration(migrationPatch, [...definitions, { id: 'extra' }]).error));
+    check('文件缺少 settings 的非旋钮字段时拒绝迁移',
+      (() => {
+        const incomplete = definitions.map(role => {
+          const copy = { ...role };
+          if (copy.id === 'worker') delete copy.instructions;
+          return copy;
+        });
+        const result = planRolesMigration(migrationPatch, incomplete);
+        return result.ok === false && /instructions/.test(result.error);
+      })());
     check('没有 roles 块时无需迁移（不误报）',
       (() => { const r = planRolesMigration('- id: agent-switchboard\n  config:\n    mount: false\n', definitions);
         return r.ok && !r.changed; })());

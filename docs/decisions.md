@@ -1230,9 +1230,10 @@ bundle（`presets/switchboard.patch.yml`，`package.json` 的 `dsh.bundle.patch`
 12. **`!!js` 解析去噪。** 只读结构检查使用 identity tag，不再每次 status/verify 刷 `TAG_RESOLVE_FAILED` 警告；不求值表达式。
 13. **upgrade 不降级。** 已安装版本高于仓库版本时，拒绝输出 `link:` 包替换指令并退出 `3`；回退必须由用户显式指定 DSH/GUI 版本。
 14. **卸载可显式删除本插件根条目。** `uninstall --drop-root-entry` 按精确 id/name 与缩进边界删除顶层 `agent-switchboard` 条目，保留其它用户配置和 `!!js`；重复 id、name 不匹配、删除后无效时拒绝。默认仍不碰用户条目。
+15. **角色收尾迁移逐字段闸门。** 除 id 集合外，设置层非旋钮字段（instructions / persona / CLI argv / canDispatch 等）必须与文件定义逐字段一致；文件缺字段或不同就跳过迁移，保留完整设置层，避免 id 对上但 persona 丢失。
 
 **依据：** 本机合成 profile 实测：无归档时 `verify` 原为 `consistent/0`；split 模式缺 roles 时 install 原为 `exit 0` 且写入空文件；其它 profile 仍登记时 purge 原会删除共享 roles；home patch 引用原不被扫描；先移包后 verify 原为 `skipped`；已安装 0.0.0 / 仓库 0.0.1 时豁免键原用 0.0.1；缺 patch 原报 ENOENT；自检与文档仍教 `inject:preset`，而仓库自己的 `check-profile-wiring` 注释已指出这会把重复声明装回去。
 
-**验证边界：** `node scripts/check-lifecycle.mjs` 扩到 **264 通过 / 0 失败**，新增覆盖见 `docs/lifecycle.md` §6.1；真实 desktop profile 的 `plugin:status` / `plugin:verify` 仍为 `consistent`。这些是离线夹具与只读真机状态，不等于真实 `--apply` 写入、CLI 包安装 / 移除或重启后的运行时验收。
+**验证边界：** `node scripts/check-lifecycle.mjs` 扩到 **265 通过 / 0 失败**，新增覆盖见 `docs/lifecycle.md` §6.1；真实 desktop profile 的 `plugin:status` / `plugin:verify` 仍为 `consistent`。这些是离线夹具与只读真机状态，不等于真实 `--apply` 写入、CLI 包安装 / 移除或重启后的运行时验收。
 
 ---
