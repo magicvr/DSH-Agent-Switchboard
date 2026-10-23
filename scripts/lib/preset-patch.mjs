@@ -108,6 +108,52 @@ export function planRolesMigration(text, definitions) {
 }
 
 /**
+ * 文本级删除本插件的**顶层根条目** `- id: agent-switchboard`。
+ *
+ * 卸载时这个条目会留下对已移除包的引用；但它也是用户可编辑的配置，所以只在
+ * 显式 `--drop-root-entry` 时按精确边界删除，并要求 `name` 与本包一致。
+ * 不经过 YAML round-trip：profile patch 含 `!!js`，序列化会把表达式降级。
+ *
+ * @param {string} text - profile patch 全文。
+ * @param {string} packageName - 本包包名；根条目的 name 必须等于它。
+ * @param {string} id - 根条目 id，默认 agent-switchboard。
+ * @returns {{ok: boolean, changed: boolean, text: string, reason?: string, error?: string}} 计划。
+ */
+export function stripRootEntry(text, packageName, id = 'agent-switchboard') {
+  const lines = String(text).split('\n');
+  const matches = [];
+  for (let i = 0; i < lines.length; i++)
+    if (new RegExp(`^-\\s*id:\\s*["']?${id}["']?\\s*$`).test(lines[i])) matches.push(i);
+  if (matches.length === 0) return { ok: true, changed: false, text, reason: '没有根条目' };
+  if (matches.length > 1) return { ok: false, changed: false, text, error: `根条目 ${id} 重复，拒绝删除` };
+  const start = matches[0];
+  let end = start + 1;
+  while (end < lines.length && (lines[end].trim() === '' || /^\s/.test(lines[end]))) end++;
+  const block = lines.slice(start, end).join('\n');
+  let entry;
+  try {
+    const parsed = parsePatch(block);
+    if (!Array.isArray(parsed) || parsed.length !== 1) throw new Error('块不是单个映射');
+    entry = parsed[0];
+  } catch (error) {
+    return { ok: false, changed: false, text, error: `根条目无法解析：${error.message}` };
+  }
+  if (!isObject(entry) || entry.id !== id) return { ok: false, changed: false, text, error: '根条目 id 不一致' };
+  if (entry.name !== packageName) {
+    return { ok: false, changed: false, text,
+      error: `根条目 name=${JSON.stringify(entry.name)} 不等于本包 ${JSON.stringify(packageName)}，拒绝删除` };
+  }
+  const next = [...lines.slice(0, start), ...lines.slice(end)].join('\n');
+  const normalized = next.trim() === '' ? '[]\n' : next;
+  try {
+    if (!Array.isArray(parsePatch(normalized))) throw new Error('顶层不是操作列表');
+  } catch (error) {
+    return { ok: false, changed: false, text, error: `删除根条目后 patch 无效：${error.message}` };
+  }
+  return { ok: true, changed: true, text: normalized };
+}
+
+/**
  * 在 profile patch 中按 id 查条目，同时识别两种合法形态：
  *   1. 顶层覆盖条目 `- id: agent-switchboard`（设置页写入的根条目通常是这种）；
  *   2. `insert:` 操作里的新条目。

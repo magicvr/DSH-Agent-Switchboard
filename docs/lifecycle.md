@@ -24,7 +24,7 @@
 | `npm run plugin:verify -- [路径参数] [--json]` | 只读验证；存在验证问题返回 `1` |
 | `npm run plugin:install -- [路径参数] [--json] [--apply]` | 包登记齐备后同步 preset；缺角色文件时优先用根条目里的 legacy `roles` 播种，没有则播种 `[]`；设置层已是 `roleSettings`（split 模式）时拒绝空播种并退出 `3`；旧格式可迁移时迁移 |
 | `npm run plugin:upgrade -- [路径参数] [--json] [--apply]` | 同步 preset 和可迁移格式，报告 manifest 变化、DSH peers 与版本差异；保留当前格式用户文件的原始字节 |
-| `npm run plugin:uninstall -- [路径参数] [--json] [--apply] [--purge-roles]` | 先剥离并验证 preset，再提示移除包；默认保留角色文件；`--purge-roles` 只在没有其它 profile 仍登记本包时删除 home 级共享文件 |
+| `npm run plugin:uninstall -- [路径参数] [--json] [--apply] [--purge-roles] [--drop-root-entry]` | 先剥离并验证 preset，再提示移除包；默认保留角色文件；`--purge-roles` 只在没有其它 profile 仍登记本包时删除 home 级共享文件；`--drop-root-entry` 按精确 id/name 删除 profile patch 里的插件根条目 |
 | `npm run version:show` | 只读列出插件、manifest、配置格式、lock、CHANGELOG 与 DSH peers；检查插件版本一致性 |
 | `npm run version:bump -- <major\|minor\|patch\|X.Y.Z> [--pre <tag>\|--finalize] [--apply]` | 默认只展示计划；显式版本必须是合法 SemVer 且严格高于当前版本 |
 
@@ -46,7 +46,7 @@
 
 共享路径解析器还接受 `--cli-config <path>`，但生命周期不读取该配置，帮助文本也未列出；不要依赖它改变生命周期行为。路径参数已对照代码，合成 profile 用例验证了路径隔离，未在本轮针对真实目标逐个运行。
 
-`--json` 输出单份 JSON 快照；收敛命令附带 `operation.command`、`apply`、`runtimeVersion`、`allowUnknown`、`events` 和 `exitCode`。`status` / `verify` 不接受 `--apply`；`--purge-roles` 仅适用于 `uninstall`；`--allow-unknown` 仅适用于 `verify`。
+`--json` 输出单份 JSON 快照；收敛命令附带 `operation.command`、`apply`、`dropRoot`、`runtimeVersion`、`allowUnknown`、`events` 和 `exitCode`。`status` / `verify` 不接受 `--apply`；`--purge-roles` 与 `--drop-root-entry` 仅适用于 `uninstall`；`--allow-unknown` 仅适用于 `verify`。
 
 ### 2.2 预演、写入与退出码
 
@@ -126,6 +126,8 @@
 
 卸载顺序不能颠倒：先运行 `npm run plugin:uninstall` 预演，再运行 `npm run plugin:uninstall -- --apply` 剥离并复读验证内联 preset（真实写入未验证）。剥离后扫描移包后仍保留的用户层：profile patch（`s.paths.patch`，默认 `cordis.patch.yml`）、`<profile>/cordis.yml`（若存在）以及 **home 级 `$DSH_HOME/cordis.patch.yml`**（若存在）的所有深度包引用，含其它 id、等价字段和 YAML alias。home patch 在 profile patch 之后应用、优先级更高，漏扫会把悬空引用放进更优先的层。仓库自身 bundle patch 随包分发、随包移除，不会留下悬空引用，因此明确排除。残留引用按文件、行号与 enclosing id 报告，退出 `1`，不输出移包步骤、不允许 purge。home patch 里的内联 preset 副本只报告、不自动剥离（工具不修改 home 层）；使用者须自行移除。不能将仅 preset id 消失视为可移包的证明；引用确已消失后才提示 DSH 移除包。
 
+如果残留的正是本插件的顶层根条目（`id: agent-switchboard`，`name` 等于本包），可显式加 `--drop-root-entry`：工具按精确 id/name 和缩进边界删除该条目，保留其余用户条目与 `!!js` 标签，先备份、写后复读验证；name 不匹配、重复 id 或删除后不是合法操作列表时拒绝。它只删这一个条目，不会猜着删别的配置。
+
 再由 desktop GUI 移除包（按钮文案未验证），或采用非 desktop 的候选 `dsh plugin --profile <name> remove <包名>`（依据 CLI 自述与源码，未实测）；重新运行卸载命令确认剩余步骤。`roles.json` 是用户数据，默认保留。仅在包已从 dependencies 与 bundles 都移除后，才可审阅并运行 `npm run plugin:uninstall -- --purge-roles --apply` 删除它（本轮真实写入未验证）；包仍登记时 `--purge-roles` 被硬拒绝。**roles.json 是 home 级共享文件**：工具会扫描同一 home 下其它 profile，只要有 profile 仍声明或启用本包、或它的 `package.json` 不可读，就拒绝 purge；拒绝发生在任何写入之前。卸载还会提示 `compatibility.json` 里可能残留的精确版本豁免（工具不自动撤销授权，避免替用户删除安全决定）。
 
 收敛写入携带规划时的原始字节，备份前及替换前复读比较；变化时拒绝覆盖并要求重新运行。缺失的 profile patch 按空用户层（`[]`）规划，不再以 ENOENT 失败。再生成前后也复核 profile 与角色快照，生成器接收规划快照摘要并在 rename 前再次比较。角色格式迁移与运行时保存同样在 rename 前比较检查时的内容，失败清理临时文件；purge 的跨 profile 拒绝与紧邻删除前的 profile `package.json` 复读都在写盘之前。此复读检查不是文件系统级 compare-and-swap，不保证阻止复读与 rename 之间极短窗口内的编辑。
@@ -138,13 +140,13 @@
 
 ### 6.1 离线已验证
 
-本轮边界修复后，实际运行 `node scripts/check-lifecycle.mjs`：**258 通过 / 0 失败**，`npm run check` 全链退出 `0`。新增夹具覆盖：verify 的 `unverified` / `--allow-unknown`、split 模式拒绝空播种、legacy roles 播种并裁成 `roleSettings`、缺 profile patch 的收敛、未登记但残留 preset 的 verify、home patch 注入与引用扫描、跨 profile 的 `--purge-roles` 拒绝与放行、按已安装版本构造豁免键、卸载残留豁免提示、CLI-managed 的 `--runtime-version`、`standard-plugins.json` 行模板漂移、link 安装源不指向本仓库、registry 安装源的 unverified、仓库 `node_modules` 的 dsh* 版本对齐。所有写入都在 `node:os` 的 `tmpdir()` 夹具内，不等于真实 profile 写入验收。
+本轮边界修复后，实际运行 `node scripts/check-lifecycle.mjs`：**264 通过 / 0 失败**，`npm run check` 全链退出 `0`。新增夹具覆盖：verify 的 `unverified` / `--allow-unknown`、split 模式拒绝空播种、legacy roles 播种并裁成 `roleSettings`、缺 profile patch 的收敛、未登记但残留 preset 的 verify、home patch 注入与引用扫描、跨 profile 的 `--purge-roles` 拒绝与放行、按已安装版本构造豁免键、卸载残留豁免提示、CLI-managed 的 `--runtime-version`、`standard-plugins.json` 行模板漂移、link 安装源不指向本仓库、registry 安装源的 unverified、仓库 `node_modules` 的 dsh* 版本对齐。所有写入都在 `node:os` 的 `tmpdir()` 夹具内，不等于真实 profile 写入验收。
 
 此前实施阶段记录的 `node scripts/check-lifecycle.mjs`：**144 通过 / 0 失败**；`node scripts/check-version.mjs`：**107 通过 / 0 失败**。`npm run check` 全链退出 `0`，包含 `check:lifecycle` / `check:version` 对应检查。合成 profile 验证路径隔离、零写入预演、幂等收敛、备份和写后复验、卸载顺序屏障、格式拒绝和有界兼容性范围；新增 tmpdir 仓库、ASAR 与真实生成器夹具验证再生成后重新收敛、第二次零写入、生成器失败及假成功的拒绝屏障、归档不可用降级与两个帮助入口。手工将再生成调用替换为不写文件的假成功，检查为 **137 通过 / 7 失败**；手工恢复后回到 **144 通过 / 0 失败**。这些不等于真实 profile 写入验收。
 
 `plugin:verify` 现在也检查 `presets/standard-plugins.json` 的漂移（行模板是运行期按角色裁剪工具清单的输入），并检查仓库 `node_modules/@deepseek-ai/dsh*` 的版本是否等于运行时（运行时未知时用唯一精确 pin）。`link:` 安装源不指向本仓库时直接失败；registry / 非 link 安装源判 `unverified`，不再用仓库制品冒充已安装包。YAML 解析对 `!!js` 使用只读 identity tag，不再刷 `TAG_RESOLVE_FAILED` 警告。
 
-独立 `npm run check:preset`（即 `node scripts/gen-preset.mjs --check`）比对**两个**生成物：`presets/switchboard.patch.yml` 的**逐字节**内容（含两个 preset 的名称、说明、`supervisorRules`、`compositionKey` 与 `excludedRoles`）与 `presets/standard-plugins.json` 的逐字节内容（后者是角色 preset 的行模板，供 Host 在运行期按角色裁剪）。本机实测（2026-10-23 加入自办调度台后，默认归档路径）：归档可读，输出 `standard 插件数: 22` / `preset 数: 2，每个 23 行` / `!!js 表达式 2 → 4`，两个产物均报无漂移，`--check：一致。`（退出 `0`）。同一批运行中 `node scripts/check-lifecycle.mjs` 为 **258 通过 / 0 失败**，`npm run check` 全链退出 `0`。**该检查在 `0.2.1-rc.1` 升级落地时还不在 `npm run check` 主链内**，这是上游 standard 漂移（新增 `dsh-time-context` / `dsh-tool-schedule` / `dsh-plugin-market/tools`，移除 `tool-subagent-codex` / `tool-subagent-claude-code` / `tool-ralph`）长期未被发现的原因；现已作为 `check` 链的最后一步。归档不可用时生成器失败并退出 `1`，属于「未验证」，不能读成一致。
+独立 `npm run check:preset`（即 `node scripts/gen-preset.mjs --check`）比对**两个**生成物：`presets/switchboard.patch.yml` 的**逐字节**内容（含两个 preset 的名称、说明、`supervisorRules`、`compositionKey` 与 `excludedRoles`）与 `presets/standard-plugins.json` 的逐字节内容（后者是角色 preset 的行模板，供 Host 在运行期按角色裁剪）。本机实测（2026-10-23 加入自办调度台后，默认归档路径）：归档可读，输出 `standard 插件数: 22` / `preset 数: 2，每个 23 行` / `!!js 表达式 2 → 4`，两个产物均报无漂移，`--check：一致。`（退出 `0`）。同一批运行中 `node scripts/check-lifecycle.mjs` 为 **264 通过 / 0 失败**，`npm run check` 全链退出 `0`。**该检查在 `0.2.1-rc.1` 升级落地时还不在 `npm run check` 主链内**，这是上游 standard 漂移（新增 `dsh-time-context` / `dsh-tool-schedule` / `dsh-plugin-market/tools`，移除 `tool-subagent-codex` / `tool-subagent-claude-code` / `tool-ralph`）长期未被发现的原因；现已作为 `check` 链的最后一步。归档不可用时生成器失败并退出 `1`，属于「未验证」，不能读成一致。
 
 ### 6.2 真机已验证
 

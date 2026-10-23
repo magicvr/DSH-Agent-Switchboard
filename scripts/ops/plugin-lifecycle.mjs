@@ -7,13 +7,14 @@ import { resolvePaths, printPaths } from '../lib/paths.mjs';
 import { collectLifecycle, isExactDshVersion } from '../lib/lifecycle.mjs';
 import { compareVersions } from '../lib/version.mjs';
 import { captureSync } from '../lib/capture.mjs';
-import { planInjectedPreset, planRolesMigration, readPatch, presetConfig, pluginsWithoutName, scanPackageReferences } from '../lib/preset-patch.mjs';
+import { planInjectedPreset, planRolesMigration, readPatch, presetConfig, pluginsWithoutName, scanPackageReferences, stripRootEntry } from '../lib/preset-patch.mjs';
 import { initialConfig, migrateConfigFileOnDisk, readConfigFileDetailed } from '../../src/config-file.js';
 
-const HELP = `用法：node scripts/ops/plugin-lifecycle.mjs <status|verify|install|upgrade|uninstall> [路径参数] [--json] [--runtime-version <semver>] [--allow-unknown]
+const HELP = `用法：node scripts/ops/plugin-lifecycle.mjs <status|verify|install|upgrade|uninstall> [路径参数] [--json] [--runtime-version <semver>] [--allow-unknown] [--drop-root-entry]
 status：只读报告；verify：只读验证；install：安装后收敛；upgrade：升级收敛；uninstall：安全剥离后提示移除包。
 写入操作默认 dry-run（省略 --apply；没有 --dry-run flag）；只有 --apply 才写盘，包括漂移的仓库 preset 再生成。
 --purge-roles：uninstall 仅包已移除、且没有其它 profile 仍登记本包时删除角色文件。--json：输出单份 JSON 快照及操作事件。
+--drop-root-entry：uninstall 专用；按精确 id/name 删除 profile patch 里的插件根条目（含备份/写后复读），用于清掉移包后的悬空引用。
 --runtime-version：CLI-managed profile 用它指定实际加载 profile 的 dsh 版本；desktop 默认读 Electron 归档。
 --allow-unknown：verify 专用；显式接受 runtime / 生成物判据未知，否则 unknown 判为 unverified 并退出 1。
 本工具不安装依赖、不执行 pnpm、不修改包登记。
@@ -121,7 +122,7 @@ function backedChange(path, next, log, original, beforeReplace = () => {}) {
   log(`PASS  写后复读验证：${path}`);
 }
 
-function converge(command, s, { apply, purge, collect, env, log }) {
+function converge(command, s, { apply, purge, collect, env, log, dropRoot = false }) {
   if (!s.profile.exists || !s.profile.packageExists || s.profile.error)
     throw new Error(`profile 不存在或无效，拒绝写入：${s.profile.error ?? s.paths.profile}`);
   const registered = s.registration.dependencyPresent || s.registration.inBundles;
@@ -166,6 +167,15 @@ function converge(command, s, { apply, purge, collect, env, log }) {
   //    顶层 `insert` 是纯追加、不按 id 去重，而 `dsh-agent-preset` 注册重复 id 会硬抛，
   //    所以内联的那份既是多余的、又会装载失败。这里统一**剥离**残留副本。
   let next = planInjectedPreset(original, block, { remove: true });
+  // 根条目是用户配置，只在显式 --drop-root-entry 时按精确 id/name 删除；
+  // 否则移包后会留下对已移除包名的悬空引用。
+  let rootDropped = false;
+  if (command === 'uninstall' && dropRoot) {
+    const strippedRoot = stripRootEntry(next, s.repo.name);
+    if (!strippedRoot.ok) throw new Error(strippedRoot.error);
+    if (strippedRoot.changed) { next = strippedRoot.text; rootDropped = true; }
+    else log(`根条目未删除：${strippedRoot.reason}`);
+  }
   // 收尾迁移：把根条目里完整的 `roles` 块裁成 `roleSettings` 旋钮块（定义已住在文件里）。
   //
   // ⚠️ 安全闸门在 `planRolesMigration` 里：设置与文件的角色 id 集合不一致、或文件里没有
@@ -261,8 +271,8 @@ function converge(command, s, { apply, purge, collect, env, log }) {
   }
   // 文案必须分别反映两件可能同时发生的事：剥离残留副本、收尾迁移。
   const willStrip = planInjectedPreset(original, block, { remove: true }) !== original;
-  const parts = [willStrip ? '将剥离残留注入副本' : '', rolesMigration.changed ? '将收尾角色设置迁移' : '']
-    .filter(Boolean);
+  const parts = [willStrip ? '将剥离残留注入副本' : '', rootDropped ? '将删除插件根条目' : '',
+    rolesMigration.changed ? '将收尾角色设置迁移' : ''].filter(Boolean);
   const presetPlan = parts.length > 0 ? parts.join('并') : '无需改动';
   const rolesPlan = seed ? (seedRoles.length > 0 ? `将用设置里的 ${seedRoles.length} 个角色播种` : '将播种空角色列表')
     : manualRoles ? '缺失但设置已是 roleSettings 形态，拒绝播种空文件'
@@ -383,6 +393,11 @@ export function runLifecycle({ argv = process.argv.slice(2), env = process.env, 
     if (command !== 'verify') throw new Error('--allow-unknown 仅适用于 verify');
     rest.splice(rest.indexOf('--allow-unknown'), 1);
   }
+  const dropRoot = rest.includes('--drop-root-entry');
+  if (dropRoot) {
+    if (command !== 'uninstall') throw new Error('--drop-root-entry 仅适用于 uninstall');
+    rest.splice(rest.indexOf('--drop-root-entry'), 1);
+  }
   const json = rest.includes('--json');
   const apply = rest.includes('--apply'), purge = rest.includes('--purge-roles');
   if ((apply && ['status', 'verify'].includes(command)) || (purge && command !== 'uninstall')) throw new Error('写入参数不适用于此命令');
@@ -395,10 +410,10 @@ export function runLifecycle({ argv = process.argv.slice(2), env = process.env, 
     const events = [];
     if (!json) printPaths(paths, log);
     let result;
-    try { result = converge(command, snapshot, { apply, purge, env,
+    try { result = converge(command, snapshot, { apply, purge, dropRoot, env,
       collect: () => collectLifecycle(options), log: line => { events.push(line); if (!json) log(line); } }); }
     catch (error) { events.push(`FAIL  ${error.message}`); if (!json) log(events.at(-1)); result = { snapshot, exitCode: 1 }; }
-    if (json) log(JSON.stringify({ ...result.snapshot, operation: { command, apply,
+    if (json) log(JSON.stringify({ ...result.snapshot, operation: { command, apply, dropRoot,
       runtimeVersion: effectiveRuntime ?? null, allowUnknown, events, exitCode: result.exitCode } }, null, 2));
     return { ...result, events };
   }

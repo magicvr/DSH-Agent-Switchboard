@@ -496,6 +496,43 @@ try {
   const cleanConfig = fixture();
   put(join(cleanConfig.p.profile, 'cordis.yml'), 'plugins: []\n');
   check('存在无包引用的 profile cordis.yml 仍允许人工移包', cleanConfig.run('uninstall', ['--apply']).exitCode === 3);
+  section('--drop-root-entry：只删本插件根条目');
+  {
+    const topRoot = `- id: agent-switchboard\n  name: ${JSON.stringify(pkg.name)}\n  config:\n    mount: false\n`;
+    const f = fixture({ patch: topRoot + cleanPatch + generated });
+    const before = readFileSync(f.p.patch);
+    const dry = f.run('uninstall', ['--drop-root-entry']);
+    check('--drop-root-entry dry-run 零写入', dry.exitCode === 1 && before.equals(readFileSync(f.p.patch)), dry.output);
+    const applied = f.run('uninstall', ['--drop-root-entry', '--apply']);
+    const text = readFileSync(f.p.patch, 'utf8');
+    check('--drop-root-entry 删除根条目与 preset、保留用户条目', applied.exitCode === 3
+      && !text.includes('id: agent-switchboard') && !text.includes('id: preset-switchboard')
+      && text.includes('id: unrelated') && /人工包移除步骤/.test(applied.output), applied.output);
+    check('--drop-root-entry 有备份', readdirSync(f.p.profile).some(name => name.includes('.bak-lifecycle-')));
+  }
+  {
+    const topRoot = `- id: agent-switchboard\n  name: ${JSON.stringify(pkg.name)}\n  config:\n    mount: false\n`;
+    const f = fixture({ registration: 'none', patch: topRoot + cleanPatch });
+    const rolesBefore = readFileSync(f.p.roles);
+    const r = f.run('uninstall', ['--drop-root-entry', '--apply']);
+    check('包已移除时 --drop-root-entry 完成清理并保留 roles', r.exitCode === 0
+      && !readFileSync(f.p.patch, 'utf8').includes('id: agent-switchboard')
+      && rolesBefore.equals(readFileSync(f.p.roles)), r.output);
+  }
+  {
+    const f = fixture({ registration: 'none',
+      patch: `- id: agent-switchboard\n  name: ${JSON.stringify(pkg.name)}\n` });
+    const r = f.run('uninstall', ['--drop-root-entry', '--apply']);
+    check('删除唯一条目后落盘为空操作列表而不是空文件', r.exitCode === 0
+      && readFileSync(f.p.patch, 'utf8').trim() === '[]', r.output);
+  }
+  {
+    const f = fixture({ registration: 'none', patch: '- id: agent-switchboard\n  name: "other"\n' });
+    const before = readFileSync(f.p.patch);
+    const r = f.run('uninstall', ['--drop-root-entry', '--apply']);
+    check('根条目 name 不匹配时拒绝删除', r.exitCode === 1
+      && /不等于本包/.test(r.output) && before.equals(readFileSync(f.p.patch)), r.output);
+  }
   for (const command of ['install', 'upgrade', 'uninstall']) {
     const f = fixture({ patch: cleanPatch + generated });
     const changed = readFileSync(f.p.patch, 'utf8') + '# 并发编辑\n';
@@ -638,7 +675,7 @@ fs.writeFileSync = (...args) => {
   const lifecycleHelp = captureSync(process.execPath, [script, '--help'], { env });
   const versionHelp = captureSync(process.execPath, [join(REPO_ROOT, 'scripts', 'ops', 'plugin-version.mjs'), '--help'], { env });
   check('lifecycle --help 五个命令、全部参数、dry-run 和完整退出码', lifecycleHelp.status === 0
-    && ['status', 'verify', 'install', 'upgrade', 'uninstall', '--apply', '--purge-roles', '--json',
+    && ['status', 'verify', 'install', 'upgrade', 'uninstall', '--apply', '--purge-roles', '--drop-root-entry', '--json',
       '--runtime-version', '--allow-unknown', '--home', '--profile', '--patch', '--roles-file', '--cwd',
       '没有 --dry-run', '0 =', '1 =', '3 =']
       .every(token => lifecycleHelp.stdout.includes(token)), lifecycleHelp.stdout + lifecycleHelp.stderr);
