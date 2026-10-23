@@ -5,6 +5,7 @@ import { join, dirname } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { resolvePaths, printPaths } from '../lib/paths.mjs';
 import { collectLifecycle, isExactDshVersion } from '../lib/lifecycle.mjs';
+import { compareVersions } from '../lib/version.mjs';
 import { captureSync } from '../lib/capture.mjs';
 import { planInjectedPreset, planRolesMigration, readPatch, presetConfig, pluginsWithoutName, scanPackageReferences } from '../lib/preset-patch.mjs';
 import { initialConfig, migrateConfigFileOnDisk, readConfigFileDetailed } from '../../src/config-file.js';
@@ -322,6 +323,20 @@ function converge(command, s, { apply, purge, collect, env, log }) {
     log(after.restart.reason);
     const otherIssues = after.verification.issues.filter(issue =>
       issue.code !== 'roles.definitions' && issue.code !== 'roles.format');
+    for (const issue of otherIssues) log(`FAIL  ${issue.code}：${issue.reason}`);
+    return { snapshot: after, exitCode: otherIssues.length ? 1 : 3 };
+  }
+  // upgrade 只向前：已安装版本高于仓库时，packageInstruction 的 link: 会变成降级。
+  let installedAhead = false;
+  if (command === 'upgrade' && isExactDshVersion(after.registration.resolvedVersion)) {
+    try { installedAhead = compareVersions(after.registration.resolvedVersion, after.repo.version) > 0; }
+    catch { installedAhead = false; }
+  }
+  if (installedAhead) {
+    log(`已安装版本 ${after.registration.resolvedVersion} 高于仓库 ${after.repo.version}；upgrade 不降级，拒绝输出包替换指令。`
+      + '如确需回退，请显式指定 DSH/GUI 的版本，而不是用本仓库当前版本覆盖。');
+    log(after.restart.reason);
+    const otherIssues = after.verification.issues.filter(issue => issue.code !== 'registration.version');
     for (const issue of otherIssues) log(`FAIL  ${issue.code}：${issue.reason}`);
     return { snapshot: after, exitCode: otherIssues.length ? 1 : 3 };
   }

@@ -416,6 +416,8 @@ export function verifyLifecycle(s) {
     addUnverified('registration.source', '安装源不是本仓库 link:/file:；无法确认已安装包与仓库制品一致');
   if (s.repoDependencies.status === 'drifted') add('dependencies.runtime', s.repoDependencies.reason);
   else if (s.repoDependencies.status === 'unknown') addUnverified('dependencies.runtime', s.repoDependencies.reason);
+  else if (s.repoDependencies.status === 'skipped' && s.paths.repoRoot === REPO_ROOT)
+    addUnverified('dependencies.runtime', s.repoDependencies.reason ?? '无法验证仓库 node_modules 的 dsh* 版本');
   if (s.preset.error) add('preset.structure', s.preset.error);
   if (!s.preset.mount) add('preset.mount', 'preset 本包 config 缺少 mount: true');
   if (s.preset.hasRoles) add('preset.roles', 'preset 携带禁止的 roles 字段；角色只能存放在 roles.json');

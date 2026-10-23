@@ -959,6 +959,10 @@ fs.writeFileSync = (...args) => {
   put(installedPath, { ...pkg, version: '0.0.0' });
   const oldVersion = changedManifest.run('upgrade', ['--apply']);
   check('upgrade 旧安装版本指向 DSH 人工包更新 exit=3', oldVersion.exitCode === 3 && /人工包更新步骤/.test(oldVersion.output));
+  put(installedPath, { ...pkg, version: '9.9.9' });
+  const aheadVersion = changedManifest.run('upgrade', ['--apply']);
+  check('upgrade 不用仓库旧版本覆盖更高安装版本', aheadVersion.exitCode === 3
+    && /不降级/.test(aheadVersion.output) && !/人工包更新步骤/.test(aheadVersion.output), aheadVersion.output);
   for (const command of ['install', 'upgrade']) for (const roles of ['{bad', { formatVersion: 999, roles: [] }]) {
     const f = fixture({ patch: cleanPatch, roles }), before = bytesTree(f.home);
     const result = f.run(command, ['--apply']);

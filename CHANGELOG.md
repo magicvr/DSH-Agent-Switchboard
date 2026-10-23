@@ -33,6 +33,7 @@
 - 退役 `inject:preset`：`probe-preset.mjs --inject` 现在硬拒绝，自检提示改为“确认 bundle 登记 + plugin:verify + 重启”，避免重新制造重复 preset 声明。
 - `plugin:verify` 增加 `presets/standard-plugins.json` 行模板漂移、安装源（`link:` 是否指向本仓库 / registry 的 unverified）与仓库 `node_modules/@deepseek-ai/dsh*` 版本三项判据；再生成时同时复读 YAML 与行模板。
 - `!!js` 的只读 YAML 结构检查改用 identity tag，不再每次 status/verify 输出 `TAG_RESOLVE_FAILED` 警告。
+- `upgrade` 只向前：已安装版本高于仓库版本时拒绝输出包替换指令并退出 `3`，避免用旧 checkout 静默降级。
 - 修复外部 CLI 角色的回流区把**过程与工具轨迹当成正文**平铺的问题：一次性子会话的 CLI 观察席改为
   **按通道分区** —— 正文区只显示 stdout（CLI 的最终消息，流式贴底），stderr 归入默认折叠的
   「过程与诊断」（失败且用户未手动干预时自动展开并改用错误色），并把它自己上报的路由事实
