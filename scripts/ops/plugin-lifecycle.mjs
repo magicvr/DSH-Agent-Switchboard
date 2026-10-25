@@ -32,11 +32,11 @@ export function packageInstruction(s, remove = false) {
   if (s.profile.kind === 'desktop') return remove
     ? `Electron DSH → Plugins 页面 → 找到 ${s.repo.name} → 卸载插件（GUI 按钮名称未验证）；确认 dependencies 与 dsh.profile.bundles 均已移除。`
     : `Electron DSH → Plugins 页面 → 添加插件 → 粘贴 ${spec} → 安装 → 立即启用（GUI 文案未验证；link: 绝对路径见 docs/plan.md 历史实测）。`;
-  return `未实测（本机 dsh CLI 可能是更旧版本；0.2.1-rc.2 归档源码/README 支持该语法）：dsh plugin --profile ${quote(s.profile.name)} ${remove ? `remove ${quote(s.repo.name)}` : `add ${quote(spec)}`}`;
+  return `未实测（本机 dsh CLI 未执行；0.2.1-rc.3 归档的 dsh-plugin-manager README 与 dsh 子命令源码支持该语法）：dsh plugin --profile ${quote(s.profile.name)} ${remove ? `remove ${quote(s.repo.name)}` : `add ${quote(spec)}`}`;
 }
 
 function exemptionInstruction(s) {
-  // 不猜测 GUI 精确文案；CLI 语法有 0.2.1-rc.2 归档源码依据，但本机 CLI 可能更旧，仍标未实测。
+  // 不猜测 GUI 精确文案；CLI 语法有 0.2.1-rc.3 归档 README/源码依据，但仍未在本机 CLI 实测。
   const key = s.compatibility.key;
   const runtime = s.compatibility.runtime.version ?? '<runtime>';
   const warning = '允许不兼容版本运行可能导致崩溃或数据损坏；请先判断能否重 pin / 升级插件，豁免只应作为最后手段。';
@@ -44,7 +44,7 @@ function exemptionInstruction(s) {
   if (s.profile.kind === 'desktop') {
     return `Electron DSH → Plugins → 本插件 → 允许不兼容版本（按钮/流程未验证）；${manual}${warning}`;
   }
-  return `未实测（本机 dsh CLI 版本可能低于 0.2.1-rc.2，源码语法）：dsh plugin --profile ${quote(s.profile.name)} `
+  return `未实测（本机 dsh CLI 未执行；0.2.1-rc.3 归档的 dsh-plugin-manager README 与 dsh plugin 子命令源码支持该语法）：dsh plugin --profile ${quote(s.profile.name)} `
     + `allow-version ${quote(key)} --dsh-version ${quote(runtime)} --accept-risk；或${manual}${warning}`;
 }
 
@@ -395,7 +395,7 @@ function converge(command, s, { apply, purge, collect, env, log, dropRoot = fals
     const staleKeys = [s.compatibility.key, ...s.compatibility.olderKeys];
     if (s.compatibility.exemptionPresent || s.compatibility.olderKeys.length > 0) {
       log(`兼容性豁免残留：${staleKeys.join(', ')} 仍在 ${join(s.paths.profile, 'compatibility.json')}；`
-        + '移除包后如不再需要，请在 DSH 插件页或 dsh plugin revoke-version（版本支持时）撤销；工具不自动删除授权。');
+        + '移除包后如不再需要，请在 DSH 插件页或 dsh plugin revoke-version 撤销（0.2.1-rc.3 归档源码/README 支持该子命令，未在本机 CLI 实测）；工具不自动删除授权。');
     }
     if (registered) { log(`人工包移除步骤：${packageInstruction(s, true)}`); return { snapshot: collect(), exitCode: 3 }; }
     if (purgeRoles && !apply) log('未写盘：roles 文件未删除；加 --apply 才执行 --purge-roles。');
