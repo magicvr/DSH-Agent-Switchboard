@@ -1,8 +1,8 @@
 # 架构设计
 
-> **状态：核心实现已落地。** Host、Client 角色设置页、CLI 专属工具与按角色委派均已实现。CLI 的 spawn 包裹链路已通过离线假 CLI 验证；`0.2.1-rc.1` 迁移已过一次**真机重启**验收（插件正常装载、`plugin:verify` consistent、完整分工版的角色 preset 在运行期注册成功，见 [`lifecycle.md`](./lifecycle.md) §6.4；自办版见 3.1h，2026-10-23 已真机重启验收）。完整分工版的 `delegate_to_*` 挂载与真实派发已于 2026-10-18 验收；**自办调度台（`switchboard-solo`）的实际挂载与派发仍未验收**。本文同时保留 DSH 契约、历史实测与仍适用的设计约束；历史方案被取代处注明当前行为。主代理写工具限制、统一结构化结果契约、并发与预算上限尚未实现；不要把目标形态当作已具备的能力。带「待定」或「未核实」标记的内容仍需验证。
+> **状态：核心实现已落地。** Host、Client 角色设置页、CLI 专属工具与按角色委派均已实现。CLI 的 spawn 包裹链路已通过离线假 CLI 验证；`0.2.1-rc.1` 迁移已过一次**真机重启**验收（插件正常装载、`plugin:verify` consistent、完整分工版的角色 preset 在运行期注册成功，见 [`lifecycle.md`](./lifecycle.md) §6.4；自办版见 3.1h，2026-10-23 已真机重启验收）。完整分工版的 `delegate_to_*` 挂载与真实派发已于 2026-10-18 验收；自办调度台（`switchboard-solo`）的 3 工具挂载与一次 scout 真实派发已于 2026-10-25 验收；GUI 取消/停止与任务面板视觉仍未验收。本文同时保留 DSH 契约、历史实测与仍适用的设计约束；历史方案被取代处注明当前行为。主代理写工具限制、统一结构化结果契约、并发与预算上限尚未实现；不要把目标形态当作已具备的能力。带「待定」或「未核实」标记的内容仍需验证。
 >
-> **DSH 基线：`0.2.1-rc.3`（自 `0.2.1-rc.2` 起无契约面变化，仅版本坐标重 pin）。** `0.2.1-rc.2` 删除了 `dsh-tool-subagent` 的 `persona` / `toolFilter` / `backgroundMode` / `enableRunInBackground`，角色 persona 与工具构成改由**每角色独立 Agent Preset** 承载（见 3.1g 与 [`decisions.md`](./decisions.md) D32），`fork` 后端已移除。真机重启已确认角色 preset 注册成功（`0.2.1-rc.2` 时）；子代理**实际拿到的**工具构成与只读裁剪、以及客户端半边，仍只有静态 / 离线验证。`0.2.1-rc.3` 重 pin 后已完全重启：插件装载、根实例 `switchboard_selftest` 健康、preset 无异常行；选中 Switchboard preset 的实际挂载与派发仍按既有条目单独验收。
+> **DSH 基线：`0.2.1-rc.3`（自 `0.2.1-rc.2` 起无契约面变化，仅版本坐标重 pin）。** `0.2.1-rc.2` 删除了 `dsh-tool-subagent` 的 `persona` / `toolFilter` / `backgroundMode` / `enableRunInBackground`，角色 persona 与工具构成改由**每角色独立 Agent Preset** 承载（见 3.1g 与 [`decisions.md`](./decisions.md) D32），`fork` 后端已移除。真机重启已确认角色 preset 注册成功（`0.2.1-rc.2` 时）；子代理**实际拿到的**工具构成与只读裁剪、以及客户端半边，仍只有静态 / 离线验证。`0.2.1-rc.3` 重 pin 后已完全重启：插件装载、根实例 `switchboard_selftest` 健康、preset 无异常行；自办调度台的实际挂载与一次 scout 派发已于 2026-10-25 验收。
 
 ## 1. 问题
 

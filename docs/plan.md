@@ -458,8 +458,9 @@
 
 - 插件正常装载，根实例 `switchboard_selftest` 报 `健康：健康`；`preset roster` = `standard ptc minimal cordis switchboard switchboard-solo switchboard-role-scout switchboard-role-worker switchboard-solo-role-scout`，`preset 异常行：（无异常行）`。
 - `roleConfig`：从 `roles.json` 读取 4 个角色，文件与 4 个旋钮覆盖一致；`plugin:verify` 为 `consistent / 已就绪`。
-- 自检如实报告根实例「已挂载角色工具：0 / 本作用域不挂载角色工具」，与设计一致；选中 Switchboard preset 的实际挂载与派发仍在下方「仍未验收」中。
+- 自检如实报告根实例「已挂载角色工具：0 / 本作用域不挂载角色工具」，与设计一致。
+- **自办调度台（`switchboard-solo`）边界：** selftest 报 `已挂载角色工具：3`（`delegate_to_scout` / `delegate_to_architect` / `delegate_to_reviewer`，无 `delegate_to_worker`）；向 scout 真实派发约 22 秒完成，返回的 README 前 10 行与本地读取逐行一致。
 
 ### 仍未验收
 
-只剩一项，且需要**切换会话 preset** 才能触发：确认 `delegate_to_*` 在**选中自办调度台（`switchboard-solo`）的会话**里实际只挂载 3 个角色工具（无 `delegate_to_worker`，自检应报 `已挂载角色工具：3`）并完成一次真实派发，从而覆盖自办 preset 的实际组合与派发；完整分工版的同类验收已于 2026-10-18 完成。客户端半边（卡片、保存往返、错误展示）仍只有静态核实。
+自办调度台的 3 工具挂载与 scout 真实派发已于 2026-10-25 验收（见上）。仍未验收的是 GUI 取消/停止沿 `exec.signal` 的传播与客户端任务面板的视觉表现；客户端半边（卡片、保存往返、错误展示）仍只有静态核实。

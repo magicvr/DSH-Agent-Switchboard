@@ -174,11 +174,11 @@ Phase 0–3 已实现，Phase 4 部分落地。`npm run check` 覆盖离线检�
 - 2026-10-18，主代理 → worker → scout 的嵌套 spawn 派发通过，结果逐级冒泡。
 - 2026-10-23，双 preset 完全重启后 roster 正常，`switchboard-solo-*` 命名空间隔离生效。
 - 2026-10-25，升到 `0.2.1-rc.3` 并完全重启后：插件正常装载，`switchboard_selftest` 报「健康」，preset roster 含 `switchboard` / `switchboard-solo` 与 `switchboard-role-scout` / `switchboard-role-worker` / `switchboard-solo-role-scout`，`preset 异常行：（无异常行）`；`roles.json` 读取 4 个角色且与设置一致，`plugin:verify` 为 `consistent`。
+- 2026-10-25，自办调度台（`switchboard-solo`）边界测试：实际只挂载 3 个角色工具（`delegate_to_scout` / `delegate_to_architect` / `delegate_to_reviewer`），无 `delegate_to_worker`；向 scout 真实派发约 22 秒完成，返回的 README 前 10 行与本地读取逐行一致。
 - codex / grok 的入口可执行性、模型与强度参数均有探针实测记录，见 [`docs/cli-backends.md`](./docs/cli-backends.md)。
 
 **仍未验收：**
 
-- 选中「自办调度台」的会话里实际只挂载 3 个角色工具（无 `delegate_to_worker`）并完成一次真实派发（按当前配置）。
 - GUI 取消/停止沿 `exec.signal` 的传播，以及客户端任务面板的视觉表现（折叠、失败自动展开）。
 - 生命周期工具：`upgrade --apply` 曾在历史 profile 上收敛成功；`install` / `uninstall` / `restore` 以及当前剥离语义的完整写入往返仍只有预演与离线夹具。Electron Plugins 页的按钮文案也未核实。
 - 设置页的真实保存往返；配置格式为 `future` / `unsupported` 时 GUI 尚未展示拒绝原因。
