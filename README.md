@@ -3,7 +3,7 @@
 > 把 DSH 主代理变成「信息流统合器」，把具体工作派给带角色的子代理——这些子代理可以跑在 DSH 内置的 spawn 后端，也可以跑在本机的 Codex / Grok CLI 上。
 
 [![status](https://img.shields.io/badge/status-implemented-green)](#状态与验证边界)
-[![DSH](https://img.shields.io/badge/DSH-0.2.1--rc.3-blue)](./package.json)
+[![DSH](https://img.shields.io/badge/DSH-0.2.1--rc.5-blue)](./package.json)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 ## 它解决什么
@@ -19,7 +19,7 @@
 
 ## 快速开始
 
-前置：DSH `0.2.1-rc.3`（peer 精确 pin）。仓库脚本需要 Node 与 `npm install`（只声明一个 devDependency `yaml`）；插件本身零构建、无运行时依赖，包管理由 DSH 负责。
+前置：DSH `0.2.1-rc.5`（peer 精确 pin）。仓库脚本需要 Node 与 `npm install`（只声明一个 devDependency `yaml`）；插件本身零构建、无运行时依赖，包管理由 DSH 负责。
 
 1. 在 DSH 的 Plugins 页安装 `link:<仓库绝对路径>` 并启用 `@magicvr/dsh-agent-switchboard`（GUI 按钮文案未核实）。
 2. `npm run plugin:status`：确认依赖、`dsh.profile.bundles` 登记与磁盘包体三项齐备。
@@ -158,7 +158,7 @@ CLI 角色不产出角色 preset，`delegate_to_<role>` 工具按 agent 安装�
 
 - **纯 ESM、零构建、dual-face 单包。** 真正有约束力的是 `package.json` 的三个契约字段：`exports["."]`、`exports["./client"]` + `dsh.client`、`dsh.bundle.patch`。
 - **设置页可写字段必须 `.volatile()`**，DSH 只暴露 volatile 字段给 GUI。bundle 的根条目只做配置桥接、不挂载角色工具；角色工具按 preset 会话挂载，不会污染其他 preset。
-- **版本门禁以 peer 为准。** 插件刻意不声明 `engines.dsh`（它一旦存在会单独决定并忽略全部 peers），改由 4 个 `@deepseek-ai/dsh*` peer 精确 pin `0.2.1-rc.3`（另 pin `@deepseek-ai/cordis` 4.0.5、`@deepseek-ai/schemastery` 3.18.5）。门禁不通过时该 profile 会静默跳过插件、设置页消失。DSH 升级后用 `npm run dsh:delta` 判断「只改版本坐标」还是「接口真的变了」。
+- **版本门禁以 peer 为准。** 插件刻意不声明 `engines.dsh`（它一旦存在会单独决定并忽略全部 peers），改由 4 个 `@deepseek-ai/dsh*` peer 精确 pin `0.2.1-rc.5`（另 pin `@deepseek-ai/cordis` 4.0.5、`@deepseek-ai/schemastery` 3.18.5）。门禁不通过时该 profile 会静默跳过插件、设置页消失。DSH 升级后用 `npm run dsh:delta` 判断「只改版本坐标」还是「接口真的变了」：它分三张面比对——契约面、安装/更新/卸载服务面（都是阻塞判定），以及只报告的客户端半边。
 - **角色配置每次派发现读。** 文件按 mtime + size 缓存；损坏时保留上一份有效缓存并标记 stale，没有有效缓存则拒绝派发。
 - **CLI 无运行时长上限。** stdout / stderr 经 Jobs 有界回流，实时日志不逐块进入任何模型上下文；任务 owner 是发起派发的 agent。
 - **可观测性存在不对称。** CLI 派发会记录角色、线路摘要与退出状态；内置 spawn 后端没有等价的返回日志，统一调度记录仍是目标（见 [`docs/architecture.md`](./docs/architecture.md) §7）。
@@ -174,11 +174,12 @@ Phase 0–3 已实现，Phase 4 部分落地。`npm run check` 覆盖离线检�
 - 2026-10-18，主代理 → worker → scout 的嵌套 spawn 派发通过，结果逐级冒泡。
 - 2026-10-23，双 preset 完全重启后 roster 正常，`switchboard-solo-*` 命名空间隔离生效。
 - 2026-10-25，升到 `0.2.1-rc.3` 并完全重启后：插件正常装载，`switchboard_selftest` 报「健康」，preset roster 含 `switchboard` / `switchboard-solo` 与 `switchboard-role-scout` / `switchboard-role-worker` / `switchboard-solo-role-scout`，`preset 异常行：（无异常行）`；`roles.json` 读取 4 个角色且与设置一致，`plugin:verify` 为 `consistent`。
+- 2026-10-25，自办调度台（`switchboard-solo`）边界测试：实际只挂载 3 个角色工具（`delegate_to_scout` / `delegate_to_architect` / `delegate_to_reviewer`），无 `delegate_to_worker`；向 scout 真实派发约 22 秒完成，返回的 README 前 10 行与本地读取逐行一致。
+- 2026-10-30，升到 `0.2.1-rc.5` 并完全重启后：插件正常装载（重 pin 前根作用域工具表里没有 `switchboard_selftest`，重启后出现），`switchboard_selftest` 报「健康」，preset roster 含 `switchboard` / `switchboard-solo` 与 `switchboard-role-scout` / `switchboard-role-worker` / `switchboard-solo-role-scout`，`preset 异常行：（无异常行）`；`roles.json` 读取 4 个角色且与设置一致，`plugin:verify` 为 `consistent`。
 - codex / grok 的入口可执行性、模型与强度参数均有探针实测记录，见 [`docs/cli-backends.md`](./docs/cli-backends.md)。
 
 **仍未验收：**
 
-- 选中「自办调度台」的会话里实际只挂载 3 个角色工具（无 `delegate_to_worker`）并完成一次真实派发（按当前配置）。
 - GUI 取消/停止沿 `exec.signal` 的传播，以及客户端任务面板的视觉表现（折叠、失败自动展开）。
 - 生命周期工具：`upgrade --apply` 曾在历史 profile 上收敛成功；`install` / `uninstall` / `restore` 以及当前剥离语义的完整写入往返仍只有预演与离线夹具。Electron Plugins 页的按钮文案也未核实。
 - 设置页的真实保存往返；配置格式为 `future` / `unsupported` 时 GUI 尚未展示拒绝原因。

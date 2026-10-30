@@ -16,6 +16,8 @@
 
 ### Changed
 
+- 适配 DSH `0.2.1-rc.5`：四个 dsh peer 精确重 pin 到 rc.5；`dsh:delta` 判定阻塞面 21 个包（契约面 12 + 安装/更新/卸载服务面 9）仅版本坐标变化，客户端半边只报告两组无害 UI / 构建产物差异，因此零代码改动，仅更新生命周期提示文案与文档证据。完全重启后根实例 `switchboard_selftest` 报「健康」、preset 无异常行、4 个角色读取一致，真机装载验收通过。
+- `dsh:delta` 改为按三张面比对：契约面与**安装/更新/卸载服务面**（`dsh-plugin-manager` / `dsh-package-manifest` / `dsh-host-plugin-inventory` / `dsh-cmdline` / `dsh` 启动器 / `dsh-home-paths` / 三个插件页 UI 包）是阻塞面，代码差异仍退出 `1`；新增**客户端半边**报告（`dsh-client-modules` / `dsh-client-ui-conversation` / `dsh-client-ui-settings` / `dsh-settings` / `dsh-client-connection`），只列变化、不参与判定——客户端包几乎每版都重打 UI bundle，哈希分不出 UI 与 slot / remote / `__ModuleLoader__` 契约的差别，算进判定只会制造假绿或假红。
 - 适配 DSH `0.2.1-rc.3`：四个 dsh peer 精确重 pin 到 rc.3；`dsh:delta` 判定契约面 12 个包仅版本坐标变化，安装/更新/卸载服务面（`dsh-plugin-manager` / `dsh-package-manifest` / `dsh` CLI 等）除版本坐标外不变，因此零代码改动，仅更新生命周期提示文案与文档证据。完全重启后根实例 `switchboard_selftest` 报「健康」、preset 无异常行、4 个角色读取一致，真机装载验收通过。
 - 按 D31 将包安装与 bundle 登记留给 DSH 官方通道；仓库工具不改 `dependencies`、不执行 pnpm、不自动创建兼容豁免，仅维护本插件派生制品并报告人工步骤。当前格式的用户角色文件保持原始字节；缺失时优先用根条目 legacy `roles` 播种，纯 split（`roleSettings`）模式拒绝播种空文件并退出 `3`。
 - 安全卸载先剥离并复读验证内联 preset，再提示移除包，避免悬空引用破坏 profile 启动；默认保留 `roles.json`，包仍登记时拒绝 `--purge-roles`。

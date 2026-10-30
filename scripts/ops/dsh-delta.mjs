@@ -13,9 +13,9 @@
 //   node scripts/ops/dsh-delta.mjs            人类可读报告
 //   node scripts/ops/dsh-delta.mjs --json     机器可读
 //
-// 退出码：
-//   0  只改版本坐标（可安全重 pin）；或两边版本已相同
-//   1  有非本地化的代码差异（必须先核对，可能要改代码）
+// 退出码（只由「阻塞面」决定，见 SURFACES）：
+//   0  阻塞面只改版本坐标（可安全重 pin）；或两边版本已相同
+//   1  阻塞面有非本地化的代码差异（必须先核对，可能要改代码）
 //   2  无法判定（归档不可用、网络取不到、包缺失）
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readdirSync, readFileSync } from 'node:fs';
@@ -26,25 +26,69 @@ import { openAsar, readJson } from '../lib/asar.mjs';
 import { resolveAsar, REPO_ROOT } from '../lib/paths.mjs';
 
 /**
- * 要比对的「契约面」：本插件真正依赖或编排的 DSH 包。
+ * 要比对的三张「面」。
  *
- * 刻意不是归档里全部 `@deepseek-ai/dsh*`（两百多个）：逐包下载两版代价过高，而这批包
- * 覆盖了本插件全部接触点。`dsh-typert-protocol` 虽未被 import，但是声明的 peer，
- * 一并纳入。新增对某个 DSH 包的依赖时，往这里加一行。
+ * 分组不是为了好看：**判定强度不同**。`blocking` 为真的面一旦有非本地化代码差异，就必须先核对
+ * 再重 pin；不阻塞的面只把变化列出来——本工具没有能力把那里的「UI 改动」与「契约改动」区分开，
+ * 假装能判就是在制造它本该防的那种静默失效。
+ *
+ * 刻意不是归档里全部 `@deepseek-ai/dsh*`（两百多个）：逐包下载两版代价过高，而这批包覆盖了
+ * 本插件全部接触点。新增对某个 DSH 包的依赖、或新增一处对 DSH 服务语义的镜像时，往对应面加一行。
  */
-const CONTRACT_PACKAGES = [
-  ['dsh-app-boot', '版本门禁本身（unmetRequirements / getDshRuntimeVersion）'],
-  ['dsh-tools', 'defineTool / ToolRuntime / schema DSL'],
-  ['dsh-scope', 'scopeOf'],
-  ['dsh-tool-subagent', '委派工具 Config、装载期 preset 校验、persona/toolFilter 硬拒'],
-  ['dsh-subagent', 'provider 契约与 SubagentStartRequest'],
-  ['dsh-subagent-spawn-in-process', 'provider 能力位（agentPreset / depthLimit）'],
-  ['dsh-agent-preset-registry', 'agentPresets.register / readDocument'],
-  ['dsh-persona', '角色 persona 行（config.prefix）'],
-  ['dsh-system-prompt', 'section 注册与渲染'],
-  ['dsh-agent', 'assembleContextFor'],
-  ['dsh-web-app', '上游 standard preset（决定生成物是否需要重新生成）'],
-  ['dsh-typert-protocol', '声明的 peer'],
+const SURFACES = [
+  {
+    id: 'contract',
+    label: '契约面',
+    blocking: true,
+    note: '插件运行时真正 import / 编排的包与其声明 peer。',
+    packages: [
+      ['dsh-app-boot', '版本门禁本身（unmetRequirements / getDshRuntimeVersion）'],
+      ['dsh-tools', 'defineTool / ToolRuntime / schema DSL'],
+      ['dsh-scope', 'scopeOf'],
+      ['dsh-tool-subagent', '委派工具 Config、装载期 preset 校验、persona/toolFilter 硬拒'],
+      ['dsh-subagent', 'provider 契约与 SubagentStartRequest'],
+      ['dsh-subagent-spawn-in-process', 'provider 能力位（agentPreset / depthLimit）'],
+      ['dsh-agent-preset-registry', 'agentPresets.register / readDocument'],
+      ['dsh-persona', '角色 persona 行（config.prefix）'],
+      ['dsh-system-prompt', 'section 注册与渲染'],
+      ['dsh-agent', 'assembleContextFor'],
+      ['dsh-web-app', '上游 standard preset（决定生成物是否需要重新生成）'],
+      ['dsh-typert-protocol', '声明的 peer'],
+    ],
+  },
+  {
+    id: 'lifecycle',
+    label: '安装/更新/卸载服务面',
+    blocking: true,
+    note: 'DSH 自己执行包管理；本仓库的生命周期工具镜像它的门禁语义、CLI 语法与 profile 布局，'
+      + '这一面变了，提示文案与文档证据就过期了。',
+    packages: [
+      ['dsh-plugin-manager', '插件服务、兼容性门禁、plugin 子命令共用实现'],
+      ['dsh-package-manifest', '插件 manifest 解析'],
+      ['dsh-host-plugin-inventory', '已安装插件清单'],
+      ['dsh-cmdline', 'dsh CLI 子命令与参数'],
+      ['dsh', '启动器（含 plugin 子命令转发）'],
+      ['dsh-home-paths', 'profile / home 路径布局'],
+      ['dsh-client-ui-plugin-manager', 'Plugins 页（人工安装/卸载通道）'],
+      ['dsh-client-ui-settings-plugins', '设置页插件段'],
+      ['dsh-client-ui-plugin-market', '插件市场'],
+    ],
+  },
+  {
+    id: 'client',
+    label: '客户端半边',
+    blocking: false,
+    note: '静态 inject 目标、slot 宿主、remote 通道与 __ModuleLoader__ 加载契约。'
+      + '客户端包几乎每个版本都会改 UI bundle，本工具区分不了 UI 与契约，因此只报告、不参与判定。',
+    reviewHint: '这些包里的 slot 名 / remote 方法 / __ModuleLoader__ 载荷字段有没有被改',
+    packages: [
+      ['dsh-client-modules', '__ModuleLoader__ 加载契约'],
+      ['dsh-client-ui-conversation', '静态 inject 目标与 slot 宿主'],
+      ['dsh-client-ui-settings', 'remote.settings API 宿主'],
+      ['dsh-settings', 'volatile 字段暴露与写入'],
+      ['dsh-client-connection', 'remote 通道'],
+    ],
+  },
 ];
 
 /** 版本坐标（`package.json` 的版本号与依赖 pin）不是接口差异，单列出来。 */
@@ -164,6 +208,48 @@ function pinnedVersion() {
   return { version: versions[0], peers };
 }
 
+/**
+ * 比对一张面里的全部包。
+ *
+ * @param {object} surface - SURFACES 的一项。
+ * @param {{pinned: string, runtime: string, registry: string, workDir: string}} run - 本次运行参数。
+ * @returns {Promise<object[]>} 每个包的比对结果。
+ */
+async function compareSurface(surface, run) {
+  const results = [];
+  for (const [name, why] of surface.packages) {
+    let pinnedDir;
+    let runtimeDir;
+    try {
+      [pinnedDir, runtimeDir] = await Promise.all([
+        fetchPackage(name, run.pinned, run.registry, run.workDir),
+        fetchPackage(name, run.runtime, run.registry, run.workDir),
+      ]);
+    } catch (error) {
+      // 单个包取不到（例如该版本未发布该包）不算致命，如实记为无法判定。
+      results.push({ name, why, status: 'unavailable', detail: error.message });
+      continue;
+    }
+    const diff = compareTrees(hashTree(pinnedDir), hashTree(runtimeDir));
+    const all = [...diff.changed, ...diff.added, ...diff.removed];
+    const code = all.filter((path) => isCodeFile(path) && !isLocaleFile(path));
+    const asset = all.filter((path) => !isCodeFile(path) && !isLocaleFile(path));
+    const localeCount = all.length - code.length - asset.length;
+    results.push({
+      name, why,
+      status: code.length > 0 ? 'code-changed'
+        : asset.length > 0 ? 'asset-only'
+          : localeCount > 0 ? 'locale-only' : 'identical',
+      code,
+      asset,
+      localeCount,
+      // 上游 standard preset 是否变化，决定生成物要不要重新生成。
+      standardPresetChanged: name === 'dsh-web-app' && all.includes(UPSTREAM_STANDARD_PRESET),
+    });
+  }
+  return results;
+}
+
 const args = process.argv.slice(2);
 const asJson = args.includes('--json');
 const unknown = args.filter((arg) => arg !== '--json');
@@ -200,7 +286,7 @@ const registry = (process.env.npm_config_registry ?? process.env.NPM_CONFIG_REGI
   .replace(/\/+$/, '');
 
 if (runtime === pinned.version) {
-  if (asJson) console.log(JSON.stringify({ runtime, pinned: pinned.version, verdict: 'same', packages: [] }, null, 2));
+  if (asJson) console.log(JSON.stringify({ runtime, pinned: pinned.version, verdict: 'same', surfaces: [] }, null, 2));
   else {
     console.log(`运行时版本：${runtime}（来自归档 dsh-app-boot）`);
     console.log(`仓库 pin：  ${pinned.version}`);
@@ -211,87 +297,89 @@ if (runtime === pinned.version) {
 
 // 需要下载两版做逐包比对。临时目录只放包体与解包结果，跑完即删。
 const workDir = mkdtempSync(join(tmpdir(), 'dsh-delta-'));
-const results = [];
-let undecidable;
+const surfaces = [];
 try {
-  for (const [name, why] of CONTRACT_PACKAGES) {
-    let pinnedDir;
-    let runtimeDir;
-    try {
-      [pinnedDir, runtimeDir] = await Promise.all([
-        fetchPackage(name, pinned.version, registry, workDir),
-        fetchPackage(name, runtime, registry, workDir),
-      ]);
-    } catch (error) {
-      // 单个包取不到（例如该版本未发布该包）不算致命，如实记为无法判定。
-      results.push({ name, why, status: 'unavailable', detail: error.message });
-      undecidable ??= error.message;
-      continue;
-    }
-    const diff = compareTrees(hashTree(pinnedDir), hashTree(runtimeDir));
-    const all = [...diff.changed, ...diff.added, ...diff.removed];
-    const code = all.filter((path) => isCodeFile(path) && !isLocaleFile(path));
-    const asset = all.filter((path) => !isCodeFile(path) && !isLocaleFile(path));
-    const localeCount = all.length - code.length - asset.length;
-    results.push({
-      name, why,
-      status: code.length > 0 ? 'code-changed'
-        : asset.length > 0 ? 'asset-only'
-          : localeCount > 0 ? 'locale-only' : 'identical',
-      code,
-      asset,
-      localeCount,
-      // 上游 standard preset 是否变化，决定生成物要不要重新生成。
-      standardPresetChanged: name === 'dsh-web-app' && all.includes(UPSTREAM_STANDARD_PRESET),
-    });
+  for (const surface of SURFACES) {
+    surfaces.push({ ...surface, results: await compareSurface(surface, { pinned: pinned.version, runtime, registry, workDir }) });
   }
 } finally {
   rmSync(workDir, { recursive: true, force: true });
 }
 
-const codeChanged = results.filter((entry) => entry.status === 'code-changed');
-const assetChanged = results.filter((entry) => entry.status === 'asset-only');
-const unavailable = results.filter((entry) => entry.status === 'unavailable');
-const standardPresetChanged = results.some((entry) => entry.standardPresetChanged === true);
-// ⚠️ 只要有一个包没比对上，就**不能**给出「可以放心重 pin」的结论——那是把「没看到差异」
+const blocking = surfaces.filter((surface) => surface.blocking);
+const changedIn = (surface, status) => surface.results.filter((entry) => entry.status === status);
+const codeChanged = blocking.flatMap((surface) => changedIn(surface, 'code-changed').map((entry) => ({ ...entry, surface })));
+const unavailable = blocking.flatMap((surface) => changedIn(surface, 'unavailable').map((entry) => ({ ...entry, surface })));
+const standardPresetChanged = surfaces.some((surface) => surface.results.some((entry) => entry.standardPresetChanged === true));
+// ⚠️ 只要有一个阻塞面的包没比对上，就**不能**给出「可以放心重 pin」的结论——那是把「没看到差异」
 //    当成「没有差异」。未比对的包一律计入「无法判定」，与仓库「未知不猜测」的原则一致。
 const fullyCompared = unavailable.length === 0;
 const verdict = codeChanged.length > 0 ? 'code-changed' : fullyCompared ? 'coordinate-only' : 'undecidable';
+// 不阻塞的面：只把变化列出来。它不影响退出码，但绝不能静默——那是这次唯一需要人睁眼的部分。
+const reviewSurfaces = surfaces.filter((surface) => !surface.blocking)
+  .map((surface) => ({ surface, entries: surface.results.filter((entry) => entry.status !== 'identical') }))
+  .filter((group) => group.entries.length > 0);
+
+/** 一张面上单个包的一行报告；`blocking=false` 时只报告、不打 PASS/FAIL 的判定色彩。 */
+function describeEntry(surface, entry, log) {
+  const { name, why } = entry;
+  if (entry.status === 'unavailable') { log(`  SKIP  ${name} — 取不到（${entry.detail}）`); return; }
+  if (entry.status === 'identical') {
+    log(`  ${surface.blocking ? 'PASS' : 'SAME'}  ${name} — 除版本坐标外逐字节相同`);
+    return;
+  }
+  if (entry.status === 'locale-only') {
+    log(`  ${surface.blocking ? 'PASS' : 'SAME'}  ${name} — 仅 ${entry.localeCount} 个本地化文案文件不同`);
+    return;
+  }
+  const isCode = entry.status === 'code-changed';
+  const label = surface.blocking ? (isCode ? 'FAIL' : 'WARN') : 'INFO';
+  const kind = isCode ? '代码' : '资产/配置';
+  const count = entry.code.length + entry.asset.length;
+  log(`  ${label}  ${name} — ${count} 个${kind}文件不同`
+    + `${entry.localeCount > 0 ? `（另有 ${entry.localeCount} 个本地化文件）` : ''}`);
+  for (const path of [...entry.code, ...entry.asset].slice(0, 10)) log(`          ${path}`);
+  if (count > 10) log(`          …（共 ${count} 个，已截断）`);
+}
 
 if (asJson) {
   console.log(JSON.stringify({
-    runtime, pinned: pinned.version, registry, verdict, standardPresetChanged, packages: results,
+    runtime,
+    pinned: pinned.version,
+    registry,
+    verdict,
+    standardPresetChanged,
+    surfaces: surfaces.map((surface) => ({
+      id: surface.id,
+      label: surface.label,
+      blocking: surface.blocking,
+      packages: surface.results,
+    })),
   }, null, 2));
 } else {
   console.log(`运行时版本：${runtime}（来自归档 dsh-app-boot）`);
   console.log(`仓库 pin：  ${pinned.version}`);
   console.log(`比对方式：  两版包体均从 ${registry} 取，逐文件 sha256（忽略 package.json；代码与资产分开判定）\n`);
-  console.log(`=== 契约面逐包比对（${CONTRACT_PACKAGES.length} 个包）===`);
-  for (const entry of results) {
-    if (entry.status === 'unavailable') { console.log(`  SKIP  ${entry.name} — 取不到（${entry.detail}）`); continue; }
-    if (entry.status === 'identical') { console.log(`  PASS  ${entry.name} — 除版本坐标外逐字节相同`); continue; }
-    if (entry.status === 'locale-only') { console.log(`  PASS  ${entry.name} — 仅 ${entry.localeCount} 个本地化文案文件不同`); continue; }
-    const label = entry.status === 'code-changed' ? 'FAIL' : 'WARN';
-    const kind = entry.status === 'code-changed' ? '代码' : '资产/配置';
-    const count = entry.code.length + entry.asset.length;
-    console.log(`  ${label}  ${entry.name} — ${count} 个${kind}文件不同` +
-      `${entry.localeCount > 0 ? `（另有 ${entry.localeCount} 个本地化文件）` : ''}`);
-    for (const path of [...entry.code, ...entry.asset].slice(0, 10)) console.log(`          ${path}`);
-    if (count > 10) console.log(`          …（共 ${count} 个，已截断）`);
+  for (const surface of surfaces) {
+    console.log(`=== ${surface.label}（${surface.blocking ? '阻塞' : '不参与判定'}，${surface.packages.length} 个包）===`);
+    console.log(`    ${surface.note}`);
+    for (const entry of surface.results) describeEntry(surface, entry, console.log);
+    console.log('');
   }
 
   if (codeChanged.length > 0) {
-    console.log(`\n结论：**有 ${codeChanged.length} 个包的接口/实现发生变化**，必须先核对下列包再决定改哪些代码；`);
+    console.log(`结论：**有 ${codeChanged.length} 个包的接口/实现发生变化**，必须先核对下列包再决定改哪些代码；`);
     console.log('  直接重 pin 会让插件加载到已改变的 API 上（这正是本项目一直在防的静默失效）。');
-    for (const entry of codeChanged) console.log(`  - ${entry.name}（${entry.why}）`);
+    for (const entry of codeChanged) console.log(`  - ${entry.name}（${entry.surface.label}：${entry.why}）`);
   } else if (!fullyCompared) {
-    console.log(`\n结论：**无法判定**——有 ${unavailable.length} 个包没比对上，不能据此断言「可以放心重 pin」。`);
+    console.log(`结论：**无法判定**——有 ${unavailable.length} 个包没比对上，不能据此断言「可以放心重 pin」。`);
     console.log('  （把「没看到差异」当成「没有差异」正是本项目一直在防的失效。）');
-    for (const entry of unavailable) console.log(`  - ${entry.name}：${entry.detail}`);
+    for (const entry of unavailable) console.log(`  - ${entry.name}（${entry.surface.label}）：${entry.detail}`);
     console.log('  取不到多半是网络/registry 不可用，或该包在这个版本尚未发布（后者本身就是需要人看一眼的信号）。');
   } else {
-    console.log(`\n结论：**只改版本坐标**（${results.length} 个契约面包全部无接口/实现变化），可以放心重 pin。`);
+    console.log(`结论：**只改版本坐标**（阻塞面 ${blocking.reduce((sum, surface) => sum + surface.results.length, 0)} 个包全部无接口/实现变化），可以放心重 pin。`);
     console.log(`  package.json 四个 dsh peers 改成 "${runtime}"，然后 npm install → npm run check → node scripts/ops/plugin-lifecycle.mjs verify。`);
+    const assetChanged = blocking.flatMap((surface) => surface.results.filter((entry) => entry.status === 'asset-only'));
     if (assetChanged.length > 0) {
       console.log(`  另：${assetChanged.length} 个包有资产/配置变化（上方 WARN），不影响本插件加载。`);
     }
@@ -300,6 +388,11 @@ if (asJson) {
     } else {
       console.log('上游 `presets/standard.patch.yml` 未变 → 生成物无需重新生成，profile 也无需改动。');
     }
+  }
+  for (const { surface, entries } of reviewSurfaces) {
+    console.log(`\nℹ️ ${surface.label}有 ${entries.length} 个包存在实现变化（上方 INFO），**不参与上面的判定**；`);
+    console.log(`   本工具分不出那里的 UI 改动与契约改动，重 pin 前请人看一眼：${surface.reviewHint}。`);
+    for (const entry of entries) console.log(`   - ${entry.name}（${entry.why}）`);
   }
 }
 
