@@ -1,6 +1,6 @@
 # 实施方案
 
-> **记录性质与 D29 当前实现补记：** 本文保留各阶段的历史方案、实测与待验收状态，不把历史记录视为当前验收结论。当前 preset 中本插件条目带 `mount: true` 与 `supervisorRules`，不带 `roles`；角色仍在 `$DSH_HOME/agent-switchboard/roles.json`。DSH 基线为 `0.2.1-rc.3`（rc.2 → rc.3 无契约面变化，仅重 pin）：preset 整体复制 standard，`instructions` / `readOnly` / `allowNestedDispatch` 由**每角色独立 Agent Preset** 承载（D32），`fork` 后端已移除，派发一律异步受理。调度规则文本由 `scripts/gen-preset.mjs` 生成，字段非 volatile、无默认值、UI 不可编辑；改动后须执行 `npm run gen:preset` → 确认 bundle 登记 → 重启 DSH 才生效（preset 由 bundle 投递，`inject:preset` 已退役）。规则注入已实现并有离线验证；生成器新增提交纪律，提交由主代理统一执行，worker 不自行提交。新增规则的生成与检查、profile 同步及真机提示词验收须分别确认，不将源码更新视为生效（见 D29）。
+> **记录性质与 D29 当前实现补记：** 本文保留各阶段的历史方案、实测与待验收状态，不把历史记录视为当前验收结论。当前 preset 中本插件条目带 `mount: true` 与 `supervisorRules`，不带 `roles`；角色仍在 `$DSH_HOME/agent-switchboard/roles.json`。DSH 基线为 `0.2.1-rc.5`（rc.2 → rc.5 无契约面变化，仅重 pin）：preset 整体复制 standard，`instructions` / `readOnly` / `allowNestedDispatch` 由**每角色独立 Agent Preset** 承载（D32），`fork` 后端已移除，派发一律异步受理。调度规则文本由 `scripts/gen-preset.mjs` 生成，字段非 volatile、无默认值、UI 不可编辑；改动后须执行 `npm run gen:preset` → 确认 bundle 登记 → 重启 DSH 才生效（preset 由 bundle 投递，`inject:preset` 已退役）。规则注入已实现并有离线验证；生成器新增提交纪律，提交由主代理统一执行，worker 不自行提交。新增规则的生成与检查、profile 同步及真机提示词验收须分别确认，不将源码更新视为生效（见 D29）。
 
 > 配套阅读：[`decisions.md`](./decisions.md)（为什么这么选）、[`architecture.md`](./architecture.md)（契约与取证）。生命周期当前支持路径与验证边界见 [`lifecycle.md`](./lifecycle.md) 及本文末尾 D31 补记；上面的底层生成 / 注入步骤保留为历史记录。
 
@@ -429,7 +429,7 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本门禁 | `dsh-app-boot.unmetRequirements()`：`engines.dsh` 存在则单独决定并忽略 peers，否则逐条校验 DSH peers。本插件不写 `engines.dsh`，四个 dsh peers 精确 pin 到 `0.2.1-rc.3`（cordis 4.0.5 / schemastery 3.18.5 同样精确） |
+| 版本门禁 | `dsh-app-boot.unmetRequirements()`：`engines.dsh` 存在则单独决定并忽略 peers，否则逐条校验 DSH peers。本插件不写 `engines.dsh`，四个 dsh peers 精确 pin 到 `0.2.1-rc.5`（cordis 4.0.5 / schemastery 3.18.5 同样精确） |
 | persona / toolFilter | 两者已从 `dsh-tool-subagent` 的 Config 删除，键存在即装载期抛错；`backgroundMode` / `enableRunInBackground` 一并删除。角色 persona 与工具构成改由**每角色独立 Agent Preset** 承载（新增 `src/role-presets.js`、生成物 `presets/standard-plugins.json`） |
 | fork | 后端移除：`dsh-subagent-fork-in-process` 的 `capabilities.agentPreset: false` + `inheritsParentContext: true` 使其无法承载角色指令与工具限制；`BUILTIN_PROVIDERS` 现为 `['spawn']`，`backend: 'fork'` 被校验拒绝 |
 | 派发语义 | 一律异步受理：工具返回 `{ kind: 'activation', subagentId }`，结果以完成通知送达；无前台 / 后台模式。注入的调度规则与路由指引已按此改写 |
@@ -444,6 +444,7 @@
 - `npm run check`：全链退出 `0`（`check-roles` 309、`check-drivers` 130、`check-cli` 71、`check-cli-provider` 292、`check-config-*` 全部通过 / 33 / 67、`check-apply` 383、`check-validation-parity` 56、`check-client` 328、`check-profile-wiring` 13、`check-version` 107、`check-lifecycle` 213、`check-script-portability` 146，均 `0 失败`）。
 - `node scripts/check-profile-wiring.mjs`：**13 通过 / 0 失败**。运行时 `0.2.1-rc.2`；仓库 DSH 要求满足运行时；仓库 `node_modules` 23 个 `@deepseek-ai/dsh*` 全部等于运行时。（历史阶段重新注入 preset 之前该项曾报 `12 通过 / 1 失败`，失败项即 profile 仍内联 `0.2.0-rc.2` 时代的旧 preset 正文。）
 - `2026-10-25` rc.3 重 pin 后：`npm run dsh:delta` 报契约面 12 个包除版本坐标外逐字节相同（退出 `0`）；`npm run check` 全链退出 `0`；`check-profile-wiring` 为 **18 通过 / 0 失败**（运行时 `0.2.1-rc.3`）；`plugin:verify` 报 `验证：consistent / 下一步：已就绪`。安装/更新/卸载服务面（`dsh-plugin-manager` / `dsh-package-manifest` / `dsh` CLI）除版本坐标外不变。真机复核见下。
+- `2026-10-30` rc.5 重 pin 后：`npm run dsh:delta`（本轮起分契约面 / 安装-更新-卸载服务面 / 客户端半边三张面）报阻塞面 21 个包除版本坐标外逐字节相同（退出 `0`，上游 `standard.patch.yml` 未变）；客户端半边只有 `dsh-client-modules`（构建 commit 常量）与 `dsh-client-ui-conversation`（视图页签 tooltip 与一条文案）两组 UI 变化，不涉 slot / remote / `__ModuleLoader__` 契约。`npm run check` 全链退出 `0`；`check-profile-wiring` 为 **18 通过 / 0 失败**（运行时 `0.2.1-rc.5`）；`plugin:verify` 报 `验证：consistent / 下一步：已就绪`。**完全重启后（同日 11:00 新进程）：** 插件正常装载（重 pin 前根作用域没有 `switchboard_selftest`，重启后出现），根实例自检报「健康」、`preset 异常行：（无异常行）`、`roleConfig` 读取 4 个角色且与设置一致。
 
 ### 验收证据（真机，2026-10-17 完全重启后）
 

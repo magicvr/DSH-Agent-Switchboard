@@ -4,7 +4,7 @@
 
 生命周期机制采用「检测 + 指令 + 收敛派生制品 + 验证」（D31），不是第二个安装器。`scripts/ops/plugin-lifecycle.mjs` 不修改 profile 的 `dependencies` 或 bundle 登记，不执行 `pnpm`，也不自动创建 `compatibility.json`。它读取实际状态、提示 DSH 人工步骤，同步或剥离本插件的内联 preset，处理角色文件并复验。
 
-这是受 DSH 契约约束的分工：实测 `dsh plugin --profile desktop ...` 硬拒绝，报 `error: profile "desktop" is managed exclusively by the Electron application`；desktop 包管理只能走 Electron GUI Plugins 页。非 desktop 的 CLI 必须指定 `--profile <name>`，缺省实测报 `error: required option '--profile <name>' not specified`。依据 CLI 自述与源码，它把参数转交给 profile 目录内的 `pnpm`；`0.2.1-rc.3` 归档的 `dsh` README 与 `dsh-plugin-manager` 源码/README 仍支持该转发，但本文的 `add <spec>` / `remove <name>` 形式**仍未在本机 CLI 实测**。遵循 [`architecture.md` §3](./architecture.md#3-dsh-插件契约已核实)，不要手写 profile 安装登记或手动运行 pnpm；本工具的定向 preset 收敛是派生制品维护，不代替 DSH 安装。
+这是受 DSH 契约约束的分工：实测 `dsh plugin --profile desktop ...` 硬拒绝，报 `error: profile "desktop" is managed exclusively by the Electron application`；desktop 包管理只能走 Electron GUI Plugins 页。非 desktop 的 CLI 必须指定 `--profile <name>`，缺省实测报 `error: required option '--profile <name>' not specified`。依据 CLI 自述与源码，它把参数转交给 profile 目录内的 `pnpm`；`0.2.1-rc.5` 归档的 `dsh` README 与 `dsh-plugin-manager` 源码/README 仍支持该转发（该包自 rc.3 起逐字节未变），但本文的 `add <spec>` / `remove <name>` 形式**仍未在本机 CLI 实测**。遵循 [`architecture.md` §3](./architecture.md#3-dsh-插件契约已核实)，不要手写 profile 安装登记或手动运行 pnpm；本工具的定向 preset 收敛是派生制品维护，不代替 DSH 安装。
 
 | 责任方 | 负责内容 |
 | --- | --- |
@@ -77,7 +77,7 @@
 
 ### 3.2 首次安装：cli-managed
 
-对已存在的非 desktop profile，使用 `--profile <profile目录>` 明确选择目标，重复上述检测、预演、收敛与复验步骤。运行时优先用 `--runtime-version <加载该 profile 的 dsh 精确版本>` 显式指定；缺省时工具从 PATH 上的 dsh 启动器旁只读读取 `@deepseek-ai/dsh/package.json`，不执行 CLI。找不到 package.json 时保持 `unverified`，不会猜版本。人工包步骤候选形式为 `dsh plugin --profile <name> add <spec>`，其中 spec 为 `link:<仓库绝对路径>`：**依据 CLI 自述与 `0.2.1-rc.3` 归档源码/README，未实测**。`0.2.1-rc.3` 的 `reconcile` 会把**新 add** 的依赖补进 `dsh.profile.bundles`；但已存在、只是缺 bundle 登记的依赖不会被补，所以安装后仍要复核 `dependencies`、`dsh.profile.bundles` 和包体三项。
+对已存在的非 desktop profile，使用 `--profile <profile目录>` 明确选择目标，重复上述检测、预演、收敛与复验步骤。运行时优先用 `--runtime-version <加载该 profile 的 dsh 精确版本>` 显式指定；缺省时工具从 PATH 上的 dsh 启动器旁只读读取 `@deepseek-ai/dsh/package.json`，不执行 CLI。找不到 package.json 时保持 `unverified`，不会猜版本。人工包步骤候选形式为 `dsh plugin --profile <name> add <spec>`，其中 spec 为 `link:<仓库绝对路径>`：**依据 CLI 自述与 `0.2.1-rc.5` 归档源码/README，未实测**。`0.2.1-rc.5` 的 `reconcile` 会把**新 add** 的依赖补进 `dsh.profile.bundles`；但已存在、只是缺 bundle 登记的依赖不会被补，所以安装后仍要复核 `dependencies`、`dsh.profile.bundles` 和包体三项。
 
 **不要用 `dsh plugin --profile <name> --help` 作只读探针。** 已实测它不会短路，首次使用会初始化 profile，曾尝试写入 profile 的 `package.json.lock`。
 
@@ -107,22 +107,22 @@
 
 兼容性判定只评估 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` peers，镜像 DSH 门禁，不把 `engines.*` 当作已执行约束。范围判断仅支持完整精确版本、`~`、`^`，采用包含预发布版本的边界比较；其它语法给出 `unknown` / `unsupported-range`，不猜测。运行时来源按 profile 类型区分：desktop 读 Electron 安装归档的 `dsh/package.json`；CLI-managed profile 优先用 `--runtime-version <加载它的 dsh 版本>`，缺省时从 PATH 上的 dsh 启动器旁只读读取 `@deepseek-ai/dsh/package.json`（**不执行 dsh**），两者都没有才保持 `unverified`，不拿 Electron 版本冒充。任何来源都**不证明当前进程已运行该版本**。兼容性判定优先使用**已安装包**的 manifest；只有已安装版本与仓库版本一致时才用仓库 manifest。
 
-> ⚠️ **两侧语义必须分清（`0.2.1-rc.1` 已核实）：** DSH 自己的门禁（`dsh-app-boot.unmetRequirements()`）是「manifest 声明了 `engines.dsh`（字符串）则**它单独决定并忽略全部 peers**，否则逐条校验 DSH peers」。本仓库工具与 `check-profile-wiring.mjs` 复刻的是**后一条分支**，因为本插件的 `package.json` **刻意不写 `engines.dsh`**——peer 精确 pin 是唯一真源，写了会静默覆盖 peers。旧说法「`engines.*` 不被当作已执行约束」只对 `0.2.0-rc.2` 成立（那个版本从不读 `engines`）。**当前本插件四个 dsh peers 精确 pin 到 `0.2.1-rc.3`，每次 DSH 升级都必须手工重 pin**：范围会让仓库 `node_modules` 解析到与运行时不同的构建，离线检查按错误接口版本通过（见 D32）。
+> ⚠️ **两侧语义必须分清（`0.2.1-rc.1` 已核实）：** DSH 自己的门禁（`dsh-app-boot.unmetRequirements()`）是「manifest 声明了 `engines.dsh`（字符串）则**它单独决定并忽略全部 peers**，否则逐条校验 DSH peers」。本仓库工具与 `check-profile-wiring.mjs` 复刻的是**后一条分支**，因为本插件的 `package.json` **刻意不写 `engines.dsh`**——peer 精确 pin 是唯一真源，写了会静默覆盖 peers。旧说法「`engines.*` 不被当作已执行约束」只对 `0.2.0-rc.2` 成立（那个版本从不读 `engines`）。**当前本插件四个 dsh peers 精确 pin 到 `0.2.1-rc.5`，每次 DSH 升级都必须手工重 pin**：范围会让仓库 `node_modules` 解析到与运行时不同的构建，离线检查按错误接口版本通过（见 D32）。
 
 **DSH 升级后的固定仪式（每次都照做，不要跳步）：**
 
 1. `node scripts/ops/plugin-lifecycle.mjs verify` —— 看裁决。`DSH peers：incompatible` 就是被门禁拒载了（症状：设置页静默消失，只写 stderr）。
-2. **判断是「只改版本坐标」还是「接口真的变了」：`npm run dsh:delta`。** 它把 pin 的版本与本机运行时版本都从 registry 取下来，对**契约面 12 个包**逐文件做 sha256 比对（代码与资产/配置分开判定），并单独报告上游 `presets/standard.patch.yml` 是否变化。退出码：`0` = 只改版本坐标，可以放心重 pin；`1` = 有接口/实现文件变化，必须先进代码核对；`2` = **无法判定**（归档不可用、registry 取不到、或某包在该版本尚未发布）——`2` **不等于安全**，只是没比对上。命令只读，不改任何仓库文件；它刻意不替你改 pin。
+2. **判断是「只改版本坐标」还是「接口真的变了」：`npm run dsh:delta`。** 它把 pin 的版本与本机运行时版本都从 registry 取下来，逐文件做 sha256 比对（代码与资产/配置分开判定），并单独报告上游 `presets/standard.patch.yml` 是否变化。它分**三张面**：**契约面 12 个包**与**安装/更新/卸载服务面 9 个包**是阻塞面；**客户端半边 5 个包只报告**（`INFO`，不参与判定——客户端包几乎每版都重打 UI bundle，哈希分不出 UI 与 slot / remote / `__ModuleLoader__` 契约的差别，所以只列出变化要求人扫一眼）。退出码只由阻塞面决定：`0` = 只改版本坐标，可以放心重 pin；`1` = 有接口/实现文件变化，必须先进代码核对；`2` = **无法判定**（归档不可用、registry 取不到、或某包在该版本尚未发布）——`2` **不等于安全**，只是没比对上。命令只读，不改任何仓库文件；它刻意不替你改 pin。服务面变了意味着本仓库工具镜像的门禁语义 / CLI 语法 / profile 布局证据过期，要按变化改提示文案与文档。
    - 手动等价做法（命令不可用时）：用 `npm pack @deepseek-ai/<pkg>@<旧版>` 与本机运行时版本分别取包，对每个包的非 `package.json` 文件做哈希比对。
-   - 已实测：`0.2.1-rc.1 → rc.2` 报 `0`（12 个包除版本坐标外逐字节相同；唯一差异是 `dsh-web-app` 的 `cordis.patch.yml` 这个本插件不消费的资产文件），`0.2.1-rc.2 → rc.3` 同样报 `0`（12 个包全部只差版本坐标，上游 `standard.patch.yml` 未变），而 `0.2.0-rc.2 → rc.2` 报 `1` 并列出真实变化的代码文件。
-3. 改 `package.json` 的四个 dsh peer pin（`cordis` / `schemastery` 若归档里也变了则一并改），然后 `npm install` 重生成 lock 与 `node_modules`。
+   - 已实测：`0.2.1-rc.1 → rc.2` 报 `0`（12 个包除版本坐标外逐字节相同；唯一差异是 `dsh-web-app` 的 `cordis.patch.yml` 这个本插件不消费的资产文件），`0.2.1-rc.2 → rc.3` 同样报 `0`（12 个包全部只差版本坐标，上游 `standard.patch.yml` 未变），`0.2.1-rc.3 → rc.5` 仍报 `0`（契约面 12 包 + 服务面 9 包全部只差版本坐标；客户端半边只报告两组无害变化），而 `0.2.0-rc.2 → rc.2` 报 `1` 并列出真实变化的代码文件。
+3. 改 `package.json` 的四个 dsh peer pin（`cordis` / `schemastery` 若归档里也变了则一并改），然后 `npm install` 重生成 lock 与 `node_modules`。**旧 `node_modules` 里还躺着上一版 dsh peer 时，`npm install` 会报 `ERESOLVE`（冲突的 peer 嵌套依赖）**——先删掉 `node_modules` 再装；lock 也要随根 peer 重生成（删掉让它重建，或确认它已跟着改名）。装完抽查 `node_modules/@deepseek-ai/dsh-*` 是否都等于运行时版本。
 4. `npm run check` 全链；`node scripts/check-profile-wiring.mjs` 会断言仓库 peers 满足归档运行时、且 `node_modules` 每个 `@deepseek-ai/dsh*` 与运行时同版本。
 5. `node scripts/ops/plugin-lifecycle.mjs verify` 应回到 `consistent`。**profile 不需要内联 preset**（声明由 `dsh.bundle.patch` 投递；仓库生成物变了只需 `gen:preset`）；若上游 `standard.patch.yml` 变了，`check:preset` 会报漂移，先 `npm run gen:preset` 再 `upgrade --apply`。
 6. 完全退出并重启 DSH，再跑 `plugin:verify` 与 `switchboard_selftest`。
 
 > **刻意不提供「按运行时版本自动改写 pin」的命令**：那种命令会在没有核对接口差异的前提下让插件加载到可能已破坏 API 的运行时上，正是本项目一直在防的静默失效。`npm run dsh:delta` 只做**判定**（只读、可自动化），改 pin 仍由人看过结论后手动改——摩擦降在判定上，不降在把关强度上。
 
-`compatibility.json` 豁免按精确 `package@version` 查找，值为允许的 DSH 版本字符串数组。**键必须用已安装包的版本**（工具已按 `registration.resolvedVersion` 构造；仓库目标版本另列为 `targetKey`），不能用仓库版本代替。插件版本改变后旧键在 DSH 中静默失效，工具会报告 `expired`；当前运行时不在数组中也会失败。工具只提示人工处理：CLI 的 `allow-version <pkg@ver> --dsh-version <runtime> --accept-risk` / `revoke-version` 有 `0.2.1-rc.3` 归档源码/README 依据但未在本机 CLI 实测；GUI 按钮文案未验证。豁免允许不兼容版本运行，可能崩溃或数据损坏，优先重 pin / 升级插件。
+`compatibility.json` 豁免按精确 `package@version` 查找，值为允许的 DSH 版本字符串数组。**键必须用已安装包的版本**（工具已按 `registration.resolvedVersion` 构造；仓库目标版本另列为 `targetKey`），不能用仓库版本代替。插件版本改变后旧键在 DSH 中静默失效，工具会报告 `expired`；当前运行时不在数组中也会失败。工具只提示人工处理：CLI 的 `allow-version <pkg@ver> --dsh-version <runtime> --accept-risk` / `revoke-version` 有 `0.2.1-rc.5` 归档源码/README 依据但未在本机 CLI 实测；GUI 按钮文案未验证。豁免允许不兼容版本运行，可能崩溃或数据损坏，优先重 pin / 升级插件。
 
 ## 5. 安全卸载与排障
 
@@ -178,5 +178,9 @@ desktop CLI 硬拒绝、CLI 必须带 profile 及带 profile 的 `--help` 会初
 - 该会话使用 `standard` preset，根实例自检据此如实报告「本作用域不挂载角色工具；配置中有 4 个角色」。
 
 **适配 `0.2.1-rc.3`（2026-10-25）：** `npm run dsh:delta` 报 12 个契约包除版本坐标外逐字节相同（退出 `0`，上游 `standard.patch.yml` 未变），因此**零代码改动**，只把四个 peer pin 从 rc.2 改成 rc.3 并重装依赖。**安装、更新、卸载机制面另行逐包比对：** `dsh-plugin-manager`（服务、兼容性门禁、CLI 共用实现）、`dsh-package-manifest`、`dsh-host-plugin-inventory`、`dsh-cmdline` 与 `dsh` 启动器除版本坐标外逐字节相同；只有 `dsh-client-ui-plugin-manager` 新增 `pluginNavigation.openList()`、`dsh-web-app` 新增 `entry-customization` 行、会话视图页签等 UI 变化，本插件均不消费 ⇒ **生命周期工具无需功能适配**，只更新了提示文案与文档证据。重装后 `npm run check` 全链退出 `0`；`check-profile-wiring` 为 **18 通过 / 0 失败**（运行时与 23 个仓库 dsh 包均为 rc.3）；`plugin:verify` 报 `DSH peers：compatible / 验证：consistent / 下一步：已就绪`，仓库生成物与行模板仍为 `current`，profile 无需改动。**2026-10-25 完全重启后：** 插件正常装载，根实例 `switchboard_selftest` 报「健康」，`preset roster` 含 `switchboard` / `switchboard-solo` 与 `switchboard-role-scout` / `switchboard-role-worker` / `switchboard-solo-role-scout`，`preset 异常行：（无异常行）`；`roleConfig` 读取 4 个角色且与设置一致。rc.3 的装载与角色 preset 注册已真机通过。
+
+**适配 `0.2.1-rc.5`（2026-10-30）：** `npm run dsh:delta`（本轮起分三张面）报**阻塞面 21 个包**（契约面 12 + 安装/更新/卸载服务面 9）除版本坐标外逐字节相同，退出 `0`，上游 `standard.patch.yml` 未变，因此**零代码改动**，只把四个 peer pin 从 rc.3 改成 rc.5 并重装依赖。**安装、更新、卸载机制面：** `dsh-plugin-manager`（服务、兼容性门禁、CLI 共用实现）、`dsh-package-manifest`、`dsh-host-plugin-inventory`、`dsh-cmdline`、`dsh` 启动器、`dsh-home-paths` 与三个插件页 UI 包（`dsh-client-ui-plugin-manager` / `dsh-client-ui-settings-plugins` / `dsh-client-ui-plugin-market`）**全部逐字节相同** ⇒ 门禁、`compatibility.json` 豁免、bundle 登记语义与 `dsh plugin` 语法依据都没变，**生命周期工具无需功能适配**，只更新了提示文案里引用的归档版本。**客户端半边（只报告）：** `dsh-client-modules` 的 `lib/index.js` 只改了构建 commit 常量，`dsh-client-ui-conversation` 的 `lib/client.js` 只改视图页签 tooltip 并删掉一条文案 ⇒ slot / remote / `__ModuleLoader__` 契约未变，客户端半边无需改动。重装时旧 `node_modules` 里的 rc.3 peers 会触发 `ERESOLVE`，删掉后重装、lock 随根 peer 重生成；重装后 `npm run check` 全链退出 `0`、`check-profile-wiring` 为 **18 通过 / 0 失败**（运行时与 23 个仓库 dsh 包均为 rc.5）、`plugin:verify` 报 `DSH peers：compatible / 验证：consistent / 下一步：已就绪`，仓库生成物与行模板仍为 `current`，profile 无需改动。**完全重启后的装载验收见下段。**
+
+**2026-10-30 完全重启后（新进程 11:00 启动）：** 插件正常装载 —— 重 pin 前根作用域的工具表里没有 `switchboard_selftest`（门禁拒载），重启后它出现在工具表中；根实例调用 `switchboard_selftest` 报 `健康：健康`、`preset roster` 含 `standard ptc minimal cordis switchboard switchboard-solo switchboard-role-scout switchboard-role-worker switchboard-solo-role-scout`、`preset 异常行：（无异常行）`；`roleConfig` 从 `roles.json` 读取 4 个角色且与设置一致（文件已与配置一致，未重写）；根作用域仍是「不挂载角色工具；配置中有 4 个角色」，与 `standard` preset 会话的预期一致。`plugin:verify` 为 `consistent / 已就绪`。rc.5 的装载与角色 preset 注册已真机通过。
 
 **已验收（2026-10-25）：** 自办调度台的 3 个角色工具与 scout 真实派发（约 22 秒完成，README 前 10 行核对一致）已通过。**仍待完成：** GUI 取消/停止沿 `exec.signal` 的传播与客户端任务面板的视觉表现仍未验收；子代理实际拿到的 persona 与工具裁剪仍只有离线证据。
